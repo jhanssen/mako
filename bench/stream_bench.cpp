@@ -2,9 +2,12 @@
 //   stream_bench mtlio <file> [seconds]       MTLIOCommandQueue loads, swept over block size and loads in flight
 //   stream_bench contend <file> [threads] [block_KiB] [GiB]
 //       GPU read bandwidth alone, then while pread threads and then MTLIO stream into another buffer
+// MTLIO loads populate the page cache, so every run reads each block of the file at most once: each
+// measurement gets its own slice of the file, visits it in shuffled order and skips blocks already resident.
 #include "mtl/context.hpp"
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -14,6 +17,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <format>
+#include <optional>
 #include <print>
 #include <random>
 #include <string>
@@ -66,14 +71,78 @@ Ref<MTL::IOCommandQueue> io_queue(MTL::Device* dev)
     return q;
 }
 
-// Keeps `inflight` single-load command buffers outstanding until `stop`; returns bytes loaded.
-uint64_t mtlio_stream(MTL::IOCommandQueue* q, MTL::IOFileHandle* h, MTL::Buffer* dst, uint64_t fsize, size_t block,
+// Read-only mapping of the file, used only to ask which pages are in the page cache.
+class Residency {
+public:
+    explicit Residency(const char* path)
+    {
+        int fd = ::open(path, O_RDONLY);
+        size_ = static_cast<uint64_t>(::lseek(fd, 0, SEEK_END));
+        base_ = ::mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (base_ == MAP_FAILED) {
+            std::println(stderr, "mmap: {}", std::strerror(errno));
+            std::exit(1);
+        }
+    }
+    ~Residency() { ::munmap(base_, size_); }
+    // True when any page of [off, off + len) is resident.
+    bool any(uint64_t off, uint64_t len) const
+    {
+        const uint64_t page = uint64_t(::getpagesize());
+        std::vector<char> vec((len + page - 1) / page);
+        if (::mincore(static_cast<char*>(base_) + off, len, vec.data()) != 0)
+            return true;
+        return std::ranges::any_of(vec, [](char c) { return c & MINCORE_INCORE; });
+    }
+
+private:
+    void* base_ = nullptr;
+    uint64_t size_ = 0;
+};
+
+// Block offsets of one slice of the file, each handed out once, in shuffled order, skipping blocks that
+// already have pages in the page cache.
+class Slice {
+public:
+    Slice(const Residency& res, uint64_t begin, uint64_t bytes, size_t block)
+        : res_(res), block_(block), order_(bytes / block)
+    {
+        for (uint64_t i = 0; i < order_.size(); ++i)
+            order_[i] = begin + i * block;
+        std::ranges::shuffle(order_, std::mt19937_64(begin ^ block));
+    }
+    // Next unread, non-resident offset, or nothing when the slice is used up.
+    std::optional<uint64_t> next()
+    {
+        for (;;) {
+            const size_t i = next_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= order_.size()) {
+                exhausted_ = true;
+                return std::nullopt;
+            }
+            if (!res_.any(order_[i], block_))
+                return order_[i];
+            skipped_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    bool exhausted() const { return exhausted_; }
+    uint64_t skipped() const { return skipped_; }
+
+private:
+    const Residency& res_;
+    size_t block_;
+    std::vector<uint64_t> order_;
+    std::atomic<size_t> next_{0};
+    std::atomic<uint64_t> skipped_{0};
+    std::atomic<bool> exhausted_{false};
+};
+
+// Keeps `inflight` single-load command buffers outstanding until `stop` or the slice runs out; returns bytes loaded.
+uint64_t mtlio_stream(MTL::IOCommandQueue* q, MTL::IOFileHandle* h, MTL::Buffer* dst, Slice& slice, size_t block,
                       int inflight, const std::atomic<bool>& stop, std::vector<double>* lat_us = nullptr)
 {
-    const uint64_t nblocks = fsize / block;
     const uint64_t slots = dst->length() / block;
-    std::mt19937_64 rng(std::random_device{}());
-    std::uniform_int_distribution<uint64_t> pick(0, nblocks - 1);
     struct Pending {
         MTL::IOCommandBuffer* cb;
         Clock::time_point t;
@@ -81,9 +150,12 @@ uint64_t mtlio_stream(MTL::IOCommandQueue* q, MTL::IOFileHandle* h, MTL::Buffer*
     std::deque<Pending> pending;
     uint64_t bytes = 0, slot = 0;
     auto issue = [&] {
+        const auto off = slice.next();
+        if (!off)
+            return;
         auto* cb = q->commandBuffer();
         cb->retain();
-        cb->loadBuffer(dst, (slot++ % slots) * block, block, h, pick(rng) * block);
+        cb->loadBuffer(dst, (slot++ % slots) * block, block, h, *off);
         auto t = Clock::now();
         cb->commit();
         pending.push_back({cb, t});
@@ -115,8 +187,15 @@ int cmd_mtlio(const char* path, double seconds)
     auto h = io_handle(ctx.device(), path);
     auto q = io_queue(ctx.device());
     Ref<MTL::Buffer> dst(ctx.device()->newBuffer(512ull << 20, MTL::ResourceStorageModeShared));
-    for (size_t kib : {128, 512, 1024, 2048, 4096, 8192}) {
-        for (int inflight : {1, 2, 4, 8, 16, 32}) {
+    const Residency res(path);
+    const size_t kibs[] = {128, 512, 1024, 2048, 4096, 8192};
+    const int inflights[] = {1, 2, 4, 8, 16, 32};
+    const uint64_t slice_bytes = fsize / (std::size(kibs) * std::size(inflights)) / (8 << 20) * (8 << 20);
+    uint64_t begin = 0;
+    for (size_t kib : kibs) {
+        for (int inflight : inflights) {
+            Slice slice(res, begin, slice_bytes, kib << 10);
+            begin += slice_bytes;
             std::atomic<bool> stop{false};
             std::vector<double> lat;
             auto t0 = Clock::now();
@@ -124,11 +203,14 @@ int cmd_mtlio(const char* path, double seconds)
                 std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
                 stop = true;
             });
-            uint64_t bytes = mtlio_stream(q.get(), h.get(), dst.get(), fsize, kib << 10, inflight, stop, &lat);
+            uint64_t bytes = mtlio_stream(q.get(), h.get(), dst.get(), slice, kib << 10, inflight, stop, &lat);
             double s = secs_since(t0);
+            stop = true;
             std::ranges::sort(lat);
-            std::println("mtlio inflight {:3}  block {:6} KiB  {:6.2f} GB/s  p50 {:8.0f} us  p99 {:8.0f} us",
-                         inflight, kib, bytes / s / 1e9, lat[lat.size() / 2], lat[(lat.size() - 1) * 99 / 100]);
+            std::println("mtlio inflight {:3}  block {:6} KiB  {:6.2f} GB/s  p50 {:8.0f} us  p99 {:8.0f} us{}{}",
+                         inflight, kib, bytes / s / 1e9, lat[lat.size() / 2], lat[(lat.size() - 1) * 99 / 100],
+                         slice.skipped() ? std::format("  ({} cached blocks skipped)", slice.skipped()) : "",
+                         slice.exhausted() ? "  (slice used up early)" : "");
         }
     }
     return 0;
@@ -157,6 +239,7 @@ int cmd_contend(const char* path, int threads, size_t block, uint64_t gib)
     const uint64_t fsize = file_size(path);
     auto lib = ctx.compile(kReadKernel);
     auto pso = ctx.pipeline(lib.get(), "read_bw");
+    const Residency res(path);
 
     const uint64_t src_bytes = gib << 30;
     Ref<MTL::Buffer> src(dev->newBuffer(src_bytes, MTL::ResourceStorageModeShared));
@@ -188,26 +271,30 @@ int cmd_contend(const char* path, int threads, size_t block, uint64_t gib)
         return passes * static_cast<double>(src_bytes) / total / 1e9;
     };
 
+    // ~2 s of GPU reads per measurement at ~550 GB/s.
+    const int passes = std::max(20, int(1.1e12 / double(src_bytes)));
     gpu_bw(3);
-    std::println("GPU read alone:        {:6.1f} GB/s", gpu_bw(20));
+    std::println("GPU read alone:        {:6.1f} GB/s", gpu_bw(passes));
 
     {
         std::atomic<bool> stop{false};
         std::atomic<uint64_t> bytes{0};
-        const uint64_t nblocks = fsize / block, slots = landing->length() / block;
+        const uint64_t slots = landing->length() / block;
+        Slice slice(res, 0, fsize / 2 / block * block, block);
         auto* base = static_cast<char*>(landing->contents());
         std::vector<std::jthread> pool;
         for (int t = 0; t < threads; ++t) {
             pool.emplace_back([&, t] {
                 int fd = ::open(path, O_RDONLY);
                 ::fcntl(fd, F_NOCACHE, 1);
-                std::mt19937_64 rng(t);
-                std::uniform_int_distribution<uint64_t> pick(0, nblocks - 1);
                 uint64_t i = t;
                 while (!stop.load(std::memory_order_relaxed)) {
+                    const auto off = slice.next();
+                    if (!off)
+                        break;
                     char* out = base + (i % slots) * block;
                     i += threads;
-                    if (::pread(fd, out, block, static_cast<off_t>(pick(rng) * block)) == static_cast<ssize_t>(block))
+                    if (::pread(fd, out, block, static_cast<off_t>(*off)) == static_cast<ssize_t>(block))
                         bytes += block;
                 }
                 ::close(fd);
@@ -216,11 +303,13 @@ int cmd_contend(const char* path, int threads, size_t block, uint64_t gib)
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         auto t0 = Clock::now();
         uint64_t b0 = bytes;
-        double bw = gpu_bw(20);
+        double bw = gpu_bw(passes);
         double ssd = (bytes - b0) / secs_since(t0) / 1e9;
         stop = true;
-        std::println("GPU read + pread:      {:6.1f} GB/s   (SSD {:.2f} GB/s, {} threads x {} KiB)", bw, ssd, threads,
-                     block >> 10);
+        std::println("GPU read + pread:      {:6.1f} GB/s   (SSD {:.2f} GB/s, {} threads x {} KiB){}{}", bw, ssd,
+                     threads, block >> 10,
+                     slice.skipped() ? std::format("  ({} cached blocks skipped)", slice.skipped()) : "",
+                     slice.exhausted() ? "  (slice used up early)" : "");
     }
 
     {
@@ -228,15 +317,19 @@ int cmd_contend(const char* path, int threads, size_t block, uint64_t gib)
         auto q = io_queue(dev);
         std::atomic<bool> stop{false};
         std::atomic<uint64_t> loaded{0};
-        std::jthread io([&] { loaded = mtlio_stream(q.get(), h.get(), landing.get(), fsize, block, threads, stop); });
+        const uint64_t half = fsize / 2 / block * block;
+        Slice slice(res, half, (fsize - half) / block * block, block);
+        std::jthread io([&] { loaded = mtlio_stream(q.get(), h.get(), landing.get(), slice, block, threads, stop); });
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         auto t0 = Clock::now();
-        double bw = gpu_bw(20);
+        double bw = gpu_bw(passes);
         double s = secs_since(t0);
         stop = true;
         io.join();
-        std::println("GPU read + MTLIO:      {:6.1f} GB/s   (SSD ~{:.2f} GB/s over the whole run)", bw,
-                     loaded / (s + 0.3) / 1e9);
+        std::println("GPU read + MTLIO:      {:6.1f} GB/s   (SSD ~{:.2f} GB/s over the whole run){}{}", bw,
+                     loaded / (s + 0.3) / 1e9,
+                     slice.skipped() ? std::format("  ({} cached blocks skipped)", slice.skipped()) : "",
+                     slice.exhausted() ? "  (slice used up early)" : "");
     }
     return 0;
 }
