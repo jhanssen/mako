@@ -11,5 +11,3 @@ target_link_libraries(mm_bench PRIVATE mako_mtl)
 
 add_executable(qformat_bench qformat_bench.cpp)
 target_link_libraries(qformat_bench PRIVATE mako_mtl)
-target_compile_definitions(qformat_bench PRIVATE GEMV_METALLIB="${GEMV_METALLIB}")
-add_dependencies(qformat_bench gemv_metallib)

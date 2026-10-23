@@ -17,8 +17,6 @@ namespace mako::glm {
 struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
-    std::string gemv_metallib;
-    std::string kernels_metallib;
 };
 
 // Decode, one token per step. Dense weights are resident; the routed experts a token selects are read

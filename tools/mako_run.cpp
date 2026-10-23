@@ -79,8 +79,6 @@ int main(int argc, char** argv)
     int n_gen = 8, top = 5;
     std::string ref_dir;
     mako::glm::Options opts;
-    opts.kernels_metallib = MAKO_DEFAULT_METALLIB;
-    opts.gemv_metallib = MAKO_DEFAULT_GEMV_METALLIB;
     for (int i = 3; i + 1 < argc; i += 2) {
         std::string a = argv[i];
         if (a == "-n")

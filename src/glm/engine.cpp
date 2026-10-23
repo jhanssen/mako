@@ -1,5 +1,6 @@
 #include "glm/engine.hpp"
 
+#include "mtl/embedded.hpp"
 #include "quant/dequant.hpp"
 
 #include <fcntl.h>
@@ -103,8 +104,8 @@ struct Engine::Layer {
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : model_(model), cfg_(cfg), opts_(opts), ctx_(ctx)
 {
-    gemv_ = std::make_unique<mtl::Gemv>(ctx_, opts_.gemv_metallib);
-    lib_ = ctx_.load(opts_.kernels_metallib);
+    gemv_ = std::make_unique<mtl::Gemv>(ctx_);
+    lib_ = ctx_.load(mtl::kernels_metallib());
 
     if (cfg_.n_expert_used > 16)
         throw std::runtime_error("more than 16 experts per token");

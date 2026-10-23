@@ -3,6 +3,7 @@
 // pool of distinct matrices (>= 512 MiB) so the weights come from DRAM, not the GPU caches.
 //   qformat_bench [T...]        token counts per GEMV (default 1 4)
 #include "mtl/context.hpp"
+#include "mtl/embedded.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -141,7 +142,7 @@ int main(int argc, char** argv)
     const double peak = measure_peak(ctx);
     std::println("{}  read peak {:.1f} GB/s (streaming kernel)", ctx.info().name, peak);
 
-    auto lib = ctx.load(GEMV_METALLIB);
+    auto lib = ctx.load(mako::mtl::gemv_metallib());
     constexpr uint64_t kPoolBytes = 512ull << 20;
     Ref<MTL::Buffer> pool(dev->newBuffer(kPoolBytes + (64ull << 20), MTL::ResourceStorageModeShared));
     {

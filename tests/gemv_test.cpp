@@ -32,7 +32,7 @@ int main(int argc, char** argv)
                  "blk.3.attn_k_b.weight", "blk.3.attn_v_b.weight", "blk.0.ffn_down.weight"};
 
     mako::mtl::Context ctx;
-    mako::mtl::Gemv gemv(ctx, MAKO_DEFAULT_GEMV_METALLIB);
+    mako::mtl::Gemv gemv(ctx);
     std::mt19937 rng(3);
     std::normal_distribution<float> nd;
     int failures = 0;
