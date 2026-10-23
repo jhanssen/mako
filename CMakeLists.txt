@@ -31,3 +31,4 @@ target_link_libraries(metal_cpp INTERFACE
 
 add_subdirectory(src)
 add_subdirectory(bench)
+add_subdirectory(tools)
