@@ -1,5 +1,5 @@
 // Decode GEMV throughput per weight format: y[T][N] = x[T][K] . W[N][K]^T with synthetic weights.
-// Kernels are the upstream ggml Metal mul_mv kernels, compiled offline. Each command buffer walks a
+// Kernels are third-party reference GEMV kernels, compiled offline. Each command buffer walks a
 // pool of distinct matrices (>= 512 MiB) so the weights come from DRAM, not the GPU caches.
 //   qformat_bench [T...]        token counts per GEMV (default 1 4)
 #include "mtl/context.hpp"
@@ -18,7 +18,7 @@ namespace {
 
 using mako::mtl::Ref;
 
-// Layout must match ggml_metal_kargs_mul_mv.
+// Layout must match the kernels' argument struct.
 struct MulMvArgs {
     int32_t ne00, ne01, ne02;
     uint64_t nb00, nb01, nb02, nb03;
@@ -41,7 +41,7 @@ struct Format {
     Scale scale = Scale::F16;
 };
 
-// nsg/nr0/smem follow the upstream defaults for these types at K >= 2048 (no split rows).
+// nsg/nr0/smem are the kernels' own defaults for these types at K >= 2048 (no split rows).
 const std::vector<Format> kFormats = {
     {"Q8_0", "kernel_mul_mv_q8_0_f32", 32, 34, 4, 2, 32 * 4 * 2, true, {0}},
     {"Q6_K", "kernel_mul_mv_q6_K_f32", 256, 210, 2, 2, 0, false, {208}},

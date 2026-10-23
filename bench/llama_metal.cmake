@@ -1,4 +1,4 @@
-# Upstream ggml Metal GEMV kernels (MIT), pinned, used as the per-format reference in qformat_bench.
+# Third-party per-format GEMV kernels (MIT), pinned by commit and hash; the baseline in qformat_bench.
 set(LLAMA_METAL_COMMIT 9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e)
 set(LLAMA_METAL_DIR ${CMAKE_BINARY_DIR}/third_party/llama-metal)
 set(_base https://raw.githubusercontent.com/ggml-org/llama.cpp/${LLAMA_METAL_COMMIT})
@@ -24,5 +24,5 @@ add_custom_command(
             -c ${LLAMA_METAL_DIR}/mul_mv.metal -o ${CMAKE_BINARY_DIR}/bench/llama_mul_mv.air
     COMMAND xcrun -sdk macosx metallib ${CMAKE_BINARY_DIR}/bench/llama_mul_mv.air -o ${LLAMA_MUL_MV_METALLIB}
     DEPENDS ${LLAMA_METAL_DIR}/mul_mv.metal
-    COMMENT "Compiling upstream mul_mv kernels")
+    COMMENT "Compiling reference GEMV kernels")
 add_custom_target(llama_mul_mv_metallib DEPENDS ${LLAMA_MUL_MV_METALLIB})
