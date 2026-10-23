@@ -1,0 +1,49 @@
+# mako
+
+An inference engine for very large mixture-of-experts language models on Apple Silicon Macs, written in C++ and Metal.
+
+Targets: **GLM-5.3-Flash** (first) and **DeepSeek-V4.1-Flash-1017** (next), on Macs with 64-256 GB of unified memory.
+Weights that don't fit in memory stream from the internal SSD into a unified-memory cache that the GPU reads directly.
+It runs on M4 and later and is tuned for M5.
+
+## Status
+
+Early. GLM-5.3-Flash decodes one token at a time and matches a reference implementation to within that
+reference's own precision. Routed experts are read from the SSD for every token (no cache yet), there is no tokenizer
+(input is token ids), no batched prompt processing and no speculative decoding. Expect it to be slow.
+
+## Requirements
+
+- Apple Silicon Mac, macOS 26 or later
+- Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`)
+- CMake 4.3 or later, Ninja
+
+## Build
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+The first configure downloads pinned dependencies (metal-cpp and third-party GEMV kernels).
+
+## Run
+
+```sh
+./build/tools/mako_run <model-00001-of-0000N.gguf> <token,ids,...> [-n tokens-to-generate]
+```
+
+The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e.g. the Maya-S quantization
+(`peasantsmith/GLM-5.3-Flash-Maya-GGUF`, `Maya-S-v2-IQ2_XXS`).
+
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `src/gguf` | GGUF reader, multi-file models |
+| `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
+| `src/kernels` | Metal kernels |
+| `src/glm` | GLM-5.3-Flash config and engine |
+| `tools` | `mako_run`, `gguf_dump`, optional `ref_dump` for parity checks |
+| `tests` | kernel tests against CPU dequantization |
+| `bench` | SSD, sync, matmul and quantization-format microbenchmarks |
