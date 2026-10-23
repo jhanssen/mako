@@ -12,8 +12,8 @@
 #include <cstring>
 #include <format>
 #include <numeric>
+#include <span>
 #include <stdexcept>
-#include <thread>
 
 namespace mako::glm {
 
@@ -98,7 +98,7 @@ struct Engine::Layer {
     DevTensor ffn_gate, ffn_up, ffn_down;
     DevTensor router, sh_gate, sh_up, sh_down;
     std::vector<float> router_bias;
-    ExpertTensor e_gate, e_up, e_down;
+    ExpertArena::LayerParts experts{};
 };
 
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
@@ -197,16 +197,50 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
                 throw std::runtime_error(p + "exp_probs_b.bias missing or not F32");
             L->router_bias.resize(cfg_.n_expert);
             read_exact(bias.file->fd(), L->router_bias.data(), cfg_.n_expert * 4, bias.tensor->offset);
-            L->e_gate = expert(p + "ffn_gate_exps.weight");
-            L->e_up = expert(p + "ffn_up_exps.weight");
-            L->e_down = expert(p + "ffn_down_exps.weight");
+            L->experts = {expert(p + "ffn_gate_exps.weight"), expert(p + "ffn_up_exps.weight"),
+                          expert(p + "ffn_down_exps.weight")};
         }
         layers_.push_back(std::move(L));
     }
     logits_.resize(cfg_.n_vocab);
+
+    std::vector<ExpertArena::LayerParts> parts;
+    for (const auto& L : layers_)
+        parts.push_back(L->experts);
+    arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
+    arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
+    arena_ = std::make_unique<ExpertArena>(ctx_.device(), ctx_.info().max_buffer, std::move(parts), cfg_.n_expert,
+                                           cfg_.n_expert_used, arena_plan_.budget);
+    arena_->prefill();
+    ctx_.queue()->addResidencySet(arena_->residency());
+
+    // The first compute pass that reads an arena buffer pays a driver cost that grows with its size (~0.5 s for
+    // 75 GB); pay it here instead of in the first step.
+    const auto t0 = Clock::now();
+    MTL::Buffer* sink = scratch("warm", 16);
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+    const uint32_t one = 1;
+    for (const auto& b : arena_->buffers()) {
+        enc->setComputePipelineState(pso("copy_f32"));
+        enc->setBuffer(b.get(), 0, 0);
+        enc->setBuffer(sink, 0, 1);
+        enc->setBytes(&one, sizeof(one), 2);
+        enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+    }
+    enc->endEncoding();
+    cb->commit();
+    cb->waitUntilCompleted();
+    arena_plan_.warm_ms = ms_since(t0);
 }
 
-Engine::~Engine() = default;
+Engine::~Engine()
+{
+    ctx_.queue()->removeResidencySet(arena_->residency());
+    arena_.reset();
+    for (auto& [path, fd] : nocache_fds_)
+        ::close(fd);
+}
 
 Engine::DevTensor Engine::upload(const std::string& name)
 {
@@ -233,7 +267,7 @@ Engine::DevTensor Engine::upload(const std::string& name)
     return d;
 }
 
-Engine::ExpertTensor Engine::expert(const std::string& name)
+ExpertArena::Part Engine::expert(const std::string& name)
 {
     auto ref = model_.find(name);
     if (!ref)
@@ -243,10 +277,17 @@ Engine::ExpertTensor Engine::expert(const std::string& name)
         throw std::runtime_error(name + ": expected [k, n, n_expert]");
     if (!mtl::Gemv::supports(t.type))
         throw std::runtime_error(std::format("{}: unsupported type {}", name, gguf::traits(t.type).name));
-    ExpertTensor e;
-    e.fd = ref.file->fd();
-    e.offset = t.offset;
-    e.expert_bytes = t.bytes / cfg_.n_expert;
+    auto [it, fresh] = nocache_fds_.try_emplace(ref.file->path(), -1);
+    if (fresh) {
+        it->second = ::open(ref.file->path().c_str(), O_RDONLY);
+        if (it->second < 0)
+            throw std::runtime_error(std::format("open {}: {}", ref.file->path(), std::strerror(errno)));
+        ::fcntl(it->second, F_NOCACHE, 1);
+    }
+    ExpertArena::Part e;
+    e.fd = it->second;
+    e.file_off = t.offset;
+    e.bytes = t.bytes / cfg_.n_expert;
     e.type = t.type;
     e.k = uint32_t(t.dims[0]);
     e.n = uint32_t(t.dims[1]);
@@ -563,27 +604,6 @@ void Engine::route(const Layer& L, uint32_t il, std::array<int, 16>& sel, std::a
         w[i] *= cfg_.expert_weights_scale;
 }
 
-void Engine::load_experts(const Layer& L, const std::array<int, 16>& sel)
-{
-    const uint32_t k = cfg_.n_expert_used;
-    const ExpertTensor* parts[3] = {&L.e_gate, &L.e_up, &L.e_down};
-    MTL::Buffer* st[3] = {scratch("st_gate", k * L.e_gate.expert_bytes), scratch("st_up", k * L.e_up.expert_bytes),
-                          scratch("st_down", k * L.e_down.expert_bytes)};
-    auto t0 = Clock::now();
-    {
-        std::vector<std::jthread> readers;
-        for (uint32_t i = 0; i < k; ++i)
-            for (int p = 0; p < 3; ++p)
-                readers.emplace_back([&, i, p] {
-                    const ExpertTensor& e = *parts[p];
-                    read_exact(e.fd, static_cast<char*>(st[p]->contents()) + uint64_t(i) * e.expert_bytes,
-                               e.expert_bytes, e.offset + uint64_t(sel[i]) * e.expert_bytes);
-                });
-    }
-    stats_.expert_read_ms += ms_since(t0);
-    stats_.expert_bytes += k * (L.e_gate.expert_bytes + L.e_up.expert_bytes + L.e_down.expert_bytes);
-}
-
 void Engine::submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc)
 {
     enc->endEncoding();
@@ -693,7 +713,8 @@ const std::vector<float>& Engine::step(int32_t token)
             }
             if (route_override_)
                 route_override_(int(il), sel.data(), w.data(), k);
-            load_experts(L, sel);
+            MTL::Buffer* ids = scratch("eids", 16 * 4);
+            arena_->ensure(il, std::span<const int>(sel.data(), k), static_cast<int32_t*>(ids->contents()));
             MTL::Buffer* ew = scratch("ew", 16 * 4);
             std::memcpy(ew->contents(), w.data(), k * 4);
 
@@ -701,21 +722,22 @@ const std::vector<float>& Engine::step(int32_t token)
             MTL::Buffer* eu = scratch("eu", k * nff * 4);
             MTL::Buffer* em = scratch("em", k * nff * 4);
             MTL::Buffer* ed = scratch("ed", k * E * 4);
-            auto expert_gemv = [&](const ExpertTensor& e, MTL::Buffer* st, MTL::Buffer* in, MTL::Buffer* out,
-                                   bool shared) {
+            auto expert_gemv = [&](int part, MTL::Buffer* in, MTL::Buffer* out, bool shared) {
+                const ExpertArena::Part& e = arena_->part(il, part);
+                const ExpertArena::Region& r = arena_->region(il, part);
                 mtl::Gemv::Args a;
                 a.type = e.type;
                 a.k = e.k;
                 a.n = e.n;
                 a.batch = k;
                 a.x_shared = shared;
-                gemv_->encode(enc, a, st, 0, in, 0, out, 0);
+                gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0);
             };
-            expert_gemv(L.e_gate, scratch("st_gate", 0), xn, eg, true);
-            expert_gemv(L.e_up, scratch("st_up", 0), xn, eu, true);
+            expert_gemv(0, xn, eg, true);
+            expert_gemv(1, xn, eu, true);
             const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
             dispatch(enc, "swiglu", {eg, eu, em}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1), MTL::Size(256, 1, 1));
-            expert_gemv(L.e_down, scratch("st_down", 0), em, ed, false);
+            expert_gemv(2, em, ed, false);
             const CombineArgs ca{E, k};
             dispatch(enc, "moe_combine", {ed, ew, sho, ffo}, &ca, sizeof(ca), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
         }
@@ -737,6 +759,8 @@ const std::vector<float>& Engine::step(int32_t token)
         throw std::runtime_error("command buffer failed");
     deliver_probes();
     std::memcpy(logits_.data(), lg->contents(), uint64_t(cfg_.n_vocab) * 4);
+    stats_.expert_read_ms = arena_->stats().read_ms;
+    stats_.expert_bytes = arena_->stats().read_bytes;
     ++pos_;
     pool->release();
     return logits_;

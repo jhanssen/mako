@@ -1,6 +1,6 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
-//            [--force DIR] [--force-route DIR]
+//            [--force DIR] [--force-route DIR] [--arena-gb N]
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
@@ -112,6 +112,8 @@ int main(int argc, char** argv)
             opts.indexer_top_k = uint32_t(std::stoul(argv[i + 1]));
         else if (a == "--ref")
             ref_dir = argv[i + 1];
+        else if (a == "--arena-gb")
+            opts.arena_gb = std::stod(argv[i + 1]);
         else if (a == "--dump")
             dump_dir = argv[i + 1];
         else if (a == "--force")
@@ -146,6 +148,17 @@ int main(int argc, char** argv)
     auto t0 = std::chrono::steady_clock::now();
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    {
+        const auto& p = engine.arena_plan();
+        const auto& a = engine.arena();
+        std::println("memory: RAM {:.1f} GB, working set {:.1f} GB, footprint {:.1f} GB, file-cache floor {:.1f} GB, "
+                     "available {:.1f} GB",
+                     p.mem.phys / 1e9, p.mem.working_set / 1e9, p.mem.footprint / 1e9, p.mem.filecache_min / 1e9,
+                     p.mem.available / 1e9);
+        std::println("expert arena: budget {:.1f} GB, {:.1f} GB in {} slots per layer, GPU warm-up {:.2f} s, "
+                     "prefilled in {:.1f} s",
+                     p.budget / 1e9, a.bytes() / 1e9, a.slots(), p.warm_ms / 1e3, a.stats().prefill_ms / 1e3);
+    }
 
     if (!force_dir.empty())
         engine.set_stream_override([&](int layer, float* streams, size_t n) {
@@ -244,7 +257,9 @@ int main(int argc, char** argv)
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
-    std::println("expert reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", st.expert_read_ms, st.expert_bytes / 1e9,
-                 st.gpu_wait_ms);
+    const auto& as = engine.arena().stats();
+    std::println("expert hits {} misses {} ({:.1f}% hit), reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", as.hits,
+                 as.misses, 100.0 * as.hits / std::max<uint64_t>(1, as.hits + as.misses), st.expert_read_ms,
+                 st.expert_bytes / 1e9, st.gpu_wait_ms);
     return 0;
 }

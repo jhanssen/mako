@@ -1,5 +1,6 @@
 #pragma once
 
+#include "glm/arena.hpp"
 #include "glm/config.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
@@ -17,10 +18,11 @@ namespace mako::glm {
 struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
+    double arena_gb = -1;       // expert arena size; < 0: from the memory budget
 };
 
-// Decode, one token per step. Dense weights are resident; the routed experts a token selects are read
-// from the model files after each MoE layer's router runs on the GPU.
+// Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
+// a token selects but the arena lacks are read from the model files after each MoE layer's router runs.
 class Engine {
 public:
     Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx);
@@ -49,6 +51,15 @@ public:
     };
     const Stats& stats() const { return stats_; }
 
+    // The memory figures the arena was sized from and its size (bytes).
+    struct ArenaPlan {
+        MemInfo mem;
+        double budget = 0;
+        double warm_ms = 0; // first GPU pass over the arena, at load
+    };
+    const ArenaPlan& arena_plan() const { return arena_plan_; }
+    const ExpertArena& arena() const { return *arena_; }
+
 private:
     struct DevTensor {
         MTL::Buffer* buf = nullptr;
@@ -56,18 +67,11 @@ private:
         gguf::Type type = gguf::Type::F32;
         std::vector<uint64_t> dims;
     };
-    struct ExpertTensor {
-        int fd = -1;
-        uint64_t offset = 0;       // first expert's bytes in the file
-        uint64_t expert_bytes = 0;
-        gguf::Type type = gguf::Type::F32;
-        uint32_t k = 0, n = 0;
-    };
     struct Layer;
 
     DevTensor upload(const std::string& name);
     DevTensor upload_optional(const std::string& name);
-    ExpertTensor expert(const std::string& name);
+    ExpertArena::Part expert(const std::string& name);
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
     MTL::ComputePipelineState* pso(const std::string& fn);
 
@@ -85,7 +89,6 @@ private:
     void ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* out, float limit);
     void route(const Layer& L, uint32_t il, std::array<int, 16>& sel, std::array<float, 16>& w);
-    void load_experts(const Layer& L, const std::array<int, 16>& sel);
     void probe(MTL::ComputeCommandEncoder* enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
     void deliver_probes();
@@ -103,6 +106,9 @@ private:
     uint64_t chunk_used_ = 0;
     std::map<std::string, mtl::Ref<MTL::Buffer>> scratch_;
     std::vector<std::unique_ptr<Layer>> layers_;
+    std::map<std::string, int> nocache_fds_; // shard path -> descriptor for expert reads
+    std::unique_ptr<ExpertArena> arena_;
+    ArenaPlan arena_plan_;
 
     gguf::ModelFiles::Ref token_embd_;
     DevTensor output_norm_, output_;

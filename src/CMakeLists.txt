@@ -24,7 +24,7 @@ add_custom_command(OUTPUT ${MAKO_METALLIB}
     COMMENT "Linking mako.metallib")
 add_custom_target(mako_metallib DEPENDS ${MAKO_METALLIB})
 
-add_library(mako_glm STATIC glm/config.cpp glm/engine.cpp)
+add_library(mako_glm STATIC glm/arena.cpp glm/config.cpp glm/engine.cpp)
 target_link_libraries(mako_glm PUBLIC mako_mtl mako_gguf)
 
 set_source_files_properties(mtl/embedded.cpp PROPERTIES
