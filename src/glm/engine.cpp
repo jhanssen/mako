@@ -511,6 +511,7 @@ bool Engine::indexer(MTL::ComputeCommandEncoder* enc, const Layer& L, uint32_t i
     MTL::Buffer* score = scratch("idx_score", uint64_t(opts_.max_ctx / kp + 1) * 4);
     const ScoreArgs sa{Di, Hi, n_pool, 1.0f / std::sqrt(float(Di * Hi))};
     dispatch(enc, "idx_score", {iq, iw, pooled, score}, &sa, sizeof(sa), MTL::Size(n_pool, 1, 1), MTL::Size(64, 1, 1));
+    probe(enc, "indexer_score", int(il), score, n_pool);
     const SelectArgs sel{n_pool, n_top, kp, pos_ + 1};
     dispatch(enc, "idx_select", {score, scratch("idx_mask", opts_.max_ctx)}, &sel, sizeof(sel), MTL::Size(1, 1, 1),
              MTL::Size(256, 1, 1), false);

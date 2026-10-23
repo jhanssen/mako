@@ -61,14 +61,12 @@ std::vector<T> load(const std::filesystem::path& file)
     return v;
 }
 
+// A reference longer than n is accepted when its tail is all -inf (padded scores).
 std::optional<Diff> compare(const std::filesystem::path& file, const float* got, size_t n)
 {
-    std::ifstream in(file, std::ios::binary | std::ios::ate);
-    if (!in || size_t(in.tellg()) != n * 4)
+    const auto ref = load<float>(file);
+    if (ref.size() < n || !std::all_of(ref.begin() + n, ref.end(), [](float v) { return std::isinf(v) && v < 0; }))
         return std::nullopt;
-    std::vector<float> ref(n);
-    in.seekg(0);
-    in.read(reinterpret_cast<char*>(ref.data()), std::streamsize(n * 4));
     double dd = 0, rr = 0, gg = 0, gr = 0;
     Diff d;
     for (size_t i = 0; i < n; ++i) {
