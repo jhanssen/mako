@@ -532,7 +532,7 @@ void Engine::ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, c
     gemv(enc, down, m, 0, out, 0);
 }
 
-void Engine::route(const Layer& L, std::array<int, 16>& sel, std::array<float, 16>& w)
+void Engine::route(const Layer& L, uint32_t il, std::array<int, 16>& sel, std::array<float, 16>& w)
 {
     const auto* logits = static_cast<const float*>(scratch("rlog", cfg_.n_expert * 4)->contents());
     const uint32_t E = cfg_.n_expert, k = cfg_.n_expert_used;
@@ -541,6 +541,8 @@ void Engine::route(const Layer& L, std::array<int, 16>& sel, std::array<float, 1
         probs[e] = 1.0f / (1.0f + std::exp(-logits[e]));
         biased[e] = probs[e] + L.router_bias[e];
     }
+    if (probe_)
+        probe_("ffn_moe_probs_biased", int(il), biased.data(), E);
     std::vector<int> idx(E);
     std::iota(idx.begin(), idx.end(), 0);
     std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
@@ -651,6 +653,10 @@ const std::vector<float>& Engine::step(int32_t token)
 
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const Layer& L = *layers_[il];
+        if (stream_override_) {
+            submit(cb, enc);
+            stream_override_(int(il), static_cast<float*>(scratch("R", hd * 4)->contents()), hd);
+        }
         hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base);
         probe(enc, "hc_attn_pre", int(il), x, E);
         norm(enc, x, &L.attn_norm, xn, 1, E, E, cfg_.rms_eps);
@@ -678,7 +684,14 @@ const std::vector<float>& Engine::step(int32_t token)
 
             std::array<int, 16> sel{};
             std::array<float, 16> w{};
-            route(L, sel, w);
+            route(L, il, sel, w);
+            if (probe_) {
+                std::array<float, 16> self{};
+                std::copy_n(sel.begin(), k, self.begin());
+                probe_("moe_sel", int(il), self.data(), k);
+            }
+            if (route_override_)
+                route_override_(int(il), sel.data(), w.data(), k);
             load_experts(L, sel);
             MTL::Buffer* ew = scratch("ew", 16 * 4);
             std::memcpy(ew->contents(), w.data(), k * 4);

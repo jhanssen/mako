@@ -35,6 +35,14 @@ public:
     using Probe = std::function<void(const std::string& name, int layer, const float* data, size_t n)>;
     void set_probe(Probe probe) { probe_ = std::move(probe); }
 
+    // Teacher forcing for parity checks. Called before each layer with its input residual streams
+    // (hc * n_embd values), which it may overwrite. Costs a GPU sync per layer.
+    using StreamOverride = std::function<void(int layer, float* streams, size_t n)>;
+    void set_stream_override(StreamOverride f) { stream_override_ = std::move(f); }
+    // Called after routing a MoE layer; may overwrite the selected experts and their final weights (k each).
+    using RouteOverride = std::function<void(int layer, int* sel, float* w, size_t k)>;
+    void set_route_override(RouteOverride f) { route_override_ = std::move(f); }
+
     struct Stats {
         double expert_read_ms = 0, gpu_wait_ms = 0;
         uint64_t expert_bytes = 0;
@@ -76,7 +84,7 @@ private:
     bool indexer(MTL::ComputeCommandEncoder* enc, const Layer& L, uint32_t il);
     void ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* out, float limit);
-    void route(const Layer& L, std::array<int, 16>& sel, std::array<float, 16>& w);
+    void route(const Layer& L, uint32_t il, std::array<int, 16>& sel, std::array<float, 16>& w);
     void load_experts(const Layer& L, const std::array<int, 16>& sel);
     void probe(MTL::ComputeCommandEncoder* enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
@@ -103,6 +111,8 @@ private:
     uint32_t pos_ = 0;
     std::vector<float> logits_;
     Probe probe_;
+    StreamOverride stream_override_;
+    RouteOverride route_override_;
     struct PendingProbe {
         std::string name;
         int layer;

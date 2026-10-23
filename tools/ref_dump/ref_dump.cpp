@@ -1,5 +1,5 @@
 // Runs token ids one at a time through the reference implementation on the CPU and writes the named
-// intermediate tensors of every step as raw fp32: <out>/<name>.<pos>.f32 (name as "<tensor>-<layer>").
+// intermediate tensors of every step as raw fp32 or int32: <out>/<name>.<pos>.f32|.i32 (name as "<tensor>-<layer>").
 //   ref_dump <model.gguf> <id,id,...> <out_dir> [name-substring ...]
 // An id list starting with '@' is text to tokenize instead; the ids are printed.
 // REF_INDEXER_TOP_K=N in the environment overrides the model's sparse-attention selection width.
@@ -44,11 +44,12 @@ bool on_tensor(ggml_tensor* t, bool ask, void* user)
     auto& d = *static_cast<Dump*>(user);
     if (ask)
         return wanted(d, t->name);
-    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t))
+    if ((t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) || !ggml_is_contiguous(t))
         return true;
     d.buf.resize(ggml_nelements(t));
     ggml_backend_tensor_get(t, d.buf.data(), 0, ggml_nbytes(t));
-    std::ofstream out(d.dir / (std::string(t->name) + "." + std::to_string(d.pos) + ".f32"), std::ios::binary);
+    const char* ext = t->type == GGML_TYPE_F32 ? ".f32" : ".i32";
+    std::ofstream out(d.dir / (std::string(t->name) + "." + std::to_string(d.pos) + ext), std::ios::binary);
     out.write(reinterpret_cast<const char*>(d.buf.data()), std::streamsize(d.buf.size() * 4));
     return true;
 }

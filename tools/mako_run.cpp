@@ -1,7 +1,10 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
-//   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--indexer-top-k N]
+//   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
+//            [--force DIR] [--force-route DIR]
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
-// logits against <DIR>/logits.<pos>.f32.
+// logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
+// --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
+// measures each layer's own error; --force-route also takes the reference's expert selection and weights.
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gguf/model_files.hpp"
@@ -17,6 +20,7 @@
 #include <optional>
 #include <print>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -45,6 +49,18 @@ struct Diff {
     double rel = 0, cos = 0, max_abs = 0;
 };
 
+template <typename T>
+std::vector<T> load(const std::filesystem::path& file)
+{
+    std::ifstream in(file, std::ios::binary | std::ios::ate);
+    if (!in)
+        return {};
+    std::vector<T> v(size_t(in.tellg()) / sizeof(T));
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size() * sizeof(T)));
+    return v;
+}
+
 std::optional<Diff> compare(const std::filesystem::path& file, const float* got, size_t n)
 {
     std::ifstream in(file, std::ios::binary | std::ios::ate);
@@ -68,6 +84,12 @@ std::optional<Diff> compare(const std::filesystem::path& file, const float* got,
     return d;
 }
 
+void dump(const std::filesystem::path& file, const float* data, size_t n)
+{
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(data), std::streamsize(n * 4));
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -78,7 +100,7 @@ int main(int argc, char** argv)
         return 2;
     }
     int n_gen = 8, top = 5;
-    std::string ref_dir;
+    std::string ref_dir, dump_dir, force_dir, route_dir;
     mako::glm::Options opts;
     for (int i = 3; i + 1 < argc; i += 2) {
         std::string a = argv[i];
@@ -92,7 +114,15 @@ int main(int argc, char** argv)
             opts.indexer_top_k = uint32_t(std::stoul(argv[i + 1]));
         else if (a == "--ref")
             ref_dir = argv[i + 1];
+        else if (a == "--dump")
+            dump_dir = argv[i + 1];
+        else if (a == "--force")
+            force_dir = argv[i + 1];
+        else if (a == "--force-route")
+            route_dir = argv[i + 1];
     }
+    if (!dump_dir.empty())
+        std::filesystem::create_directories(dump_dir);
     auto model = mako::gguf::ModelFiles::open(argv[1]);
     if (!model) {
         std::println(stderr, "{}", model.error());
@@ -119,17 +149,60 @@ int main(int argc, char** argv)
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 
+    if (!force_dir.empty())
+        engine.set_stream_override([&](int layer, float* streams, size_t n) {
+            if (layer == 0)
+                return;
+            const auto file = std::filesystem::path(force_dir) /
+                              std::format("l_out-{}.{}.f32", layer - 1, engine.position());
+            const auto v = load<float>(file);
+            if (v.size() != n)
+                throw std::runtime_error("--force: missing or wrong-sized " + file.string());
+            std::ranges::copy(v, streams);
+        });
+    if (!route_dir.empty())
+        engine.set_route_override([&](int layer, int* sel, float* w, size_t k) {
+            const auto dir = std::filesystem::path(route_dir);
+            const auto ids = load<int32_t>(dir / std::format("ffn_moe_topk-{}.{}.i32", layer, engine.position()));
+            const auto ws =
+                load<float>(dir / std::format("ffn_moe_weights_scaled-{}.{}.f32", layer, engine.position()));
+            if (ids.size() != k || ws.size() != k)
+                throw std::runtime_error(std::format("--force-route: missing routing for layer {}", layer));
+            std::ranges::copy(ids, sel);
+            std::ranges::copy(ws, w);
+        });
+
     double worst_rel = 0;
     auto report = [&](const std::string& name, const float* data, size_t n) {
-        const auto file = std::filesystem::path(ref_dir) / (name + "." + std::to_string(engine.position()) + ".f32");
-        if (auto d = compare(file, data, n)) {
+        const auto base = name + "." + std::to_string(engine.position()) + ".f32";
+        if (!dump_dir.empty())
+            dump(std::filesystem::path(dump_dir) / base, data, n);
+        if (ref_dir.empty())
+            return;
+        if (name.starts_with("moe_sel-")) {
+            const auto file = std::format("ffn_moe_topk-{}.{}.i32", name.substr(8), engine.position());
+            auto ref = load<int32_t>(std::filesystem::path(ref_dir) / file);
+            std::vector<int32_t> got(data, data + n);
+            if (ref.size() != n) {
+                std::println("  {:16} (no reference)", name);
+                return;
+            }
+            std::ranges::sort(ref);
+            std::ranges::sort(got);
+            if (ref == got)
+                std::println("  {:16} same", name);
+            else
+                std::println("  {:16} DIFFERS mako {} ref {}", name, got, ref);
+            return;
+        }
+        if (auto d = compare(std::filesystem::path(ref_dir) / base, data, n)) {
             worst_rel = std::max(worst_rel, d->rel);
             std::println("  {:16} rel {:9.2e}  cos {:.6f}  max {:9.2e}", name, d->rel, d->cos, d->max_abs);
         } else {
             std::println("  {:16} (no reference)", name);
         }
     };
-    if (!ref_dir.empty())
+    if (!ref_dir.empty() || !dump_dir.empty())
         engine.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
             report(layer < 0 ? name : std::format("{}-{}", name, layer), data, n);
         });
@@ -145,6 +218,8 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < ids.size(); ++i) {
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(ids[i]);
+        if (!dump_dir.empty())
+            dump(std::filesystem::path(dump_dir) / std::format("logits.{}.f32", i), logits.data(), logits.size());
         if (!ref_dir.empty()) {
             const auto file = std::filesystem::path(ref_dir) / std::format("logits.{}.f32", i);
             if (auto d = compare(file, logits.data(), logits.size()))
