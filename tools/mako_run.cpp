@@ -1,10 +1,11 @@
-// Runs token ids through the GLM engine and prints the top logits at each position and a greedy continuation.
+// Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--indexer-top-k N]
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
 // logits against <DIR>/logits.<pos>.f32.
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gguf/model_files.hpp"
+#include "text/tokenizer.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -92,16 +93,21 @@ int main(int argc, char** argv)
         else if (a == "--ref")
             ref_dir = argv[i + 1];
     }
-    auto ids = parse_ids(argv[2]);
-    if (ids.empty()) {
-        std::println(stderr, "no token ids");
-        return 2;
-    }
-
     auto model = mako::gguf::ModelFiles::open(argv[1]);
     if (!model) {
         std::println(stderr, "{}", model.error());
         return 1;
+    }
+    auto tok = mako::text::Tokenizer::load(model->meta());
+    if (!tok) {
+        std::println(stderr, "{}", tok.error());
+        return 1;
+    }
+    const std::string input = argv[2];
+    auto ids = input.starts_with('@') ? tok->encode(std::string_view(input).substr(1), true) : parse_ids(input);
+    if (ids.empty()) {
+        std::println(stderr, "no input tokens");
+        return 2;
     }
     auto cfg = mako::glm::Config::load(*model);
     if (!cfg) {
@@ -149,9 +155,11 @@ int main(int argc, char** argv)
                      show(logits));
     }
     std::string gen;
+    std::vector<int32_t> gen_ids;
     for (int g = 0; g < n_gen; ++g) {
         const int next = top_k(logits, 1)[0];
         gen += std::format("{},", next);
+        gen_ids.push_back(next);
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(next);
         std::println("gen {:4} in {:7} {:7.0f} ms  top{}", g, next,
@@ -162,6 +170,7 @@ int main(int argc, char** argv)
         std::println("worst probe rel error {:.2e}", worst_rel);
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
+    std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
     std::println("expert reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", st.expert_read_ms, st.expert_bytes / 1e9,
                  st.gpu_wait_ms);
     return 0;

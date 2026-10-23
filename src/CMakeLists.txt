@@ -31,3 +31,6 @@ set_source_files_properties(mtl/embedded.cpp PROPERTIES
     COMPILE_OPTIONS "--embed-dir=${CMAKE_BINARY_DIR};-Wno-c23-extensions"
     OBJECT_DEPENDS "${MAKO_METALLIB};${GEMV_METALLIB}")
 add_dependencies(mako_mtl mako_metallib gemv_metallib)
+
+add_library(mako_text STATIC text/tokenizer.cpp)
+target_link_libraries(mako_text PUBLIC mako_gguf)

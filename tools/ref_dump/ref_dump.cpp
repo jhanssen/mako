@@ -3,6 +3,8 @@
 //   ref_dump <model.gguf> <id,id,...> <out_dir> [name-substring ...]
 // An id list starting with '@' is text to tokenize instead; the ids are printed.
 // REF_INDEXER_TOP_K=N in the environment overrides the model's sparse-attention selection width.
+// REF_TOKENIZE=<file>: load only the vocabulary, tokenize each 0x1E-separated case of <file> (special tokens
+// parsed) and print one line of ids per case; the other arguments are ignored.
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <print>
 #include <sstream>
 #include <string>
@@ -73,6 +76,27 @@ int main(int argc, char** argv)
     }
 
     llama_backend_init();
+    if (const char* tf = std::getenv("REF_TOKENIZE")) {
+        auto vp = llama_model_default_params();
+        vp.vocab_only = true;
+        llama_model* vm = llama_model_load_from_file(argv[1], vp);
+        if (!vm)
+            return 1;
+        const llama_vocab* v = llama_model_get_vocab(vm);
+        std::ifstream in(tf, std::ios::binary);
+        std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::stringstream cases(all);
+        for (std::string c; std::getline(cases, c, '\x1e');) {
+            std::vector<llama_token> t(c.size() + 16);
+            const int n = llama_tokenize(v, c.data(), int32_t(c.size()), t.data(), int32_t(t.size()), false, true);
+            std::string line;
+            for (int i = 0; i < n; ++i)
+                line += (i ? "," : "") + std::to_string(t[i]);
+            std::println("{}", line);
+        }
+        llama_model_free(vm);
+        return 0;
+    }
     auto mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
     std::vector<llama_model_kv_override> overrides;
