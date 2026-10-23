@@ -29,6 +29,9 @@ target_include_directories(metal_cpp SYSTEM INTERFACE ${metal_cpp_SOURCE_DIR})
 target_link_libraries(metal_cpp INTERFACE
     "-framework Foundation" "-framework Metal" "-framework QuartzCore")
 
+include(cmake/gemv_kernels.cmake)
+
 add_subdirectory(src)
 add_subdirectory(bench)
 add_subdirectory(tools)
+add_subdirectory(tests)

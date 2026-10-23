@@ -141,7 +141,7 @@ int main(int argc, char** argv)
     const double peak = measure_peak(ctx);
     std::println("{}  read peak {:.1f} GB/s (streaming kernel)", ctx.info().name, peak);
 
-    auto lib = ctx.load(LLAMA_MUL_MV_METALLIB);
+    auto lib = ctx.load(GEMV_METALLIB);
     constexpr uint64_t kPoolBytes = 512ull << 20;
     Ref<MTL::Buffer> pool(dev->newBuffer(kPoolBytes + (64ull << 20), MTL::ResourceStorageModeShared));
     {
