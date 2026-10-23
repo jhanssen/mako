@@ -4,7 +4,7 @@ An inference engine for very large mixture-of-experts language models on Apple S
 
 Targets: **GLM-5.3-Flash** (first) and **DeepSeek-V4.1-Flash-1017** (next), on Macs with 64-256 GB of unified memory.
 Weights that don't fit in memory stream from the internal SSD into a unified-memory cache that the GPU reads directly.
-It runs on M4 and later and is tuned for M5.
+It is tuned for M5 and meant to run on M3 and later (GPU family Apple9); so far it has only been tested on M4, and M3 is untested.
 
 ## Status
 
