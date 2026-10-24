@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 
@@ -98,20 +99,77 @@ double arena_budget(const MemInfo& m)
 }
 
 ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<LayerParts> layers, uint32_t n_expert,
-                         uint32_t n_used, double budget_bytes)
+                         uint32_t n_used, double budget_bytes, const std::vector<std::vector<uint64_t>>& counts)
     : layers_(std::move(layers)), regions_(layers_.size()), n_expert_(n_expert)
 {
+    const size_t nl = layers_.size();
+    const uint64_t budget = uint64_t(std::max(0.0, budget_bytes));
+    std::vector<uint64_t> slot_bytes(nl, 0);
     uint64_t per_slot = 0;
-    for (const auto& L : layers_)
-        for (const Part& p : L)
-            per_slot += round_up(p.bytes, kPage);
+    for (size_t l = 0; l < nl; ++l) {
+        for (const Part& p : layers_[l])
+            slot_bytes[l] += round_up(p.bytes, kPage);
+        per_slot += slot_bytes[l];
+    }
     if (per_slot == 0)
         throw std::runtime_error("no MoE layers");
-    slots_ = uint32_t(std::min<uint64_t>(n_expert, uint64_t(std::max(0.0, budget_bytes)) / per_slot));
-    if (slots_ < n_used)
-        throw std::runtime_error(std::format("expert arena of {:.1f} GB holds {} slots per layer, fewer than the {} "
-                                             "experts a token uses",
-                                             budget_bytes / 1e9, slots_, n_used));
+    slots_.assign(nl, 0);
+    order_.assign(nl, {});
+    usage_.assign(nl, std::vector<uint64_t>(n_expert, 0));
+    score_.assign(nl, std::vector<uint64_t>(n_expert, 0));
+    for (size_t l = 0; l < nl && l < counts.size(); ++l)
+        if (counts[l].size() == n_expert)
+            score_[l] = counts[l];
+    const bool profiled = std::ranges::any_of(counts, [&](const auto& c) { return c.size() == n_expert; });
+    for (size_t l = 0; l < nl; ++l) {
+        if (!slot_bytes[l])
+            continue;
+        order_[l].resize(n_expert);
+        std::iota(order_[l].begin(), order_[l].end(), 0);
+        if (l < counts.size() && counts[l].size() == n_expert)
+            std::ranges::stable_sort(order_[l], [&](int a, int b) { return counts[l][a] > counts[l][b]; });
+    }
+    if (!profiled) {
+        const uint32_t s = uint32_t(std::min<uint64_t>(n_expert, budget / per_slot));
+        for (size_t l = 0; l < nl; ++l)
+            slots_[l] = slot_bytes[l] ? s : 0;
+    } else {
+        // Every MoE layer gets n_used slots, then the rest go to (layer, rank) by count per byte; a layer's ranks
+        // are taken in order, since its counts only fall with rank.
+        uint64_t used = 0;
+        struct Cand {
+            double value;
+            uint32_t layer, rank;
+        };
+        std::vector<Cand> cands;
+        for (size_t l = 0; l < nl; ++l) {
+            if (!slot_bytes[l])
+                continue;
+            slots_[l] = n_used;
+            used += uint64_t(n_used) * slot_bytes[l];
+            for (uint32_t r = n_used; r < n_expert; ++r) {
+                const uint64_t c = l < counts.size() && counts[l].size() == n_expert ? counts[l][order_[l][r]] : 0;
+                cands.push_back({double(c) / double(slot_bytes[l]), uint32_t(l), r});
+            }
+        }
+        std::ranges::stable_sort(cands, [](const Cand& a, const Cand& b) { return a.value > b.value; });
+        std::vector<char> blocked(nl, 0);
+        for (const Cand& c : cands) {
+            if (blocked[c.layer] || c.rank != slots_[c.layer])
+                continue;
+            if (used + slot_bytes[c.layer] > budget) {
+                blocked[c.layer] = 1;
+                continue;
+            }
+            used += slot_bytes[c.layer];
+            ++slots_[c.layer];
+        }
+    }
+    for (size_t l = 0; l < nl; ++l)
+        if (slot_bytes[l] && slots_[l] < n_used)
+            throw std::runtime_error(std::format("expert arena of {:.1f} GB holds {} slots in layer {}, fewer than the "
+                                                 "{} experts a token uses",
+                                                 budget_bytes / 1e9, slots_[l], l, n_used));
 
     // Regions in order, each inside one chunk; a chunk is at most one Metal buffer.
     const uint64_t limit = max_buffer / kPage * kPage;
@@ -120,7 +178,7 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     for (size_t l = 0; l < layers_.size(); ++l)
         for (int p = 0; p < 3; ++p) {
             const uint64_t stride = round_up(layers_[l][p].bytes, kPage);
-            const uint64_t size = stride * slots_;
+            const uint64_t size = stride * slots_[l];
             if (size == 0)
                 continue;
             if (size > limit)
@@ -157,8 +215,12 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
         dev->newBuffer(std::max<uint64_t>(layers_.size() * n_expert_ * 4, 16), MTL::ResourceStorageModeShared));
 
     std::fill_n(static_cast<int32_t*>(table_buf_->contents()), layers_.size() * n_expert_, -1);
-    slot_expert_.assign(layers_.size(), std::vector<int32_t>(slots_, -1));
-    last_use_.assign(layers_.size(), std::vector<uint64_t>(slots_, 0));
+    slot_expert_.resize(nl);
+    last_use_.resize(nl);
+    for (size_t l = 0; l < nl; ++l) {
+        slot_expert_[l].assign(slots_[l], -1);
+        last_use_[l].assign(slots_[l], 0);
+    }
 }
 
 ExpertArena::~ExpertArena()
@@ -195,10 +257,11 @@ void ExpertArena::prefill()
         if (!layers_[l][0].bytes)
             continue;
         loads.clear();
-        for (uint32_t s = 0; s < slots_; ++s) {
-            loads.emplace_back(int(s), int32_t(s));
-            slot_expert_[l][s] = int32_t(s);
-            table[l * n_expert_ + s] = int32_t(s);
+        for (uint32_t s = 0; s < slots_[l]; ++s) {
+            const int e = order_[l][s];
+            loads.emplace_back(e, int32_t(s));
+            slot_expert_[l][s] = e;
+            table[l * n_expert_ + e] = int32_t(s);
         }
         read_into(l, loads);
     }
@@ -213,7 +276,12 @@ void ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     auto& owner = slot_expert_[layer];
     auto& last = last_use_[layer];
     ++clock_;
-    std::vector<char> taken(slots_, 0);
+    const uint32_t n_slots = slots_[layer];
+    for (int e : experts) {
+        ++usage_[layer][e];
+        ++score_[layer][e];
+    }
+    std::vector<char> taken(n_slots, 0);
     std::vector<size_t> missed;
     for (size_t i = 0; i < experts.size(); ++i) {
         const int32_t s = table[experts[i]];
@@ -231,14 +299,17 @@ void ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     std::vector<std::pair<int, int32_t>> loads;
     for (size_t i : missed) {
         int32_t victim = -1;
-        for (uint32_t s = 0; s < slots_; ++s) {
+        for (uint32_t s = 0; s < n_slots; ++s) {
             if (taken[s])
                 continue;
             if (owner[s] < 0) {
                 victim = int32_t(s);
                 break;
             }
-            if (victim < 0 || last[s] < last[victim])
+            if (victim < 0)
+                victim = int32_t(s);
+            const uint64_t us = score_[layer][owner[s]], uv = score_[layer][owner[victim]];
+            if (us < uv || (us == uv && last[s] < last[victim]))
                 victim = int32_t(s);
         }
         if (owner[victim] >= 0)

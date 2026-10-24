@@ -1,6 +1,8 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
-//            [--force DIR] [--force-route DIR] [--arena-gb N]
+//            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE]
+// --expert-counts places experts in the arena by a routing profile; --save-counts writes this run's routing
+// counts in the same format ("layer c0 c1 ..." per MoE layer).
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
@@ -98,7 +100,7 @@ int main(int argc, char** argv)
         return 2;
     }
     int n_gen = 8, top = 5;
-    std::string ref_dir, dump_dir, force_dir, route_dir;
+    std::string ref_dir, dump_dir, force_dir, route_dir, save_counts;
     mako::glm::Options opts;
     for (int i = 3; i + 1 < argc; i += 2) {
         std::string a = argv[i];
@@ -112,6 +114,10 @@ int main(int argc, char** argv)
             opts.indexer_top_k = uint32_t(std::stoul(argv[i + 1]));
         else if (a == "--ref")
             ref_dir = argv[i + 1];
+        else if (a == "--expert-counts")
+            opts.expert_counts = argv[i + 1];
+        else if (a == "--save-counts")
+            save_counts = argv[i + 1];
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(argv[i + 1]);
         else if (a == "--dump")
@@ -120,6 +126,14 @@ int main(int argc, char** argv)
             force_dir = argv[i + 1];
         else if (a == "--force-route")
             route_dir = argv[i + 1];
+        else {
+            std::println(stderr, "unknown option {}", a);
+            return 2;
+        }
+    }
+    if ((argc - 3) % 2) {
+        std::println(stderr, "option {} needs a value", argv[argc - 1]);
+        return 2;
     }
     if (!dump_dir.empty())
         std::filesystem::create_directories(dump_dir);
@@ -155,9 +169,16 @@ int main(int argc, char** argv)
                      "available {:.1f} GB",
                      p.mem.phys / 1e9, p.mem.working_set / 1e9, p.mem.footprint / 1e9, p.mem.filecache_min / 1e9,
                      p.mem.available / 1e9);
-        std::println("expert arena: budget {:.1f} GB, {:.1f} GB in {} slots per layer, GPU warm-up {:.2f} s, "
+        uint32_t lo = UINT32_MAX, hi = 0, moe = 0;
+        for (uint32_t l = 0; l < cfg->n_layer; ++l)
+            if (a.slots(l)) {
+                lo = std::min(lo, a.slots(l));
+                hi = std::max(hi, a.slots(l));
+                ++moe;
+            }
+        std::println("expert arena: budget {:.1f} GB, {:.1f} GB, {}-{} slots in each of {} layers, GPU warm-up {:.2f} s, "
                      "prefilled in {:.1f} s",
-                     p.budget / 1e9, a.bytes() / 1e9, a.slots(), p.warm_ms / 1e3, a.stats().prefill_ms / 1e3);
+                     p.budget / 1e9, a.bytes() / 1e9, lo, hi, moe, p.warm_ms / 1e3, a.stats().prefill_ms / 1e3);
     }
 
     if (!force_dir.empty())
@@ -257,11 +278,24 @@ int main(int argc, char** argv)
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
+    if (!save_counts.empty()) {
+        std::ofstream out(save_counts, std::ios::trunc);
+        const auto& u = engine.arena().usage();
+        for (uint32_t l = 0; l < u.size(); ++l) {
+            if (!engine.arena().slots(l))
+                continue;
+            out << l;
+            for (uint64_t c : u[l])
+                out << ' ' << c;
+            out << '\n';
+        }
+    }
     const auto& as = engine.arena().stats();
     std::println("expert hits {} misses {} ({:.1f}% hit), reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", as.hits,
                  as.misses, 100.0 * as.hits / std::max<uint64_t>(1, as.hits + as.misses), st.expert_read_ms,
                  st.expert_bytes / 1e9, st.gpu_wait_ms);
-    std::println("gpu exec {:.0f} ms over {} steps ({:.1f} ms/step)", st.gpu_exec_ms, ids.size() + gen_ids.size(),
-                 st.gpu_exec_ms / double(ids.size() + gen_ids.size()));
+    const double steps = double(ids.size() + gen_ids.size());
+    std::println("per step: {:.1f} ms in step(), {:.1f} ms encoding, {:.1f} ms commit to done, {:.1f} ms GPU start to end",
+                 st.step_ms / steps, st.encode_ms / steps, st.gpu_wait_ms / steps, st.gpu_exec_ms / steps);
     return 0;
 }

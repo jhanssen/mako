@@ -11,8 +11,10 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <fstream>
 #include <numeric>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 
 namespace mako::glm {
@@ -213,8 +215,26 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         parts.push_back(L->experts);
     arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
+    std::vector<std::vector<uint64_t>> counts;
+    if (!opts_.expert_counts.empty()) {
+        std::ifstream in(opts_.expert_counts);
+        if (!in)
+            throw std::runtime_error("cannot open " + opts_.expert_counts);
+        counts.resize(cfg_.n_layer);
+        for (std::string line; std::getline(in, line);) {
+            std::istringstream ls(line);
+            uint32_t layer;
+            if (!(ls >> layer) || layer >= cfg_.n_layer)
+                continue;
+            for (uint64_t c; ls >> c;)
+                counts[layer].push_back(c);
+            if (counts[layer].size() != cfg_.n_expert)
+                throw std::runtime_error(std::format("{}: layer {} has {} counts, expected {}", opts_.expert_counts,
+                                                     layer, counts[layer].size(), cfg_.n_expert));
+        }
+    }
     arena_ = std::make_unique<ExpertArena>(ctx_.device(), ctx_.info().max_buffer, std::move(parts), cfg_.n_expert,
-                                           cfg_.n_expert_used, arena_plan_.budget);
+                                           cfg_.n_expert_used, arena_plan_.budget, counts);
     arena_->prefill();
 
     // The first compute pass that reads an arena buffer pays a driver cost that grows with its size (~0.5 s for
@@ -628,6 +648,10 @@ void Engine::serve_moe(MTL::CommandBuffer* cb)
 void Engine::finish(MTL::CommandBuffer* cb)
 {
     auto t0 = Clock::now();
+    if (encoding_) {
+        stats_.encode_ms += std::chrono::duration<double, std::milli>(t0 - step_start_).count();
+        encoding_ = false;
+    }
     cb->commit();
     serve_moe(cb);
     cb->waitUntilCompleted();
@@ -678,6 +702,8 @@ const std::vector<float>& Engine::step(int32_t token)
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E;
     const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps};
 
+    step_start_ = Clock::now();
+    encoding_ = true;
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Buffer* x = scratch("x", E * 4);
     MTL::Buffer* xn = scratch("xn", E * 4);
@@ -817,6 +843,7 @@ const std::vector<float>& Engine::step(int32_t token)
     stats_.expert_bytes = arena_->stats().read_bytes;
     ++pos_;
     pool->release();
+    stats_.step_ms += ms_since(step_start_);
     return logits_;
 }
 

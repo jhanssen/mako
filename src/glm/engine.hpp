@@ -7,6 +7,7 @@
 #include "mtl/gemv.hpp"
 
 #include <array>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -19,6 +20,7 @@ struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
+    std::string expert_counts;  // routing profile ("layer c0 c1 ..." per line) that places experts in the arena
 };
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
@@ -47,6 +49,7 @@ public:
 
     struct Stats {
         double expert_read_ms = 0, gpu_wait_ms = 0, gpu_exec_ms = 0; // exec: GPU start to end, summed
+        double encode_ms = 0, step_ms = 0; // encode: step start to the first commit
         uint64_t expert_bytes = 0;
     };
     const Stats& stats() const { return stats_; }
@@ -125,6 +128,8 @@ private:
 
     Probe probe_;
     StreamOverride stream_override_;
+    std::chrono::steady_clock::time_point step_start_;
+    bool encoding_ = false;
     RouteOverride route_override_;
     struct PendingProbe {
         std::string name;

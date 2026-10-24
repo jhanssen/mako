@@ -48,13 +48,16 @@ public:
         double read_ms = 0, prefill_ms = 0;
     };
 
+    // `counts` (per layer, n_expert routing counts from a profile; may be empty) decides which experts start
+    // resident and how many slots each layer gets: slots go to the most used (layer, expert) pairs per byte, at
+    // least n_used per layer. Without counts every layer gets the same number of slots, filled in id order.
     ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<LayerParts> layers, uint32_t n_expert,
-                uint32_t n_used, double budget_bytes);
+                uint32_t n_used, double budget_bytes, const std::vector<std::vector<uint64_t>>& counts = {});
     ~ExpertArena();
     ExpertArena(const ExpertArena&) = delete;
     ExpertArena& operator=(const ExpertArena&) = delete;
 
-    uint32_t slots() const { return slots_; }
+    uint32_t slots(uint32_t layer) const { return slots_[layer]; }
     uint64_t bytes() const { return bytes_; }
     const Part& part(uint32_t layer, int p) const { return layers_[layer][p]; }
     const Region& region(uint32_t layer, int p) const { return regions_[layer][p]; }
@@ -62,20 +65,27 @@ public:
     MTL::Buffer* slot_table() const { return table_buf_.get(); }
     const std::vector<mtl::Ref<MTL::Buffer>>& buffers() const { return bufs_; }
 
-    // Loads experts 0..slots-1 of every MoE layer.
+    // Loads each MoE layer's first slots(layer) experts in profile order (id order without a profile).
     void prefill();
-    // Makes the selected experts of a layer resident, reading the misses into the least recently used slots,
-    // and writes their slots to `slots_out`. No command buffer may be reading this layer's slots meanwhile.
+    // Makes the selected experts of a layer resident, reading the misses into the slots of the least used experts
+    // (profile counts plus selections so far; ties: least recently used), and writes their slots to `slots_out`.
+    // Never evicts a selected expert, so the GPU may read those meanwhile; no other slot of the layer may be in use.
     void ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out);
 
     const Stats& stats() const { return stats_; }
+    // How often each expert was selected since construction, [layer][expert].
+    const std::vector<std::vector<uint64_t>>& usage() const { return usage_; }
 
 private:
     void read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads); // (expert, slot)
 
     std::vector<LayerParts> layers_;
     std::vector<std::array<Region, 3>> regions_;
-    uint32_t n_expert_ = 0, slots_ = 0;
+    uint32_t n_expert_ = 0;
+    std::vector<uint32_t> slots_;              // per layer
+    std::vector<std::vector<int32_t>> order_;  // per layer, experts in prefill order
+    std::vector<std::vector<uint64_t>> usage_;
+    std::vector<std::vector<uint64_t>> score_; // profile counts plus usage: the least scored resident is evicted
     uint64_t bytes_ = 0;
     std::vector<std::pair<void*, uint64_t>> chunks_;
     std::vector<mtl::Ref<MTL::Buffer>> bufs_;
