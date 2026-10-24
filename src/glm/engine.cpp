@@ -97,7 +97,7 @@ struct LayerNormArgs {
 struct SoftmaxArgs {
     uint32_t n_kv;
     float scale;
-    uint32_t masked, first_kv, heads, mask_stride;
+    uint32_t first_kv, heads;
 };
 struct PvArgs {
     uint32_t heads, dim, n_kv, keys_per_split;
@@ -499,6 +499,20 @@ void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
 // Scratch bytes a prefill allocates: per token of a chunk (the attention stages and the dense FFNs), per token of a
 // group (the residual streams and the routed FFN's inputs and outputs), the expert batch buffers, and the attention
 // scores and partial sums (bounded by the query group size, not the chunk) plus the decode scratch.
+uint32_t Engine::sparse_group() const
+{
+    // The indexer's dot products (heads x pools per token) dominate: at most 64 MB of them, at most 32 tokens.
+    const uint64_t dots = uint64_t(cfg_.indexer_heads) * (opts_.max_ctx / cfg_.indexer_kpool + 1) * 4;
+    return uint32_t(std::clamp<uint64_t>((64ull << 20) / dots, 1, 32));
+}
+
+uint64_t Engine::sparse_scratch() const
+{
+    const uint64_t pools = opts_.max_ctx / cfg_.indexer_kpool + 1, L = sparse_list_stride(), H = cfg_.n_head;
+    const uint64_t per_token = (cfg_.indexer_heads + 1) * pools + L + 1 + H * L + 8 * H * cfg_.kv_lora_rank;
+    return uint64_t(sparse_group()) * per_token * 4;
+}
+
 uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
 {
     const uint64_t E = cfg_.n_embd, hd = uint64_t(cfg_.hc) * E, inner = cfg_.kda_inner(), D = cfg_.kda_head_dim;
@@ -511,7 +525,8 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
                                      + std::max<uint64_t>({cfg_.n_ff, H * R, H * cfg_.head_k, inner}) / 2; // GEMM input
     const uint64_t per_group_token = 3 * E + 3 * hd + 48 + 2 * cfg_.n_expert + 32 + k + 16 + E / 2 + k * E;
     const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (E / 2 + 2 * nff + nff / 2);
-    return (uint64_t(chunk) * per_chunk_token + uint64_t(group) * per_group_token + batch) * 4 + (96ull << 20);
+    return (uint64_t(chunk) * per_chunk_token + uint64_t(group) * per_group_token + batch) * 4 + sparse_scratch() +
+           (96ull << 20);
 }
 
 void Engine::apply_pressure()
@@ -893,11 +908,10 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
 
 // Attention of `tokens` consecutive query positions (rows of H heads of q, latent width R) over a half latent cache
 // read once for all heads: scores by GEMM, softmax over each row's visible keys (row r of token i sees
-// first_kv + i keys; only the indexer's selected cells when sparse), then the output split over key ranges and summed.
+// first_kv + i keys), then the output split over key ranges and summed.
 void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off,
-                    MTL::Buffer* out, uint64_t out_off, uint32_t tokens, uint32_t first_kv, bool sparse)
+                    MTL::Buffer* out, uint64_t out_off, uint32_t tokens, uint32_t first_kv)
 {
-    // Sparse: query token i's mask row (indexer_select) is i * max_ctx bytes into idx_mask.
     const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, rows = tokens * H;
     const uint32_t n_kv = first_kv + tokens - 1;
     // At most 16 splits of at least 256 keys, whole 64-key tiles.
@@ -907,11 +921,10 @@ void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::B
     MTL::Buffer* partial = scratch("pv_part", uint64_t(splits) * rows * R * 4);
     gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, cache, 0, halves(enc, q, q_off, rows, R, 0), 0, scores, 0);
     after(enc, "attn_scores");
-    const SoftmaxArgs sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u, first_kv, H, opts_.max_ctx};
+    const SoftmaxArgs sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), first_kv, H};
     enc->setComputePipelineState(pso("attn_softmax"));
     enc->setBuffer(scores, 0, 0);
-    enc->setBuffer(scratch("idx_mask", uint64_t(tokens) * opts_.max_ctx), 0, 1);
-    enc->setBytes(&sa, sizeof(sa), 2);
+    enc->setBytes(&sa, sizeof(sa), 1);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "attn_softmax");
@@ -991,15 +1004,16 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         uint32_t g = 1;
         while (g < group && t + g < T && (pos0 + t + g + 1) / kp <= n_top)
             ++g;
-        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, false);
+        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1);
         t += g;
     }
+    // Past the dense window, groups of a size independent of the context: the selection bounds their scratch.
+    const uint32_t sgroup = sparse_group();
     while (t < T) {
-        const uint32_t g = std::min(group, T - t);
-        if (indexer_select(enc, il, t, pos0 + t, g))
-            attend_sparse(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g);
-        else
-            attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, false);
+        const uint32_t g = std::min(sgroup, T - t);
+        if (!indexer_select(enc, il, t, pos0 + t, g))
+            throw std::logic_error("sparse attention group inside the dense window");
+        attend_sparse(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g);
         t += g;
     }
     per_head(L.v_b, lat, R, vout, cfg_.head_v);
@@ -1136,7 +1150,7 @@ void Engine::attend_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache,
     enc->setBuffer(partial, 0, 4);
     enc->setBytes(&ga, sizeof(ga), 5);
     for (int rep_ = repeats("attn_gather_pv"); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size(R / 64, 1, tokens * splits), MTL::Size(128, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size(R / 128, 1, tokens * splits), MTL::Size(256, 1, 1));
     after(enc, "attn_gather_pv");
     const uint32_t sum[2] = {rows * R, splits};
     enc->setComputePipelineState(pso("sum_splits"));

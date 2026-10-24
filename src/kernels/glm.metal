@@ -505,30 +505,26 @@ kernel void rms_norm_gate(device const float* x [[buffer(0)]], device const floa
 struct SoftmaxArgs {
     uint n_kv;      // row length
     float scale;
-    uint masked;    // mask[t] == 0 drops key t (query token i's mask row at mask + i * mask_stride)
     uint first_kv;  // keys visible to row 0; row r sees first_kv + r / heads (causal across query tokens)
     uint heads;
-    uint mask_stride;
 };
 
 // In place, per row of n_kv scores (rows: query tokens x heads): p = softmax(scores * scale) over the row's
 // visible keys, zero beyond. One threadgroup per row.
-kernel void attn_softmax(device float* scores [[buffer(0)]], device const uchar* mask [[buffer(1)]],
-                         constant SoftmaxArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+kernel void attn_softmax(device float* scores [[buffer(0)]], constant SoftmaxArgs& a [[buffer(1)]],
+                         uint row [[threadgroup_position_in_grid]],
                          uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
     device float* sh = scores + uint64_t(row) * a.n_kv;
     const uint vis = min(a.n_kv, a.first_kv + row / a.heads);
-    mask += uint64_t(row / a.heads) * a.mask_stride;
     float m = -INFINITY;
     for (uint t = tid; t < vis; t += TG)
-        if (!a.masked || mask[t])
-            m = max(m, sh[t] * a.scale);
+        m = max(m, sh[t] * a.scale);
     m = tg_max(m, scratch, tid);
     float s = 0.0f;
     for (uint t = tid; t < a.n_kv; t += TG) {
-        const float e = (t < vis && (!a.masked || mask[t])) ? exp(sh[t] * a.scale - m) : 0.0f;
+        const float e = t < vis ? exp(sh[t] * a.scale - m) : 0.0f;
         sh[t] = e;
         s += e;
     }
