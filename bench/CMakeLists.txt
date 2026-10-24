@@ -14,3 +14,5 @@ target_link_libraries(qformat_bench PRIVATE mako_mtl)
 
 add_executable(lend_bench lend_bench.cpp)
 target_link_libraries(lend_bench PRIVATE mako_mtl)
+
+add_executable(mem_watchdog mem_watchdog.cpp)

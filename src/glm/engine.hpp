@@ -12,6 +12,9 @@
 #include <array>
 #include <chrono>
 #include <functional>
+#include <dispatch/dispatch.h>
+
+#include <atomic>
 #include <map>
 #include <memory>
 #include <span>
@@ -202,6 +205,13 @@ private:
     std::vector<std::unique_ptr<Layer>> layers_;
     std::map<std::string, int> nocache_fds_; // shard path -> descriptor for expert reads
     std::unique_ptr<LockedMemory> simulated_; // before arena_: released after it
+    // macOS memory-pressure level (0 normal, 1 warning, 2 critical), set from a dispatch source; applied between
+    // steps by apply_pressure(), which lends the arena's lendable slots under pressure and takes them back after.
+    std::atomic<int> pressure_{0};
+    bool pressure_lent_ = false;
+    dispatch_queue_t pressure_queue_ = nullptr;
+    dispatch_source_t pressure_src_ = nullptr;
+    void apply_pressure();
     std::unique_ptr<ExpertArena> arena_;
     ArenaPlan arena_plan_;
     std::string routing_key_;

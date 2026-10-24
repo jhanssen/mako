@@ -12,6 +12,7 @@
 #include <deque>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -394,6 +395,21 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
                                                      err ? err->localizedDescription()->utf8String() : "?"));
         }
     }
+    pressure_queue_ = dispatch_queue_create("mako.memory-pressure", DISPATCH_QUEUE_SERIAL);
+    pressure_src_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                           DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN |
+                                               DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                           pressure_queue_);
+    if (pressure_src_) {
+        dispatch_set_context(pressure_src_, this);
+        dispatch_source_set_event_handler_f(pressure_src_, [](void* ctx) {
+            auto* e = static_cast<Engine*>(ctx);
+            const uintptr_t d = dispatch_source_get_data(e->pressure_src_);
+            e->pressure_.store(d & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : d & DISPATCH_MEMORYPRESSURE_WARN ? 1 : 0,
+                               std::memory_order_relaxed);
+        });
+        dispatch_resume(pressure_src_);
+    }
     load_.total_ms = ms_since(t_load);
 }
 
@@ -490,6 +506,21 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
     return (uint64_t(chunk) * per_chunk_token + uint64_t(group) * per_group_token + batch) * 4 + (96ull << 20);
 }
 
+void Engine::apply_pressure()
+{
+    const int level = pressure_.load(std::memory_order_relaxed);
+    if (level > 0 && !pressure_lent_ && !arena_->lent() && arena_->lendable_bytes()) {
+        arena_->lend();
+        pressure_lent_ = true;
+        std::fprintf(stderr, "mako: memory pressure (%s): released %.1f GB of expert slots\n",
+                     level > 1 ? "critical" : "warning", arena_->lendable_bytes() / 1e9);
+    } else if (level == 0 && pressure_lent_ && arena_->reclaim()) {
+        pressure_lent_ = false;
+        std::fprintf(stderr, "mako: memory pressure over: took back %.1f GB of expert slots\n",
+                     arena_->lendable_bytes() / 1e9);
+    }
+}
+
 void Engine::reset()
 {
     for (auto& b : kda_state_)
@@ -532,6 +563,12 @@ void Engine::save_profile(const std::filesystem::path& path, bool merge) const
 
 Engine::~Engine()
 {
+    if (pressure_src_) {
+        dispatch_source_cancel(pressure_src_);
+        dispatch_sync_f(pressure_queue_, nullptr, [](void*) {}); // a running handler finishes first
+        dispatch_release(pressure_src_);
+        dispatch_release(pressure_queue_);
+    }
     arena_.reset();
     for (auto& [path, fd] : nocache_fds_)
         ::close(fd);
@@ -1238,6 +1275,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     const uint32_t T = uint32_t(tokens.size());
     if (T == 0 || T > kMaxDecodeTokens || (T > 1 && (probe_ || stream_override_ || route_override_)))
         throw std::runtime_error("bad decode step");
+    apply_pressure();
     if (pos_ + T > opts_.max_ctx)
         throw std::runtime_error("context full");
     for (int32_t token : tokens)
@@ -1597,6 +1635,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
             throw std::runtime_error("token out of range");
     if (pos_ + tokens.size() > opts_.max_ctx)
         throw std::runtime_error("context full");
+    apply_pressure();
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
     const uint32_t chunk = std::max<uint32_t>(1, opts_.prefill_chunk);
     const auto t_start = Clock::now();
@@ -1639,7 +1678,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 auto it = kept.find(kv.first);
                 return it == kept.end() || it->second != kv.second.get();
             });
-            e.arena_->reclaim();
+            if (!e.pressure_lent_) // under memory pressure the slots stay lent
+                e.arena_->reclaim();
         }
     } restore{*this, lend, kept};
 
