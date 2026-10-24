@@ -11,10 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <format>
-#include <fstream>
 #include <numeric>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 
 namespace mako::glm {
@@ -215,24 +213,15 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         parts.push_back(L->experts);
     arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
-    std::vector<std::vector<uint64_t>> counts;
-    if (!opts_.expert_counts.empty()) {
-        std::ifstream in(opts_.expert_counts);
-        if (!in)
-            throw std::runtime_error("cannot open " + opts_.expert_counts);
-        counts.resize(cfg_.n_layer);
-        for (std::string line; std::getline(in, line);) {
-            std::istringstream ls(line);
-            uint32_t layer;
-            if (!(ls >> layer) || layer >= cfg_.n_layer)
-                continue;
-            for (uint64_t c; ls >> c;)
-                counts[layer].push_back(c);
-            if (counts[layer].size() != cfg_.n_expert)
-                throw std::runtime_error(std::format("{}: layer {} has {} counts, expected {}", opts_.expert_counts,
-                                                     layer, counts[layer].size(), cfg_.n_expert));
-        }
-    }
+    routing_key_ = glm::routing_key(model_, cfg_);
+    default_profile_ = default_profile_path(routing_key_);
+    if (!opts_.expert_counts.empty())
+        loaded_profile_ = opts_.expert_counts;
+    else if (std::filesystem::exists(default_profile_))
+        loaded_profile_ = default_profile_;
+    Counts counts;
+    if (!loaded_profile_.empty())
+        counts = load_profile(loaded_profile_, cfg_.n_layer, cfg_.n_expert);
     arena_ = std::make_unique<ExpertArena>(ctx_.device(), ctx_.info().max_buffer, std::move(parts), cfg_.n_expert,
                                            cfg_.n_expert_used, arena_plan_.budget, counts);
     arena_->prefill();
@@ -255,6 +244,21 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     cb->commit();
     cb->waitUntilCompleted();
     arena_plan_.warm_ms = ms_since(t0);
+}
+
+void Engine::save_profile(const std::filesystem::path& path, bool merge) const
+{
+    Counts counts = merge && std::filesystem::exists(path) ? load_profile(path, cfg_.n_layer, cfg_.n_expert)
+                                                            : Counts(cfg_.n_layer);
+    const auto& usage = arena_->usage();
+    for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+        if (!arena_->slots(l))
+            continue;
+        counts[l].resize(cfg_.n_expert, 0);
+        for (uint32_t e = 0; e < cfg_.n_expert; ++e)
+            counts[l][e] += usage[l][e];
+    }
+    glm::save_profile(path, counts);
 }
 
 Engine::~Engine()

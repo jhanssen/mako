@@ -1,0 +1,168 @@
+The river town woke slowly. Fishing boats knocked against the pier, a baker pulled the first loaves from a stone oven, and the smell of bread drifted over the square where the market would open at eight. Nobody noticed the stranger at the edge of the harbour until she asked the ferryman, in careful, old-fashioned English, whether the island lighthouse was still kept by the Ardent family.
+"Not since the storm," he said. "Forty years now. Why do you ask?"
+"Because my grandmother kept it," she answered, and handed him a folded letter.
+
+A short history of the printing press: before the fifteenth century, books in Europe were copied by hand, which made them rare and expensive. Movable metal type, combined with oil-based ink and a press adapted from wine and paper making, allowed a workshop to produce hundreds of identical pages a day. Within fifty years printing shops had spread to more than two hundred cities, prices fell, literacy rose, and ideas travelled faster than any authority could control them.
+
+Climate and weather are often confused. Weather describes the state of the atmosphere over hours or days: temperature, humidity, wind and precipitation. Climate is the long-term pattern of weather in a region, usually averaged over thirty years or more. A single cold winter does not disprove a warming trend, just as one hot afternoon does not prove it.
+
+## Release notes, version 2.4
+
+- Faster startup: configuration files are parsed lazily.
+- Fixed a crash when the cache directory was missing.
+- The `--verbose` flag now prints timing for each stage.
+- Deprecated: the `legacy_mode` option will be removed in 3.0.
+
+```python
+from dataclasses import dataclass
+from collections import Counter
+
+@dataclass
+class Order:
+    customer: str
+    items: list[str]
+    total: float
+
+def top_customers(orders: list[Order], n: int = 3) -> list[tuple[str, float]]:
+    spent: dict[str, float] = {}
+    for o in orders:
+        spent[o.customer] = spent.get(o.customer, 0.0) + o.total
+    return sorted(spent.items(), key=lambda kv: kv[1], reverse=True)[:n]
+
+def most_common_items(orders: list[Order]) -> list[tuple[str, int]]:
+    return Counter(item for o in orders for item in o.items).most_common(5)
+```
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// Returns the k most frequent words, ties broken alphabetically.
+std::vector<std::string> top_words(const std::vector<std::string>& words, size_t k) {
+    std::unordered_map<std::string, int> freq;
+    for (const auto& w : words)
+        ++freq[w];
+    std::vector<std::pair<std::string, int>> v(freq.begin(), freq.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+        return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
+    std::vector<std::string> out;
+    for (size_t i = 0; i < std::min(k, v.size()); ++i)
+        out.push_back(v[i].first);
+    return out;
+}
+```
+
+```javascript
+async function fetchWithRetry(url, retries = 3, delayMs = 500) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise((r) => setTimeout(r, delayMs * 2 ** attempt));
+    }
+  }
+}
+```
+
+```rust
+use std::collections::HashMap;
+
+fn word_lengths(text: &str) -> HashMap<usize, usize> {
+    let mut hist = HashMap::new();
+    for word in text.split_whitespace() {
+        *hist.entry(word.chars().count()).or_insert(0) += 1;
+    }
+    hist
+}
+```
+
+```go
+func reverse(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
+}
+```
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+for f in logs/*.log; do
+  errors=$(grep -c "ERROR" "$f" || true)
+  echo "$(basename "$f"): $errors errors"
+done | sort -t: -k2 -n -r | head -5
+```
+
+```sql
+WITH monthly AS (
+  SELECT date_trunc('month', created_at) AS month, region, SUM(amount) AS revenue
+  FROM sales
+  GROUP BY 1, 2
+)
+SELECT month, region, revenue,
+       revenue - LAG(revenue) OVER (PARTITION BY region ORDER BY month) AS change
+FROM monthly
+ORDER BY region, month;
+```
+
+{"id": 4182, "name": "Ada Ruiz", "roles": ["admin", "editor"], "active": true, "last_login": "2025-03-14T09:26:53Z", "settings": {"theme": "dark", "language": "es"}}
+
+Problem: A rectangle has a perimeter of 36 cm and its length is twice its width. Find its area.
+Solution: Let the width be w. Then the length is 2w, and the perimeter is 2(w + 2w) = 6w = 36, so w = 6 cm and the length is 12 cm. The area is 6 × 12 = 72 cm².
+
+The derivative of f(x) = x^2 \sin(x) follows from the product rule: f'(x) = 2x \sin(x) + x^2 \cos(x). For the integral \int_0^1 x e^{x} \, dx, integrate by parts with u = x and dv = e^x dx, which gives [x e^x - e^x]_0^1 = (e - e) - (0 - 1) = 1.
+
+A matrix A is invertible exactly when its determinant is nonzero. For a 2×2 matrix with rows (a, b) and (c, d), the determinant is ad − bc and the inverse is (1 / (ad − bc)) times the matrix with rows (d, −b) and (−c, a).
+
+Proof that √2 is irrational: suppose √2 = p/q in lowest terms. Then p² = 2q², so p² is even and therefore p is even; write p = 2r. Then 4r² = 2q², so q² = 2r² and q is even too, contradicting that p/q was in lowest terms.
+
+User: I keep getting "permission denied" when I run my script. What should I check?
+Assistant: Three common causes: the file is not executable (run `chmod +x script.sh`), the script lives on a volume mounted with `noexec`, or the first line points to an interpreter that does not exist. Running `ls -l script.sh` and `head -1 script.sh` usually shows which one it is.
+User: It was the chmod. Thanks!
+Assistant: Glad that fixed it.
+
+User: Write a haiku about debugging at night.
+Assistant: Cursor blinks alone / one missing semicolon / the moon has gone home
+
+User: Summarize the pros and cons of remote work in two sentences.
+Assistant: Remote work removes commuting and gives people more control over their time and surroundings. It can also blur the line between work and home and make spontaneous collaboration harder.
+
+Le marché du samedi matin attire les habitants de tout le quartier : on y trouve des fromages de la région, des fruits de saison et du pain encore chaud. Les enfants courent entre les étals pendant que les parents discutent avec les marchands.
+
+Die Bibliothek öffnet werktags um neun Uhr. Ausgeliehene Bücher können bis zu vier Wochen behalten und zweimal verlängert werden, sofern keine Vormerkung vorliegt.
+
+El proyecto se retrasó dos semanas porque el proveedor cambió las especificaciones del material, pero el equipo recuperó el tiempo trabajando en paralelo en el diseño y en las pruebas.
+
+Il treno per Firenze parte dal binario sette alle 14:35; si consiglia di arrivare in stazione almeno dieci minuti prima.
+
+O tempo em Lisboa hoje está ensolarado, com máximas de vinte e quatro graus e vento fraco do norte.
+
+Сегодня в городе прошёл сильный дождь, и движение на главных улицах было затруднено до самого вечера.
+
+这个周末我们打算去山里徒步，如果天气好的话，还可以在湖边露营一晚。
+
+明日の会議は午後二時から始まります。資料は事前に共有フォルダに置いておきますので、目を通しておいてください。
+
+이번 학기에는 통계학과 프로그래밍 수업을 함께 듣기로 했습니다.
+
+مرحبًا، هل يمكنك أن تخبرني كيف أصل إلى أقرب محطة قطار من هنا؟
+
+Recipe: lentil soup for four. Rinse 250 g of red lentils. Soften one chopped onion, two carrots and two cloves of garlic in olive oil, add a teaspoon of cumin, then the lentils and one litre of vegetable stock. Simmer for twenty minutes, blend half of it for texture, season with salt, pepper and a squeeze of lemon.
+
+Meeting notes, Tuesday: the team agreed to move the launch to the second week of May. Priya will finish the onboarding flow, Tom will fix the billing bug reported by two customers, and everyone should review the security checklist before Friday. Open question: do we need a separate status page for the API?
+
+Explain like I'm five: why is the sky blue? Sunlight looks white but is really a mix of all colours. When it passes through the air, the tiny bits of gas bounce the blue light around much more than the red light, so blue light comes at your eyes from every part of the sky.
+
+Legal-style clause: The Licensee shall not sublicense, sell or otherwise transfer the Software to any third party without the prior written consent of the Licensor, and any attempt to do so shall be void.
+
+Chess: after 1. e4 e5 2. Nf3 Nc6 3. Bb5, the Ruy Lopez, Black's most common reply is 3...a6, asking the bishop to decide whether to retreat to a4 or exchange on c6.
+
+Quick facts: water boils at 100 °C at sea level; the speed of light is about 299,792 km/s; a leap year has 366 days; the human body has 206 bones; Mount Everest is 8,849 metres tall.

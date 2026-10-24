@@ -1,8 +1,8 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
-//            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE]
-// --expert-counts places experts in the arena by a routing profile; --save-counts writes this run's routing
-// counts in the same format ("layer c0 c1 ..." per MoE layer).
+//            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
+// The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
+// another; --save-counts writes this run's routing counts, --learn adds them to the model's profile.
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
@@ -101,39 +101,45 @@ int main(int argc, char** argv)
     }
     int n_gen = 8, top = 5;
     std::string ref_dir, dump_dir, force_dir, route_dir, save_counts;
+    bool learn = false;
     mako::glm::Options opts;
-    for (int i = 3; i + 1 < argc; i += 2) {
-        std::string a = argv[i];
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--learn") {
+            learn = true;
+            continue;
+        }
+        if (i + 1 >= argc) {
+            std::println(stderr, "option {} needs a value", a);
+            return 2;
+        }
+        const char* v = argv[++i];
         if (a == "-n")
-            n_gen = std::stoi(argv[i + 1]);
+            n_gen = std::stoi(v);
         else if (a == "--ctx")
-            opts.max_ctx = uint32_t(std::stoul(argv[i + 1]));
+            opts.max_ctx = uint32_t(std::stoul(v));
         else if (a == "--top")
-            top = std::stoi(argv[i + 1]);
+            top = std::stoi(v);
         else if (a == "--indexer-top-k")
-            opts.indexer_top_k = uint32_t(std::stoul(argv[i + 1]));
+            opts.indexer_top_k = uint32_t(std::stoul(v));
         else if (a == "--ref")
-            ref_dir = argv[i + 1];
+            ref_dir = v;
         else if (a == "--expert-counts")
-            opts.expert_counts = argv[i + 1];
+            opts.expert_counts = v;
         else if (a == "--save-counts")
-            save_counts = argv[i + 1];
+            save_counts = v;
         else if (a == "--arena-gb")
-            opts.arena_gb = std::stod(argv[i + 1]);
+            opts.arena_gb = std::stod(v);
         else if (a == "--dump")
-            dump_dir = argv[i + 1];
+            dump_dir = v;
         else if (a == "--force")
-            force_dir = argv[i + 1];
+            force_dir = v;
         else if (a == "--force-route")
-            route_dir = argv[i + 1];
+            route_dir = v;
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
         }
-    }
-    if ((argc - 3) % 2) {
-        std::println(stderr, "option {} needs a value", argv[argc - 1]);
-        return 2;
     }
     if (!dump_dir.empty())
         std::filesystem::create_directories(dump_dir);
@@ -176,6 +182,11 @@ int main(int argc, char** argv)
                 hi = std::max(hi, a.slots(l));
                 ++moe;
             }
+        if (engine.loaded_profile().empty())
+            std::println("no routing profile for this model; mako_calibrate makes one ({})",
+                         engine.default_profile().string());
+        else
+            std::println("routing profile: {}", engine.loaded_profile().string());
         std::println("expert arena: budget {:.1f} GB, {:.1f} GB, {}-{} slots in each of {} layers, GPU warm-up {:.2f} s, "
                      "prefilled in {:.1f} s",
                      p.budget / 1e9, a.bytes() / 1e9, lo, hi, moe, p.warm_ms / 1e3, a.stats().prefill_ms / 1e3);
@@ -278,17 +289,11 @@ int main(int argc, char** argv)
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
-    if (!save_counts.empty()) {
-        std::ofstream out(save_counts, std::ios::trunc);
-        const auto& u = engine.arena().usage();
-        for (uint32_t l = 0; l < u.size(); ++l) {
-            if (!engine.arena().slots(l))
-                continue;
-            out << l;
-            for (uint64_t c : u[l])
-                out << ' ' << c;
-            out << '\n';
-        }
+    if (!save_counts.empty())
+        engine.save_profile(save_counts, false);
+    if (learn) {
+        engine.save_profile(engine.default_profile(), true);
+        std::println("routing counts added to {}", engine.default_profile().string());
     }
     const auto& as = engine.arena().stats();
     std::println("expert hits {} misses {} ({:.1f}% hit), reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", as.hits,

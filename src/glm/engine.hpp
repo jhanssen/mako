@@ -2,6 +2,7 @@
 
 #include "glm/arena.hpp"
 #include "glm/config.hpp"
+#include "glm/profile.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemv.hpp"
@@ -20,7 +21,8 @@ struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
-    std::string expert_counts;  // routing profile ("layer c0 c1 ..." per line) that places experts in the arena
+    std::string expert_counts;  // routing profile placing experts in the arena; empty: the model's default profile
+                                // (default_profile_path), when it exists
 };
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
@@ -62,6 +64,12 @@ public:
     };
     const ArenaPlan& arena_plan() const { return arena_plan_; }
     const ExpertArena& arena() const { return *arena_; }
+
+    const std::string& routing_key() const { return routing_key_; }
+    const std::filesystem::path& default_profile() const { return default_profile_; }
+    const std::filesystem::path& loaded_profile() const { return loaded_profile_; } // empty: none
+    // Writes the routing counts of this engine's steps to `path`, added to the file's counts when `merge`.
+    void save_profile(const std::filesystem::path& path, bool merge) const;
 
 private:
     struct DevTensor {
@@ -113,6 +121,8 @@ private:
     std::map<std::string, int> nocache_fds_; // shard path -> descriptor for expert reads
     std::unique_ptr<ExpertArena> arena_;
     ArenaPlan arena_plan_;
+    std::string routing_key_;
+    std::filesystem::path default_profile_, loaded_profile_;
 
     gguf::ModelFiles::Ref token_embd_;
     DevTensor output_norm_, output_;
@@ -129,6 +139,7 @@ private:
     Probe probe_;
     StreamOverride stream_override_;
     std::chrono::steady_clock::time_point step_start_;
+    uint64_t dense_bytes_ = 0;
     bool encoding_ = false;
     RouteOverride route_override_;
     struct PendingProbe {
