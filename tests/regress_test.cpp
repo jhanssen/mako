@@ -6,6 +6,8 @@
 //   session      generation through Session: greedy and speculative tokens, prefix reuse from the current state
 //                and from a checkpoint (the same logits as a fresh prefill), a repeated prompt, a read cancelled
 //                between groups and resumed, drafts after a restore
+//   ablate       per-layer direction removal: the streams after an ablated layer have no component along its
+//                directions, prefill and decode agree, all-zero directions and switching it off change nothing
 //   long         a prompt past the dense-attention window (sparse selection, lent arena slots) against the
 //                reference, then decode
 //   regress_test <model.gguf> [case ...] [--update]
@@ -29,6 +31,7 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <random>
 #include <print>
 #include <sstream>
 #include <string>
@@ -580,6 +583,98 @@ int main(int argc, char** argv)
                               seeded, unseeded));
         }
         session.clear();
+    }
+
+    if (want("ablate")) {
+        std::println("ablate");
+        const std::vector<int32_t> prompt{785, 3840, 315, 279, 12745, 20406, 44038, 1657, 23566, 11, 504, 279,
+                                          35056, 315, 279, 3283, 311, 279, 4399, 315, 90427, 1164, 304, 220};
+        const uint32_t E = cfg->n_embd, NL = cfg->n_layer, nv = cfg->n_vocab, k = 2;
+        auto kl = [&](const std::vector<float>& want, const std::vector<float>& got) {
+            const auto lw = log_softmax(want.data(), nv), lg = log_softmax(got.data(), nv);
+            double d = 0;
+            for (uint32_t i = 0; i < nv; ++i)
+                d += std::exp(lw[i]) * (lw[i] - lg[i]);
+            return d;
+        };
+        auto split = [&]() -> std::vector<float> { // prefill all but the last token, step that one
+            engine.reset();
+            engine.prefill(std::span(prompt).first(prompt.size() - 1));
+            return engine.step(prompt.back());
+        };
+        auto whole = [&]() -> std::vector<float> {
+            engine.reset();
+            return engine.prefill(prompt);
+        };
+        const auto base = whole(), base_split = split();
+
+        // Random orthonormal directions for every layer but the first, which stays all zero.
+        std::mt19937 rng(11);
+        std::normal_distribution<float> nd;
+        std::vector<float> dirs(uint64_t(NL) * k * E, 0.0f);
+        for (uint32_t l = 1; l < NL; ++l)
+            for (uint32_t d = 0; d < k; ++d) {
+                float* v = dirs.data() + (uint64_t(l) * k + d) * E;
+                for (uint32_t i = 0; i < E; ++i)
+                    v[i] = nd(rng);
+                for (uint32_t p = 0; p < d; ++p) {
+                    const float* u = dirs.data() + (uint64_t(l) * k + p) * E;
+                    double dot = 0;
+                    for (uint32_t i = 0; i < E; ++i)
+                        dot += double(v[i]) * u[i];
+                    for (uint32_t i = 0; i < E; ++i)
+                        v[i] -= float(dot) * u[i];
+                }
+                double n = 0;
+                for (uint32_t i = 0; i < E; ++i)
+                    n += double(v[i]) * v[i];
+                for (uint32_t i = 0; i < E; ++i)
+                    v[i] /= float(std::sqrt(n));
+            }
+
+        engine.set_ablation(std::vector<float>(uint64_t(NL) * E, 0.0f));
+        const bool zero_same = whole() == base && split() == base_split;
+        engine.set_ablation(dirs);
+        const auto abl = whole(), abl_split = split();
+
+        // The streams after layer l: probed while the last token runs as a step.
+        std::map<int, std::vector<float>> streams;
+        engine.reset();
+        engine.prefill(std::span(prompt).first(prompt.size() - 1));
+        engine.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
+            if (name == "l_out")
+                streams[layer].assign(data, data + n);
+        });
+        engine.step(prompt.back());
+        engine.set_probe({});
+        double worst_on = 0, worst_off = 0; // |stream . v| / |stream|, ablated layers and the first
+        for (const auto& [l, r] : streams)
+            for (uint32_t h = 0; h < r.size() / E; ++h)
+                for (uint32_t d = 0; d < k; ++d) {
+                    const float* x = r.data() + uint64_t(h) * E;
+                    const uint32_t ld = l == 0 ? 1 : uint32_t(l); // the first layer: measured against layer 1's
+                    const float* v = dirs.data() + (uint64_t(ld) * k + d) * E;
+                    double dot = 0, n = 0;
+                    for (uint32_t i = 0; i < E; ++i) {
+                        dot += double(x[i]) * v[i];
+                        n += double(x[i]) * x[i];
+                    }
+                    (l == 0 ? worst_off : worst_on) = std::max(l == 0 ? worst_off : worst_on, std::abs(dot) / std::sqrt(n));
+                }
+        engine.set_ablation({});
+        const bool off_same = whole() == base;
+
+        check(zero_same, "all-zero directions: the same logits, bit for bit");
+        check(streams.size() == NL && worst_on < 1e-4 && worst_off > 1e-3,
+              std::format("streams after an ablated layer along its directions: worst {:.1e} of their norm (a "
+                          "layer left alone: {:.1e})",
+                          worst_on, worst_off));
+        const double kl_paths = kl(abl, abl_split), kl_paths_base = kl(base, base_split), effect = kl(base, abl);
+        // Measured when set: prefill vs decode 2.8e-9 (6.4e-10 without); the random directions' effect 1.2e-4.
+        check(kl_paths < 10 * kl_paths_base + 1e-7 && effect > 1000 * kl_paths,
+              std::format("prefill and decode agree when ablating (KL {:.1e}; without {:.1e}); effect KL {:.1e}",
+                          kl_paths, kl_paths_base, effect));
+        check(off_same, "switched off: the logits as before, bit for bit");
     }
 
     if (want("long")) {

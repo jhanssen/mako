@@ -987,3 +987,37 @@ kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buff
     if (i < n)
         y[i] = x[i];
 }
+
+struct AblateArgs {
+    uint n_embd;
+    uint k;      // directions, orthonormal
+    float scale; // 1: the components are removed entirely
+};
+
+// Each row loses its components along k directions (x -= scale (x . v) v, one direction after another); one
+// threadgroup of 256 a row.
+kernel void ablate_rows(device float* x [[buffer(0)]], device const float* v [[buffer(1)]],
+                        constant AblateArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[8];
+    x += uint64_t(row) * a.n_embd;
+    for (uint k = 0; k < a.k; ++k) {
+        device const float* d = v + uint64_t(k) * a.n_embd;
+        float acc = 0.0f;
+        for (uint i = tid; i < a.n_embd; i += 256)
+            acc += x[i] * d[i];
+        acc = simd_sum(acc);
+        if (lane == 0)
+            part[sg] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float c = 0.0f;
+        for (uint s = 0; s < 8; ++s)
+            c += part[s];
+        c *= a.scale;
+        for (uint i = tid; i < a.n_embd; i += 256)
+            x[i] -= c * d[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup); // part is rewritten for the next direction
+    }
+}

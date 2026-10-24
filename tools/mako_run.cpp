@@ -2,7 +2,7 @@
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
 //            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
 //            [--stats summary|steps|layers|kernels] [--stats-out FILE] [--prefill-chunk N] [--prefill-group N] [--logits-out DIR]
-//            [--spec] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--seed N]
+//            [--spec] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--seed N] [--ablate FILE] [--ablate-scale S]
 // The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
 // another; --save-counts writes this run's routing counts, --learn adds them to the model's profile.
 // --stats prints a Markdown telemetry summary at the end; --stats-out also writes its records as JSON lines.
@@ -13,6 +13,7 @@
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
 // measures each layer's own error; --force-route also takes the reference's expert selection and weights.
+// --ablate removes per-layer directions (raw float32) from the residual streams (Engine::set_ablation).
 // --spec or a sampling option generates through a Session (speculatively with --spec; sampled with --temp > 0).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -113,6 +114,8 @@ int main(int argc, char** argv)
     bool learn = false;
     mako::glm::Options opts;
     mako::glm::GenerateParams gp;
+    std::string ablate;
+    float ablate_scale = 1.0f;
     gp.sampling.temperature = 0;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -155,6 +158,10 @@ int main(int argc, char** argv)
             opts.simulate_ram_gb = std::stod(v);
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(v);
+        else if (a == "--ablate")
+            ablate = v;
+        else if (a == "--ablate-scale")
+            ablate_scale = std::stof(v);
         else if (a == "--dump")
             dump_dir = v;
         else if (a == "--logits-out")
@@ -219,6 +226,8 @@ int main(int argc, char** argv)
     auto t0 = std::chrono::steady_clock::now();
     opts.mtp = mtp_stats || spec;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
+    if (!ablate.empty())
+        engine.set_ablation(mako::glm::Engine::read_directions(ablate), ablate_scale);
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (!stats_out.empty() && opts.telemetry == mako::glm::Telemetry::off)
         opts.telemetry = mako::glm::Telemetry::summary;

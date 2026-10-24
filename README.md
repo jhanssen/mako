@@ -60,6 +60,11 @@ conversation's next turn reuses the context its previous turn left. `developer` 
 otherwise). Not supported (HTTP 400): `n` > 1, `logprobs`, `tool_choice` other than auto/none, structured
 `response_format`.
 
+`--ablate FILE` (also on `mako_run`) removes per-layer directions from the residual streams (abliteration): before
+layer l's FFN output is mixed into the hyper-connection streams, it and the streams lose their components along
+layer l's directions. The file is raw float32, layers x k x n_embd, each layer's k directions orthonormal or all
+zero; `--ablate-scale` sets the strength (default 1). The next-token block is left alone.
+
 For pi, a provider in `~/.pi/agent/models.json` with `"api": "openai-completions"`, `"baseUrl":
 "http://127.0.0.1:8080/v1"`, `"reasoning": true` and `"compat": {"supportsMidConvoSystemMessages": true}` (system
 prompt changes then append instead of rewriting the start of the prompt, which would re-read the whole context).

@@ -1,6 +1,8 @@
 // OpenAI-compatible HTTP server for a model.
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--no-spec]
-// Sampling defaults come from the model's general.sampling.* metadata.
+//              [--ablate FILE] [--ablate-scale S]
+// Sampling defaults come from the model's general.sampling.* metadata. --ablate removes per-layer directions
+// (raw float32, layers x k x n_embd) from the residual streams (Engine::set_ablation).
 #include "chat/template.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -19,12 +21,14 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--no-spec]");
+                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S]");
         return 2;
     }
     mako::server::ServerOptions so;
     mako::glm::Options opts;
     opts.max_ctx = 131072;
+    std::string ablate;
+    float ablate_scale = 1.0f;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--no-spec") {
@@ -46,6 +50,10 @@ int main(int argc, char** argv)
             so.model_id = v;
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(v);
+        else if (a == "--ablate")
+            ablate = v;
+        else if (a == "--ablate-scale")
+            ablate_scale = std::stof(v);
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
@@ -85,6 +93,15 @@ int main(int argc, char** argv)
     const auto t0 = std::chrono::steady_clock::now();
     opts.mtp = so.speculative;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
+    if (!ablate.empty()) {
+        try {
+            engine.set_ablation(mako::glm::Engine::read_directions(ablate), ablate_scale);
+        } catch (const std::exception& e) {
+            std::println(stderr, "--ablate: {}", e.what());
+            return 1;
+        }
+        std::println(stderr, "ablating the directions in {} (scale {})", ablate, ablate_scale);
+    }
     std::println(stderr, "loaded in {:.1f} s; context {} tokens; temperature {}, top_p {}",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), opts.max_ctx,
                  so.sampling.temperature, so.sampling.top_p);

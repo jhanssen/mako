@@ -90,6 +90,14 @@ public:
     // The logits after the last step's (or prefill's) last token.
     const std::vector<float>& logits() const { return logits_; }
     uint32_t max_context() const { return opts_.max_ctx; }
+    // Abliteration: before layer l's FFN output is mixed into the residual streams, it and the streams lose their
+    // components along layer l's directions (x -= scale (x . v) v), in prefill and decode; the next-token block is
+    // left alone. dirs: n_layer * k * n_embd floats, each layer's k directions orthonormal or all zero (the layer
+    // is left alone); k follows from the size. Empty: off. Throws std::invalid_argument on a size that does not fit.
+    void set_ablation(std::vector<float> dirs, float scale = 1.0f);
+    bool ablating() const { return ablate_k_ > 0; }
+    // A raw float32 file of directions for set_ablation(). Throws std::runtime_error.
+    static std::vector<float> read_directions(const std::string& path);
     uint32_t checkpoint_slots() const { return opts_.checkpoints; }
     // Size of one checkpoint().
     uint64_t checkpoint_bytes() const;
@@ -281,6 +289,11 @@ private:
     std::chrono::steady_clock::time_point step_start_;
     LoadStats load_;
     StepStats last_step_, last_prefill_;
+    mtl::Ref<MTL::Buffer> ablate_buf_; // set_ablation()'s directions
+    uint32_t ablate_k_ = 0;
+    float ablate_scale_ = 1.0f;
+    std::vector<char> ablate_layer_; // the layer has non-zero directions
+    void ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, MTL::Buffer* x, uint32_t rows);
     // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
     struct Timed {
         uint32_t layer;
