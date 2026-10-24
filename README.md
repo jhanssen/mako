@@ -44,7 +44,7 @@ ctest --test-dir build --output-on-failure                     # -L kernels | to
 ```
 
 Every test needs the model and reports as skipped without it. The `e2e` tests (about a minute) check greedy decode
-tokens, prefill against token-by-token decode, logits against stored reference top-k (`tests/data/parity_ref.bin`)
+tokens, prefill against token-by-token decode, logits against stored reference top-k (`tests/data/*_ref.bin`)
 and a prompt past the dense-attention window. After an intended numerical change, `regress_test <model> --update`
 re-records `tests/data/regress_expected.txt`; review that diff.
 

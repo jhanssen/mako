@@ -2,10 +2,13 @@
 //   decode       greedy tokens of a short prompt match the recorded ones
 //   prefill      prefill at several chunk sizes gives token-by-token decode's logits and continuation
 //   parity       per-position logits stay close to the reference implementation's (stored top-k)
-//   long         a prompt past the dense-attention window (sparse selection, lent arena slots), then decode
-//   regress_test <model.gguf> [case ...] [--update] [--import-ref <logits dir>]
+//   long         a prompt past the dense-attention window (sparse selection, lent arena slots) against the
+//                reference, then decode
+//   regress_test <model.gguf> [case ...] [--update]
+//   regress_test - --import-ref <logits dir> parity|long
 // --update rewrites the recorded tokens and logits from this run; --import-ref turns a reference run's logits
-// (logits.<pos>.f32) for the parity prompt into the stored top-k file. Exit 77: the model is missing (skipped).
+// (logits.<pos>.f32) for a case's prompt (data/<case>_ids.txt) into its stored top-k (data/<case>_ref.bin).
+// Exit 77: the model is missing (skipped).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gguf/model_files.hpp"
@@ -36,8 +39,8 @@ const fs::path kExpected = kData / "regress_expected.txt";
 // Prefill vs decode on the short prompt: KL between their distributions and the largest difference among decode's
 // top-20 logits (a maximum over the whole vocabulary measures f16 noise in the far tail instead). Measured when
 // set: KL 1.3e-4, top-20 difference 0.052, the same at every chunk size.
-constexpr double kPrefillKl = 5e-4;
-constexpr double kPrefillTopDiff = 0.1;
+constexpr double kPrefillKl = 2e-4;
+constexpr double kPrefillTopDiff = 0.06;
 constexpr double kLongTopDiff = 0.05; // the long prompt's top logit vs recorded
 constexpr int kTopK = 64;                // reference logits stored per position
 
@@ -125,10 +128,14 @@ bool load_ref(const fs::path& p, RefTopK& r)
     return bool(in);
 }
 
-int import_ref(const fs::path& dir, const std::vector<int32_t>& ids)
+int import_ref(const fs::path& dir, const std::string& name)
 {
-    std::ofstream out(kData / "parity_ref.bin", std::ios::binary);
-    const uint32_t n = uint32_t(ids.size()), k = kTopK;
+    const uint32_t n = uint32_t(parse_ids(read_file(kData / (name + "_ids.txt"))).size()), k = kTopK;
+    if (!n) {
+        std::println(stderr, "no prompt {}", name);
+        return 1;
+    }
+    std::ofstream out(kData / (name + "_ref.bin"), std::ios::binary);
     out.write(reinterpret_cast<const char*>(&n), 4);
     out.write(reinterpret_cast<const char*>(&k), 4);
     for (uint32_t pos = 0; pos < n; ++pos) {
@@ -150,37 +157,47 @@ int import_ref(const fs::path& dir, const std::vector<int32_t>& ids)
             out.write(reinterpret_cast<const char*>(&x[order[i]]), 4);
         }
     }
-    std::println("wrote {} positions of top-{} reference logits", n, k);
+    std::println("wrote {} positions of top-{} reference logits to {}_ref.bin", n, k, name);
     return 0;
 }
 
-// KL(ref || ours) over the reference's top-k (the rest of its mass is left out) and top-1 agreement.
+// KL(ref || ours) over the reference's top-k (the rest of its mass is left out) and top-1 agreement, over the
+// positions added from `from` on.
 struct Parity {
-    double kl_mean = 0, kl_max = 0, agree = 0, mass = 0;
-};
+    const RefTopK& ref;
+    uint32_t from = 0;
+    double kl_sum = 0, kl_max = 0, agree = 0, mass = 0;
+    uint32_t n = 0;
 
-Parity parity(const RefTopK& ref, const std::vector<std::vector<float>>& logits)
-{
-    Parity p;
-    const uint32_t n = std::min<uint32_t>(ref.positions, uint32_t(logits.size()));
-    for (uint32_t pos = 0; pos < n; ++pos) {
-        const auto ours = log_softmax(logits[pos].data(), logits[pos].size());
-        double kl = 0, mass = 0;
+    void add(uint32_t pos, const float* logits, size_t n_vocab)
+    {
+        if (pos < from || pos >= ref.positions)
+            return;
+        const auto ours = log_softmax(logits, n_vocab);
+        double kl = 0, m = 0;
         for (const auto& [id, v] : ref.top[pos]) {
             const double lp = v - ref.lse[pos];
             kl += std::exp(lp) * (lp - ours[id]);
-            mass += std::exp(lp);
+            m += std::exp(lp);
         }
-        p.kl_mean += kl;
-        p.kl_max = std::max(p.kl_max, kl);
-        p.mass += mass;
-        p.agree += argmax(logits[pos]) == ref.top[pos][0].first;
+        kl_sum += kl;
+        kl_max = std::max(kl_max, kl);
+        mass += m;
+        agree += int(std::max_element(logits, logits + n_vocab) - logits) == ref.top[pos][0].first;
+        ++n;
     }
-    p.kl_mean /= n;
-    p.mass /= n;
-    p.agree /= n;
-    return p;
-}
+    double kl_mean() const { return n ? kl_sum / n : 0; }
+    double top1() const { return n ? agree / n : 0; }
+    // Checks KL mean and top-1 agreement against limits.
+    void check_limits(const std::string& what, double kl_limit, double top1_limit) const
+    {
+        check(n > 0 && kl_mean() < kl_limit && top1() > top1_limit,
+              std::format("{} ({} positions): KL mean {:.5f} (limit {}), max {:.4f}, top-1 {:.2f}% (limit {}%), "
+                          "top-{} mass {:.3f}",
+                          what, n, kl_mean(), kl_limit, kl_max, 100 * top1(), 100 * top1_limit, ref.k,
+                          n ? mass / n : 0));
+    }
+};
 
 std::vector<int32_t> greedy(mako::glm::Engine& e, std::vector<float> logits, int n)
 {
@@ -221,15 +238,15 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         if (a == "--update")
             update = true;
-        else if (a == "--import-ref" && i + 1 < argc)
+        else if (a == "--import-ref" && i + 1 < argc) // the case name (parity, long) follows as a case
             ref_dir = argv[++i];
         else
             cases.push_back(a);
     }
     const auto want = [&](const char* c) { return cases.empty() || std::ranges::find(cases, c) != cases.end(); };
-    const auto parity_ids = parse_ids(read_file(kData / "parity_ids.txt"));
     if (!ref_dir.empty())
-        return import_ref(ref_dir, parity_ids);
+        return cases.size() == 1 ? import_ref(ref_dir, cases[0]) : 2;
+    const auto parity_ids = parse_ids(read_file(kData / "parity_ids.txt"));
     if (model_path.empty() || !fs::exists(model_path)) {
         std::println("model {} not found: skipped", model_path);
         return 77;
@@ -302,35 +319,47 @@ int main(int argc, char** argv)
         if (!load_ref(kData / "parity_ref.bin", ref) || ref.positions != parity_ids.size()) {
             check(false, "reference top-k missing or not for this prompt");
         } else {
-            std::vector<std::vector<float>> pf;
+            Parity pf{ref};
             engine.reset();
-            engine.set_logits_sink([&](uint32_t, const float* l) { pf.emplace_back(l, l + cfg->n_vocab); });
+            engine.set_logits_sink([&](uint32_t pos, const float* l) { pf.add(pos, l, cfg->n_vocab); });
             engine.prefill(parity_ids);
             engine.set_logits_sink({});
-            const Parity p = parity(ref, pf);
-            // Measured when set: KL mean 0.0086, top-1 95.3%.
-            check(p.kl_mean < 0.012 && p.agree > 0.935,
-                  std::format("prefill vs reference: KL mean {:.5f} (limit 0.012), max {:.4f}, top-1 {:.1f}% (limit "
-                              "93.5%), top-{} mass {:.3f}",
-                              p.kl_mean, p.kl_max, 100 * p.agree, ref.k, p.mass));
-            const std::vector<int32_t> head(parity_ids.begin(), parity_ids.begin() + 128);
-            std::vector<std::vector<float>> dec;
+            // Limits ~1.1x the measured KL and a few positions of top-1; measured when set: KL 0.0086, 95.3%.
+            pf.check_limits("prefill vs reference", 0.0095, 0.945);
+            Parity dec{ref};
             engine.reset();
-            run_steps(engine, head, &dec);
-            const Parity d = parity(ref, dec);
-            // Measured when set: KL mean 0.0119, top-1 94.5%.
-            check(d.kl_mean < 0.016 && d.agree > 0.92,
-                  std::format("decode vs reference (128 positions): KL mean {:.5f} (limit 0.016), top-1 {:.1f}% (limit 92%)",
-                              d.kl_mean, 100 * d.agree));
+            for (uint32_t pos = 0; pos < 128; ++pos) {
+                const auto& l = engine.step(parity_ids[pos]);
+                dec.add(pos, l.data(), l.size());
+            }
+            // Measured when set: KL 0.0119, 94.5% (one position is 0.8%).
+            dec.check_limits("decode vs reference", 0.013, 0.937);
         }
     }
 
     if (want("long")) {
-        const auto ids = tok->encode(read_file(MAKO_CALIBRATION), true);
+        const auto ids = parse_ids(read_file(kData / "long_ids.txt"));
         std::println("long ({} tokens)", ids.size());
+        check(tok->encode(read_file(MAKO_CALIBRATION), true) == ids, "corpus tokenizes to the stored ids");
+        RefTopK ref;
+        const bool have_ref = load_ref(kData / "long_ref.bin", ref) && ref.positions == ids.size();
+        Parity all{ref}, sparse{ref, 2048};
         engine.reset();
+        if (have_ref)
+            engine.set_logits_sink([&](uint32_t pos, const float* l) {
+                all.add(pos, l, cfg->n_vocab);
+                sparse.add(pos, l, cfg->n_vocab);
+            });
         const auto l = engine.prefill(ids);
+        engine.set_logits_sink({});
         check(!engine.arena().lent(), "arena slots reclaimed after prefill");
+        if (!have_ref) {
+            check(false, "reference top-k missing or not for this prompt");
+        } else {
+            // Measured when set: all positions KL 0.0076, 96.8%; positions >= 2048 KL 0.0072, 95.6% (one is 0.3%).
+            all.check_limits("prefill vs reference", 0.0084, 0.963);
+            sparse.check_limits("prefill vs reference, sparse attention", 0.0079, 0.948);
+        }
         const int top = argmax(l);
         recorded["long_top"] = std::format("{} {:.3f}", top, l[top]);
         if (!update) {
