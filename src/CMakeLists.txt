@@ -6,7 +6,7 @@ add_library(mako_gguf STATIC gguf/gguf.cpp gguf/model_files.cpp quant/dequant.cp
 target_include_directories(mako_gguf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(MAKO_METALLIB ${CMAKE_BINARY_DIR}/mako.metallib)
-set(MAKO_METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/glm.metal)
+set(MAKO_METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/glm.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemv.metal)
 set(_airs)
 foreach(src ${MAKO_METAL_SOURCES})
     get_filename_component(stem ${src} NAME_WE)

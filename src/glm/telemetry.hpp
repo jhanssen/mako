@@ -12,8 +12,9 @@
 namespace mako::glm {
 
 // How much the engine measures and reports: summary (machine, load, per-token averages), steps (every step too),
-// layers (every step's per-layer GPU time too), kernels (GPU time per kernel instead of per layer; every dispatch
-// gets its own encoder, which adds overhead, so absolute times run high).
+// layers (every step's per-layer GPU time too), kernels (GPU time per kernel instead of per layer). At the kernels
+// level every dispatch gets its own timestamped encoder, which inflates kernel times severalfold for small kernels
+// and about 2x for large ones; use it to find candidates, not to size them.
 enum class Telemetry { off, summary, steps, layers, kernels };
 std::optional<Telemetry> parse_telemetry(std::string_view s);
 

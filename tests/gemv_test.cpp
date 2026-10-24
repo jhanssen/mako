@@ -1,5 +1,5 @@
 // GPU GEMV against CPU dequantization on real tensors of a model file.
-//   gemv_test <model shard.gguf> [tensor ...]
+//   gemv_test <model shard.gguf> [--time] [tensor ...]
 #include "gguf/gguf.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemv.hpp"
@@ -25,11 +25,18 @@ int main(int argc, char** argv)
         return 1;
     }
     std::vector<std::string> names;
-    for (int i = 2; i < argc; ++i)
-        names.emplace_back(argv[i]);
+    bool timed = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--time")
+            timed = true;
+        else
+            names.emplace_back(argv[i]);
+    }
     if (names.empty())
-        names = {"blk.0.attn_q.weight", "blk.0.ssm_f_b.weight", "blk.0.ssm_f_a.weight", "blk.0.hc_attn_fn.weight",
-                 "blk.3.attn_k_b.weight", "blk.3.attn_v_b.weight", "blk.0.ffn_down.weight"};
+        names = {"blk.0.attn_q.weight",       "blk.0.ssm_f_b.weight",       "blk.0.ssm_f_a.weight",
+                 "blk.0.hc_attn_fn.weight",   "blk.3.attn_k_b.weight",      "blk.3.attn_v_b.weight",
+                 "blk.0.ffn_down.weight",     "blk.0.ssm_beta.weight",      "blk.0.ssm_g_a.weight",
+                 "blk.3.ffn_gate_inp.weight"};
 
     mako::mtl::Context ctx;
     mako::mtl::Gemv gemv(ctx);
@@ -79,13 +86,38 @@ int main(int argc, char** argv)
         const double rel = std::sqrt(err / ref);
         const bool ok = rel < 1e-4;
         failures += !ok;
-        std::println("{:28} {:5} k={:5} n={:6} batch={:3}  rel err {:.2e}  {}", name,
-                     mako::gguf::traits(t->type).name, k, n, batch, rel, ok ? "ok" : "FAIL");
+        std::string timing;
+        if (timed) {
+            // GPU time per dispatch over a chain of dependent dispatches, as in a decode step, cycling through
+            // copies of the matrix that together exceed the GPU's caches (decode reads every weight from DRAM).
+            const uint64_t copies = std::max<uint64_t>(2, (256ull << 20) / data.size());
+            mako::mtl::Ref<MTL::Buffer> wc(ctx.device()->newBuffer(data.size() * copies, MTL::ResourceStorageModeShared));
+            for (uint64_t c = 0; c < copies; ++c)
+                std::memcpy(static_cast<char*>(wc->contents()) + c * data.size(), data.data(), data.size());
+            for (bool own : {false, true}) {
+                gemv.set_own_kernels(own);
+                double best = 1e9;
+                for (int rep = 0; rep < 3; ++rep) {
+                    auto* tcb = ctx.queue()->commandBuffer();
+                    auto* tenc = tcb->computeCommandEncoder();
+                    for (int r = 0; r < 200; ++r)
+                        gemv.encode(tenc, a, wc.get(), (r % copies) * data.size(), x.get(), 0, y.get(), 0);
+                    tenc->endEncoding();
+                    tcb->commit();
+                    tcb->waitUntilCompleted();
+                    best = std::min(best, (tcb->GPUEndTime() - tcb->GPUStartTime()) * 1e6 / 200);
+                }
+                timing += std::format("  {} {:6.1f} us", own ? "own" : "per-format", best);
+            }
+            gemv.set_own_kernels(true);
+        }
+        std::println("{:28} {:5} k={:5} n={:6} batch={:3}  rel err {:.2e}  {}{}", name,
+                     mako::gguf::traits(t->type).name, k, n, batch, rel, ok ? "ok" : "FAIL", timing);
     }
 
     // Indexed GEMV over expert slots (padded stride, ids not in slot order) against the batched GEMV over the same
     // experts copied contiguously: checks the slot addressing (expert types have no CPU dequantization).
-    if (argc == 2) {
+    if (names.size() == 10) {
         const int experts[] = {5, 287, 0, 100, 42, 7, 200, 13};
         const int32_t slot_ids[] = {3, 0, 7, 1, 6, 2, 5, 4};
         constexpr int n_sel = 8;
@@ -134,9 +166,34 @@ int main(int argc, char** argv)
             const double rel = std::sqrt(err / ref);
             const bool ok = rel < 1e-6;
             failures += !ok;
-            std::println("{:28} {:7} k={:5} n={:6} indexed x{} {:8}  rel err vs batched {:.2e}  {}", name,
+            std::string timing;
+            if (timed) {
+                const uint64_t bytes = stride * n_sel, copies = std::max<uint64_t>(2, (256ull << 20) / bytes);
+                auto many = buffer(bytes * copies);
+                for (uint64_t c = 0; c < copies; ++c)
+                    std::memcpy(static_cast<char*>(many->contents()) + c * bytes, slots->contents(), bytes);
+                for (bool own : {false, true}) {
+                    gemv.set_own_kernels(own);
+                    double best = 1e9;
+                    for (int rep = 0; rep < 3; ++rep) {
+                        auto* tcb = ctx.queue()->commandBuffer();
+                        auto* tenc = tcb->computeCommandEncoder();
+                        for (int r = 0; r < 100; ++r)
+                            gemv.encode_indexed(tenc, a, many.get(), (r % copies) * bytes, stride, ids.get(), 0, x.get(),
+                                                0, y.get(), 0);
+                        tenc->endEncoding();
+                        tcb->commit();
+                        tcb->waitUntilCompleted();
+                        best = std::min(best, (tcb->GPUEndTime() - tcb->GPUStartTime()) * 1e6 / 100);
+                    }
+                    timing += std::format("  {} {:6.1f} us ({:.0f} GB/s)", own ? "own" : "per-format", best,
+                                          double(eb) * n_sel / best / 1e3);
+                }
+                gemv.set_own_kernels(true);
+            }
+            std::println("{:28} {:7} k={:5} n={:6} indexed x{} {:8}  rel err vs batched {:.2e}  {}{}", name,
                          mako::gguf::traits(t->type).name, k, n, n_sel, shared ? "shared x" : "own x", rel,
-                         ok ? "ok" : "FAIL");
+                         ok ? "ok" : "FAIL", timing);
         }
     }
     return failures ? 1 : 0;
