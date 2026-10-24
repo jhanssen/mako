@@ -3,6 +3,7 @@
 //   ref_dump <model.gguf> <id,id,...> <out_dir> [name-substring ...]
 // An id list starting with '@' is text to tokenize instead; the ids are printed.
 // REF_INDEXER_TOP_K=N in the environment overrides the model's sparse-attention selection width.
+// REF_BATCH=N: logits only (no intermediate tensors), the ids fed N at a time: much faster for long prompts.
 // REF_TOKENIZE=<file>: load only the vocabulary, tokenize each 0x1E-separated case of <file> (special tokens
 // parsed) and print one line of ids per case; the other arguments are ignored.
 #include "ggml-backend.h"
@@ -19,6 +20,7 @@
 #include <print>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -116,10 +118,17 @@ int main(int argc, char** argv)
         return 1;
     auto cp = llama_context_default_params();
     cp.n_ctx = std::max<uint32_t>(512, uint32_t(ids.size() + id_arg.size() / 2 + 16));
-    cp.n_batch = 1;
-    cp.n_ubatch = 1;
-    cp.cb_eval = on_tensor;
-    cp.cb_eval_user_data = &d;
+    const int batch = std::getenv("REF_BATCH") ? std::max(1, std::atoi(std::getenv("REF_BATCH"))) : 0;
+    cp.n_batch = batch ? uint32_t(batch) : 1;
+    cp.n_ubatch = cp.n_batch;
+    if (batch) {
+        const int threads = int(std::thread::hardware_concurrency());
+        cp.n_threads = threads;
+        cp.n_threads_batch = threads;
+    } else {
+        cp.cb_eval = on_tensor;
+        cp.cb_eval_user_data = &d;
+    }
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx)
         return 1;
@@ -137,6 +146,34 @@ int main(int argc, char** argv)
         for (auto id : ids)
             list += std::to_string(id) + ",";
         std::println("ids {}", list);
+    }
+    if (batch) {
+        llama_batch b = llama_batch_init(batch, 0, 1);
+        for (size_t i0 = 0; i0 < ids.size(); i0 += size_t(batch)) {
+            const int n = int(std::min<size_t>(size_t(batch), ids.size() - i0));
+            b.n_tokens = n;
+            for (int j = 0; j < n; ++j) {
+                b.token[j] = ids[i0 + j];
+                b.pos[j] = llama_pos(i0 + j);
+                b.n_seq_id[j] = 1;
+                b.seq_id[j][0] = 0;
+                b.logits[j] = 1;
+            }
+            if (llama_decode(ctx, b) != 0) {
+                std::println(stderr, "decode failed at {}", i0);
+                return 1;
+            }
+            for (int j = 0; j < n; ++j) {
+                const float* logits = llama_get_logits_ith(ctx, j);
+                std::ofstream out(d.dir / ("logits." + std::to_string(i0 + j) + ".f32"), std::ios::binary);
+                out.write(reinterpret_cast<const char*>(logits), std::streamsize(n_vocab) * 4);
+            }
+            std::println("positions {}..{} done", i0, i0 + n - 1);
+        }
+        llama_batch_free(b);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 0;
     }
     for (size_t i = 0; i < ids.size(); ++i) {
         d.pos = int(i);
