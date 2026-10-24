@@ -583,7 +583,10 @@ void Engine::serve_moe(MTL::CommandBuffer* cb)
     const uint32_t k = cfg_.n_expert_used;
     auto* sel = static_cast<int*>(scratch("msel", 16 * 4)->contents());
     auto* w = static_cast<float*>(scratch("ew", 16 * 4)->contents());
-    auto* ids = static_cast<int32_t*>(scratch("eids", 16 * 4)->contents());
+    auto* hit_ids = static_cast<const int32_t*>(scratch("eids_hit", 16 * 4)->contents());
+    auto* miss_ids = static_cast<int32_t*>(scratch("eids_miss", 16 * 4)->contents());
+    auto* miss_rank = static_cast<int32_t*>(scratch("mrank", 16 * 4)->contents());
+    auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(cfg_.n_layer) * 36)->contents());
     for (const auto [il, v] : pending_moe_) {
         for (uint32_t spins = 0; routed_->signaledValue() < v; ++spins)
             if (spins % 4096 == 4095 && cb->status() == MTL::CommandBufferStatusError)
@@ -597,9 +600,26 @@ void Engine::serve_moe(MTL::CommandBuffer* cb)
             std::copy_n(sel, k, self.begin());
             probe_("moe_sel", int(il), self.data(), k);
         }
-        if (route_override_)
+        // An override changes the selection after the GPU looked it up: then every expert goes to the miss pass.
+        const bool overridden = bool(route_override_);
+        if (overridden)
             route_override_(int(il), sel, w, k);
-        arena_->ensure(il, std::span<const int>(sel, k), ids);
+        std::array<int32_t, 16> slots{};
+        arena_->ensure(il, std::span<const int>(sel, k), slots.data());
+        for (uint32_t j = 0; j < k; ++j) {
+            if (overridden) {
+                miss_rank[j] = int32_t(j);
+                miss_ids[j] = slots[j];
+            } else if (miss_rank[j] >= 0) {
+                miss_ids[miss_rank[j]] = slots[j];
+            } else if (hit_ids[j] != slots[j]) {
+                throw std::runtime_error(std::format("layer {}: GPU found expert {} in slot {}, the arena has it in {}",
+                                                     il, sel[j], hit_ids[j], slots[j]));
+            }
+        }
+        if (overridden)
+            for (int d = 0; d < 3; ++d)
+                indirect[il * 9 + d * 3 + 2] = k;
         ready_->setSignaledValue(v);
     }
     pending_moe_.clear();
@@ -708,8 +728,30 @@ const std::vector<float>& Engine::step(int32_t token)
             const uint32_t k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
             MTL::Buffer* sho = scratch("sho", E * 4);
             MTL::Buffer* rlog = scratch("rlog", cfg_.n_expert * 4);
-            MTL::Buffer* ids = scratch("eids", 16 * 4);
             MTL::Buffer* ew = scratch("ew", 16 * 4);
+            MTL::Buffer* hit_ids = scratch("eids_hit", 16 * 4);
+            MTL::Buffer* miss_ids = scratch("eids_miss", 16 * 4);
+            MTL::Buffer* miss_rank = scratch("mrank", 16 * 4);
+            MTL::Buffer* indirect = scratch("mind", uint64_t(cfg_.n_layer) * 36);
+            const uint64_t ind_off = uint64_t(il) * 36;
+            auto part_args = [&](int part) {
+                const ExpertArena::Part& e = arena_->part(il, part);
+                mtl::Gemv::Args a;
+                a.type = e.type;
+                a.k = e.k;
+                a.n = e.n;
+                a.batch = k;
+                a.x_shared = part < 2;
+                return a;
+            };
+            // x, y of the miss pass's dispatches; moe_route writes z, the number of misses.
+            auto* ind = static_cast<uint32_t*>(indirect->contents()) + il * 9;
+            for (int part = 0; part < 3; ++part) {
+                const MTL::Size g = gemv_->indexed_grid(part_args(part));
+                ind[part * 3] = uint32_t(g.width);
+                ind[part * 3 + 1] = uint32_t(g.height);
+            }
+
             gemv(enc, L.router, xn, 0, rlog, 0);
             ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, sho, cfg_.swiglu_clamp_shexp[il]);
             const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale};
@@ -720,36 +762,44 @@ const std::vector<float>& Engine::step(int32_t token)
             enc->setBuffer(ew, 0, 3);
             enc->setBuffer(scratch("mbiased", cfg_.n_expert * 4), 0, 4);
             enc->setBytes(&ra, sizeof(ra), 5);
+            enc->setBuffer(arena_->slot_table(), uint64_t(il) * cfg_.n_expert * 4, 6);
+            enc->setBuffer(hit_ids, 0, 7);
+            enc->setBuffer(miss_rank, 0, 8);
+            enc->setBuffer(indirect, ind_off, 9);
             enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
             enc->endEncoding();
             const uint64_t v = ++event_value_;
             cb->encodeSignalEvent(routed_.get(), v);
+            pending_moe_.emplace_back(il, v);
+            enc = cb->computeCommandEncoder();
+
+            // Resident experts run while the CPU reads the misses; the miss pass waits for it.
+            const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
+            auto pass = [&](MTL::Buffer* ids, bool miss, const char* tag) {
+                MTL::Buffer* eg = scratch(std::string("eg") + tag, k * nff * 4);
+                MTL::Buffer* eu = scratch(std::string("eu") + tag, k * nff * 4);
+                MTL::Buffer* em = scratch(std::string("em") + tag, k * nff * 4);
+                MTL::Buffer* ed = scratch(std::string("ed") + tag, k * E * 4);
+                auto run = [&](int part, MTL::Buffer* in, MTL::Buffer* out) {
+                    const ExpertArena::Region& r = arena_->region(il, part);
+                    gemv_->encode_indexed(enc, part_args(part), r.buf, r.off, r.stride, ids, 0, in, 0, out, 0,
+                                          miss ? indirect : nullptr, ind_off + uint64_t(part) * 12);
+                };
+                run(0, xn, eg);
+                run(1, xn, eu);
+                dispatch(enc, "swiglu", {eg, eu, em}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1),
+                         MTL::Size(256, 1, 1));
+                run(2, em, ed);
+                return ed;
+            };
+            MTL::Buffer* ed_hit = pass(hit_ids, false, "h");
+            enc->endEncoding();
             cb->encodeWait(ready_.get(), v);
             enc = cb->computeCommandEncoder();
-            pending_moe_.emplace_back(il, v);
-
-            MTL::Buffer* eg = scratch("eg", k * nff * 4);
-            MTL::Buffer* eu = scratch("eu", k * nff * 4);
-            MTL::Buffer* em = scratch("em", k * nff * 4);
-            MTL::Buffer* ed = scratch("ed", k * E * 4);
-            auto expert_gemv = [&](int part, MTL::Buffer* in, MTL::Buffer* out, bool shared) {
-                const ExpertArena::Part& e = arena_->part(il, part);
-                const ExpertArena::Region& r = arena_->region(il, part);
-                mtl::Gemv::Args a;
-                a.type = e.type;
-                a.k = e.k;
-                a.n = e.n;
-                a.batch = k;
-                a.x_shared = shared;
-                gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0);
-            };
-            expert_gemv(0, xn, eg, true);
-            expert_gemv(1, xn, eu, true);
-            const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
-            dispatch(enc, "swiglu", {eg, eu, em}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1), MTL::Size(256, 1, 1));
-            expert_gemv(2, em, ed, false);
+            MTL::Buffer* ed_miss = pass(miss_ids, true, "m");
             const CombineArgs ca{E, k};
-            dispatch(enc, "moe_combine", {ed, ew, sho, ffo}, &ca, sizeof(ca), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+            dispatch(enc, "moe_combine_split", {ed_hit, ed_miss, miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
+                     MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
         }
         probe(enc, "ffn_out", int(il), ffo, E);
         hc_post(enc, ffo);
