@@ -1,5 +1,5 @@
 // Prints a GGUF file's metadata and tensor table; works on a partial download once the header is in.
-//   gguf_dump <file> [--tensors] [--filter <substring>]
+//   gguf_dump <file> [--tensors] [--filter <substring>] [--raw <key>]   (--raw: only that string value, whole)
 #include "gguf/gguf.hpp"
 
 #include <cstdio>
@@ -10,22 +10,33 @@
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::println(stderr, "usage: gguf_dump <file> [--tensors] [--filter <substring>]");
+        std::println(stderr, "usage: gguf_dump <file> [--tensors] [--filter <substring>] [--raw <key>]");
         return 2;
     }
     bool tensors = false;
-    std::string filter;
+    std::string filter, raw;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--tensors")
             tensors = true;
         else if (a == "--filter" && i + 1 < argc)
             filter = argv[++i];
+        else if (a == "--raw" && i + 1 < argc)
+            raw = argv[++i];
     }
     auto f = mako::gguf::File::open(argv[1]);
     if (!f) {
         std::println(stderr, "{}", f.error());
         return 1;
+    }
+    if (!raw.empty()) {
+        const auto s = f->get_string(raw);
+        if (!s) {
+            std::println(stderr, "no string {}", raw);
+            return 1;
+        }
+        std::fwrite(s->data(), 1, s->size(), stdout);
+        return 0;
     }
     std::println("GGUF v{}  {} tensors  data at {}  file {} bytes", f->version(), f->tensors().size(), f->data_offset(),
                  f->size());
