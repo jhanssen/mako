@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -77,6 +78,7 @@ public:
     const std::vector<std::vector<uint64_t>>& usage() const { return usage_; }
 
 private:
+    class Readers;
     void read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads); // (expert, slot)
 
     std::vector<LayerParts> layers_;
@@ -94,6 +96,7 @@ private:
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]
     uint64_t clock_ = 0;
     Stats stats_;
+    std::unique_ptr<Readers> readers_;
 };
 
 } // namespace mako::glm

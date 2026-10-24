@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <numeric>
@@ -110,6 +111,14 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     : model_(model), cfg_(cfg), opts_(opts), ctx_(ctx)
 {
     const auto t_load = Clock::now();
+    if (const char* r = std::getenv("MAKO_REPEAT")) {
+        const std::string_view spec(r);
+        const size_t colon = spec.rfind(':');
+        if (colon == std::string_view::npos)
+            throw std::runtime_error("MAKO_REPEAT wants <label substring>:<n>");
+        repeat_label_ = spec.substr(0, colon);
+        repeat_n_ = std::max(1, std::atoi(r + colon + 1));
+    }
     gemv_ = std::make_unique<mtl::Gemv>(ctx_);
     lib_ = ctx_.load(mtl::kernels_metallib());
 
@@ -463,9 +472,12 @@ void Engine::gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buf
     a.k = uint32_t(w.dims[0]);
     a.n = uint32_t(w.dims[1]);
     a.batch = batch;
-    gemv_->encode(enc, a, w.buf, w.off, x, x_off, y, y_off);
+    const bool labelled = opts_.telemetry == Telemetry::kernels || repeat_n_ > 1;
+    const std::string label = labelled ? std::format("gemv {} {}x{}", gguf::traits(a.type).name, a.k, a.n) : "";
+    for (int r = repeats(label); r > 0; --r)
+        gemv_->encode(enc, a, w.buf, w.off, x, x_off, y, y_off);
     if (opts_.telemetry == Telemetry::kernels)
-        after(enc, std::format("gemv {} {}x{}", gguf::traits(a.type).name, a.k, a.n));
+        after(enc, label);
 }
 
 void Engine::dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
@@ -477,10 +489,12 @@ void Engine::dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, s
         enc->setBuffer(b, 0, i++);
     if (args)
         enc->setBytes(args, args_size, i);
-    if (threads)
-        enc->dispatchThreads(grid, tg);
-    else
-        enc->dispatchThreadgroups(grid, tg);
+    for (int r = repeats(fn); r > 0; --r) {
+        if (threads)
+            enc->dispatchThreads(grid, tg);
+        else
+            enc->dispatchThreadgroups(grid, tg);
+    }
     after(enc, fn);
 }
 
@@ -493,7 +507,8 @@ void Engine::norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTen
     enc->setBuffer(w ? w->buf : x, w ? w->off : 0, 1);
     enc->setBuffer(y, 0, 2);
     enc->setBytes(&a, sizeof(a), 3);
-    enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+    for (int r = repeats("rms_norm"); r > 0; --r)
+        enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "rms_norm");
 }
 
@@ -970,11 +985,15 @@ const std::vector<float>& Engine::step(int32_t token)
                 auto run = [&](int part, MTL::Buffer* in, MTL::Buffer* out) {
                     const ExpertArena::Region& r = arena_->region(il, part);
                     const mtl::Gemv::Args a = part_args(part);
-                    gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0,
-                                          miss ? indirect : nullptr, ind_off + uint64_t(part) * 12);
+                    const bool labelled = opts_.telemetry == Telemetry::kernels || repeat_n_ > 1;
+                    const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name,
+                                                                     a.k, a.n, miss ? "miss" : "hit")
+                                                       : "";
+                    for (int rep = repeats(label); rep > 0; --rep)
+                        gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0,
+                                              miss ? indirect : nullptr, ind_off + uint64_t(part) * 12);
                     if (opts_.telemetry == Telemetry::kernels)
-                        after(enc, std::format("expert {} {}x{} {}", gguf::traits(a.type).name, a.k, a.n,
-                                               miss ? "miss" : "hit"));
+                        after(enc, label);
                 };
                 run(0, xn, eg);
                 run(1, xn, eu);

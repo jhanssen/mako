@@ -158,6 +158,14 @@ private:
         NS::UInteger start, end;
         std::string kernel; // kernels level; empty: the encoder held no dispatch
     };
+    // MAKO_REPEAT=<label substring>:<n> encodes matching GEMVs, norms and helper dispatches n times, so the extra
+    // step time measures their cost in place (they all recompute their output from their inputs).
+    std::string repeat_label_;
+    int repeat_n_ = 1;
+    int repeats(std::string_view label) const
+    {
+        return repeat_n_ > 1 && label.find(repeat_label_) != std::string_view::npos ? repeat_n_ : 1;
+    }
     MTL::CommandBuffer* cur_cb_ = nullptr;
     uint32_t cur_layer_ = 0;
     std::vector<mtl::Ref<MTL::CounterSampleBuffer>> samples_; // kSamplesPerBuffer each; index / that picks one

@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <functional>
+#include <condition_variable>
+#include <exception>
 #include <cstring>
 #include <format>
 #include <numeric>
@@ -21,7 +25,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr uint64_t kPage = 16384;
-constexpr int kReaders = 8; // enough reads in flight for the SSD's plateau at 2 MiB blocks
+constexpr int kReaders = 8;              // reads in flight: the SSD's plateau needs 4-8 at 1 MiB
+constexpr uint64_t kReadChunk = 1 << 20; // a miss's parts are read in chunks of this size
 
 uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
@@ -47,20 +52,75 @@ void read_exact(int fd, void* dst, uint64_t bytes, uint64_t offset)
     }
 }
 
-// Runs task(i) for i in [0, n) on up to kReaders threads.
-template <typename F>
-void parallel(size_t n, F&& task)
-{
-    std::atomic<size_t> next{0};
-    std::vector<std::jthread> workers;
-    for (size_t t = 0; t < std::min<size_t>(n, kReaders); ++t)
-        workers.emplace_back([&] {
-            for (size_t i; (i = next.fetch_add(1)) < n;)
-                task(i);
-        });
-}
-
 } // namespace
+
+// Persistent reader threads; run() hands them tasks 0..n-1 and returns when all are done.
+class ExpertArena::Readers {
+public:
+    Readers()
+    {
+        for (int t = 0; t < kReaders; ++t)
+            threads_.emplace_back([this](std::stop_token st) { work(st); });
+    }
+    ~Readers()
+    {
+        for (auto& t : threads_)
+            t.request_stop();
+        cv_.notify_all();
+    }
+
+    void run(size_t n, const std::function<void(size_t)>& task)
+    {
+        std::unique_lock lock(m_);
+        task_ = &task;
+        n_ = n;
+        next_ = 0;
+        done_ = 0;
+        error_ = nullptr;
+        ++generation_;
+        cv_.notify_all();
+        done_cv_.wait(lock, [&] { return done_ == n_; });
+        task_ = nullptr;
+        if (error_)
+            std::rethrow_exception(error_);
+    }
+
+private:
+    void work(std::stop_token st)
+    {
+        uint64_t seen = 0;
+        std::unique_lock lock(m_);
+        for (;;) {
+            cv_.wait(lock, st, [&] { return generation_ != seen; });
+            if (st.stop_requested())
+                return;
+            seen = generation_;
+            while (task_ && next_ < n_) {
+                const size_t i = next_++;
+                lock.unlock();
+                std::exception_ptr err;
+                try {
+                    (*task_)(i);
+                } catch (...) {
+                    err = std::current_exception();
+                }
+                lock.lock();
+                if (err && !error_)
+                    error_ = err;
+                if (++done_ == n_)
+                    done_cv_.notify_one();
+            }
+        }
+    }
+
+    std::mutex m_;
+    std::condition_variable_any cv_, done_cv_;
+    const std::function<void(size_t)>* task_ = nullptr;
+    size_t n_ = 0, next_ = 0, done_ = 0;
+    uint64_t generation_ = 0;
+    std::exception_ptr error_;
+    std::vector<std::jthread> threads_;
+};
 
 MemInfo query_memory(uint64_t working_set)
 {
@@ -100,7 +160,7 @@ double arena_budget(const MemInfo& m)
 
 ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<LayerParts> layers, uint32_t n_expert,
                          uint32_t n_used, double budget_bytes, const std::vector<std::vector<uint64_t>>& counts)
-    : layers_(std::move(layers)), regions_(layers_.size()), n_expert_(n_expert)
+    : layers_(std::move(layers)), regions_(layers_.size()), n_expert_(n_expert), readers_(std::make_unique<Readers>())
 {
     const size_t nl = layers_.size();
     const uint64_t budget = uint64_t(std::max(0.0, budget_bytes));
@@ -236,12 +296,23 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
 {
     const auto t0 = Clock::now();
     const LayerParts& L = layers_[layer];
-    parallel(loads.size() * 3, [&](size_t i) {
-        const auto [e, s] = loads[i / 3];
-        const Part& p = L[i % 3];
-        const Region& r = regions_[layer][i % 3];
-        read_exact(p.fd, static_cast<char*>(r.buf->contents()) + r.off + uint64_t(s) * r.stride, p.bytes,
-                   p.file_off + uint64_t(e) * p.bytes);
+    struct Chunk {
+        uint32_t load;
+        int part;
+        uint64_t off, bytes;
+    };
+    std::vector<Chunk> chunks;
+    for (uint32_t i = 0; i < loads.size(); ++i)
+        for (int p = 0; p < 3; ++p)
+            for (uint64_t off = 0; off < L[p].bytes; off += kReadChunk)
+                chunks.push_back({i, p, off, std::min(kReadChunk, L[p].bytes - off)});
+    readers_->run(chunks.size(), [&](size_t i) {
+        const Chunk& c = chunks[i];
+        const auto [e, s] = loads[c.load];
+        const Part& p = L[c.part];
+        const Region& r = regions_[layer][c.part];
+        read_exact(p.fd, static_cast<char*>(r.buf->contents()) + r.off + uint64_t(s) * r.stride + c.off, c.bytes,
+                   p.file_off + uint64_t(e) * p.bytes + c.off);
     });
     stats_.read_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     for (const Part& p : L)
