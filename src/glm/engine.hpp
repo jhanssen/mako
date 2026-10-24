@@ -29,6 +29,7 @@ struct Options {
     std::string expert_counts;  // routing profile placing experts in the arena; empty: the model's default profile
                                 // (default_profile_path), when it exists
     Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
+    bool mtp = false; // load the next-token block (speculative decoding): its weights, caches and expert slots
 };
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
@@ -40,12 +41,19 @@ public:
 
     // Runs one token at the next position and returns its logits.
     const std::vector<float>& step(int32_t token);
+    // Two consecutive tokens in one step (speculative verification): their logits, a row each.
+    const std::vector<float>& step2(int32_t a, int32_t b);
+    // Undoes the second token of the last step2(): its position becomes the next one again.
+    void rollback();
     // The next-token block's guess for the token after `next`, where `next` follows the token of the last step():
     // from that step's final hidden state and `next`'s embedding. Also fills the block's own attention cache at the
     // last step's position, so it must run after every step for later drafts to see the whole context. -1 without
     // the block.
     int32_t mtp_draft(int32_t next);
-    bool has_mtp() const { return cfg_.n_layer_mtp > 0; }
+    // The same over the positions of the last step's first next.size() tokens (rows of its hidden state), each
+    // followed by next[i]; the guess comes from the last.
+    int32_t mtp_draft(std::span<const int32_t> next);
+    bool has_mtp() const { return layers_.size() > cfg_.n_layer; }
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     const std::vector<float>& prefill(std::span<const int32_t> tokens);
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
@@ -128,16 +136,17 @@ private:
     void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
                   const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads = true);
     void norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
-              uint32_t n, uint32_t wn, float eps, uint64_t x_off = 0, uint64_t y_off = 0);
+              uint32_t n, uint32_t wn, float eps, uint64_t x_off = 0, uint64_t y_off = 0, uint32_t ystride = 0);
     // R (and out) at byte offset r_off: a chunk's rows of a longer stream.
     void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
                 MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T, uint64_t r_off = 0);
     void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out, MTL::Buffer* pc,
                  uint32_t T, uint64_t r_off = 0);
-    // One token: hc_post(post_x, R -> R_out, pc) when post_x is set (else R_out is R), then hc_pre of the next block
+    // T tokens: hc_post(post_x, R -> R_out, pc) when post_x is set (else R_out is R), then hc_pre of the next block
     // on the new stream (fn, scale, base) into x and pc, in two dispatches.
     void hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
-                 const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc);
+                 const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc,
+                 uint32_t T = 1);
     void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
              uint32_t T);
     void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
@@ -151,8 +160,13 @@ private:
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
                    uint64_t x_off = 0, uint64_t out_off = 0);
     void serve_moe(MTL::CommandBuffer* cb);
+    void decode_tokens(std::span<const int32_t> tokens);
+    void mtp_fill(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* h, uint64_t h_off, MTL::Buffer* e, uint64_t e_off,
+                  uint32_t T, uint32_t pos0);
+    // T (<= kMaxDecodeTokens) tokens' routed FFN plus shared expert, rows of xn into rows of ffo.
     void moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il,
-                    MTL::Buffer* xn, MTL::Buffer* ffo);
+                    MTL::Buffer* xn, MTL::Buffer* ffo, uint32_t T);
+    static constexpr uint32_t kMaxDecodeTokens = 4;
     // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
     MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                         uint32_t ld);
@@ -192,6 +206,11 @@ private:
     gguf::ModelFiles::Ref token_embd_;
     DevTensor output_norm_, output_;
     std::vector<mtl::Ref<MTL::Buffer>> kda_state_, conv_state_, kv_cache_, idx_cache_, idx_pooled_;
+    // A speculative step's KDA and conv states after its first snap_ tokens, swapped in by rollback().
+    std::vector<mtl::Ref<MTL::Buffer>> kda_state_alt_, conv_state_alt_;
+    uint32_t snap_ = 0;
+    uint32_t last_tokens_ = 0, last_pos0_ = 0; // the last decode step's token count and first position
+    std::vector<float> logits_all_;            // its logits, a row per token
 
     uint32_t pos_ = 0;
     uint32_t built_chunk_ = 0, built_group_ = 0;
@@ -200,7 +219,12 @@ private:
     // selected experts are resident and their slots written (serve_moe).
     mtl::Ref<MTL::SharedEvent> routed_, ready_;
     uint64_t event_value_ = 0;
-    std::vector<std::pair<uint32_t, uint64_t>> pending_moe_; // (layer, event value) not yet served
+    struct PendingMoe {
+        uint32_t layer;
+        uint64_t value; // event value
+        uint32_t tokens;
+    };
+    std::vector<PendingMoe> pending_moe_; // not yet served
 
     Probe probe_;
     LogitsSink logits_sink_;

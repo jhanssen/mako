@@ -106,7 +106,7 @@ int main(int argc, char** argv)
     }
     int n_gen = 8, top = 5;
     std::string ref_dir, dump_dir, force_dir, route_dir, save_counts, stats_out, logits_dir;
-    bool mtp_stats = false;
+    bool mtp_stats = false, spec = false;
     bool learn = false;
     mako::glm::Options opts;
     for (int i = 3; i < argc; ++i) {
@@ -117,6 +117,10 @@ int main(int argc, char** argv)
         }
         if (a == "--mtp-stats") {
             mtp_stats = true;
+            continue;
+        }
+        if (a == "--spec") {
+            spec = mtp_stats = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -193,6 +197,7 @@ int main(int argc, char** argv)
     }
     mako::mtl::Context ctx;
     auto t0 = std::chrono::steady_clock::now();
+    opts.mtp = mtp_stats;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (!stats_out.empty() && opts.telemetry == mako::glm::Telemetry::off)
@@ -294,9 +299,9 @@ int main(int argc, char** argv)
 
     std::vector<float> logits;
     const bool batched = opts.prefill_chunk > 0 && ids.size() > 1 && ref_dir.empty() &&
-                         force_dir.empty() && route_dir.empty() && !mtp_stats;
-    // --mtp-stats: the next-token block runs after every step (on the prompt with the actual next token, which fills
-    // its cache), and its guesses are compared with the greedy tokens that follow.
+                         force_dir.empty() && route_dir.empty();
+    // --mtp-stats: the next-token block runs after every step (prefill fills its cache for the prompt), and its
+    // guesses are compared with the greedy tokens that follow. --spec decodes speculatively with it.
     if (mtp_stats && !engine.has_mtp()) {
         std::println(stderr, "the model has no next-token block");
         return 1;
@@ -316,6 +321,8 @@ int main(int argc, char** argv)
         telemetry.prefill(engine.last_prefill(), uint32_t(ids.size()));
         std::println("prefill {} tokens in {:.0f} ms ({:.1f} tok/s), chunks of {}  top{}", ids.size(), ms,
                      ids.size() / ms * 1e3, opts.prefill_chunk, show(logits));
+        if (mtp_stats)
+            draft = engine.mtp_draft(top_k(logits, 1)[0]);
     }
     for (size_t i = 0; i < (batched ? 0 : ids.size()); ++i) {
         auto t = std::chrono::steady_clock::now();
@@ -338,7 +345,46 @@ int main(int argc, char** argv)
     }
     std::string gen;
     std::vector<int32_t> gen_ids;
-    for (int g = 0; g < n_gen; ++g) {
+    if (spec) {
+        // Speculative greedy decoding: verify [pending, draft] in one two-token step; keep the draft if the first
+        // row's greedy token is the draft, else roll the second token back.
+        auto argmax = [&](const float* l) { return int32_t(std::max_element(l, l + cfg->n_vocab) - l); };
+        int32_t pending = top_k(logits, 1)[0];
+        int rounds = 0, accepted = 0;
+        double verify_ms = 0, draft_ms = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (int(gen_ids.size()) < n_gen) {
+            const auto tv = std::chrono::steady_clock::now();
+            const auto& two = engine.step2(pending, draft);
+            verify_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
+            telemetry.step(engine.last_step());
+            const auto td = std::chrono::steady_clock::now();
+            const int32_t g1 = argmax(two.data());
+            gen_ids.push_back(pending);
+            ++rounds;
+            if (g1 == draft && int(gen_ids.size()) < n_gen) {
+                ++accepted;
+                gen_ids.push_back(draft);
+                const int32_t g2 = argmax(two.data() + cfg->n_vocab);
+                const int32_t both[2] = {draft, g2};
+                draft = engine.mtp_draft(std::span<const int32_t>(both));
+                pending = g2;
+            } else {
+                engine.rollback();
+                draft = engine.mtp_draft(g1);
+                pending = g1;
+            }
+            draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        for (int32_t t : gen_ids)
+            gen += std::format("{},", t);
+        std::println("speculative: {} tokens in {} rounds ({:.1f}% drafts accepted), {:.1f} ms/token; per round: "
+                     "two-token step {:.1f} ms, next-token block {:.1f} ms",
+                     gen_ids.size(), rounds, 100.0 * accepted / std::max(1, rounds), ms / gen_ids.size(),
+                     verify_ms / std::max(1, rounds), draft_ms / std::max(1, rounds));
+    }
+    for (int g = 0; g < (spec ? 0 : n_gen); ++g) {
         const int next = top_k(logits, 1)[0];
         gen += std::format("{},", next);
         gen_ids.push_back(next);

@@ -37,6 +37,7 @@ struct NormArgs {
     uint n;       // row length
     uint wn;      // weight length (the weight repeats every wn elements); 0: no weight
     float eps;
+    uint ystride; // rms_norm: y row stride in elements (0: n)
 };
 
 // y = x / sqrt(mean(x^2) + eps) * w (w of n, or none when wn is 0), one threadgroup per row; n a multiple of 4.
@@ -46,7 +47,7 @@ kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w 
 {
     threadgroup float scratch[TG / 32];
     device const float4* xr = reinterpret_cast<device const float4*>(x + uint64_t(row) * a.n);
-    device float4* yr = reinterpret_cast<device float4*>(y + uint64_t(row) * a.n);
+    device float4* yr = reinterpret_cast<device float4*>(y + uint64_t(row) * (a.ystride ? a.ystride : a.n));
     device const float4* w4 = reinterpret_cast<device const float4*>(w);
     const uint n4 = a.n / 4;
     float s = 0.0f;
@@ -199,10 +200,11 @@ kernel void hc_expand(device const float* x [[buffer(0)]], device const float* R
     }
 }
 
-// One token's stream step, as hc_post then the next hc_pre (norm, mixing GEMV, hc_mix, hc_collapse) would do it, in
-// two dispatches. A: threadgroups over the flattened stream (j = h * n_embd + i): with `expand`, R_new[j] = x[i] *
-// post[h] + sum_s comb[s][h] * R[s][i] is written to out (else R_new = R); each threadgroup writes its partial sum
-// of R_new^2 and of the 24 dot products fn[m] . R_new to part[tg][25].
+// A few tokens' stream step, as hc_post then the next hc_pre (norm, mixing GEMV, hc_mix, hc_collapse) would do it,
+// in two dispatches. A, grid (parts, tokens): threadgroups over each token's flattened stream (j = h * n_embd + i):
+// with `expand`, R_new[j] = x[i] * post[h] + sum_s comb[s][h] * R[s][i] is written to out (else R_new = R); each
+// writes its partial sum of R_new^2 and of the 24 dot products fn[m] . R_new to part[token][tg][25]. Per token: x
+// rows of n_embd, R rows of 4 * n_embd, pc rows of 24.
 struct HcStepArgs {
     uint n_embd;
     uint expand;
@@ -216,11 +218,17 @@ constant uint HC_TG = 256;
 kernel void hc_step_a(device const float* x [[buffer(0)]], device const float* R [[buffer(1)]],
                       device const float* pc [[buffer(2)]], device float* out [[buffer(3)]],
                       device const float* fn [[buffer(4)]], device float* part [[buffer(5)]],
-                      constant HcStepArgs& a [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
-                      uint tid [[thread_position_in_threadgroup]])
+                      constant HcStepArgs& a [[buffer(6)]], uint2 tg2 [[threadgroup_position_in_grid]],
+                      uint2 tid2 [[thread_position_in_threadgroup]])
 {
     threadgroup float red[25][HC_TG / 32];
+    const uint tg = tg2.x, tok = tg2.y, tid = tid2.x;
     const uint hd = 4 * a.n_embd, per = (hd + a.parts - 1) / a.parts;
+    x += uint64_t(tok) * a.n_embd;
+    R += uint64_t(tok) * hd;
+    pc += tok * 24;
+    out += uint64_t(tok) * hd;
+    part += uint64_t(tok) * a.parts * 25;
     const uint j0 = tg * per, j1 = min(hd, j0 + per);
     float acc[25] = {};
     for (uint j = j0 + tid; j < j1; j += HC_TG) {
@@ -252,14 +260,18 @@ kernel void hc_step_a(device const float* x [[buffer(0)]], device const float* R
     }
 }
 
-// B, one threadgroup: mixes = (sum of the partial dots) / rms(R_new), then hc_mix -> pc, then x = sum_h pre[h] *
-// R_new[h].
+// B, one threadgroup per token: mixes = (sum of the partial dots) / rms(R_new), then hc_mix -> pc, then x = sum_h
+// pre[h] * R_new[h].
 kernel void hc_step_b(device const float* part [[buffer(0)]], device const float* Rn [[buffer(1)]],
                       device const float* scale [[buffer(2)]], device const float* base [[buffer(3)]],
                       device float* pc [[buffer(4)]], device float* x [[buffer(5)]],
                       constant HcStepArgs& a [[buffer(6)]], uint tid [[thread_position_in_threadgroup]],
-                      uint nt [[threads_per_threadgroup]])
+                      uint nt [[threads_per_threadgroup]], uint tok [[threadgroup_position_in_grid]])
 {
+    part += uint64_t(tok) * a.parts * 25;
+    Rn += uint64_t(tok) * 4 * a.n_embd;
+    pc += tok * 24;
+    x += uint64_t(tok) * a.n_embd;
     threadgroup float mixes[25];
     threadgroup float pre[4];
     threadgroup float parts[64 * 25];
@@ -325,6 +337,7 @@ struct ConvArgs {
     uint channels;   // per projection
     uint kernel_len; // taps, the last one multiplies the current token (at most 8)
     uint tokens;     // x and y are [tokens][3 * channels]
+    uint snap;       // nonzero: also write the state after this many tokens to snap_state (for a rollback)
 };
 
 // Causal depthwise conv over q|k|v (3 * channels), then SiLU, for consecutive tokens. The state holds the
@@ -332,7 +345,8 @@ struct ConvArgs {
 kernel void kda_conv(device const float* x [[buffer(0)]], device const float* wq [[buffer(1)]],
                      device const float* wk [[buffer(2)]], device const float* wv [[buffer(3)]],
                      device float* state [[buffer(4)]], device float* y [[buffer(5)]],
-                     constant ConvArgs& a [[buffer(6)]], uint c [[thread_position_in_grid]])
+                     constant ConvArgs& a [[buffer(6)]], device float* snap_state [[buffer(7)]],
+                     uint c [[thread_position_in_grid]])
 {
     const uint width = 3 * a.channels;
     if (c >= width)
@@ -352,6 +366,9 @@ kernel void kda_conv(device const float* x [[buffer(0)]], device const float* wq
             hist[j] = hist[j + 1];
         hist[taps - 1] = xc;
         y[uint64_t(t) * width + c] = acc * sigmoidf(acc);
+        if (t + 1 == a.snap)
+            for (uint j = 0; j < taps; ++j)
+                snap_state[uint64_t(c) * taps + j] = hist[j];
     }
     for (uint j = 0; j < taps; ++j)
         s[j] = hist[j];
@@ -410,6 +427,7 @@ struct ScanArgs {
     uint qkv_stride; // q, k, v elements between tokens
     uint inner;      // g and o elements between tokens
     uint heads;      // beta elements between tokens
+    uint snap;       // nonzero: also write the state after this many tokens to snap_state (for a rollback)
 };
 
 // One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
@@ -422,7 +440,8 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
                      device const float* v [[buffer(2)]], device const float* g [[buffer(3)]],
                      device const float* beta [[buffer(4)]], device float* state [[buffer(5)]],
                      device float* o [[buffer(6)]], constant ScanArgs& a [[buffer(7)]],
-                     uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]])
+                     device float* snap_state [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint2 tid2 [[thread_position_in_threadgroup]])
 {
     constexpr uint D = 128, ROWS = 32, STRIDE = 132; // padded rows: the 4 lanes x 8 rows of a simdgroup hit distinct banks
     threadgroup float Ms[ROWS * STRIDE];
@@ -457,6 +476,11 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
         if (lane == 0)
             o[go + j0 + row] = out * rsqrt(float(D));
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t + 1 == a.snap) {
+            device float* Ss = snap_state + uint64_t(h) * D * D + uint64_t(j0) * D;
+            for (uint idx = tid; idx < ROWS * D; idx += 128)
+                Ss[idx] = Ms[(idx / D) * STRIDE + idx % D];
+        }
     }
     for (uint idx = tid; idx < ROWS * D; idx += 128)
         Mg[idx] = Ms[(idx / D) * STRIDE + idx % D];
@@ -586,8 +610,8 @@ struct RouteArgs {
 // Then each selected expert is looked up in `slots` (this layer's expert -> arena slot, -1 absent): a resident
 // one gets its slot in hit_ids and miss_rank -1; a missing one slot 0 (its result is not used) and its index
 // among the misses. The miss count goes to the z of the three indirect dispatches (gate, up, down).
-// One simdgroup (32 threads) per token t: logits and biased rows of n_expert (<= 512), sel and w rows of 16
-// (n_used <= 16 used); hit_ids, miss_rank and indirect only with a.lookup. Lane l keeps experts l, l + 32, ... in
+// One simdgroup (32 threads) per token t: logits and biased rows of n_expert (<= 512), sel, w, hit_ids and
+// miss_rank rows of 16 (n_used <= 16 used), indirect rows of 9 (the last three only with a.lookup). Lane l keeps experts l, l + 32, ... in
 // registers; each of the n_used rounds takes the largest biased score left (lowest index on ties).
 kernel void moe_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
                       device int* sel [[buffer(2)]], device float* w [[buffer(3)]], device float* biased [[buffer(4)]],
@@ -601,6 +625,9 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
     biased += uint64_t(t) * a.n_expert;
     sel += t * 16;
     w += t * 16;
+    hit_ids += t * 16;
+    miss_rank += t * 16;
+    indirect += t * 9;
     float v[K];
     for (uint k = 0; k < K; ++k) {
         const uint e = lane + 32 * k;
@@ -652,13 +679,22 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
 }
 
 // moe_combine over results split into resident experts (x_hit, row e) and misses (x_miss, row miss_rank[e]).
+// Grid (n, tokens): token t's rows are x_hit[t * n_used + e], x_miss[t * n_used + rank], miss_rank and w rows of
+// 16, shared and y rows of n.
 kernel void moe_combine_split(device const float* x_hit [[buffer(0)]], device const float* x_miss [[buffer(1)]],
                               device const int* miss_rank [[buffer(2)]], device const float* w [[buffer(3)]],
                               device const float* shared [[buffer(4)]], device float* y [[buffer(5)]],
-                              constant CombineArgs& a [[buffer(6)]], uint i [[thread_position_in_grid]])
+                              constant CombineArgs& a [[buffer(6)]], uint2 gid [[thread_position_in_grid]])
 {
+    const uint i = gid.x, t = gid.y;
     if (i >= a.n)
         return;
+    x_hit += uint64_t(t) * a.n_used * a.n;
+    x_miss += uint64_t(t) * a.n_used * a.n;
+    miss_rank += t * 16;
+    w += t * 16;
+    shared += uint64_t(t) * a.n;
+    y += uint64_t(t) * a.n;
     float acc = shared[i];
     for (uint e = 0; e < a.n_used; ++e) {
         const int r = miss_rank[e];
@@ -864,6 +900,14 @@ kernel void idx_select(device const float* score [[buffer(0)]], device uchar* ma
     }
     for (uint c = a.n_pool * a.kpool + tid; c < a.n_kv; c += TG)
         mask[c] = 1;
+}
+
+// y[t * ldy + i] = x[t * n + i]; grid (n, rows).
+kernel void copy_rows(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint2& a [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.x)
+        y[uint64_t(gid.y) * a.y + gid.x] = x[uint64_t(gid.y) * a.x + gid.x];
 }
 
 kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],

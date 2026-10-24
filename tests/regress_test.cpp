@@ -2,6 +2,7 @@
 //   decode       greedy tokens of a short prompt match the recorded ones
 //   prefill      prefill at several chunk sizes gives token-by-token decode's logits and continuation
 //   parity       per-position logits stay close to the reference implementation's (stored top-k)
+//   spec         a two-token step (speculative verification), and its rollback, match single-token steps
 //   long         a prompt past the dense-attention window (sparse selection, lent arena slots) against the
 //                reference, then decode
 //   regress_test <model.gguf> [case ...] [--update]
@@ -335,6 +336,44 @@ int main(int argc, char** argv)
             // Measured when set: KL 0.0119, 94.5% (one position is 0.8%).
             dec.check_limits("decode vs reference", 0.013, 0.935);
         }
+    }
+
+    if (want("spec")) {
+        std::println("spec");
+        const std::vector<int32_t> prompt{785, 3840, 315, 279, 12745, 20406, 44038, 1657, 23566, 11, 504, 279};
+        const int32_t a = 35056, b = 315, c = 279, wrong = 13;
+        const size_t nv = cfg->n_vocab;
+        auto close = [&](const float* got, const std::vector<float>& want, const std::string& what) {
+            const auto lr = log_softmax(want.data(), nv), lg = log_softmax(got, nv);
+            double kl = 0;
+            for (size_t i = 0; i < nv; ++i)
+                kl += std::exp(lr[i]) * (lr[i] - lg[i]);
+            std::vector<int32_t> order(nv);
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(), order.begin() + 20, order.end(),
+                              [&](int x, int y) { return want[x] > want[y]; });
+            double diff = 0;
+            for (int i = 0; i < 20; ++i)
+                diff = std::max(diff, double(std::abs(got[order[i]] - want[order[i]])));
+            // Measured when set: KL <= 7e-9, top-20 difference <= 0.0005.
+            check(kl <= 1e-6 && diff <= 0.01,
+                  std::format("{}: KL {:.2e}, top-20 logit difference {:.4f}", what, kl, diff));
+        };
+        engine.reset();
+        engine.prefill(prompt);
+        const auto ra = engine.step(a), rb = engine.step(b), rc = engine.step(c);
+        engine.reset();
+        engine.prefill(prompt);
+        const auto two = engine.step2(a, b);
+        close(two.data(), ra, "two-token step, first token");
+        close(two.data() + nv, rb, "two-token step, second token");
+        engine.reset();
+        engine.prefill(prompt);
+        engine.step2(a, wrong);
+        engine.rollback();
+        const auto again = engine.step2(b, c);
+        close(again.data(), rb, "after a rollback, first token");
+        close(again.data() + nv, rc, "after a rollback, second token");
     }
 
     if (want("long")) {
