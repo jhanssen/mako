@@ -79,7 +79,15 @@ struct ScoreArgs {
     uint32_t stride;
 };
 struct SelectArgs {
-    uint32_t first, n_top, kpool, score_stride, mask_stride;
+    uint32_t first, n_top, kpool, score_stride, mask_stride, list_stride;
+};
+struct GatherArgs {
+    uint32_t heads, dim, stride, splits, tokens;
+};
+struct ListSoftmaxArgs {
+    uint32_t stride;
+    float scale;
+    uint32_t heads;
 };
 struct LayerNormArgs {
     uint32_t n;
@@ -988,8 +996,10 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     }
     while (t < T) {
         const uint32_t g = std::min(group, T - t);
-        const bool sparse = indexer_select(enc, il, t, pos0 + t, g);
-        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, sparse);
+        if (indexer_select(enc, il, t, pos0 + t, g))
+            attend_sparse(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g);
+        else
+            attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, false);
         t += g;
     }
     per_head(L.v_b, lat, R, vout, cfg_.head_v);
@@ -1062,10 +1072,69 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     after(enc, "idx_score");
     if (pos == pos_ && count == 1)
         probe(enc, "indexer_score", int(il), score, n_pool);
-    const SelectArgs sel{pos + 1, n_top, kp, stride, opts_.max_ctx};
-    dispatch(enc, "idx_select", {score, scratch("idx_mask", uint64_t(count) * opts_.max_ctx)}, &sel, sizeof(sel),
-             MTL::Size(count, 1, 1), MTL::Size(256, 1, 1), false);
+    const SelectArgs sel{pos + 1, n_top, kp, stride, opts_.max_ctx, sparse_list_stride()};
+    enc->setComputePipelineState(pso("idx_select"));
+    enc->setBuffer(score, 0, 0);
+    enc->setBuffer(scratch("idx_mask", uint64_t(count) * opts_.max_ctx), 0, 1);
+    enc->setBytes(&sel, sizeof(sel), 2);
+    enc->setBuffer(scratch("idx_list", uint64_t(count) * sparse_list_stride() * 4), 0, 3);
+    enc->setBuffer(scratch("idx_count", uint64_t(count) * 4), 0, 4);
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(count, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "idx_select");
     return true;
+}
+
+// Attention of `tokens` consecutive query positions (rows of H heads of q) over the cache rows the indexer listed for
+// each (indexer_select): gathered scores, softmax over each token's list, gathered sum (split over the list for
+// few tokens, so a single token still fills the GPU).
+void Engine::attend_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off,
+                           MTL::Buffer* out, uint64_t out_off, uint32_t tokens)
+{
+    const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, rows = tokens * H, L = sparse_list_stride();
+    const uint32_t splits = tokens < 8 ? 8 : 1;
+    MTL::Buffer* list = scratch("idx_list", uint64_t(tokens) * L * 4);
+    MTL::Buffer* count = scratch("idx_count", uint64_t(tokens) * 4);
+    MTL::Buffer* scores = scratch("sp_scores", uint64_t(rows) * L * 4);
+    MTL::Buffer* partial = scratch("sp_part", uint64_t(splits) * rows * R * 4);
+    MTL::Buffer* qh = halves(enc, q, q_off, rows, R, 0);
+    const GatherArgs ga{H, R, L, splits, tokens};
+    enc->setComputePipelineState(pso("attn_gather_scores"));
+    enc->setBuffer(qh, 0, 0);
+    enc->setBuffer(cache, 0, 1);
+    enc->setBuffer(list, 0, 2);
+    enc->setBuffer(count, 0, 3);
+    enc->setBuffer(scores, 0, 4);
+    enc->setBytes(&ga, sizeof(ga), 5);
+    for (int rep_ = repeats("attn_gather_scores"); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size((L + 31) / 32, 1, tokens), MTL::Size(128, 1, 1));
+    after(enc, "attn_gather_scores");
+    const ListSoftmaxArgs sa{L, 1.0f / std::sqrt(float(cfg_.head_k)), H};
+    enc->setComputePipelineState(pso("attn_softmax_list"));
+    enc->setBuffer(scores, 0, 0);
+    enc->setBuffer(count, 0, 1);
+    enc->setBytes(&sa, sizeof(sa), 2);
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "attn_softmax_list");
+    enc->setComputePipelineState(pso("attn_gather_pv"));
+    enc->setBuffer(scores, 0, 0);
+    enc->setBuffer(cache, 0, 1);
+    enc->setBuffer(list, 0, 2);
+    enc->setBuffer(count, 0, 3);
+    enc->setBuffer(partial, 0, 4);
+    enc->setBytes(&ga, sizeof(ga), 5);
+    for (int rep_ = repeats("attn_gather_pv"); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(R / 64, 1, tokens * splits), MTL::Size(128, 1, 1));
+    after(enc, "attn_gather_pv");
+    const uint32_t sum[2] = {rows * R, splits};
+    enc->setComputePipelineState(pso("sum_splits"));
+    enc->setBuffer(partial, 0, 0);
+    enc->setBuffer(out, out_off, 1);
+    enc->setBytes(sum, sizeof(sum), 2);
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(rows * R, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "sum_splits");
 }
 
 struct HcStepArgs {

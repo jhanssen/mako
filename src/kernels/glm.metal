@@ -537,6 +537,35 @@ kernel void attn_softmax(device float* scores [[buffer(0)]], device const uchar*
         sh[t] *= inv;
 }
 
+// Softmax of each (token, head) score row over its token's count of list entries, scaled; entries past the count
+// become zero. Threadgroup per row.
+struct ListSoftmaxArgs {
+    uint stride; // row length
+    float scale;
+    uint heads;  // rows per token
+};
+kernel void attn_softmax_list(device float* scores [[buffer(0)]], device const uint* count [[buffer(1)]],
+                              constant ListSoftmaxArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device float* sh = scores + uint64_t(row) * a.stride;
+    const uint n = count[row / a.heads];
+    float m = -INFINITY;
+    for (uint t = tid; t < n; t += TG)
+        m = max(m, sh[t] * a.scale);
+    m = tg_max(m, scratch, tid);
+    float s = 0.0f;
+    for (uint t = tid; t < a.stride; t += TG) {
+        const float e = t < n ? exp(sh[t] * a.scale - m) : 0.0f;
+        sh[t] = e;
+        s += e;
+    }
+    const float inv = 1.0f / tg_sum(s, scratch, tid);
+    for (uint t = tid; t < a.stride; t += TG)
+        sh[t] *= inv;
+}
+
 // y[i] = sum over splits of partial[split][i].
 kernel void sum_splits(device const float* partial [[buffer(0)]], device float* y [[buffer(1)]],
                        constant uint2& a [[buffer(2)]], uint i [[thread_position_in_grid]])
@@ -822,6 +851,7 @@ struct SelectArgs {
     uint kpool;
     uint score_stride; // floats between tokens' score rows
     uint mask_stride;  // bytes between tokens' mask rows
+    uint list_stride;  // entries between tokens' cell lists
 };
 struct SelectRow {
     uint n_pool, n_top, kpool, n_kv;
@@ -836,7 +866,8 @@ static uint order_key(float f)
 // mask[cell] = 1 for the members of the n_top best pools and for the incomplete tail; one threadgroup per token.
 // Ties at the threshold keep the lowest pool indices.
 kernel void idx_select(device const float* score [[buffer(0)]], device uchar* mask [[buffer(1)]],
-                       constant SelectArgs& sa [[buffer(2)]], uint tid [[thread_position_in_threadgroup]],
+                       constant SelectArgs& sa [[buffer(2)]], device uint* list [[buffer(3)]],
+                       device uint* count [[buffer(4)]], uint tid [[thread_position_in_threadgroup]],
                        uint j [[threadgroup_position_in_grid]])
 {
     score += uint64_t(j) * sa.score_stride;
@@ -900,6 +931,29 @@ kernel void idx_select(device const float* score [[buffer(0)]], device uchar* ma
     }
     for (uint c = a.n_pool * a.kpool + tid; c < a.n_kv; c += TG)
         mask[c] = 1;
+
+    // The kept cells as a sorted list (for attention that gathers them): each thread counts a contiguous range,
+    // a prefix sum gives its offset.
+    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup uint sums[TG / 32];
+    list += uint64_t(j) * sa.list_stride;
+    const uint per = (a.n_kv + TG - 1) / TG, c0 = min(a.n_kv, tid * per), c1 = min(a.n_kv, c0 + per);
+    uint mine = 0;
+    for (uint c = c0; c < c1; ++c)
+        mine += mask[c] != 0;
+    const uint in_simd = simd_prefix_exclusive_sum(mine);
+    if (tid % 32 == 31)
+        sums[tid / 32] = in_simd + mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint base = 0;
+    for (uint w = 0; w < tid / 32; ++w)
+        base += sums[w];
+    uint at = base + in_simd;
+    for (uint c = c0; c < c1; ++c)
+        if (mask[c])
+            list[at++] = c;
+    if (tid == TG - 1)
+        count[j] = at;
 }
 
 // y[t * ldy + i] = x[t * n + i]; grid (n, rows).
