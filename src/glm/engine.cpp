@@ -108,6 +108,8 @@ void read_exact(int fd, void* dst, uint64_t bytes, uint64_t offset)
 
 struct Engine::Layer {
     bool kda = false, dense = false;
+    bool mtp = false; // the next-token block: plain residuals instead of hyper-connections
+    DevTensor eh_proj, enorm, hnorm, head_norm;
     DevTensor attn_norm, ffn_norm, hc_attn_fn, hc_attn_base, hc_attn_scale, hc_ffn_fn, hc_ffn_base, hc_ffn_scale;
     // KDA
     DevTensor wq, wk, wv, conv_q, conv_k, conv_v, f_a, f_b, beta, ssm_a, dt_b, g_a, g_b, o_norm;
@@ -152,6 +154,41 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     output_ = upload("output.weight");
 
     const uint32_t D = cfg_.kda_head_dim, inner = cfg_.kda_inner();
+    auto load_mla = [&](Layer& L, const std::string& p) {
+        L.q_a = upload(p + "attn_q_a.weight");
+        L.q_a_norm = upload(p + "attn_q_a_norm.weight");
+        L.q_b = upload(p + "attn_q_b.weight");
+        L.kv_a = upload(p + "attn_kv_a_mqa.weight");
+        L.kv_a_norm = upload(p + "attn_kv_a_norm.weight");
+        L.k_b = upload(p + "attn_k_b.weight");
+        L.v_b = upload(p + "attn_v_b.weight");
+        L.idx_q_b = upload(p + "indexer.attn_q_b.weight");
+        L.idx_k = upload(p + "indexer.attn_k.weight");
+        L.idx_k_norm = upload(p + "indexer.k_norm.weight");
+        L.idx_k_norm_b = upload(p + "indexer.k_norm.bias");
+        L.idx_proj = upload(p + "indexer.proj.weight");
+        L.idx_gate = upload(p + "indexer_compressor_gate.weight");
+        L.idx_ape = upload(p + "indexer_compressor_ape.weight");
+        kda_state_.emplace_back();
+        conv_state_.emplace_back();
+        kv_cache_.emplace_back(ctx_.device()->newBuffer(uint64_t(opts_.max_ctx) * cfg_.kv_lora_rank * 2,
+                                                        MTL::ResourceStorageModeShared));
+        idx_cache_.emplace_back(ctx_.device()->newBuffer(uint64_t(opts_.max_ctx) * 2 * cfg_.indexer_dim * 4,
+                                                         MTL::ResourceStorageModeShared));
+        idx_pooled_.emplace_back(ctx_.device()->newBuffer(
+            uint64_t(opts_.max_ctx / cfg_.indexer_kpool + 1) * cfg_.indexer_dim * 4, MTL::ResourceStorageModeShared));
+    };
+    auto load_moe = [&](Layer& L, const std::string& p) {
+        L.router = upload(p + "ffn_gate_inp.weight");
+        L.sh_gate = upload(p + "ffn_gate_shexp.weight");
+        L.sh_up = upload(p + "ffn_up_shexp.weight");
+        L.sh_down = upload(p + "ffn_down_shexp.weight");
+        L.router_bias = upload(p + "exp_probs_b.bias");
+        if (L.router_bias.type != gguf::Type::F32 || L.router_bias.dims[0] != cfg_.n_expert)
+            throw std::runtime_error(p + "exp_probs_b.bias is not F32 [n_expert]");
+        L.experts = {expert(p + "ffn_gate_exps.weight"), expert(p + "ffn_up_exps.weight"),
+                     expert(p + "ffn_down_exps.weight")};
+    };
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         auto L = std::make_unique<Layer>();
         const std::string p = std::format("blk.{}.", il);
@@ -191,44 +228,31 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             idx_cache_.emplace_back();
             idx_pooled_.emplace_back();
         } else {
-            L->q_a = upload(p + "attn_q_a.weight");
-            L->q_a_norm = upload(p + "attn_q_a_norm.weight");
-            L->q_b = upload(p + "attn_q_b.weight");
-            L->kv_a = upload(p + "attn_kv_a_mqa.weight");
-            L->kv_a_norm = upload(p + "attn_kv_a_norm.weight");
-            L->k_b = upload(p + "attn_k_b.weight");
-            L->v_b = upload(p + "attn_v_b.weight");
-            L->idx_q_b = upload(p + "indexer.attn_q_b.weight");
-            L->idx_k = upload(p + "indexer.attn_k.weight");
-            L->idx_k_norm = upload(p + "indexer.k_norm.weight");
-            L->idx_k_norm_b = upload(p + "indexer.k_norm.bias");
-            L->idx_proj = upload(p + "indexer.proj.weight");
-            L->idx_gate = upload(p + "indexer_compressor_gate.weight");
-            L->idx_ape = upload(p + "indexer_compressor_ape.weight");
-            kda_state_.emplace_back();
-            conv_state_.emplace_back();
-            kv_cache_.emplace_back(ctx_.device()->newBuffer(uint64_t(opts_.max_ctx) * cfg_.kv_lora_rank * 2,
-                                                            MTL::ResourceStorageModeShared));
-            idx_cache_.emplace_back(ctx_.device()->newBuffer(uint64_t(opts_.max_ctx) * 2 * cfg_.indexer_dim * 4,
-                                                             MTL::ResourceStorageModeShared));
-            idx_pooled_.emplace_back(ctx_.device()->newBuffer(
-                uint64_t(opts_.max_ctx / cfg_.indexer_kpool + 1) * cfg_.indexer_dim * 4, MTL::ResourceStorageModeShared));
+            load_mla(*L, p);
         }
         if (L->dense) {
             L->ffn_gate = upload(p + "ffn_gate.weight");
             L->ffn_up = upload(p + "ffn_up.weight");
             L->ffn_down = upload(p + "ffn_down.weight");
         } else {
-            L->router = upload(p + "ffn_gate_inp.weight");
-            L->sh_gate = upload(p + "ffn_gate_shexp.weight");
-            L->sh_up = upload(p + "ffn_up_shexp.weight");
-            L->sh_down = upload(p + "ffn_down_shexp.weight");
-            L->router_bias = upload(p + "exp_probs_b.bias");
-            if (L->router_bias.type != gguf::Type::F32 || L->router_bias.dims[0] != cfg_.n_expert)
-                throw std::runtime_error(p + "exp_probs_b.bias is not F32 [n_expert]");
-            L->experts = {expert(p + "ffn_gate_exps.weight"), expert(p + "ffn_up_exps.weight"),
-                          expert(p + "ffn_down_exps.weight")};
+            load_moe(*L, p);
         }
+        layers_.push_back(std::move(L));
+    }
+    // The next-token (MTP) block after the trunk, as layers_[n_layer]: an MLA attention and a MoE FFN of its own.
+    if (cfg_.n_layer_mtp > 0) {
+        auto L = std::make_unique<Layer>();
+        const std::string p = std::format("blk.{}.", cfg_.n_layer);
+        L->mtp = true;
+        L->attn_norm = upload(p + "attn_norm.weight");
+        L->ffn_norm = upload(p + "ffn_norm.weight");
+        L->wo = upload(p + "attn_output.weight");
+        load_mla(*L, p);
+        load_moe(*L, p);
+        L->eh_proj = upload(p + "nextn.eh_proj.weight");
+        L->enorm = upload(p + "nextn.enorm.weight");
+        L->hnorm = upload(p + "nextn.hnorm.weight");
+        L->head_norm = upload(p + "nextn.shared_head_norm.weight");
         layers_.push_back(std::move(L));
     }
     logits_.resize(cfg_.n_vocab);
@@ -601,13 +625,13 @@ void Engine::dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, s
 }
 
 void Engine::norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
-                  uint32_t n, uint32_t wn, float eps, uint64_t x_off)
+                  uint32_t n, uint32_t wn, float eps, uint64_t x_off, uint64_t y_off)
 {
     const NormArgs a{n, w ? wn : 0, eps};
     enc->setComputePipelineState(pso("rms_norm"));
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(w ? w->buf : x, w ? w->off : 0, 1);
-    enc->setBuffer(y, 0, 2);
+    enc->setBuffer(y, y_off, 2);
     enc->setBytes(&a, sizeof(a), 3);
     for (int r = repeats("rms_norm"); r > 0; --r)
         enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
@@ -1001,7 +1025,7 @@ void Engine::serve_moe(MTL::CommandBuffer* cb)
     auto* hit_ids = static_cast<const int32_t*>(scratch("eids_hit", 16 * 4)->contents());
     auto* miss_ids = static_cast<int32_t*>(scratch("eids_miss", 16 * 4)->contents());
     auto* miss_rank = static_cast<int32_t*>(scratch("mrank", 16 * 4)->contents());
-    auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(cfg_.n_layer) * 36)->contents());
+    auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(cfg_.n_layer + 1) * 36)->contents());
     for (const auto [il, v] : pending_moe_) {
         const auto t_wait = Clock::now();
         for (uint32_t spins = 0; routed_->signaledValue() < v; ++spins)
@@ -1184,92 +1208,7 @@ const std::vector<float>& Engine::step(int32_t token)
         if (L.dense) {
             ffn_dense(enc, L.ffn_gate, L.ffn_up, L.ffn_down, xn, ffo, cfg_.swiglu_clamp_shexp[il], 1);
         } else {
-            const uint32_t k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
-            MTL::Buffer* sho = scratch("sho", E * 4);
-            MTL::Buffer* rlog = scratch("rlog", cfg_.n_expert * 4);
-            MTL::Buffer* ew = scratch("ew", 16 * 4);
-            MTL::Buffer* hit_ids = scratch("eids_hit", 16 * 4);
-            MTL::Buffer* miss_ids = scratch("eids_miss", 16 * 4);
-            MTL::Buffer* miss_rank = scratch("mrank", 16 * 4);
-            MTL::Buffer* indirect = scratch("mind", uint64_t(cfg_.n_layer) * 36);
-            const uint64_t ind_off = uint64_t(il) * 36;
-            auto part_args = [&](int part) {
-                const ExpertArena::Part& e = arena_->part(il, part);
-                mtl::Gemv::Args a;
-                a.type = e.type;
-                a.k = e.k;
-                a.n = e.n;
-                a.batch = k;
-                a.x_shared = part < 2;
-                return a;
-            };
-            // x, y of the miss pass's dispatches; moe_route writes z, the number of misses.
-            auto* ind = static_cast<uint32_t*>(indirect->contents()) + il * 9;
-            for (int part = 0; part < 3; ++part) {
-                const MTL::Size g = gemv_->indexed_grid(part_args(part));
-                ind[part * 3] = uint32_t(g.width);
-                ind[part * 3 + 1] = uint32_t(g.height);
-            }
-
-            gemv(enc, L.router, xn, 0, rlog, 0);
-            ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], 1);
-            const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale, 1};
-            enc->setComputePipelineState(pso("moe_route"));
-            enc->setBuffer(rlog, 0, 0);
-            enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
-            enc->setBuffer(scratch("msel", 16 * 4), 0, 2);
-            enc->setBuffer(ew, 0, 3);
-            enc->setBuffer(scratch("mbiased", cfg_.n_expert * 4), 0, 4);
-            enc->setBytes(&ra, sizeof(ra), 5);
-            enc->setBuffer(arena_->slot_table(), uint64_t(il) * cfg_.n_expert * 4, 6);
-            enc->setBuffer(hit_ids, 0, 7);
-            enc->setBuffer(miss_rank, 0, 8);
-            enc->setBuffer(indirect, ind_off, 9);
-            for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(32, 1, 1));
-            after(enc, "moe_route");
-            enc->endEncoding();
-            const uint64_t v = ++event_value_;
-            cb->encodeSignalEvent(routed_.get(), v);
-            pending_moe_.emplace_back(il, v);
-            enc = encoder(cb, il, 2);
-
-            // Resident experts run while the CPU reads the misses; the miss pass waits for it.
-            const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
-            auto pass = [&](MTL::Buffer* ids, bool miss, const char* tag) {
-                MTL::Buffer* eg = scratch(std::string("eg") + tag, k * nff * 4);
-                MTL::Buffer* eu = scratch(std::string("eu") + tag, k * nff * 4);
-                MTL::Buffer* em = scratch(std::string("em") + tag, k * nff * 4);
-                MTL::Buffer* ed = scratch(std::string("ed") + tag, k * E * 4);
-                auto run = [&](int part, MTL::Buffer* in, MTL::Buffer* out) {
-                    const ExpertArena::Region& r = arena_->region(il, part);
-                    const mtl::Gemv::Args a = part_args(part);
-                    const bool labelled = opts_.telemetry == Telemetry::kernels || repeat_n_ > 1;
-                    const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name,
-                                                                     a.k, a.n, miss ? "miss" : "hit")
-                                                       : "";
-                    for (int rep = repeats(label); rep > 0; --rep)
-                        gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0,
-                                              miss ? indirect : nullptr, ind_off + uint64_t(part) * 12,
-                                              {r.tail, r.tail_off, r.split});
-                    if (opts_.telemetry == Telemetry::kernels)
-                        after(enc, label);
-                };
-                run(0, xn, eg);
-                run(1, xn, eu);
-                dispatch(enc, "swiglu", {eg, eu, em}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1),
-                         MTL::Size(256, 1, 1));
-                run(2, em, ed);
-                return ed;
-            };
-            MTL::Buffer* ed_hit = pass(hit_ids, false, "h");
-            enc->endEncoding();
-            cb->encodeWait(ready_.get(), v);
-            enc = encoder(cb, il, 3);
-            MTL::Buffer* ed_miss = pass(miss_ids, true, "m");
-            const CombineArgs ca{E, k};
-            dispatch(enc, "moe_combine_split", {ed_hit, ed_miss, miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
-                     MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+            moe_decode(cb, enc, L, il, xn, ffo);
         }
         probe(enc, "ffn_out", int(il), ffo, E);
         if (fused && il + 1 < cfg_.n_layer) {
@@ -1313,6 +1252,149 @@ const std::vector<float>& Engine::step(int32_t token)
     return logits_;
 }
 
+
+int32_t Engine::mtp_draft(int32_t next)
+{
+    if (!has_mtp() || pos_ == 0)
+        return -1;
+    if (next < 0 || uint32_t(next) >= cfg_.n_vocab)
+        throw std::runtime_error("token out of range");
+    const Layer& L = *layers_[cfg_.n_layer];
+    const uint32_t E = cfg_.n_embd, il = cfg_.n_layer, pos = pos_ - 1;
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::Buffer* e = scratch("mtp_e", E * 4);
+    MTL::Buffer* cat = scratch("mtp_cat", 2 * E * 4);
+    MTL::Buffer* r = scratch("mtp_r", E * 4);
+    MTL::Buffer* r2 = scratch("mtp_r2", E * 4);
+    MTL::Buffer* xn = scratch("mtp_xn", E * 4);
+    MTL::Buffer* att = scratch("mtp_att", E * 4);
+    MTL::Buffer* ffo = scratch("mtp_ffo", E * 4);
+    MTL::Buffer* lg = scratch("mtp_logits", uint64_t(cfg_.n_vocab) * 4);
+    {
+        const gguf::Tensor& t = *token_embd_.tensor;
+        const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
+        std::vector<std::byte> row(rb);
+        read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(next) * rb);
+        quant::dequant_row(t.type, row.data(), static_cast<float*>(e->contents()), E);
+    }
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    cur_layer_ = cfg_.n_layer;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
+    // [enorm(embedding of next); hnorm(the step's post-norm hidden state, still in "xn")] -> eh_proj
+    norm(enc, e, &L.enorm, cat, 1, E, E, cfg_.rms_eps);
+    norm(enc, scratch("xn", E * 4), &L.hnorm, cat, 1, E, E, cfg_.rms_eps, 0, uint64_t(E) * 4);
+    gemv(enc, L.eh_proj, cat, 0, r, 0);
+    norm(enc, r, &L.attn_norm, xn, 1, E, E, cfg_.rms_eps);
+    mla(enc, L, il, xn, att, 1, pos);
+    dispatch(enc, "add", {r, att, r2}, &E, sizeof(E), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+    norm(enc, r2, &L.ffn_norm, xn, 1, E, E, cfg_.rms_eps);
+    moe_decode(cb, enc, L, il, xn, ffo);
+    dispatch(enc, "add", {r2, ffo, r}, &E, sizeof(E), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+    norm(enc, r, &L.head_norm, xn, 1, E, E, cfg_.rms_eps);
+    gemv(enc, output_, xn, 0, lg, 0);
+    enc->endEncoding();
+    finish(cb);
+    const auto* l = static_cast<const float*>(lg->contents());
+    const int32_t draft = int32_t(std::max_element(l, l + cfg_.n_vocab) - l);
+    pool->release();
+    return draft;
+}
+
+// One token's routed FFN (plus the shared expert) of layer il on xn into ffo: GPU routing, the resident experts at
+// once and the misses after the CPU has read them (serve_moe).
+void Engine::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il,
+                        MTL::Buffer* xn, MTL::Buffer* ffo)
+{
+    const uint32_t E = cfg_.n_embd;
+    const uint32_t tl = std::min(il, cfg_.n_layer); // telemetry: the next-token block counts as the rest
+        const uint32_t k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
+        MTL::Buffer* sho = scratch("sho", E * 4);
+        MTL::Buffer* rlog = scratch("rlog", cfg_.n_expert * 4);
+        MTL::Buffer* ew = scratch("ew", 16 * 4);
+        MTL::Buffer* hit_ids = scratch("eids_hit", 16 * 4);
+        MTL::Buffer* miss_ids = scratch("eids_miss", 16 * 4);
+        MTL::Buffer* miss_rank = scratch("mrank", 16 * 4);
+        MTL::Buffer* indirect = scratch("mind", uint64_t(cfg_.n_layer + 1) * 36);
+        const uint64_t ind_off = uint64_t(il) * 36;
+        auto part_args = [&](int part) {
+            const ExpertArena::Part& e = arena_->part(il, part);
+            mtl::Gemv::Args a;
+            a.type = e.type;
+            a.k = e.k;
+            a.n = e.n;
+            a.batch = k;
+            a.x_shared = part < 2;
+            return a;
+        };
+        // x, y of the miss pass's dispatches; moe_route writes z, the number of misses.
+        auto* ind = static_cast<uint32_t*>(indirect->contents()) + il * 9;
+        for (int part = 0; part < 3; ++part) {
+            const MTL::Size g = gemv_->indexed_grid(part_args(part));
+            ind[part * 3] = uint32_t(g.width);
+            ind[part * 3 + 1] = uint32_t(g.height);
+        }
+
+        gemv(enc, L.router, xn, 0, rlog, 0);
+        ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], 1);
+        const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale, 1};
+        enc->setComputePipelineState(pso("moe_route"));
+        enc->setBuffer(rlog, 0, 0);
+        enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
+        enc->setBuffer(scratch("msel", 16 * 4), 0, 2);
+        enc->setBuffer(ew, 0, 3);
+        enc->setBuffer(scratch("mbiased", cfg_.n_expert * 4), 0, 4);
+        enc->setBytes(&ra, sizeof(ra), 5);
+        enc->setBuffer(arena_->slot_table(), uint64_t(il) * cfg_.n_expert * 4, 6);
+        enc->setBuffer(hit_ids, 0, 7);
+        enc->setBuffer(miss_rank, 0, 8);
+        enc->setBuffer(indirect, ind_off, 9);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(32, 1, 1));
+        after(enc, "moe_route");
+        enc->endEncoding();
+        const uint64_t v = ++event_value_;
+        cb->encodeSignalEvent(routed_.get(), v);
+        pending_moe_.emplace_back(il, v);
+        enc = encoder(cb, tl, il < cfg_.n_layer ? 2 : -1);
+
+        // Resident experts run while the CPU reads the misses; the miss pass waits for it.
+        const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
+        auto pass = [&](MTL::Buffer* ids, bool miss, const char* tag) {
+            MTL::Buffer* eg = scratch(std::string("eg") + tag, k * nff * 4);
+            MTL::Buffer* eu = scratch(std::string("eu") + tag, k * nff * 4);
+            MTL::Buffer* em = scratch(std::string("em") + tag, k * nff * 4);
+            MTL::Buffer* ed = scratch(std::string("ed") + tag, k * E * 4);
+            auto run = [&](int part, MTL::Buffer* in, MTL::Buffer* out) {
+                const ExpertArena::Region& r = arena_->region(il, part);
+                const mtl::Gemv::Args a = part_args(part);
+                const bool labelled = opts_.telemetry == Telemetry::kernels || repeat_n_ > 1;
+                const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name,
+                                                                 a.k, a.n, miss ? "miss" : "hit")
+                                                   : "";
+                for (int rep = repeats(label); rep > 0; --rep)
+                    gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0,
+                                          miss ? indirect : nullptr, ind_off + uint64_t(part) * 12,
+                                          {r.tail, r.tail_off, r.split});
+                if (opts_.telemetry == Telemetry::kernels)
+                    after(enc, label);
+            };
+            run(0, xn, eg);
+            run(1, xn, eu);
+            dispatch(enc, "swiglu", {eg, eu, em}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1),
+                     MTL::Size(256, 1, 1));
+            run(2, em, ed);
+            return ed;
+        };
+        MTL::Buffer* ed_hit = pass(hit_ids, false, "h");
+        enc->endEncoding();
+        cb->encodeWait(ready_.get(), v);
+        enc = encoder(cb, tl, il < cfg_.n_layer ? 3 : -1);
+        MTL::Buffer* ed_miss = pass(miss_ids, true, "m");
+        const CombineArgs ca{E, k};
+        dispatch(enc, "moe_combine_split", {ed_hit, ed_miss, miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
+                 MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+}
 
 // Prompt processing: chunks of tokens go through each layer together (projections as GEMMs, the sequential parts
 // token by token inside the kernels), with one CPU synchronization per MoE layer to make the chunk's experts

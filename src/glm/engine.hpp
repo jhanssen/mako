@@ -40,6 +40,12 @@ public:
 
     // Runs one token at the next position and returns its logits.
     const std::vector<float>& step(int32_t token);
+    // The next-token block's guess for the token after `next`, where `next` follows the token of the last step():
+    // from that step's final hidden state and `next`'s embedding. Also fills the block's own attention cache at the
+    // last step's position, so it must run after every step for later drafts to see the whole context. -1 without
+    // the block.
+    int32_t mtp_draft(int32_t next);
+    bool has_mtp() const { return cfg_.n_layer_mtp > 0; }
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     const std::vector<float>& prefill(std::span<const int32_t> tokens);
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
@@ -122,7 +128,7 @@ private:
     void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
                   const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads = true);
     void norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
-              uint32_t n, uint32_t wn, float eps, uint64_t x_off = 0);
+              uint32_t n, uint32_t wn, float eps, uint64_t x_off = 0, uint64_t y_off = 0);
     // R (and out) at byte offset r_off: a chunk's rows of a longer stream.
     void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
                 MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T, uint64_t r_off = 0);
@@ -145,6 +151,8 @@ private:
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
                    uint64_t x_off = 0, uint64_t out_off = 0);
     void serve_moe(MTL::CommandBuffer* cb);
+    void moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il,
+                    MTL::Buffer* xn, MTL::Buffer* ffo);
     // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
     MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                         uint32_t ld);

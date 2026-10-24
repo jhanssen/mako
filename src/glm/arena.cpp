@@ -192,12 +192,15 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
         if (l < counts.size() && counts[l].size() == n_expert)
             std::ranges::stable_sort(order_[l], [&](int a, int b) { return counts[l][a] > counts[l][b]; });
     }
+    // Every MoE layer keeps n_used slots plus its share of the lendable ones.
+    const uint32_t want_lend = uint32_t(std::ceil(std::max(0.0, lendable_bytes) / double(per_slot)));
+    const uint32_t floor_slots = std::min(n_expert, n_used + want_lend);
     if (!profiled) {
         const uint32_t s = uint32_t(std::min<uint64_t>(n_expert, budget / per_slot));
         for (size_t l = 0; l < nl; ++l)
             slots_[l] = slot_bytes[l] ? s : 0;
     } else {
-        // Every MoE layer gets n_used slots, then the rest go to (layer, rank) by count per byte; a layer's ranks
+        // Every MoE layer gets floor_slots, then the rest go to (layer, rank) by count per byte; a layer's ranks
         // are taken in order, since its counts only fall with rank.
         uint64_t used = 0;
         struct Cand {
@@ -208,9 +211,9 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
         for (size_t l = 0; l < nl; ++l) {
             if (!slot_bytes[l])
                 continue;
-            slots_[l] = n_used;
-            used += uint64_t(n_used) * slot_bytes[l];
-            for (uint32_t r = n_used; r < n_expert; ++r) {
+            slots_[l] = floor_slots;
+            used += uint64_t(floor_slots) * slot_bytes[l];
+            for (uint32_t r = floor_slots; r < n_expert; ++r) {
                 const uint64_t c = l < counts.size() && counts[l].size() == n_expert ? counts[l][order_[l][r]] : 0;
                 cands.push_back({double(c) / double(slot_bytes[l]), uint32_t(l), r});
             }
@@ -235,7 +238,7 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
                                                  budget_bytes / 1e9, slots_[l], l, n_used));
 
     // The last `lend` slots of every MoE layer are lendable, as long as n_used others remain.
-    uint32_t lend = uint32_t(std::ceil(std::max(0.0, lendable_bytes) / double(per_slot)));
+    uint32_t lend = want_lend;
     for (size_t l = 0; l < nl; ++l)
         if (slot_bytes[l])
             lend = std::min(lend, slots_[l] - n_used);
@@ -247,12 +250,14 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     for (size_t l = 0; l < layers_.size(); ++l)
         for (int p = 0; p < 3; ++p) {
             const uint64_t stride = round_up(layers_[l][p].bytes, kPage);
+            uint32_t main_slots = 0;
             if (slot_bytes[l]) {
-                regions_[l][p].split = slots_[l] - lend;
+                main_slots = slots_[l] - lend;
+                regions_[l][p].split = lend ? main_slots : UINT32_MAX; // UINT32_MAX: no lendable slots
                 regions_[l][p].tail_off = tail_bytes_;
                 tail_bytes_ += stride * lend;
             }
-            const uint64_t size = stride * regions_[l][p].split;
+            const uint64_t size = stride * main_slots;
             if (size == 0)
                 continue;
             if (size > limit)

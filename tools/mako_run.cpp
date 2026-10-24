@@ -106,12 +106,17 @@ int main(int argc, char** argv)
     }
     int n_gen = 8, top = 5;
     std::string ref_dir, dump_dir, force_dir, route_dir, save_counts, stats_out, logits_dir;
+    bool mtp_stats = false;
     bool learn = false;
     mako::glm::Options opts;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--learn") {
             learn = true;
+            continue;
+        }
+        if (a == "--mtp-stats") {
+            mtp_stats = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -289,7 +294,15 @@ int main(int argc, char** argv)
 
     std::vector<float> logits;
     const bool batched = opts.prefill_chunk > 0 && ids.size() > 1 && ref_dir.empty() &&
-                         force_dir.empty() && route_dir.empty();
+                         force_dir.empty() && route_dir.empty() && !mtp_stats;
+    // --mtp-stats: the next-token block runs after every step (on the prompt with the actual next token, which fills
+    // its cache), and its guesses are compared with the greedy tokens that follow.
+    if (mtp_stats && !engine.has_mtp()) {
+        std::println(stderr, "the model has no next-token block");
+        return 1;
+    }
+    int32_t draft = -1;
+    int mtp_hits = 0, mtp_tries = 0;
     if (batched) {
         if (!dump_dir.empty() || !logits_dir.empty())
             engine.set_logits_sink([&](uint32_t pos, const float* lg) {
@@ -320,6 +333,8 @@ int main(int argc, char** argv)
         std::println("pos {:4} in {:7} {:7.0f} ms  top{}", i, ids[i],
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(),
                      show(logits));
+        if (mtp_stats)
+            draft = engine.mtp_draft(i + 1 < ids.size() ? ids[i + 1] : top_k(logits, 1)[0]);
     }
     std::string gen;
     std::vector<int32_t> gen_ids;
@@ -330,6 +345,15 @@ int main(int argc, char** argv)
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(next);
         telemetry.step(engine.last_step());
+        if (mtp_stats) {
+            // draft guessed the token after `next`, which is now the greedy one
+            const int after = top_k(logits, 1)[0];
+            if (draft >= 0 && g + 1 < n_gen) {
+                ++mtp_tries;
+                mtp_hits += draft == after;
+            }
+            draft = engine.mtp_draft(after);
+        }
         std::println("gen {:4} in {:7} {:7.0f} ms  top{}", g, next,
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(),
                      show(logits));
@@ -338,6 +362,9 @@ int main(int argc, char** argv)
         std::println("worst probe rel error {:.2e}", worst_rel);
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
+    if (mtp_stats)
+        std::println("next-token block: {} of {} guesses matched the greedy token ({:.1f}%)", mtp_hits, mtp_tries,
+                     100.0 * mtp_hits / std::max(1, mtp_tries));
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
     if (opts.telemetry != mako::glm::Telemetry::off)
         std::print("\n{}", telemetry.markdown());
