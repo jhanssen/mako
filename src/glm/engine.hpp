@@ -79,7 +79,9 @@ public:
     Checkpoint checkpoint();
     void restore(const Checkpoint& cp);
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
-    const std::vector<float>& prefill(std::span<const int32_t> tokens);
+    // `cancelled` is polled between groups of tokens (Options::prefill_group): true stops there, with the tokens so
+    // far in the context (position() tells how many) and the logits after the last of them.
+    const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {});
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
     using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }

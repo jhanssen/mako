@@ -41,7 +41,7 @@ verified by rejection sampling, so the output has the same distribution as witho
 
 Programs generate through `glm::Session` (`src/glm/session.hpp`): it takes the whole prompt each time, keeps the
 longest prefix the engine already holds (continuing the current state, or restoring a checkpoint of the
-recurrent state taken at an earlier prompt's end), samples, drafts and stops on stop tokens or a length limit.
+recurrent state taken before an earlier prompt's last token), samples, drafts and stops on stop tokens or a length limit.
 
 The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e.g. the Maya-S quantization
 (`peasantsmith/GLM-5.3-Flash-Maya-GGUF`, `Maya-S-v2-IQ2_XXS`).

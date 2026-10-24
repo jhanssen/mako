@@ -4,7 +4,8 @@
 //   parity       per-position logits stay close to the reference implementation's (stored top-k)
 //   spec         a two-token step (speculative verification), and its rollback, match single-token steps
 //   session      generation through Session: greedy and speculative tokens, prefix reuse from the current state
-//                and from a checkpoint (the same logits as a fresh prefill), drafts after a restore
+//                and from a checkpoint (the same logits as a fresh prefill), a repeated prompt, a read cancelled
+//                between groups and resumed, drafts after a restore
 //   long         a prompt past the dense-attention window (sparse selection, lent arena slots) against the
 //                reference, then decode
 //   regress_test <model.gguf> [case ...] [--update]
@@ -432,9 +433,16 @@ int main(int argc, char** argv)
         greedy_p.max_tokens = 24;
         greedy_p.speculative = false;
 
+        // As a session reads a prompt: all but its last token, then that one as a step (the checkpoint goes between).
+        auto as_session = [&](std::span<const int32_t> p) -> const std::vector<float>& {
+            if (p.size() > 1)
+                engine.prefill(p.first(p.size() - 1));
+            return engine.step(p.back());
+        };
+
         // Greedy without drafts: the plain decode loop's tokens.
         engine.reset();
-        const auto want = greedy(engine, engine.prefill(prompt), 24);
+        const auto want = greedy(engine, as_session(prompt), 24);
         mako::glm::Session session(engine);
         auto r = session.generate(prompt, greedy_p);
         check(r.tokens == want && r.finish == mako::glm::Finish::max_tokens, "greedy session tokens match the decode loop");
@@ -472,9 +480,9 @@ int main(int argc, char** argv)
         }
 
         // Prefix reuse. Continuing the context (prompt, its output, more text) keeps every token; a prompt diverging
-        // right after the first one restores the checkpoint taken at its end. Both give the logits of the same
-        // tokens run without a session, bit for bit (prefill split at any position gives the same logits; the
-        // generated tokens ran as decode steps, whose rounding differs from prefill's).
+        // right after the first one, or the same prompt again, restores the checkpoint taken before its last token.
+        // Each gives the logits of the same tokens run without a session, bit for bit (prefill split at any position
+        // gives the same logits; the generated tokens ran as decode steps, whose rounding differs from prefill's).
         session.clear();
         r = session.generate(prompt, greedy_p);
         std::vector<int32_t> cont = prompt;
@@ -486,20 +494,49 @@ int main(int argc, char** argv)
         auto rc = session.generate(cont, zero);
         const auto l_cont = engine.logits();
         engine.reset();
-        engine.prefill(std::span(cont).first(prompt.size()));
+        as_session(std::span(cont).first(prompt.size()));
         for (size_t i = prompt.size(); i < held; ++i)
             engine.step(cont[i]);
-        const double kl_cont = kl_to(engine.prefill(std::span(cont).subspan(held)), l_cont);
+        const double kl_cont = kl_to(as_session(std::span(cont).subspan(held)), l_cont);
         std::vector<int32_t> branch = prompt;
         branch.insert(branch.end(), {576, 1052, 374, 264, 1273});
         auto rb = session.generate(branch, zero);
         const auto l_branch = engine.logits();
-        const double kl_branch = kl_to(fresh(branch), l_branch);
+        engine.reset();
+        const double kl_branch = kl_to(as_session(branch), l_branch);
+        auto ra = session.generate(branch, zero);
+        const auto l_again = engine.logits();
         check(rc.reused_tokens == held, std::format("continuation reuses the {} tokens held ({})", held, rc.reused_tokens));
-        check(rb.reused_tokens == prompt.size(),
-              std::format("diverging prompt restores the checkpoint at {} ({})", prompt.size(), rb.reused_tokens));
-        check(kl_cont == 0 && kl_branch == 0,
-              std::format("logits as without a session: continued KL {:.2e}, restored KL {:.2e}", kl_cont, kl_branch));
+        check(rb.reused_tokens == prompt.size() - 1,
+              std::format("diverging prompt restores the checkpoint at {} ({})", prompt.size() - 1, rb.reused_tokens));
+        check(ra.reused_tokens == branch.size() - 1,
+              std::format("the same prompt again restores the checkpoint at {} ({})", branch.size() - 1, ra.reused_tokens));
+        check(kl_cont == 0 && kl_branch == 0 && kl_to(l_branch, l_again) == 0,
+              std::format("logits as without a session: continued KL {:.2e}, restored KL {:.2e}, again KL {:.2e}",
+                          kl_cont, kl_branch, kl_to(l_branch, l_again)));
+
+        // Reading a prompt cancelled between groups keeps the groups read; the next request continues from there,
+        // with the logits of an uninterrupted read.
+        {
+            const auto corpus = parse_ids(read_file(kData / "long_ids.txt"));
+            engine.set_prefill_group(1024);
+            session.clear();
+            auto stop_now = zero;
+            int polls = 0;
+            stop_now.cancelled = [&] { return ++polls > 0; };
+            const auto rx = session.generate(corpus, stop_now);
+            const size_t kept = session.context().size();
+            const auto ry = session.generate(corpus, zero);
+            const auto l_resumed = engine.logits();
+            engine.reset();
+            engine.prefill(std::span(corpus).first(kept));
+            const double kl_resumed = kl_to(as_session(std::span(corpus).subspan(kept)), l_resumed);
+            engine.set_prefill_group(opts.prefill_group);
+            check(rx.finish == mako::glm::Finish::cancelled && rx.tokens.empty() && polls == 1 &&
+                      kept == 1024 && ry.reused_tokens == kept && kl_resumed == 0,
+                  std::format("cancelled read keeps {} of {} tokens ({} polls), resumed with {} reused, KL {:.2e}", kept,
+                              corpus.size(), polls, ry.reused_tokens, kl_resumed));
+        }
 
         // After a restore, the next-token block's cache at the checkpoint's last position is refilled for the new
         // next token: its guesses as after a fresh prefill (that row came from prefill there, from a decode-path pass

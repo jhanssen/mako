@@ -1798,7 +1798,7 @@ void Engine::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc
 // Prompt processing: chunks of tokens go through each layer together (projections as GEMMs, the sequential parts
 // token by token inside the kernels), with one CPU synchronization per MoE layer to make the chunk's experts
 // resident. Leaves the same caches and state as step() would token by token.
-const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
+const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled)
 {
     if (tokens.size() < 2 || probe_ || stream_override_ || route_override_ || opts_.telemetry == Telemetry::kernels) {
         for (int32_t t : tokens)
@@ -1860,6 +1860,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
 
     // Groups of up to `group` tokens go through the layers together: each layer's attention in chunks of `chunk`
     // tokens, then its FFN for the whole group, so a routed expert is loaded at most once per layer and group.
+    size_t done = tokens.size();
     for (size_t g0 = 0; g0 < tokens.size(); g0 += group) {
         const uint32_t G = uint32_t(std::min<size_t>(group, tokens.size() - g0));
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
@@ -2152,7 +2153,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         }
 
         // The next-token block's cache for the group's positions whose following token is known; the hidden state of
-        // the prompt's last position goes to "xn" for the first mtp_draft().
+        // the group's last position goes to "xn" for the first mtp_draft() (or a checkpoint if prefill stops here).
         cur_layer_ = cfg_.n_layer;
         if (has_mtp()) {
             MTL::Buffer* hg = scratch("p_h", uint64_t(G) * E * 4);
@@ -2164,14 +2165,12 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 mtp_fill(enc, hg, uint64_t(c0) * E * 4, scratch("mf_e", uint64_t(group) * E * 4), uint64_t(c0) * E * 4,
                          T, pos_ + uint32_t(g0) + c0);
             }
-            if (g0 + G == tokens.size()) {
-                const uint32_t n = E;
-                enc->setComputePipelineState(pso("copy_f32"));
-                enc->setBuffer(hg, uint64_t(G - 1) * E * 4, 0);
-                enc->setBuffer(scratch("xn", uint64_t(kMaxDecodeTokens) * E * 4), 0, 1);
-                enc->setBytes(&n, sizeof(n), 2);
-                enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
-            }
+            const uint32_t n = E;
+            enc->setComputePipelineState(pso("copy_f32"));
+            enc->setBuffer(hg, uint64_t(G - 1) * E * 4, 0);
+            enc->setBuffer(scratch("xn", uint64_t(kMaxDecodeTokens) * E * 4), 0, 1);
+            enc->setBytes(&n, sizeof(n), 2);
+            enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
         }
 
         // Logits of the group's last token, or of every token (in chunks) for a logits sink.
@@ -2216,8 +2215,12 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
             }
         }
         pool->release();
+        if (cancelled && g0 + G < tokens.size() && cancelled()) {
+            done = g0 + G;
+            break;
+        }
     }
-    pos_ += uint32_t(tokens.size());
+    pos_ += uint32_t(done);
     last_pos0_ = pos_ - 1; // mtp_draft() continues from the last position
     last_tokens_ = 1;
     stats_.expert_read_ms = arena_->stats().read_ms;

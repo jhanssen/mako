@@ -16,6 +16,9 @@ struct GenerateParams {
     uint32_t max_tokens = 256;
     std::vector<int32_t> stop_tokens; // generation ends after one of these (it is part of the output)
     bool speculative = true;          // draft with the next-token block, when the engine has it
+    // Polled while the prompt is read (between groups of tokens): true stops (Finish::cancelled, no tokens), keeping
+    // the part read so far in the context.
+    std::function<bool()> cancelled;
 };
 
 enum class Finish { stop_token, max_tokens, context_full, cancelled };
@@ -30,7 +33,8 @@ struct GenerateResult {
 
 // A conversation's context on an engine. Each generate() gets the whole prompt (earlier turns included); the
 // longest prefix the engine already holds is kept, from the current state or from a checkpoint of the recurrent
-// state taken at the end of an earlier prompt (a chat template that rewrites the last answer diverges there).
+// state taken before the last token of an earlier prompt (the same prompt again, or a chat template that rewrites
+// the last answer, diverges there).
 class Session {
 public:
     // max_checkpoints beyond the engine's checkpoint_slots() use memory its budget did not reserve.

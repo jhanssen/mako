@@ -112,7 +112,9 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
         try {
             OutputParser parser(tok, cr.tools, cr.stop);
             bool stopped = false;
-            const auto r = generate(prompt, cr, parser, [](const Delta&) { return true; }, stopped);
+            const auto closed = req.is_connection_closed;
+            cr.gen.cancelled = closed;
+            const auto r = generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped);
             const char* finish = finish_reason(r, parser, stopped);
             log_result(id, r, finish);
             res.set_content(completion(id, created, model, parser, finish, r), "application/json");
@@ -122,6 +124,8 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
         return;
     }
 
+    // The provider runs after this handler returns; the check only holds the socket.
+    cr.gen.cancelled = req.is_connection_closed;
     auto shared = std::make_shared<ChatRequest>(std::move(cr));
     res.set_chunked_content_provider("text/event-stream", [this, shared, prompt = std::move(prompt), id, created,
                                                            model](size_t, httplib::DataSink& sink) {

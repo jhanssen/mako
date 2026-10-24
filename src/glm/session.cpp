@@ -87,9 +87,26 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     const auto rest = prompt.subspan(ctx_.size());
     if (!ctx_.empty() && mtp_next_ != rest[0])
         e_.mtp_seed(rest[0]);
-    const std::vector<float>& lp = rest.size() == 1 ? e_.step(rest[0]) : e_.prefill(rest);
-    ctx_.assign(prompt.begin(), prompt.end());
-    save_checkpoint();
+    // The checkpoint is taken before the prompt's last token, so that the same prompt again (reuse stops short of
+    // its end) or one continuing differently right after it restores it.
+    if (rest.size() > 1) {
+        e_.prefill(rest.first(rest.size() - 1), p.cancelled);
+        if (const size_t read = e_.position(); read < prompt.size() - 1) {
+            // The next-token block's cache already holds the last position read with the prompt's next token.
+            ctx_.assign(prompt.begin(), prompt.begin() + read);
+            mtp_next_ = e_.has_mtp() ? prompt[read] : -1;
+            res.finish = Finish::cancelled;
+            res.prefill_ms = ms_since(t_prefill);
+            return res;
+        }
+        if (e_.has_mtp())
+            e_.mtp_seed(prompt.back());
+    }
+    ctx_.assign(prompt.begin(), prompt.end() - 1);
+    if (!ctx_.empty())
+        save_checkpoint();
+    const std::vector<float>& lp = e_.step(prompt.back());
+    ctx_.push_back(prompt.back());
     res.prefill_ms = ms_since(t_prefill);
 
     const auto t_decode = std::chrono::steady_clock::now();
