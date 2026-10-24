@@ -2,6 +2,7 @@
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
 //            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
 //            [--stats summary|steps|layers|kernels] [--stats-out FILE] [--prefill-chunk N] [--prefill-group N] [--logits-out DIR]
+//            [--spec] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--seed N]
 // The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
 // another; --save-counts writes this run's routing counts, --learn adds them to the model's profile.
 // --stats prints a Markdown telemetry summary at the end; --stats-out also writes its records as JSON lines.
@@ -12,8 +13,10 @@
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
 // measures each layer's own error; --force-route also takes the reference's expert selection and weights.
+// --spec or a sampling option generates through a Session (speculatively with --spec; sampled with --temp > 0).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "glm/session.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
@@ -106,9 +109,11 @@ int main(int argc, char** argv)
     }
     int n_gen = 8, top = 5;
     std::string ref_dir, dump_dir, force_dir, route_dir, save_counts, stats_out, logits_dir;
-    bool mtp_stats = false, spec = false;
+    bool mtp_stats = false, spec = false, use_session = false;
     bool learn = false;
     mako::glm::Options opts;
+    mako::glm::GenerateParams gp;
+    gp.sampling.temperature = 0;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--learn") {
@@ -120,7 +125,7 @@ int main(int argc, char** argv)
             continue;
         }
         if (a == "--spec") {
-            spec = mtp_stats = true;
+            spec = use_session = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -167,6 +172,19 @@ int main(int argc, char** argv)
             opts.telemetry = *t;
         } else if (a == "--stats-out")
             stats_out = v;
+        else if (a == "--temp" || a == "--top-k" || a == "--top-p" || a == "--min-p" || a == "--seed") {
+            use_session = true;
+            if (a == "--temp")
+                gp.sampling.temperature = std::stof(v);
+            else if (a == "--top-k")
+                gp.sampling.top_k = uint32_t(std::stoul(v));
+            else if (a == "--top-p")
+                gp.sampling.top_p = std::stof(v);
+            else if (a == "--min-p")
+                gp.sampling.min_p = std::stof(v);
+            else
+                gp.seed = std::stoull(v);
+        }
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
@@ -199,7 +217,7 @@ int main(int argc, char** argv)
     }
     mako::mtl::Context ctx;
     auto t0 = std::chrono::steady_clock::now();
-    opts.mtp = mtp_stats;
+    opts.mtp = mtp_stats || spec;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (!stats_out.empty() && opts.telemetry == mako::glm::Telemetry::off)
@@ -300,7 +318,7 @@ int main(int argc, char** argv)
     };
 
     std::vector<float> logits;
-    const bool batched = opts.prefill_chunk > 0 && ids.size() > 1 && ref_dir.empty() &&
+    const bool batched = !use_session && opts.prefill_chunk > 0 && ids.size() > 1 && ref_dir.empty() &&
                          force_dir.empty() && route_dir.empty();
     // --mtp-stats: the next-token block runs after every step (prefill fills its cache for the prompt), and its
     // guesses are compared with the greedy tokens that follow. --spec decodes speculatively with it.
@@ -326,7 +344,7 @@ int main(int argc, char** argv)
         if (mtp_stats)
             draft = engine.mtp_draft(top_k(logits, 1)[0]);
     }
-    for (size_t i = 0; i < (batched ? 0 : ids.size()); ++i) {
+    for (size_t i = 0; i < (batched || use_session ? 0 : ids.size()); ++i) {
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(ids[i]);
         telemetry.step(engine.last_step());
@@ -347,46 +365,31 @@ int main(int argc, char** argv)
     }
     std::string gen;
     std::vector<int32_t> gen_ids;
-    if (spec) {
-        // Speculative greedy decoding: verify [pending, draft] in one two-token step; keep the draft if the first
-        // row's greedy token is the draft, else roll the second token back.
-        auto argmax = [&](const float* l) { return int32_t(std::max_element(l, l + cfg->n_vocab) - l); };
-        int32_t pending = top_k(logits, 1)[0];
-        int rounds = 0, accepted = 0;
-        double verify_ms = 0, draft_ms = 0;
-        const auto t0 = std::chrono::steady_clock::now();
-        while (int(gen_ids.size()) < n_gen) {
-            const auto tv = std::chrono::steady_clock::now();
-            const auto& two = engine.step2(pending, draft);
-            verify_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
-            telemetry.step(engine.last_step());
-            const auto td = std::chrono::steady_clock::now();
-            const int32_t g1 = argmax(two.data());
-            gen_ids.push_back(pending);
-            ++rounds;
-            if (g1 == draft && int(gen_ids.size()) < n_gen) {
-                ++accepted;
-                gen_ids.push_back(draft);
-                const int32_t g2 = argmax(two.data() + cfg->n_vocab);
-                const int32_t both[2] = {draft, g2};
-                draft = engine.mtp_draft(std::span<const int32_t>(both));
-                pending = g2;
-            } else {
-                engine.rollback();
-                draft = engine.mtp_draft(g1);
-                pending = g1;
+    if (use_session) {
+        mako::glm::Session session(engine);
+        gp.max_tokens = uint32_t(n_gen);
+        gp.speculative = spec;
+        uint32_t recorded = uint32_t(ids.size());
+        const auto r = session.generate(ids, gp, [&](int32_t) {
+            if (engine.position() != recorded) { // a step ran since the last token (not for an accepted draft)
+                telemetry.step(engine.last_step());
+                recorded = engine.position();
             }
-            draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
-        }
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            return true;
+        });
+        telemetry.prefill(engine.last_prefill(), uint32_t(ids.size()));
+        gen_ids = r.tokens;
         for (int32_t t : gen_ids)
             gen += std::format("{},", t);
-        std::println("speculative: {} tokens in {} rounds ({:.1f}% drafts accepted), {:.1f} ms/token; per round: "
-                     "two-token step {:.1f} ms, next-token block {:.1f} ms",
-                     gen_ids.size(), rounds, 100.0 * accepted / std::max(1, rounds), ms / gen_ids.size(),
-                     verify_ms / std::max(1, rounds), draft_ms / std::max(1, rounds));
+        std::println("prefill {} tokens in {:.0f} ms ({:.1f} tok/s)", ids.size(), r.prefill_ms,
+                     ids.size() / r.prefill_ms * 1e3);
+        std::println("generated {} tokens in {:.0f} ms ({:.1f} ms/token){}", gen_ids.size(), r.decode_ms,
+                     r.decode_ms / std::max<size_t>(1, gen_ids.size()),
+                     spec ? std::format(", {} of {} drafts accepted ({:.1f}%)", r.accepted, r.drafts,
+                                        100.0 * r.accepted / std::max(1u, r.drafts))
+                          : std::string());
     }
-    for (int g = 0; g < (spec ? 0 : n_gen); ++g) {
+    for (int g = 0; g < (use_session ? 0 : n_gen); ++g) {
         const int next = top_k(logits, 1)[0];
         gen += std::format("{},", next);
         gen_ids.push_back(next);

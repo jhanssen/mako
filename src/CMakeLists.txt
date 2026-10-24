@@ -30,8 +30,11 @@ add_custom_target(mako_version
             -P ${PROJECT_SOURCE_DIR}/cmake/version.cmake
     BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp)
 
-add_library(mako_glm STATIC glm/arena.cpp glm/config.cpp glm/engine.cpp glm/profile.cpp glm/telemetry.cpp)
-target_link_libraries(mako_glm PUBLIC mako_mtl mako_gguf)
+add_library(mako_gen STATIC gen/sampler.cpp)
+target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_library(mako_glm STATIC glm/arena.cpp glm/config.cpp glm/engine.cpp glm/profile.cpp glm/session.cpp glm/telemetry.cpp)
+target_link_libraries(mako_glm PUBLIC mako_mtl mako_gguf mako_gen)
 target_include_directories(mako_glm PRIVATE ${CMAKE_BINARY_DIR}/generated)
 add_dependencies(mako_glm mako_version)
 
@@ -40,5 +43,5 @@ set_source_files_properties(mtl/embedded.cpp PROPERTIES
     OBJECT_DEPENDS "${MAKO_METALLIB};${GEMV_METALLIB}")
 add_dependencies(mako_mtl mako_metallib gemv_metallib)
 
-add_library(mako_text STATIC text/tokenizer.cpp)
+add_library(mako_text STATIC text/stream.cpp text/tokenizer.cpp)
 target_link_libraries(mako_text PUBLIC mako_gguf)

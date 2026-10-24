@@ -1550,21 +1550,83 @@ void Engine::mtp_fill(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* h, uint64_t
 int32_t Engine::mtp_draft(int32_t next)
 {
     const int32_t t[1] = {next};
-    return mtp_draft(std::span<const int32_t>(t));
+    return mtp_run(t, 0);
 }
 
 int32_t Engine::mtp_draft(std::span<const int32_t> next)
 {
+    return mtp_run(next, 0);
+}
+
+std::span<const float> Engine::mtp_logits()
+{
+    return {static_cast<const float*>(scratch("mtp_logits", uint64_t(cfg_.n_vocab) * 4)->contents()), cfg_.n_vocab};
+}
+
+void Engine::mtp_seed(int32_t next)
+{
+    if (!has_mtp() || pos_ == 0)
+        return;
+    const int32_t t[1] = {next};
+    mtp_run(t, pos_ - 1 - last_pos0_);
+}
+
+Engine::Checkpoint Engine::checkpoint()
+{
+    Checkpoint cp;
+    cp.pos = pos_;
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il)
+        for (auto* b : {kda_state_[il].get(), conv_state_[il].get()})
+            if (b) {
+                const auto* p = static_cast<const std::byte*>(b->contents());
+                cp.state.insert(cp.state.end(), p, p + b->length());
+            }
+    if (has_mtp() && pos_ > 0) {
+        const uint32_t E = cfg_.n_embd;
+        const auto* h = static_cast<const float*>(scratch("xn", uint64_t(kMaxDecodeTokens) * E * 4)->contents());
+        cp.hidden.assign(h + uint64_t(pos_ - 1 - last_pos0_) * E, h + uint64_t(pos_ - last_pos0_) * E);
+    }
+    return cp;
+}
+
+void Engine::restore(const Checkpoint& cp)
+{
+    if (cp.pos > opts_.max_ctx)
+        throw std::runtime_error("checkpoint past the context size");
+    size_t off = 0;
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il)
+        for (auto* b : {kda_state_[il].get(), conv_state_[il].get()})
+            if (b) {
+                if (off + b->length() > cp.state.size())
+                    throw std::runtime_error("checkpoint from another engine");
+                std::memcpy(b->contents(), cp.state.data() + off, b->length());
+                off += b->length();
+            }
+    if (off != cp.state.size())
+        throw std::runtime_error("checkpoint from another engine");
+    pos_ = cp.pos;
+    last_pos0_ = pos_ > 0 ? pos_ - 1 : 0;
+    last_tokens_ = 1;
+    if (!cp.hidden.empty()) {
+        auto* h = static_cast<float*>(scratch("xn", uint64_t(kMaxDecodeTokens) * cfg_.n_embd * 4)->contents());
+        std::memcpy(h, cp.hidden.data(), cp.hidden.size() * 4);
+    }
+}
+
+// The next-token block over the last step's hidden rows row0.. (positions last_pos0_ + row0..), each followed by
+// next[i]; returns the guess after the last.
+int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)
+{
     const uint32_t T = uint32_t(next.size());
     if (!has_mtp() || pos_ == 0)
         return -1;
-    if (T == 0 || T > last_tokens_)
+    if (T == 0 || row0 + T > last_tokens_)
         throw std::runtime_error("next-token block: more tokens than the last step had");
     for (int32_t token : next)
         if (token < 0 || uint32_t(token) >= cfg_.n_vocab)
             throw std::runtime_error("token out of range");
     const Layer& L = *layers_[cfg_.n_layer];
-    const uint32_t E = cfg_.n_embd, il = cfg_.n_layer, pos = last_pos0_;
+    const uint32_t E = cfg_.n_embd, il = cfg_.n_layer, pos = last_pos0_ + row0;
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     const uint64_t rows = kMaxDecodeTokens;
     MTL::Buffer* e = scratch("mtp_e", rows * E * 4);
@@ -1588,12 +1650,12 @@ int32_t Engine::mtp_draft(std::span<const int32_t> next)
     cur_cb_ = cb;
     cur_layer_ = cfg_.n_layer;
     MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
-    // Row i: [enorm(embedding of next[i]); hnorm(the step's post-norm hidden state row i, still in "xn")] ->
-    // eh_proj, at the step's position i.
+    // Row i: [enorm(embedding of next[i]); hnorm(the step's post-norm hidden state row row0 + i, still in "xn")]
+    // -> eh_proj, at the step's position row0 + i.
     MTL::Buffer* h = scratch("xn", rows * E * 4);
     for (uint32_t i = 0; i < T; ++i) {
         norm(enc, e, &L.enorm, cat, 1, E, E, cfg_.rms_eps, uint64_t(i) * E * 4, uint64_t(i) * 2 * E * 4);
-        norm(enc, h, &L.hnorm, cat, 1, E, E, cfg_.rms_eps, uint64_t(i) * E * 4, uint64_t(2 * i + 1) * E * 4);
+        norm(enc, h, &L.hnorm, cat, 1, E, E, cfg_.rms_eps, uint64_t(row0 + i) * E * 4, uint64_t(2 * i + 1) * E * 4);
     }
     gemv(enc, L.eh_proj, cat, 0, r, 0, 1, T);
     norm(enc, r, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);

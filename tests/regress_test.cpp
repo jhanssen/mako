@@ -3,6 +3,8 @@
 //   prefill      prefill at several chunk sizes gives token-by-token decode's logits and continuation
 //   parity       per-position logits stay close to the reference implementation's (stored top-k)
 //   spec         a two-token step (speculative verification), and its rollback, match single-token steps
+//   session      generation through Session: greedy and speculative tokens, prefix reuse from the current state
+//                and from a checkpoint (the same logits as a fresh prefill), drafts after a restore
 //   long         a prompt past the dense-attention window (sparse selection, lent arena slots) against the
 //                reference, then decode
 //   regress_test <model.gguf> [case ...] [--update]
@@ -12,6 +14,7 @@
 // Exit 77: the model is missing (skipped).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "glm/session.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "text/tokenizer.hpp"
@@ -405,6 +408,141 @@ int main(int argc, char** argv)
             // Measured when set: ~67-75% on similar text.
             check(accepted > rounds / 2, std::format("drafts accepted: {} of {} rounds (limit half)", accepted, rounds));
         }
+    }
+
+    if (want("session")) {
+        std::println("session");
+        const std::vector<int32_t> prompt{785, 3840, 315, 279, 12745, 20406, 44038, 1657, 23566, 11, 504, 279,
+                                          35056, 315, 279, 3283, 311, 279, 4399, 315, 90427, 1164, 304, 220,
+                                          117721, 18, 11, 323, 1181, 10168, 374, 2058, 6476, 3351, 13};
+        const uint32_t nv = cfg->n_vocab;
+        auto kl_to = [&](const std::vector<float>& want, const std::vector<float>& got) {
+            const auto lw = log_softmax(want.data(), nv), lg = log_softmax(got.data(), nv);
+            double kl = 0;
+            for (uint32_t i = 0; i < nv; ++i)
+                kl += std::exp(lw[i]) * (lw[i] - lg[i]);
+            return kl;
+        };
+        auto fresh = [&](const std::vector<int32_t>& p) {
+            engine.reset();
+            return engine.prefill(p);
+        };
+        mako::glm::GenerateParams greedy_p;
+        greedy_p.sampling.temperature = 0;
+        greedy_p.max_tokens = 24;
+        greedy_p.speculative = false;
+
+        // Greedy without drafts: the plain decode loop's tokens.
+        engine.reset();
+        const auto want = greedy(engine, engine.prefill(prompt), 24);
+        mako::glm::Session session(engine);
+        auto r = session.generate(prompt, greedy_p);
+        check(r.tokens == want && r.finish == mako::glm::Finish::max_tokens, "greedy session tokens match the decode loop");
+
+        // Speculative greedy: each token is the argmax of the logits before it (teacher-forced over prompt + output),
+        // except at near-ties, where the two-token step's rounding may choose the other.
+        if (engine.has_mtp()) {
+            session.clear();
+            auto sp = greedy_p;
+            sp.speculative = true;
+            sp.max_tokens = 48;
+            const auto rs = session.generate(prompt, sp);
+            std::vector<int32_t> all = prompt;
+            all.insert(all.end(), rs.tokens.begin(), rs.tokens.end());
+            std::map<uint32_t, std::vector<float>> forced;
+            engine.reset();
+            engine.set_logits_sink([&](uint32_t pos, const float* l) {
+                if (pos + 1 >= prompt.size())
+                    forced[pos].assign(l, l + nv);
+            });
+            engine.prefill(all);
+            engine.set_logits_sink({});
+            int off = 0, ties = 0;
+            for (size_t i = 0; i < rs.tokens.size(); ++i) {
+                const auto& l = forced[uint32_t(prompt.size() - 1 + i)];
+                const int32_t best = argmax(l);
+                if (best != rs.tokens[i])
+                    ++(l[best] - l[rs.tokens[i]] < 0.05f ? ties : off);
+            }
+            check(off == 0 && rs.tokens.size() == 48,
+                  std::format("speculative greedy tokens are the teacher-forced argmax ({} near-ties, {} not)", ties, off));
+            // Measured when set: ~67-75% on similar text.
+            check(rs.accepted * 2 > rs.drafts, std::format("drafts accepted: {} of {}", rs.accepted, rs.drafts));
+            session.clear();
+        }
+
+        // Prefix reuse. Continuing the context (prompt, its output, more text) keeps every token; a prompt diverging
+        // right after the first one restores the checkpoint taken at its end. Both give the logits of the same
+        // tokens run without a session, bit for bit (prefill split at any position gives the same logits; the
+        // generated tokens ran as decode steps, whose rounding differs from prefill's).
+        session.clear();
+        r = session.generate(prompt, greedy_p);
+        std::vector<int32_t> cont = prompt;
+        cont.insert(cont.end(), r.tokens.begin(), r.tokens.end());
+        cont.insert(cont.end(), {13, 785, 6722, 315});
+        const size_t held = session.context().size();
+        auto zero = greedy_p;
+        zero.max_tokens = 0;
+        auto rc = session.generate(cont, zero);
+        const auto l_cont = engine.logits();
+        engine.reset();
+        engine.prefill(std::span(cont).first(prompt.size()));
+        for (size_t i = prompt.size(); i < held; ++i)
+            engine.step(cont[i]);
+        const double kl_cont = kl_to(engine.prefill(std::span(cont).subspan(held)), l_cont);
+        std::vector<int32_t> branch = prompt;
+        branch.insert(branch.end(), {576, 1052, 374, 264, 1273});
+        auto rb = session.generate(branch, zero);
+        const auto l_branch = engine.logits();
+        const double kl_branch = kl_to(fresh(branch), l_branch);
+        check(rc.reused_tokens == held, std::format("continuation reuses the {} tokens held ({})", held, rc.reused_tokens));
+        check(rb.reused_tokens == prompt.size(),
+              std::format("diverging prompt restores the checkpoint at {} ({})", prompt.size(), rb.reused_tokens));
+        check(kl_cont == 0 && kl_branch == 0,
+              std::format("logits as without a session: continued KL {:.2e}, restored KL {:.2e}", kl_cont, kl_branch));
+
+        // After a restore, the next-token block's cache at the checkpoint's last position is refilled for the new
+        // next token: its guesses as after a fresh prefill (that row came from prefill there, from a decode-path pass
+        // here, so not bit for bit).
+        if (engine.has_mtp()) {
+            const std::vector<int32_t> probes{13, 11, 279, 315, 323, 264, 374, 220};
+            auto drafts = [&] {
+                std::vector<std::vector<float>> d;
+                for (int32_t x : probes) {
+                    engine.mtp_draft(x);
+                    const auto l = engine.mtp_logits();
+                    d.emplace_back(l.begin(), l.end());
+                }
+                return d;
+            };
+            fresh(branch);
+            const auto want_d = drafts();
+            auto restored = [&](bool seed) {
+                engine.reset();
+                engine.prefill(prompt);
+                const auto cp = engine.checkpoint();
+                engine.mtp_draft(13); // as if the answer had started with another token
+                engine.step(576);
+                engine.mtp_draft(1);
+                engine.step(1);
+                engine.mtp_draft(2);
+                engine.restore(cp);
+                if (seed)
+                    engine.mtp_seed(branch[prompt.size()]);
+                engine.prefill(std::span(branch).subspan(prompt.size()));
+                const auto d = drafts();
+                double worst = 0;
+                for (size_t i = 0; i < d.size(); ++i)
+                    worst = std::max(worst, kl_to(want_d[i], d[i]));
+                return worst;
+            };
+            const double seeded = restored(true), unseeded = restored(false);
+            // Measured when set: 2.5e-7 (stale row: 4.6e-2).
+            check(seeded <= 1e-5 && seeded * 10 < unseeded,
+                  std::format("drafts after a restore and seed: worst KL to a fresh prefill's {:.2e} (unseeded {:.2e})",
+                              seeded, unseeded));
+        }
+        session.clear();
     }
 
     if (want("long")) {

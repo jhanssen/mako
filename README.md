@@ -35,7 +35,13 @@ The first configure downloads pinned dependencies (metal-cpp and third-party GEM
 
 `--spec` decodes speculatively with the model's next-token (MTP) block: each step verifies the pending token and one
 draft (about 14% faster on an M5 Max at ~67% of drafts accepted; output equals greedy decoding except where a
-near-tied routing choice flips). It loads the block's weights and gives its experts cache slots.
+near-tied routing choice flips). It loads the block's weights and gives its experts cache slots. `--temp T`
+(with `--top-k`, `--top-p`, `--min-p`, `--seed`) samples instead of decoding greedily; with `--spec`, drafts are
+verified by rejection sampling, so the output has the same distribution as without them.
+
+Programs generate through `glm::Session` (`src/glm/session.hpp`): it takes the whole prompt each time, keeps the
+longest prefix the engine already holds (continuing the current state, or restoring a checkpoint of the
+recurrent state taken at an earlier prompt's end), samples, drafts and stops on stop tokens or a length limit.
 
 The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e.g. the Maya-S quantization
 (`peasantsmith/GLM-5.3-Flash-Maya-GGUF`, `Maya-S-v2-IQ2_XXS`).
@@ -44,12 +50,13 @@ The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e
 
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<model-00001-of-0000N.gguf>   # or MAKO_MODEL in the environment at configure
-ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | e2e
+ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | sampler | e2e
 ```
 
-Every test needs the model and reports as skipped without it. The `e2e` tests (about a minute) check greedy decode
-tokens, prefill against token-by-token decode, logits against stored reference top-k (`tests/data/*_ref.bin`)
-and a prompt past the dense-attention window (against the reference, not exact tokens). After an intended
+Every test but `sampler` needs the model and reports as skipped without it. The `e2e` tests (about a minute) check
+greedy decode tokens, prefill against token-by-token decode, logits against stored reference top-k
+(`tests/data/*_ref.bin`), speculative steps, generation and prefix reuse through `Session`, and a prompt past the
+dense-attention window (against the reference, not exact tokens). After an intended
 numerical change, `regress_test <model> --update` re-records `tests/data/regress_expected.txt`; review that diff.
 
 ## Layout
@@ -59,7 +66,9 @@ numerical change, `regress_test <model> --update` re-records `tests/data/regress
 | `src/gguf` | GGUF reader, multi-file models |
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
-| `src/glm` | GLM-5.3-Flash config and engine |
+| `src/glm` | GLM-5.3-Flash config, engine and generation session |
+| `src/gen` | sampling |
+| `src/text` | tokenizer, UTF-8 streaming detokenizer |
 | `tools` | `mako_run`, `mako_calibrate`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
 | `tests` | kernel, tokenizer and end-to-end regression tests (ctest) |
 | `bench` | SSD, sync, matmul and quantization-format microbenchmarks |

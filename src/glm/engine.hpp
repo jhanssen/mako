@@ -59,7 +59,24 @@ public:
     // The same over the positions of the last step's first next.size() tokens (rows of its hidden state), each
     // followed by next[i]; the guess comes from the last.
     int32_t mtp_draft(std::span<const int32_t> next);
+    // Tells the next-token block that the token after position() - 1 is `next`: refills its attention cache there
+    // (the last draft may have assumed another token). No-op without the block or at position 0.
+    void mtp_seed(int32_t next);
+    // The logits behind the last draft (valid until the next one).
+    std::span<const float> mtp_logits();
     bool has_mtp() const { return layers_.size() > cfg_.n_layer; }
+
+    // The recurrent state at a position, to continue from it later (prefix reuse). The attention caches are
+    // positional and not part of it: restore() is valid while the tokens before cp.pos are the same as when the
+    // checkpoint was taken.
+    struct Checkpoint {
+        uint32_t pos = 0;
+        std::vector<std::byte> state; // the KDA layers' scan and convolution states
+        std::vector<float> hidden;    // position pos - 1's final hidden state (the next-token block's input)
+        uint64_t bytes() const { return state.size() + hidden.size() * 4; }
+    };
+    Checkpoint checkpoint();
+    void restore(const Checkpoint& cp);
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     const std::vector<float>& prefill(std::span<const int32_t> tokens);
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
@@ -67,6 +84,10 @@ public:
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
 
     uint32_t position() const { return pos_; }
+    // The logits after the last step's (or prefill's) last token.
+    const std::vector<float>& logits() const { return logits_; }
+    uint32_t max_context() const { return opts_.max_ctx; }
+    const Config& config() const { return cfg_; }
     // Back to position 0 with empty recurrent state (the expert arena keeps its contents).
     void reset();
     // At most the chunk size the engine was built with, which sized the arena's lendable slots.
@@ -129,6 +150,7 @@ private:
     };
     struct Layer;
 
+    int32_t mtp_run(std::span<const int32_t> next, uint32_t row0);
     DevTensor upload(const std::string& name);
     DevTensor upload_optional(const std::string& name);
     ExpertArena::Part expert(const std::string& name);
