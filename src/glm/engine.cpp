@@ -363,8 +363,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     std::vector<MTL::Buffer*> arena_bufs;
     for (const auto& b : arena_->buffers())
         arena_bufs.push_back(b.get());
-    if (arena_->tail_buffer())
-        arena_bufs.push_back(arena_->tail_buffer());
+    for (MTL::Buffer* b : arena_->tail_buffers())
+        arena_bufs.push_back(b);
     for (MTL::Buffer* b : arena_bufs) {
         enc->setComputePipelineState(pso("copy_f32"));
         enc->setBuffer(b, 0, 0);
@@ -1826,12 +1826,13 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
         }
     }
 
-    // A long prompt's scratch buffers take the memory of the arena's lendable slots; afterwards the buffers go and
-    // the slots come back. Shorter prompts' scratch (under kLendBelow) is left to the budget's headroom.
+    // A longer prompt's scratch beyond kLendBelow (left to the budget's headroom) takes the memory of lendable
+    // slots, whole layers' at a time; afterwards the buffers go and the slots come back (read again).
     constexpr uint64_t kLendBelow = 256ull << 20;
     const uint32_t group = std::max(chunk, opts_.prefill_group);
-    const bool lend = prefill_scratch(uint32_t(std::min<size_t>(chunk, tokens.size())),
-                                      uint32_t(std::min<size_t>(group, tokens.size()))) > kLendBelow;
+    const uint64_t need = prefill_scratch(uint32_t(std::min<size_t>(chunk, tokens.size())),
+                                          uint32_t(std::min<size_t>(group, tokens.size())));
+    const bool lend = need > kLendBelow;
     // Kept past a lending prefill: the next-token block's first draft reads the last hidden state from it.
     if (has_mtp())
         scratch("xn", uint64_t(kMaxDecodeTokens) * cfg_.n_embd * 4);
@@ -1839,7 +1840,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
     if (lend) {
         for (const auto& [name, b] : scratch_)
             kept.emplace(name, b.get());
-        arena_->lend();
+        arena_->lend(need - kLendBelow);
     }
     struct Restore {
         Engine& e;
@@ -2112,26 +2113,29 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                     arena_->ensure(il, std::span<const int>(&order[i], 1), &slot[order[i]], true);
                 }
                 commit(b0, n_resident);
-                b0 = n_resident;
-                for (size_t i = n_resident; i < order.size(); ++i) {
-                    const int e = order[i];
-                    if (rows_of(b0, i + 1) > kBatchRows) {
-                        commit(b0, i);
-                        b0 = i;
+                // Misses are read a few at a time (their chunks in flight together) and each batch goes to the GPU
+                // as soon as it is resident, so reading the next overlaps running this one.
+                constexpr size_t kMissesPerRead = 4;
+                std::vector<int32_t> got(kMissesPerRead);
+                for (size_t i = n_resident; i < order.size();) {
+                    size_t j = i + 1;
+                    while (j < order.size() && j - i < kMissesPerRead && rows_of(i, j + 1) <= kBatchRows)
+                        ++j;
+                    while (!arena_->ensure(il, std::span<const int>(&order[i], j - i), got.data(), true)) {
+                        // Not enough unpinned slots: free the oldest batch's, or read fewer.
+                        if (!inflight.empty())
+                            retire();
+                        else if (j - i > 1)
+                            j = i + (j - i) / 2;
+                        else
+                            throw std::runtime_error("expert arena has no slot for one expert");
                     }
-                    while (!arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true)) {
-                        // No unpinned slot: free the oldest batch's, or run the pending misses to free theirs.
-                        if (inflight.empty()) {
-                            if (b0 == i)
-                                throw std::runtime_error("expert arena has no slot for one expert");
-                            commit(b0, i);
-                            b0 = i;
-                        }
-                        retire();
-                    }
+                    for (size_t m = i; m < j; ++m)
+                        slot[order[m]] = got[m - i];
+                    commit(i, j);
+                    i = j;
                 }
                 last_step_.ensure_ms += ms_since(t_ensure);
-                run(b0, order.size(), slot);
                 // This layer's slots are only touched again after the group's work is drained.
                 for (InFlight& f : inflight)
                     committed.push_back(f.cb);

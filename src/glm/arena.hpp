@@ -44,8 +44,8 @@ private:
 // and part (gate, up, down) has a region of equal-stride slots: slot s < split is at buf + off + s * stride, a
 // lendable slot s >= split at tail + tail_off + (s - split) * stride; the same s holds one expert's three parts.
 // Kernels consume (region, slot ids), whichever family they target.
-// The lendable slots of all layers share one buffer that lend() releases, returning its memory to the system (a
-// wrapped page stays held by Metal while its buffer lives), and reclaim() rebuilds.
+// Each layer's lendable slots are one buffer that lend() can release, returning its memory to the system (a wrapped
+// page stays held by Metal while its buffer lives), and reclaim() rebuilds.
 class ExpertArena {
 public:
     struct Part {
@@ -91,15 +91,16 @@ public:
     // Expert -> slot (-1: not resident), [n_layer][n_expert] int32, kept current for GPU-side lookup.
     MTL::Buffer* slot_table() const { return table_buf_.get(); }
     const std::vector<mtl::Ref<MTL::Buffer>>& buffers() const { return bufs_; }
-    MTL::Buffer* tail_buffer() const { return tail_buf_.get(); }
+    std::vector<MTL::Buffer*> tail_buffers() const;
     uint64_t lendable_bytes() const { return tail_bytes_; }
 
-    // Evicts the experts in the lendable slots and frees their memory; ensure() then uses only the other slots.
-    void lend();
-    // Rebuilds the lendable slots and fills the free slots with the best-scoring experts not resident. Returns
-    // false, leaving them lent, when their memory cannot be locked again.
+    // Evicts the experts in whole layers' lendable slots (the last layers first) until at least `bytes` are lent,
+    // and frees their memory; ensure() then uses only those layers' other slots.
+    void lend(uint64_t bytes = UINT64_MAX);
+    // Rebuilds the lent slots and fills the free slots with the best-scoring experts not resident. Returns false,
+    // leaving some lent, when their memory cannot be locked again.
     bool reclaim();
-    bool lent() const { return lent_; }
+    bool lent() const;
 
     // Loads each MoE layer's first slots(layer) experts in profile order (id order without a profile).
     void prefill();
@@ -131,10 +132,14 @@ private:
     std::vector<std::pair<void*, uint64_t>> chunks_;
     std::vector<mtl::Ref<MTL::Buffer>> bufs_;
     MTL::Device* dev_ = nullptr;
-    void* tail_mem_ = nullptr;
-    uint64_t tail_bytes_ = 0;
-    mtl::Ref<MTL::Buffer> tail_buf_;
-    bool lent_ = false;
+    struct Tail { // a layer's lendable slots
+        void* mem = nullptr; // null while lent
+        uint64_t bytes = 0;
+        mtl::Ref<MTL::Buffer> buf;
+    };
+    bool map_tail(uint32_t layer); // false: the memory could not be locked
+    std::vector<Tail> tails_;
+    uint64_t tail_bytes_ = 0; // all layers'
     mtl::Ref<MTL::Buffer> table_buf_;
     std::vector<std::vector<int32_t>> slot_expert_; // [layer][slot] -> expert, -1 free
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]

@@ -24,3 +24,7 @@ endif()
 
 add_executable(mako_serve mako_serve.cpp)
 target_link_libraries(mako_serve PRIVATE mako_server)
+
+add_executable(prefill_sweep prefill_sweep.cpp)
+target_link_libraries(prefill_sweep PRIVATE mako_glm mako_text)
+target_compile_definitions(prefill_sweep PRIVATE MAKO_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

@@ -290,6 +290,7 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     // Regions in order, each inside one chunk; a chunk is at most one Metal buffer.
     const uint64_t limit = max_buffer / kPage * kPage;
     std::vector<uint64_t> chunk_sizes{0};
+    tails_.resize(layers_.size());
     std::vector<std::array<std::pair<size_t, uint64_t>, 3>> place(layers_.size()); // (chunk, offset)
     for (size_t l = 0; l < layers_.size(); ++l)
         for (int p = 0; p < 3; ++p) {
@@ -298,7 +299,8 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
             if (slot_bytes[l]) {
                 main_slots = slots_[l] - lend;
                 regions_[l][p].split = lend ? main_slots : UINT32_MAX; // UINT32_MAX: no lendable slots
-                regions_[l][p].tail_off = tail_bytes_;
+                regions_[l][p].tail_off = tails_[l].bytes;
+                tails_[l].bytes += stride * lend;
                 tail_bytes_ += stride * lend;
             }
             const uint64_t size = stride * main_slots;
@@ -335,12 +337,10 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
                 regions_[l][p].buf = bufs_[place[l][p].first].get();
                 regions_[l][p].off = place[l][p].second;
             }
-    if (tail_bytes_ > limit)
-        throw std::runtime_error("lendable expert slots larger than the largest Metal buffer");
-    if (tail_bytes_) {
-        reclaim();
-        bytes_ += tail_bytes_;
-    }
+    for (uint32_t l = 0; l < layers_.size(); ++l)
+        if (tails_[l].bytes && !map_tail(l))
+            throw std::runtime_error("locking the lendable expert slots failed");
+    bytes_ += tail_bytes_;
 
     table_buf_ = mtl::Ref<MTL::Buffer>(
         dev->newBuffer(std::max<uint64_t>(layers_.size() * n_expert_ * 4, 16), MTL::ResourceStorageModeShared));
@@ -359,10 +359,12 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
 ExpertArena::~ExpertArena()
 {
     bufs_.clear();
-    tail_buf_ = {};
-    if (tail_mem_) {
-        ::munlock(tail_mem_, tail_bytes_);
-        ::munmap(tail_mem_, tail_bytes_);
+    for (Tail& t : tails_) {
+        t.buf = {};
+        if (t.mem) {
+            ::munlock(t.mem, t.bytes);
+            ::munmap(t.mem, t.bytes);
+        }
     }
     for (auto [mem, size] : chunks_) {
         ::munlock(mem, size);
@@ -434,7 +436,7 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     auto& last = last_use_[layer];
     const uint32_t n_slots = slots_[layer];
     std::vector<char> taken(pinned_[layer]);
-    if (lent_)
+    if (tails_[layer].bytes && !tails_[layer].mem)
         std::fill(taken.begin() + regions_[layer][0].split, taken.end(), 1);
     size_t misses = 0;
     for (int e : experts) {
@@ -503,12 +505,31 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     return true;
 }
 
-void ExpertArena::lend()
+std::vector<MTL::Buffer*> ExpertArena::tail_buffers() const
 {
-    if (lent_ || !tail_bytes_)
-        return;
+    std::vector<MTL::Buffer*> v;
+    for (const Tail& t : tails_)
+        if (t.buf)
+            v.push_back(t.buf.get());
+    return v;
+}
+
+bool ExpertArena::lent() const
+{
+    return std::ranges::any_of(tails_, [](const Tail& t) { return t.bytes && !t.mem; });
+}
+
+void ExpertArena::lend(uint64_t bytes)
+{
+    uint64_t lent = 0;
+    for (const Tail& t : tails_)
+        if (t.bytes && !t.mem)
+            lent += t.bytes;
     auto* table = static_cast<int32_t*>(table_buf_->contents());
-    for (uint32_t l = 0; l < layers_.size(); ++l)
+    for (uint32_t l = uint32_t(layers_.size()); l-- > 0 && lent < bytes;) {
+        Tail& t = tails_[l];
+        if (!t.mem)
+            continue;
         for (uint32_t s = regions_[l][0].split; s < slots_[l]; ++s) {
             if (pinned_[l][s])
                 throw std::runtime_error("lending a pinned expert slot");
@@ -517,44 +538,50 @@ void ExpertArena::lend()
                 slot_expert_[l][s] = -1;
             }
         }
-    for (auto& rs : regions_)
-        for (Region& r : rs)
+        for (Region& r : regions_[l])
             r.tail = nullptr;
-    // The buffer goes first: Metal keeps the pages it wraps until then (the system gets them back shortly after).
-    tail_buf_ = {};
-    ::munlock(tail_mem_, tail_bytes_);
-    ::munmap(tail_mem_, tail_bytes_);
-    tail_mem_ = nullptr;
-    lent_ = true;
+        // The buffer goes first: Metal keeps the pages it wraps until then (the system gets them back shortly after).
+        t.buf = {};
+        ::munlock(t.mem, t.bytes);
+        ::munmap(t.mem, t.bytes);
+        t.mem = nullptr;
+        lent += t.bytes;
+    }
+}
+
+bool ExpertArena::map_tail(uint32_t layer)
+{
+    Tail& t = tails_[layer];
+    void* mem = ::mmap(nullptr, t.bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    const int err = mem == MAP_FAILED ? errno : lock_chunked(mem, t.bytes);
+    if (err) {
+        if (mem != MAP_FAILED)
+            ::munmap(mem, t.bytes);
+        return false;
+    }
+    t.mem = mem;
+    t.buf = mtl::Ref<MTL::Buffer>(dev_->newBuffer(mem, t.bytes, MTL::ResourceStorageModeShared, nullptr));
+    if (!t.buf)
+        throw std::runtime_error("wrapping the lendable expert slots in a Metal buffer failed");
+    for (Region& r : regions_[layer])
+        if (r.stride)
+            r.tail = t.buf.get();
+    return true;
 }
 
 bool ExpertArena::reclaim()
 {
-    if (tail_mem_ || !tail_bytes_)
+    if (!lent())
         return true;
-    void* mem = ::mmap(nullptr, tail_bytes_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    const int err = mem == MAP_FAILED ? errno : lock_chunked(mem, tail_bytes_);
-    if (err) {
-        if (mem != MAP_FAILED)
-            ::munmap(mem, tail_bytes_);
-        // At construction the arena needs its slots; afterwards they can stay lent (unused) and come back later.
-        if (!lent_)
-            throw std::runtime_error(std::format("locking the lendable expert slots failed: {}", std::strerror(err)));
-        std::fprintf(stderr, "mako: taking back %.1f GB of lent expert slots failed (%s); running without them\n",
-                     tail_bytes_ / 1e9, std::strerror(err));
-        return false;
-    }
-    tail_mem_ = mem;
-    tail_buf_ = mtl::Ref<MTL::Buffer>(dev_->newBuffer(mem, tail_bytes_, MTL::ResourceStorageModeShared, nullptr));
-    if (!tail_buf_)
-        throw std::runtime_error("wrapping the lendable expert slots in a Metal buffer failed");
-    for (auto& rs : regions_)
-        for (Region& r : rs)
-            if (r.stride)
-                r.tail = tail_buf_.get();
-    if (!lent_) // construction: prefill() fills the slots
-        return true;
-    lent_ = false;
+    bool all = true;
+    for (uint32_t l = 0; l < layers_.size(); ++l)
+        if (tails_[l].bytes && !tails_[l].mem && !map_tail(l)) {
+            // They can stay lent (unused) and come back later.
+            std::fprintf(stderr, "mako: taking back %.1f GB of lent expert slots failed; running without them\n",
+                         tails_[l].bytes / 1e9);
+            all = false;
+            break;
+        }
     // Free slots take the best-scoring experts not resident (the prefill may have loaded some lend() evicted
     // elsewhere, displacing others).
     auto* table = static_cast<int32_t*>(table_buf_->contents());
@@ -563,6 +590,7 @@ bool ExpertArena::reclaim()
     for (uint32_t l = 0; l < layers_.size(); ++l) {
         if (!layers_[l][0].bytes)
             continue;
+        const uint32_t usable = tails_[l].bytes && !tails_[l].mem ? regions_[l][0].split : slots_[l];
         missing.clear();
         for (int e = 0; e < int(n_expert_); ++e)
             if (table[l * n_expert_ + e] < 0)
@@ -570,7 +598,7 @@ bool ExpertArena::reclaim()
         std::ranges::stable_sort(missing, [&](int x, int y) { return score_[l][x] > score_[l][y]; });
         loads.clear();
         size_t next = 0;
-        for (uint32_t s = 0; s < slots_[l] && next < missing.size(); ++s) {
+        for (uint32_t s = 0; s < usable && next < missing.size(); ++s) {
             if (slot_expert_[l][s] >= 0)
                 continue;
             const int e = missing[next++];
@@ -581,7 +609,7 @@ bool ExpertArena::reclaim()
         if (!loads.empty())
             read_into(l, loads);
     }
-    return true;
+    return all;
 }
 
 } // namespace mako::glm
