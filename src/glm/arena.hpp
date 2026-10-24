@@ -96,8 +96,8 @@ public:
 
     // Evicts the experts in the lendable slots and frees their memory; ensure() then uses only the other slots.
     void lend();
-    // Rebuilds the lendable slots and reads back the experts lend() evicted, unless resident by now. Returns false,
-    // leaving them lent, when their memory cannot be locked again.
+    // Rebuilds the lendable slots and fills the free slots with the best-scoring experts not resident. Returns
+    // false, leaving them lent, when their memory cannot be locked again.
     bool reclaim();
     bool lent() const { return lent_; }
 
@@ -126,7 +126,7 @@ private:
     std::vector<uint32_t> slots_;              // per layer
     std::vector<std::vector<int32_t>> order_;  // per layer, experts in prefill order
     std::vector<std::vector<uint64_t>> usage_;
-    std::vector<std::vector<uint64_t>> score_; // profile counts plus usage: the least scored resident is evicted
+    std::vector<std::vector<double>> score_;   // decayed usage, seeded from the profile: the least scored resident is evicted
     uint64_t bytes_ = 0;
     std::vector<std::pair<void*, uint64_t>> chunks_;
     std::vector<mtl::Ref<MTL::Buffer>> bufs_;
@@ -135,7 +135,6 @@ private:
     uint64_t tail_bytes_ = 0;
     mtl::Ref<MTL::Buffer> tail_buf_;
     bool lent_ = false;
-    std::vector<std::vector<int32_t>> evicted_; // [layer] experts lend() evicted
     mtl::Ref<MTL::Buffer> table_buf_;
     std::vector<std::vector<int32_t>> slot_expert_; // [layer][slot] -> expert, -1 free
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]

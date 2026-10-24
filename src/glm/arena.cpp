@@ -220,10 +220,13 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     slots_.assign(nl, 0);
     order_.assign(nl, {});
     usage_.assign(nl, std::vector<uint64_t>(n_expert, 0));
-    score_.assign(nl, std::vector<uint64_t>(n_expert, 0));
+    // The profile only seeds the scores (a tenth of a use per count), so the session's recent routing soon
+    // outweighs it.
+    score_.assign(nl, std::vector<double>(n_expert, 0.0));
     for (size_t l = 0; l < nl && l < counts.size(); ++l)
         if (counts[l].size() == n_expert)
-            score_[l] = counts[l];
+            for (uint32_t e = 0; e < n_expert; ++e)
+                score_[l][e] = 0.1 * double(counts[l][e]);
     const bool profiled = std::ranges::any_of(counts, [&](const auto& c) { return c.size() == n_expert; });
     for (size_t l = 0; l < nl; ++l) {
         if (!slot_bytes[l])
@@ -443,9 +446,13 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     if (size_t(std::ranges::count(taken, 0)) < misses)
         return false;
     ++clock_;
+    // Each use adds 1; scores halve every 256 calls, so usage long past counts for little.
+    static const double decay = std::exp2(-1.0 / 256);
+    for (double& c : score_[layer])
+        c *= decay;
     for (int e : experts) {
         ++usage_[layer][e];
-        ++score_[layer][e];
+        score_[layer][e] += 1.0;
     }
     std::vector<size_t> missed;
     for (size_t i = 0; i < experts.size(); ++i) {
@@ -476,7 +483,7 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
             }
             if (victim < 0)
                 victim = int32_t(s);
-            const uint64_t us = score_[layer][owner[s]], uv = score_[layer][owner[victim]];
+            const double us = score_[layer][owner[s]], uv = score_[layer][owner[victim]];
             if (us < uv || (us == uv && last[s] < last[victim]))
                 victim = int32_t(s);
         }
@@ -501,13 +508,11 @@ void ExpertArena::lend()
     if (lent_ || !tail_bytes_)
         return;
     auto* table = static_cast<int32_t*>(table_buf_->contents());
-    evicted_.assign(layers_.size(), {});
     for (uint32_t l = 0; l < layers_.size(); ++l)
         for (uint32_t s = regions_[l][0].split; s < slots_[l]; ++s) {
             if (pinned_[l][s])
                 throw std::runtime_error("lending a pinned expert slot");
             if (const int e = slot_expert_[l][s]; e >= 0) {
-                evicted_[l].push_back(e);
                 table[l * n_expert_ + e] = -1;
                 slot_expert_[l][s] = -1;
             }
@@ -547,19 +552,28 @@ bool ExpertArena::reclaim()
         for (Region& r : rs)
             if (r.stride)
                 r.tail = tail_buf_.get();
+    if (!lent_) // construction: prefill() fills the slots
+        return true;
     lent_ = false;
+    // Free slots take the best-scoring experts not resident (the prefill may have loaded some lend() evicted
+    // elsewhere, displacing others).
     auto* table = static_cast<int32_t*>(table_buf_->contents());
     std::vector<std::pair<int, int32_t>> loads;
-    for (uint32_t l = 0; l < evicted_.size(); ++l) {
+    std::vector<int> missing;
+    for (uint32_t l = 0; l < layers_.size(); ++l) {
+        if (!layers_[l][0].bytes)
+            continue;
+        missing.clear();
+        for (int e = 0; e < int(n_expert_); ++e)
+            if (table[l * n_expert_ + e] < 0)
+                missing.push_back(e);
+        std::ranges::stable_sort(missing, [&](int x, int y) { return score_[l][x] > score_[l][y]; });
         loads.clear();
-        uint32_t s = regions_[l][0].split;
-        for (int e : evicted_[l]) {
-            if (table[l * n_expert_ + e] >= 0)
+        size_t next = 0;
+        for (uint32_t s = 0; s < slots_[l] && next < missing.size(); ++s) {
+            if (slot_expert_[l][s] >= 0)
                 continue;
-            while (s < slots_[l] && slot_expert_[l][s] >= 0)
-                ++s;
-            if (s == slots_[l])
-                break;
+            const int e = missing[next++];
             slot_expert_[l][s] = e;
             table[l * n_expert_ + e] = int32_t(s);
             loads.emplace_back(e, int32_t(s));
@@ -567,7 +581,6 @@ bool ExpertArena::reclaim()
         if (!loads.empty())
             read_into(l, loads);
     }
-    evicted_.clear();
     return true;
 }
 
