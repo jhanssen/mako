@@ -79,7 +79,7 @@ struct ScoreArgs {
     uint32_t stride;
 };
 struct SelectArgs {
-    uint32_t first, n_top, kpool, score_stride, mask_stride, list_stride;
+    uint32_t first, n_top, kpool, score_stride, list_stride;
 };
 struct GatherArgs {
     uint32_t heads, dim, stride, splits, tokens;
@@ -1068,17 +1068,16 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     enc->setBuffer(score, 0, 3);
     enc->setBytes(&sa, sizeof(sa), 4);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreads(MTL::Size(last_pools, count, 1), MTL::Size(64, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size((last_pools + 255) / 256, count, 1), MTL::Size(256, 1, 1));
     after(enc, "idx_score");
     if (pos == pos_ && count == 1)
         probe(enc, "indexer_score", int(il), score, n_pool);
-    const SelectArgs sel{pos + 1, n_top, kp, stride, opts_.max_ctx, sparse_list_stride()};
+    const SelectArgs sel{pos + 1, n_top, kp, stride, sparse_list_stride()};
     enc->setComputePipelineState(pso("idx_select"));
     enc->setBuffer(score, 0, 0);
-    enc->setBuffer(scratch("idx_mask", uint64_t(count) * opts_.max_ctx), 0, 1);
-    enc->setBytes(&sel, sizeof(sel), 2);
-    enc->setBuffer(scratch("idx_list", uint64_t(count) * sparse_list_stride() * 4), 0, 3);
-    enc->setBuffer(scratch("idx_count", uint64_t(count) * 4), 0, 4);
+    enc->setBytes(&sel, sizeof(sel), 1);
+    enc->setBuffer(scratch("idx_list", uint64_t(count) * sparse_list_stride() * 4), 0, 2);
+    enc->setBuffer(scratch("idx_count", uint64_t(count) * 4), 0, 3);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(count, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "idx_select");

@@ -826,23 +826,33 @@ struct ScoreArgs {
 // pools; grid (pools of the last token, tokens).
 kernel void idx_score(device const float* q [[buffer(0)]], device const float* w [[buffer(1)]],
                       device const float* pooled [[buffer(2)]], device float* score [[buffer(3)]],
-                      constant ScoreArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+                      constant ScoreArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                      uint2 tid2 [[thread_position_in_threadgroup]])
 {
-    const uint p = gid.x, j = gid.y;
-    if (p >= (a.first + j) / a.kpool)
-        return;
+    // Threadgroups (pools / 256, tokens): the token's q and w in threadgroup memory, a pool per thread with one
+    // accumulator per head (heads <= 32, dim <= 128), so each key element is read once.
+    threadgroup float qs[32 * 128], ws[32];
+    const uint tid = tid2.x, j = tg.y, p = tg.x * 256 + tid;
     q += uint64_t(j) * a.heads * a.dim;
     w += uint64_t(j) * a.heads;
-    score += uint64_t(j) * a.stride;
+    for (uint i = tid; i < a.heads * a.dim; i += 256)
+        qs[i] = q[i];
+    if (tid < a.heads)
+        ws[tid] = w[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p >= (a.first + j) / a.kpool)
+        return;
     device const float* k = pooled + uint64_t(p) * a.dim;
-    float total = 0.0f;
-    for (uint h = 0; h < a.heads; ++h) {
-        float dot = 0.0f;
-        for (uint i = 0; i < a.dim; ++i)
-            dot += q[h * a.dim + i] * k[i];
-        total += max(dot, 0.0f) * w[h];
+    float dot[32] = {};
+    for (uint i = 0; i < a.dim; ++i) {
+        const float kv = k[i];
+        for (uint h = 0; h < a.heads; ++h)
+            dot[h] += qs[h * a.dim + i] * kv;
     }
-    score[p] = total * a.w_scale;
+    float total = 0.0f;
+    for (uint h = 0; h < a.heads; ++h)
+        total += max(dot[h], 0.0f) * ws[h];
+    score[uint64_t(j) * a.stride + p] = total * a.w_scale;
 }
 
 struct SelectArgs {
@@ -850,7 +860,6 @@ struct SelectArgs {
     uint n_top;        // pools to keep
     uint kpool;
     uint score_stride; // floats between tokens' score rows
-    uint mask_stride;  // bytes between tokens' mask rows
     uint list_stride;  // entries between tokens' cell lists
 };
 struct SelectRow {
@@ -863,97 +872,92 @@ static uint order_key(float f)
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// mask[cell] = 1 for the members of the n_top best pools and for the incomplete tail; one threadgroup per token.
-// Ties at the threshold keep the lowest pool indices.
-kernel void idx_select(device const float* score [[buffer(0)]], device uchar* mask [[buffer(1)]],
-                       constant SelectArgs& sa [[buffer(2)]], device uint* list [[buffer(3)]],
-                       device uint* count [[buffer(4)]], uint tid [[thread_position_in_threadgroup]],
-                       uint j [[threadgroup_position_in_grid]])
+// Exclusive prefix sum of v over the threadgroup (TG threads); sums holds TG / 32 entries. Also returns the total.
+static uint tg_prefix(uint v, threadgroup uint* sums, uint tid, thread uint& total)
+{
+    const uint in_simd = simd_prefix_exclusive_sum(v);
+    if (tid % 32 == 31)
+        sums[tid / 32] = in_simd + v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint base = 0;
+    total = 0;
+    for (uint w = 0; w < TG / 32; ++w) {
+        base += w < tid / 32 ? sums[w] : 0;
+        total += sums[w];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return base + in_simd;
+}
+
+// One threadgroup per token: the cells of its n_top best pools (ties at the threshold keep the lowest pool
+// indices) and of the incomplete tail, as a sorted list, and their count.
+kernel void idx_select(device const float* score [[buffer(0)]], constant SelectArgs& sa [[buffer(1)]],
+                       device uint* list [[buffer(2)]], device uint* count [[buffer(3)]],
+                       uint tid [[thread_position_in_threadgroup]], uint j [[threadgroup_position_in_grid]])
 {
     score += uint64_t(j) * sa.score_stride;
-    mask += uint64_t(j) * sa.mask_stride;
+    list += uint64_t(j) * sa.list_stride;
     const SelectRow a{(sa.first + j) / sa.kpool, sa.n_top, sa.kpool, sa.first + j};
     threadgroup atomic_uint hist[256];
+    threadgroup uint sums[TG / 32];
     threadgroup uint sh_prefix, sh_need;
-    const uint all = a.n_pool <= a.n_top;
+    const bool all = a.n_pool <= a.n_top;
     if (tid == 0) {
         sh_prefix = 0;
         sh_need = a.n_top;
     }
-    uint prefix_mask = 0;
+    // Radix select of the n_top-th largest key, 8 bits at a time: the bucket where the count from the top reaches
+    // what is still needed (a prefix sum over the buckets in descending order).
+    uint prefix_mask = 0, total = 0;
     for (int shift = 24; shift >= 0 && !all; shift -= 8) {
-        for (uint i = tid; i < 256; i += TG)
-            atomic_store_explicit(&hist[i], 0, memory_order_relaxed);
+        atomic_store_explicit(&hist[tid], 0, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint prefix = sh_prefix;
+        const uint prefix = sh_prefix, need = sh_need;
         for (uint p = tid; p < a.n_pool; p += TG) {
             const uint k = order_key(score[p]);
             if ((k & prefix_mask) == prefix)
                 atomic_fetch_add_explicit(&hist[(k >> shift) & 255], 1, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            uint need = sh_need;
-            for (int b = 255; b >= 0; --b) {
-                const uint c = atomic_load_explicit(&hist[b], memory_order_relaxed);
-                if (c >= need) {
-                    sh_prefix = prefix | (uint(b) << shift);
-                    break;
-                }
-                need -= c;
-            }
-            sh_need = need;
+        const uint b = 255 - tid, c = atomic_load_explicit(&hist[b], memory_order_relaxed);
+        const uint before = tg_prefix(c, sums, tid, total);
+        if (before < need && need <= before + c) {
+            sh_prefix = prefix | (b << shift);
+            sh_need = need - before;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         prefix_mask |= 255u << shift;
     }
     const uint thresh = sh_prefix, ties = sh_need;
-    // keep everything above the threshold key, and the first `ties` pools equal to it
-    if (tid == 0) {
-        uint c = 0;
-        for (uint p = 0; p < a.n_pool && !all; ++p)
-            if (order_key(score[p]) == thresh) {
-                mask[p * a.kpool] = c < ties ? 2 : 0;
-                ++c;
-            }
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint p = tid; p < a.n_pool; p += TG) {
-        uchar keep;
-        if (all)
-            keep = 1;
-        else {
-            const uint k = order_key(score[p]);
-            keep = k > thresh ? 1 : (k == thresh ? (mask[p * a.kpool] == 2 ? 1 : 0) : 0);
-        }
-        for (uint j = 0; j < a.kpool; ++j)
-            mask[p * a.kpool + j] = keep;
-    }
-    for (uint c = a.n_pool * a.kpool + tid; c < a.n_kv; c += TG)
-        mask[c] = 1;
 
-    // The kept cells as a sorted list (for attention that gathers them): each thread counts a contiguous range,
-    // a prefix sum gives its offset.
-    threadgroup_barrier(mem_flags::mem_device);
-    threadgroup uint sums[TG / 32];
-    list += uint64_t(j) * sa.list_stride;
-    const uint per = (a.n_kv + TG - 1) / TG, c0 = min(a.n_kv, tid * per), c1 = min(a.n_kv, c0 + per);
-    uint mine = 0;
-    for (uint c = c0; c < c1; ++c)
-        mine += mask[c] != 0;
-    const uint in_simd = simd_prefix_exclusive_sum(mine);
-    if (tid % 32 == 31)
-        sums[tid / 32] = in_simd + mine;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint base = 0;
-    for (uint w = 0; w < tid / 32; ++w)
-        base += sums[w];
-    uint at = base + in_simd;
-    for (uint c = c0; c < c1; ++c)
-        if (mask[c])
-            list[at++] = c;
-    if (tid == TG - 1)
-        count[j] = at;
+    // Each thread takes a contiguous range of pools: count the kept ones (above the threshold, or equal to it with a
+    // rank below `ties`), then write their cells at its offset.
+    const uint per = (a.n_pool + TG - 1) / TG, p0 = min(a.n_pool, tid * per), p1 = min(a.n_pool, p0 + per);
+    uint gt = 0, eq = 0;
+    for (uint p = p0; p < p1; ++p) {
+        const uint k = order_key(score[p]);
+        gt += all || k > thresh;
+        eq += !all && k == thresh;
+    }
+    const uint eq_before = tg_prefix(eq, sums, tid, total);
+    const uint eq_kept = ties > eq_before ? min(eq, ties - eq_before) : 0;
+    uint kept_total = 0;
+    const uint kept_before = tg_prefix(gt + eq_kept, sums, tid, kept_total);
+    uint at = kept_before * a.kpool, rank = eq_before;
+    for (uint p = p0; p < p1; ++p) {
+        const uint k = order_key(score[p]);
+        bool keep = all || k > thresh;
+        if (!all && k == thresh)
+            keep = rank++ < ties;
+        if (keep)
+            for (uint c = 0; c < a.kpool; ++c)
+                list[at++] = p * a.kpool + c;
+    }
+    const uint tail0 = a.n_pool * a.kpool;
+    for (uint c = tail0 + tid; c < a.n_kv; c += TG)
+        list[kept_total * a.kpool + (c - tail0)] = c;
+    if (tid == 0)
+        count[j] = kept_total * a.kpool + (a.n_kv - tail0);
 }
 
 // y[t * ldy + i] = x[t * n + i]; grid (n, rows).
