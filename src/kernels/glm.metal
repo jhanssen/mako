@@ -422,8 +422,9 @@ struct SwigluArgs {
 };
 
 // y = silu(min(g, limit)) * clamp(u, -limit, limit); g and u are [rows][n].
+template <typename T>
 kernel void swiglu(device const float* gt [[buffer(0)]], device const float* up [[buffer(1)]],
-                   device float* y [[buffer(2)]], constant SwigluArgs& a [[buffer(3)]],
+                   device T* y [[buffer(2)]], constant SwigluArgs& a [[buffer(3)]],
                    uint i [[thread_position_in_grid]])
 {
     if (i >= a.n)
@@ -433,8 +434,12 @@ kernel void swiglu(device const float* gt [[buffer(0)]], device const float* up 
         g = min(g, a.limit);
         u = clamp(u, -a.limit, a.limit);
     }
-    y[i] = g * sigmoidf(g) * u;
+    y[i] = T(g * sigmoidf(g) * u);
 }
+template [[host_name("swiglu")]] kernel void swiglu<float>(device const float*, device const float*, device float*,
+                                                          constant SwigluArgs&, uint);
+template [[host_name("swiglu_half")]] kernel void swiglu<half>(device const float*, device const float*, device half*,
+                                                              constant SwigluArgs&, uint);
 
 struct CombineArgs {
     uint n;
@@ -557,13 +562,18 @@ kernel void moe_combine_split(device const float* x_hit [[buffer(0)]], device co
 }
 
 // y[i] = x[idx[i]], rows of n; grid (n, rows of y).
+template <typename T>
 kernel void gather_rows(device const float* x [[buffer(0)]], device const int* idx [[buffer(1)]],
-                        device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
+                        device T* y [[buffer(2)]], constant uint& n [[buffer(3)]],
                         uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x < n)
-        y[uint64_t(gid.y) * n + gid.x] = x[uint64_t(idx[gid.y]) * n + gid.x];
+        y[uint64_t(gid.y) * n + gid.x] = T(x[uint64_t(idx[gid.y]) * n + gid.x]);
 }
+template [[host_name("gather_rows")]] kernel void gather_rows<float>(device const float*, device const int*,
+                                                                    device float*, constant uint&, uint2);
+template [[host_name("gather_rows_half")]] kernel void gather_rows<half>(device const float*, device const int*,
+                                                                        device half*, constant uint&, uint2);
 
 // Per token t: y[t] = shared[t] + sum_e w[t][e] * x[pos[t][e]], over n_used experts (w, pos rows of 16);
 // grid (n, tokens).

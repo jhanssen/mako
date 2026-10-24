@@ -70,17 +70,18 @@ int main(int argc, char** argv)
             for (size_t i = 0; i < rows.size(); ++i)
                 mako::quant::dequant_row(t->type, data.data() + rows[i] * rb, deq[i].data(), k);
 
-        for (bool exact : {false, true})
         for (uint32_t tokens : {1u, 37u, 64u, 200u}) {
-            gemm.set_exact_activations(exact);
-            auto x = buffer(uint64_t(k) * tokens * 4), y = buffer(uint64_t(n) * tokens * 4);
+            auto x = buffer(uint64_t(k) * tokens * 4), xh = buffer(uint64_t(k) * tokens * 2);
+            auto y = buffer(uint64_t(n) * tokens * 4);
             auto* xf = static_cast<float*>(x->contents());
             for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
                 xf[i] = nd(rng);
             auto yref = buffer(uint64_t(n) * tokens * 4);
             auto* cb = ctx.queue()->commandBuffer();
             auto* enc = cb->computeCommandEncoder();
-            gemm.encode(enc, t->type, k, n, tokens, w.get(), 0, x.get(), 0, y.get(), 0);
+            gemm.to_half(enc, x.get(), 0, tokens, k, 0, xh.get(), 0);
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            gemm.encode(enc, t->type, k, n, tokens, w.get(), 0, xh.get(), 0, y.get(), 0);
             if (!cpu_ref) {
                 mako::mtl::Gemv::Args a{t->type, k, n, tokens, 1, false};
                 gemv.encode(enc, a, w.get(), 0, x.get(), 0, yref.get(), 0);
@@ -106,27 +107,31 @@ int main(int argc, char** argv)
             const double rel = std::sqrt(err / ref);
             const bool ok = rel < 5e-3;
             failures += !ok;
-            std::println("{:28} {:7} k={:5} n={:6} t={:4} {}  rel err {:.2e} vs {}  {}", name, tr.name, k, n,
-                         tokens, exact ? "x32" : "x16", rel, cpu_ref ? "CPU" : "GEMV", ok ? "ok" : "FAIL");
+            std::println("{:28} {:7} k={:5} n={:6} t={:4}  rel err {:.2e} vs {}  {}", name, tr.name, k, n, tokens,
+                         rel, cpu_ref ? "CPU" : "GEMV", ok ? "ok" : "FAIL");
         }
 
-        // Speed at 512 tokens.
-        for (bool exact : {false, true}) {
-        gemm.set_exact_activations(exact);
-        const uint32_t tokens = 512;
-        auto x = buffer(uint64_t(k) * tokens * 4), y = buffer(uint64_t(n) * tokens * 4);
-        std::fill_n(static_cast<float*>(x->contents()), uint64_t(k) * tokens, 0.01f);
+        // Speed at 28 (an expert's share of a chunk), 64 and 512 tokens (random activations: the matrix units' power, and so clocks, depend on the data).
+        for (const uint32_t tokens : {28u, 64u, 512u}) {
+        auto xh = buffer(uint64_t(k) * tokens * 2), y = buffer(uint64_t(n) * tokens * 4);
+        for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
+            static_cast<__fp16*>(xh->contents())[i] = __fp16(nd(rng));
+        // Sustained: the GPU clocks down between short, spaced-out dispatches, so time 20 back to back after a
+        // warm-up of about half a second.
         double best = 1e9;
-        for (int rep = 0; rep < 5; ++rep) {
+        for (int rep = 0; rep < 8; ++rep) {
             auto* cb = ctx.queue()->commandBuffer();
             auto* enc = cb->computeCommandEncoder();
-            gemm.encode(enc, t->type, k, n, tokens, w.get(), 0, x.get(), 0, y.get(), 0);
+            const int n_disp = rep < 3 ? 200 : 20;
+            for (int d = 0; d < n_disp; ++d)
+                gemm.encode(enc, t->type, k, n, tokens, w.get(), 0, xh.get(), 0, y.get(), 0);
             enc->endEncoding();
             cb->commit();
             cb->waitUntilCompleted();
-            best = std::min(best, cb->GPUEndTime() - cb->GPUStartTime());
+            if (rep >= 3)
+                best = std::min(best, (cb->GPUEndTime() - cb->GPUStartTime()) / n_disp);
         }
-        std::println("{:28} t=512 {}: {:8.1f} us, {:6.2f} TFLOP/s", name, exact ? "x32" : "x16", best * 1e6,
+        std::println("{:28} t={:3}: {:8.1f} us, {:6.2f} TFLOP/s", name, tokens, best * 1e6,
                      2.0 * k * n * tokens / best / 1e12);
         }
     }

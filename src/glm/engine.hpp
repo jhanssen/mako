@@ -136,6 +136,9 @@ private:
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T);
     void serve_moe(MTL::CommandBuffer* cb);
+    // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
+    MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
+                        uint32_t ld);
     uint64_t prefill_scratch(uint32_t chunk) const;
     // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
     MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section,

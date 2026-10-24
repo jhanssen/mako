@@ -405,7 +405,8 @@ uint64_t Engine::prefill_scratch(uint32_t chunk) const
                                + 2 * cfg_.q_lora_rank + H * cfg_.head_k + 2 * R + 2 * H * R + H * cfg_.head_v
                                + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) + cfg_.indexer_dim // MLA
                                + 3 * uint64_t(cfg_.n_ff)                                        // dense FFN
-                               + 2 * cfg_.n_expert + 32 + 2 * k * E + 3 * k * cfg_.n_ff_exp;    // MoE
+                               + 2 * cfg_.n_expert + 32 + 2 * k * E + 3 * k * cfg_.n_ff_exp     // MoE
+                               + std::max<uint64_t>({cfg_.n_ff, H * R, H * cfg_.head_k, inner}) / 2; // GEMM input
     return uint64_t(chunk) * per_token * 4 + (96ull << 20);
 }
 
@@ -543,8 +544,8 @@ void Engine::proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buf
                   uint64_t y_off, uint32_t T, uint32_t ldy)
 {
     const uint32_t k = uint32_t(w.dims[0]), n = uint32_t(w.dims[1]);
-    if (T > 1 && (n >= 256 || (ldy && ldy != n)) && k % 64 == 0 && mtl::Gemm::supports(w.type)) {
-        gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, x, x_off, y, y_off, ldy);
+    if (T > 1 && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type)) {
+        gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, halves(enc, x, x_off, T, k, 0), 0, y, y_off, ldy);
         if (opts_.telemetry == Telemetry::kernels)
             after(enc, std::format("gemm {} {}x{}", gguf::traits(w.type).name, k, n));
         return;
@@ -555,6 +556,14 @@ void Engine::proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buf
     }
     for (uint32_t t = 0; t < T; ++t)
         gemv(enc, w, x, x_off + uint64_t(t) * k * 4, y, y_off + uint64_t(t) * ldy * 4);
+}
+
+MTL::Buffer* Engine::halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
+                            uint32_t ld)
+{
+    MTL::Buffer* h = scratch("xh", uint64_t(rows) * cols * 2);
+    gemm_->to_half(enc, x, x_off, rows, cols, ld, h, 0);
+    return h;
 }
 
 void Engine::dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
@@ -726,7 +735,7 @@ void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::B
     const uint32_t splits = (n_kv + keys_per_split - 1) / keys_per_split;
     MTL::Buffer* scores = scratch("scores", uint64_t(rows) * n_kv * 4);
     MTL::Buffer* partial = scratch("pv_part", uint64_t(splits) * rows * R * 4);
-    gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, cache, 0, q, q_off, scores, 0);
+    gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, cache, 0, halves(enc, q, q_off, rows, R, 0), 0, scores, 0);
     after(enc, "attn_scores");
     const SoftmaxArgs sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u, first_kv, H};
     enc->setComputePipelineState(pso("attn_softmax"));
@@ -791,8 +800,9 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         }
         const uint32_t k = uint32_t(w.dims[0]), nr = uint32_t(w.dims[1]);
         const uint64_t mat = mtl::Gemv::row_bytes(w.type, k) * nr;
+        MTL::Buffer* xh = halves(enc, x, 0, T, H * xw, 0);
         for (uint32_t h = 0; h < H; ++h)
-            gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off + h * mat, x, uint64_t(h) * xw * 4, y,
+            gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off + h * mat, xh, uint64_t(h) * xw * 2, y,
                           uint64_t(h) * yw * 4, H * yw, H * xw);
         after(enc, "per_head_gemm");
     };
@@ -1381,10 +1391,10 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                         posp[u] = int32_t(row++);
                     }
                 }
-                MTL::Buffer* xg = scratch("p_xg", uint64_t(rows) * E * 4);
+                MTL::Buffer* xg = scratch("p_xg", uint64_t(rows) * E * 2); // half, for the GEMMs
                 MTL::Buffer* gg = scratch("p_gg", uint64_t(rows) * nff * 4);
                 MTL::Buffer* ug = scratch("p_ug", uint64_t(rows) * nff * 4);
-                MTL::Buffer* mg = scratch("p_mg", uint64_t(rows) * nff * 4);
+                MTL::Buffer* mg = scratch("p_mg", uint64_t(rows) * nff * 2); // half
                 MTL::Buffer* yg = scratch("p_yg", uint64_t(rows) * E * 4);
                 const SwigluArgs sa0{0, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
 
@@ -1399,7 +1409,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                         const ExpertArena::Part& p = arena_->part(il, part);
                         const auto [wb, wo] = arena_->region(il, part).at(uint32_t(slot[e]));
                         gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, x,
-                                      uint64_t(start[e]) * xw * 4, y, uint64_t(start[e]) * yw * 4);
+                                      uint64_t(start[e]) * xw * 2, y, uint64_t(start[e]) * yw * 4);
                     };
                     for (size_t i = b0; i < b1; ++i) {
                         gemm_part(0, order[i], xg, E, gg, nff);
@@ -1409,10 +1419,10 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     const uint32_t r0 = start[order[b0]], r1 = start[order[b1 - 1]] + uint32_t(users[order[b1 - 1]].size());
                     SwigluArgs sa = sa0;
                     sa.n = (r1 - r0) * nff;
-                    enc->setComputePipelineState(pso("swiglu"));
+                    enc->setComputePipelineState(pso("swiglu_half"));
                     enc->setBuffer(gg, uint64_t(r0) * nff * 4, 0);
                     enc->setBuffer(ug, uint64_t(r0) * nff * 4, 1);
-                    enc->setBuffer(mg, uint64_t(r0) * nff * 4, 2);
+                    enc->setBuffer(mg, uint64_t(r0) * nff * 2, 2);
                     enc->setBytes(&sa, sizeof(sa), 3);
                     enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
                     enc->memoryBarrier(MTL::BarrierScopeBuffers);
@@ -1423,7 +1433,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 };
 
                 const uint32_t ne = E;
-                enc->setComputePipelineState(pso("gather_rows"));
+                enc->setComputePipelineState(pso("gather_rows_half"));
                 enc->setBuffer(xn, 0, 0);
                 enc->setBuffer(tok, 0, 1);
                 enc->setBuffer(xg, 0, 2);
