@@ -586,78 +586,68 @@ struct RouteArgs {
 // Then each selected expert is looked up in `slots` (this layer's expert -> arena slot, -1 absent): a resident
 // one gets its slot in hit_ids and miss_rank -1; a missing one slot 0 (its result is not used) and its index
 // among the misses. The miss count goes to the z of the three indirect dispatches (gate, up, down).
-// One threadgroup of TG threads per token t: logits and biased rows of n_expert, sel and w rows of 16 (n_used
-// <= 16 used); hit_ids, miss_rank and indirect only with a.lookup.
+// One simdgroup (32 threads) per token t: logits and biased rows of n_expert (<= 512), sel and w rows of 16
+// (n_used <= 16 used); hit_ids, miss_rank and indirect only with a.lookup. Lane l keeps experts l, l + 32, ... in
+// registers; each of the n_used rounds takes the largest biased score left (lowest index on ties).
 kernel void moe_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
                       device int* sel [[buffer(2)]], device float* w [[buffer(3)]], device float* biased [[buffer(4)]],
                       constant RouteArgs& a [[buffer(5)]], device const int* slots [[buffer(6)]],
                       device int* hit_ids [[buffer(7)]], device int* miss_rank [[buffer(8)]],
-                      device uint* indirect [[buffer(9)]], uint tid [[thread_position_in_threadgroup]],
+                      device uint* indirect [[buffer(9)]], uint lane [[thread_position_in_threadgroup]],
                       uint t [[threadgroup_position_in_grid]])
 {
+    constexpr uint K = 16;
     logits += uint64_t(t) * a.n_expert;
     biased += uint64_t(t) * a.n_expert;
     sel += t * 16;
     w += t * 16;
-    threadgroup float best_v[TG / 32];
-    threadgroup uint best_i[TG / 32];
-    threadgroup uint chosen[16];
-    for (uint e = tid; e < a.n_expert; e += TG)
-        biased[e] = 1.0f / (1.0f + precise::exp(-logits[e])) + bias[e];
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint r = 0; r < a.n_used; ++r) {
-        float v = -INFINITY;
-        uint idx = 0xffffffffu;
-        for (uint e = tid; e < a.n_expert; e += TG) {
-            bool taken = false;
-            for (uint j = 0; j < r; ++j)
-                taken |= chosen[j] == e;
-            const float b = biased[e];
-            if (!taken && (b > v || (b == v && e < idx))) {
-                v = b;
-                idx = e;
-            }
+    float v[K];
+    for (uint k = 0; k < K; ++k) {
+        const uint e = lane + 32 * k;
+        v[k] = -INFINITY;
+        if (e < a.n_expert) {
+            v[k] = 1.0f / (1.0f + precise::exp(-logits[e])) + bias[e];
+            biased[e] = v[k];
         }
-        const float m = simd_max(v);
-        const uint mi = simd_min(v == m ? idx : 0xffffffffu);
-        if (tid % 32 == 0) {
-            best_v[tid / 32] = m;
-            best_i[tid / 32] = mi;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            float bv = -INFINITY;
-            uint bi = 0xffffffffu;
-            for (uint s = 0; s < TG / 32; ++s)
-                if (best_v[s] > bv || (best_v[s] == bv && best_i[s] < bi)) {
-                    bv = best_v[s];
-                    bi = best_i[s];
-                }
-            chosen[r] = bi;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0) {
-        float p[16], sum = 0.0f;
-        for (uint j = 0; j < a.n_used; ++j) {
-            p[j] = 1.0f / (1.0f + precise::exp(-logits[chosen[j]]));
-            sum += p[j];
-        }
-        if (a.norm)
-            sum = max(sum, 6.103515625e-5f);
-        uint misses = 0;
-        for (uint j = 0; j < a.n_used; ++j) {
-            sel[j] = int(chosen[j]);
-            w[j] = (a.norm ? p[j] / sum : p[j]) * a.scale;
-            if (a.lookup) {
-                const int s = slots[chosen[j]];
-                hit_ids[j] = max(s, 0);
-                miss_rank[j] = s >= 0 ? -1 : int(misses++);
+    uint mine = 0xffffffffu; // the expert chosen in round `lane`
+    for (uint r = 0; r < a.n_used; ++r) {
+        float bv = -INFINITY;
+        uint bk = 0;
+        for (uint k = 0; k < K; ++k)
+            if (v[k] > bv) { // ascending e within the lane: strict > keeps the lowest index on ties
+                bv = v[k];
+                bk = k;
             }
+        const float m = simd_max(bv);
+        const uint e = simd_min(bv == m && bv > -INFINITY ? lane + 32 * bk : 0xffffffffu);
+        if (e % 32 == lane)
+            v[e / 32] = -INFINITY;
+        if (lane == r)
+            mine = e;
+    }
+    const bool used = lane < a.n_used;
+    const float p = used ? 1.0f / (1.0f + precise::exp(-logits[mine])) : 0.0f;
+    float sum = 0.0f;
+    for (uint j = 0; j < a.n_used; ++j)
+        sum += simd_shuffle(p, j);
+    if (a.norm)
+        sum = max(sum, 6.103515625e-5f);
+    if (used) {
+        sel[lane] = int(mine);
+        w[lane] = (a.norm ? p / sum : p) * a.scale;
+    }
+    if (a.lookup) {
+        const int s = used ? slots[mine] : 0;
+        const uint miss = used && s < 0 ? 1u : 0u;
+        const uint rank = simd_prefix_exclusive_sum(miss);
+        if (used) {
+            hit_ids[lane] = max(s, 0);
+            miss_rank[lane] = miss ? int(rank) : -1;
         }
-        if (a.lookup)
-            for (uint d = 0; d < 3; ++d)
-                indirect[d * 3 + 2] = misses;
+        const uint misses = simd_sum(miss);
+        if (lane < 3)
+            indirect[lane * 3 + 2] = misses;
     }
 }
 

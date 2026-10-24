@@ -1226,7 +1226,7 @@ const std::vector<float>& Engine::step(int32_t token)
             enc->setBuffer(miss_rank, 0, 8);
             enc->setBuffer(indirect, ind_off, 9);
             for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(32, 1, 1));
             after(enc, "moe_route");
             enc->endEncoding();
             const uint64_t v = ++event_value_;
@@ -1474,7 +1474,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 enc->setBuffer(unused, 0, 8);
                 enc->setBuffer(unused, 0, 9);
                 for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-                    enc->dispatchThreadgroups(MTL::Size(G, 1, 1), MTL::Size(256, 1, 1));
+                    enc->dispatchThreadgroups(MTL::Size(G, 1, 1), MTL::Size(32, 1, 1));
                 after(enc, "moe_route");
                 submit(cb, enc);
                 cur_cb_ = cb;
