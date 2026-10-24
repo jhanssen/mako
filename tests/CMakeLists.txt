@@ -3,3 +3,6 @@ target_link_libraries(gemv_test PRIVATE mako_glm)
 
 add_executable(tokenizer_test tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE mako_text)
+
+add_executable(gemm_test gemm_test.cpp)
+target_link_libraries(gemm_test PRIVATE mako_mtl)
