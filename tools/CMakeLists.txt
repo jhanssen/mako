@@ -21,3 +21,6 @@ target_link_libraries(ffn_check PRIVATE mako_glm)
 if(MAKO_REF_SRC AND MAKO_REF_BUILD)
     add_subdirectory(ref_dump)
 endif()
+
+add_executable(mako_serve mako_serve.cpp)
+target_link_libraries(mako_serve PRIVATE mako_server)

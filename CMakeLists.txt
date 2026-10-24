@@ -31,6 +31,7 @@ target_link_libraries(metal_cpp INTERFACE
 
 include(cmake/gemv_kernels.cmake)
 include(cmake/jinja.cmake)
+include(cmake/server_deps.cmake)
 
 add_subdirectory(src)
 add_subdirectory(bench)
