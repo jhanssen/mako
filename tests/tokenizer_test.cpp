@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <filesystem>
 #include <print>
 #include <sstream>
 #include <string>
@@ -17,6 +18,10 @@ int main(int argc, char** argv)
     if (argc < 4) {
         std::println(stderr, "usage: tokenizer_test <model.gguf> <cases> <expected>");
         return 2;
+    }
+    if (!std::filesystem::exists(argv[1])) {
+        std::println("model {} not found: skipped", argv[1]);
+        return 77;
     }
     auto f = mako::gguf::File::open(argv[1]);
     if (!f) {

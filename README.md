@@ -36,6 +36,18 @@ The first configure downloads pinned dependencies (metal-cpp and third-party GEM
 The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e.g. the Maya-S quantization
 (`peasantsmith/GLM-5.3-Flash-Maya-GGUF`, `Maya-S-v2-IQ2_XXS`).
 
+## Tests
+
+```sh
+cmake -S . -B build -DMAKO_MODEL=<model-00001-of-0000N.gguf>   # or MAKO_MODEL in the environment at configure
+ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | e2e
+```
+
+Every test needs the model and reports as skipped without it. The `e2e` tests (about a minute) check greedy decode
+tokens, prefill against token-by-token decode, logits against stored reference top-k (`tests/data/parity_ref.bin`)
+and a prompt past the dense-attention window. After an intended numerical change, `regress_test <model> --update`
+re-records `tests/data/regress_expected.txt`; review that diff.
+
 ## Layout
 
 | Path | Contents |
@@ -44,6 +56,6 @@ The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
 | `src/glm` | GLM-5.3-Flash config and engine |
-| `tools` | `mako_run`, `gguf_dump`, optional `ref_dump` for parity checks |
-| `tests` | kernel tests against CPU dequantization |
+| `tools` | `mako_run`, `mako_calibrate`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
+| `tests` | kernel, tokenizer and end-to-end regression tests (ctest) |
 | `bench` | SSD, sync, matmul and quantization-format microbenchmarks |

@@ -46,6 +46,10 @@ public:
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
 
     uint32_t position() const { return pos_; }
+    // Back to position 0 with empty recurrent state (the expert arena keeps its contents).
+    void reset();
+    // At most the chunk size the engine was built with, which sized the arena's lendable slots.
+    void set_prefill_chunk(uint32_t chunk);
 
     // Called after each named stage of a step with the fp32 values it produced (for parity checks).
     using Probe = std::function<void(const std::string& name, int layer, const float* data, size_t n)>;
@@ -170,6 +174,7 @@ private:
     std::vector<mtl::Ref<MTL::Buffer>> kda_state_, conv_state_, kv_cache_, idx_cache_, idx_pooled_;
 
     uint32_t pos_ = 0;
+    uint32_t built_chunk_ = 0;
     std::vector<float> logits_;
     // Each MoE layer signals routed_ after its router ran and waits for ready_, which the CPU signals once the
     // selected experts are resident and their slots written (serve_moe).

@@ -238,6 +238,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     for (const auto& L : layers_)
         parts.push_back(L->experts);
     arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
+    built_chunk_ = opts_.prefill_chunk;
     arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk));
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
     auto t_phase = Clock::now();
@@ -406,6 +407,24 @@ uint64_t Engine::prefill_scratch(uint32_t chunk) const
                                + 3 * uint64_t(cfg_.n_ff)                                        // dense FFN
                                + 2 * cfg_.n_expert + 32 + 2 * k * E + 3 * k * cfg_.n_ff_exp;    // MoE
     return uint64_t(chunk) * per_token * 4 + (96ull << 20);
+}
+
+void Engine::reset()
+{
+    for (auto& b : kda_state_)
+        if (b)
+            std::memset(b->contents(), 0, b->length());
+    for (auto& b : conv_state_)
+        if (b)
+            std::memset(b->contents(), 0, b->length());
+    pos_ = 0;
+}
+
+void Engine::set_prefill_chunk(uint32_t chunk)
+{
+    if (chunk > built_chunk_)
+        throw std::runtime_error(std::format("prefill chunk {} above the {} the engine was built with", chunk, built_chunk_));
+    opts_.prefill_chunk = chunk;
 }
 
 void Engine::save_profile(const std::filesystem::path& path, bool merge) const

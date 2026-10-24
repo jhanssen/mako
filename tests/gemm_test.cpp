@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <print>
 #include <random>
 #include <string>
@@ -20,6 +21,10 @@ int main(int argc, char** argv)
     if (argc < 2) {
         std::println(stderr, "usage: gemm_test <model.gguf> [tensor ...]");
         return 2;
+    }
+    if (!std::filesystem::exists(argv[1])) {
+        std::println("model {} not found: skipped", argv[1]);
+        return 77;
     }
     auto f = mako::gguf::File::open(argv[1]);
     if (!f) {

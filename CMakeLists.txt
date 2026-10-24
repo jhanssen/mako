@@ -34,4 +34,7 @@ include(cmake/gemv_kernels.cmake)
 add_subdirectory(src)
 add_subdirectory(bench)
 add_subdirectory(tools)
+# Model-backed tests (ctest) need the first shard of the GGUF; without it they report as skipped.
+set(MAKO_MODEL "$ENV{MAKO_MODEL}" CACHE FILEPATH "First GGUF shard for the tests")
+enable_testing()
 add_subdirectory(tests)
