@@ -39,20 +39,24 @@ struct NormArgs {
     float eps;
 };
 
-// y = x / sqrt(mean(x^2) + eps) * w, one threadgroup per row.
+// y = x / sqrt(mean(x^2) + eps) * w (w of n, or none when wn is 0), one threadgroup per row; n a multiple of 4.
 kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                      device float* y [[buffer(2)]], constant NormArgs& a [[buffer(3)]],
                      uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
-    device const float* xr = x + uint64_t(row) * a.n;
-    device float* yr = y + uint64_t(row) * a.n;
+    device const float4* xr = reinterpret_cast<device const float4*>(x + uint64_t(row) * a.n);
+    device float4* yr = reinterpret_cast<device float4*>(y + uint64_t(row) * a.n);
+    device const float4* w4 = reinterpret_cast<device const float4*>(w);
+    const uint n4 = a.n / 4;
     float s = 0.0f;
-    for (uint i = tid; i < a.n; i += TG)
-        s += xr[i] * xr[i];
+    for (uint i = tid; i < n4; i += TG) {
+        const float4 v = xr[i];
+        s += dot(v, v);
+    }
     const float inv = rsqrt(tg_sum(s, scratch, tid) / float(a.n) + a.eps);
-    for (uint i = tid; i < a.n; i += TG)
-        yr[i] = xr[i] * inv * (a.wn ? w[i % a.wn] : 1.0f);
+    for (uint i = tid; i < n4; i += TG)
+        yr[i] = xr[i] * inv * (a.wn ? w4[i] : float4(1.0f));
 }
 
 // y = (x - mean) / sqrt(var + eps) * w + b, one threadgroup per row.
