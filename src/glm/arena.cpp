@@ -277,9 +277,11 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     std::fill_n(static_cast<int32_t*>(table_buf_->contents()), layers_.size() * n_expert_, -1);
     slot_expert_.resize(nl);
     last_use_.resize(nl);
+    pinned_.resize(nl);
     for (size_t l = 0; l < nl; ++l) {
         slot_expert_[l].assign(slots_[l], -1);
         last_use_[l].assign(slots_[l], 0);
+        pinned_[l].assign(slots_[l], 0);
     }
 }
 
@@ -319,6 +321,8 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
         stats_.read_bytes += loads.size() * p.bytes;
 }
 
+void ExpertArena::unpin(uint32_t layer) { std::ranges::fill(pinned_[layer], 0); }
+
 void ExpertArena::prefill()
 {
     const auto t0 = Clock::now();
@@ -341,32 +345,44 @@ void ExpertArena::prefill()
     stats_.read_bytes = 0;
 }
 
-void ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out)
+bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin)
 {
     auto* table = static_cast<int32_t*>(table_buf_->contents()) + uint64_t(layer) * n_expert_;
     auto& owner = slot_expert_[layer];
     auto& last = last_use_[layer];
-    ++clock_;
     const uint32_t n_slots = slots_[layer];
+    std::vector<char> taken(pinned_[layer]);
+    size_t misses = 0;
+    for (int e : experts) {
+        if (table[e] >= 0)
+            taken[table[e]] = 1;
+        else
+            ++misses;
+    }
+    if (size_t(std::ranges::count(taken, 0)) < misses)
+        return false;
+    ++clock_;
     for (int e : experts) {
         ++usage_[layer][e];
         ++score_[layer][e];
     }
-    std::vector<char> taken(n_slots, 0);
     std::vector<size_t> missed;
     for (size_t i = 0; i < experts.size(); ++i) {
         const int32_t s = table[experts[i]];
         if (s >= 0) {
             slots_out[i] = s;
-            taken[s] = 1;
             last[s] = clock_;
             ++stats_.hits;
         } else {
             missed.push_back(i);
         }
     }
+    if (pin)
+        for (size_t i = 0; i < experts.size(); ++i)
+            if (table[experts[i]] >= 0)
+                pinned_[layer][table[experts[i]]] = 1;
     if (missed.empty())
-        return;
+        return true;
     std::vector<std::pair<int, int32_t>> loads;
     for (size_t i : missed) {
         int32_t victim = -1;
@@ -390,10 +406,13 @@ void ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
         taken[victim] = 1;
         last[victim] = clock_;
         slots_out[i] = victim;
+        if (pin)
+            pinned_[layer][victim] = 1;
         loads.emplace_back(experts[i], victim);
         ++stats_.misses;
     }
     read_into(layer, loads);
+    return true;
 }
 
 } // namespace mako::glm

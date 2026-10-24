@@ -6,6 +6,7 @@
 #include "glm/telemetry.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
+#include "mtl/gemm.hpp"
 #include "mtl/gemv.hpp"
 
 #include <array>
@@ -13,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,7 @@ struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
+    uint32_t prefill_chunk = 512; // tokens prefill() runs through each layer together
     std::string expert_counts;  // routing profile placing experts in the arena; empty: the model's default profile
                                 // (default_profile_path), when it exists
     Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
@@ -36,6 +39,8 @@ public:
 
     // Runs one token at the next position and returns its logits.
     const std::vector<float>& step(int32_t token);
+    // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
+    const std::vector<float>& prefill(std::span<const int32_t> tokens);
 
     uint32_t position() const { return pos_; }
 
@@ -91,18 +96,25 @@ private:
     MTL::ComputePipelineState* pso(const std::string& fn);
 
     void gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
-              uint64_t y_off, uint32_t batch = 1);
+              uint64_t y_off, uint32_t batch = 1, uint32_t t = 1);
+    void proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
+              uint64_t y_off, uint32_t T, uint32_t ldy = 0);
     void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
                   const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads = true);
     void norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
               uint32_t n, uint32_t wn, float eps);
-    void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base);
-    void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x);
-    void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il);
-    void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il);
-    bool indexer(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il);
+    void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
+                MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T);
+    void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out, MTL::Buffer* pc,
+                 uint32_t T);
+    void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
+             uint32_t T);
+    void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
+             uint32_t T, uint32_t pos0);
+    bool indexer(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, uint64_t xn_off,
+                 MTL::Buffer* qrn, uint64_t qrn_off, uint32_t pos);
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
-                   const DevTensor& down, MTL::Buffer* out, float limit);
+                   const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T);
     void serve_moe(MTL::CommandBuffer* cb);
     // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
     MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section);
@@ -121,6 +133,7 @@ private:
     Options opts_;
     mtl::Context& ctx_;
     std::unique_ptr<mtl::Gemv> gemv_;
+    std::unique_ptr<mtl::Gemm> gemm_;
     mtl::Ref<MTL::Library> lib_;
     std::map<std::string, mtl::Ref<MTL::ComputePipelineState>> psos_;
 

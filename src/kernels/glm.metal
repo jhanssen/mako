@@ -82,17 +82,22 @@ struct HcArgs {
     uint n_embd;
     uint iters;
     float eps;
+    uint tokens; // hc_mix
 };
 
 // From the 24 mixes of one token: pre (4), post (4) and the Sinkhorn-normalized 4x4 comb.
 // comb is stored dst-fastest: comb[src * 4 + dst].
-kernel void hc_mix(device const float* mixes [[buffer(0)]], device const float* scale [[buffer(1)]],
-                   device const float* base [[buffer(2)]], device float* pre [[buffer(3)]],
-                   device float* post [[buffer(4)]], device float* comb [[buffer(5)]],
-                   constant HcArgs& a [[buffer(6)]], uint tid [[thread_position_in_grid]])
+// One thread per token: mixes [tokens][24] -> pc [tokens][24] = pre[4], post[4], comb[16].
+kernel void hc_mix(device const float* mixes_all [[buffer(0)]], device const float* scale [[buffer(1)]],
+                   device const float* base [[buffer(2)]], device float* pc [[buffer(3)]],
+                   constant HcArgs& a [[buffer(4)]], uint t [[thread_position_in_grid]])
 {
-    if (tid != 0)
+    if (t >= a.tokens)
         return;
+    device const float* mixes = mixes_all + t * 24;
+    device float* pre = pc + t * 24;
+    device float* post = pre + 4;
+    device float* comb = pre + 8;
     for (uint i = 0; i < 4; ++i) {
         pre[i] = sigmoidf(mixes[i] * scale[0] + base[i]) + a.eps;
         post[i] = 2.0f * sigmoidf(mixes[4 + i] * scale[1] + base[4 + i]);
@@ -142,27 +147,36 @@ kernel void hc_mix(device const float* mixes [[buffer(0)]], device const float* 
         comb[i] = c[i];
 }
 
-// x = sum_h R[h] * pre[h]
-kernel void hc_collapse(device const float* R [[buffer(0)]], device const float* pre [[buffer(1)]],
+// x = sum_h R[h] * pre[h]; grid (n_embd, tokens), R [tokens][4][n_embd], pc and x per token.
+kernel void hc_collapse(device const float* R [[buffer(0)]], device const float* pc [[buffer(1)]],
                         device float* x [[buffer(2)]], constant HcArgs& a [[buffer(3)]],
-                        uint i [[thread_position_in_grid]])
+                        uint2 gid [[thread_position_in_grid]])
 {
+    const uint i = gid.x, t = gid.y;
     if (i >= a.n_embd)
         return;
+    R += uint64_t(t) * 4 * a.n_embd;
+    x += uint64_t(t) * a.n_embd;
+    device const float* pre = pc + t * 24;
     float acc = 0.0f;
     for (uint h = 0; h < 4; ++h)
         acc += R[h * a.n_embd + i] * pre[h];
     x[i] = acc;
 }
 
-// out[dst] = x * post[dst] + sum_src comb[src][dst] * R[src]; out may not alias R.
+// out[dst] = x * post[dst] + sum_src comb[src][dst] * R[src]; grid (n_embd, tokens); out may not alias R.
 kernel void hc_expand(device const float* x [[buffer(0)]], device const float* R [[buffer(1)]],
-                      device const float* post [[buffer(2)]], device const float* comb [[buffer(3)]],
-                      device float* out [[buffer(4)]], constant HcArgs& a [[buffer(5)]],
-                      uint i [[thread_position_in_grid]])
+                      device const float* pc [[buffer(2)]], device float* out [[buffer(3)]],
+                      constant HcArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
 {
+    const uint i = gid.x, t = gid.y;
     if (i >= a.n_embd)
         return;
+    x += uint64_t(t) * a.n_embd;
+    R += uint64_t(t) * 4 * a.n_embd;
+    out += uint64_t(t) * 4 * a.n_embd;
+    device const float* post = pc + t * 24 + 4;
+    device const float* comb = pc + t * 24 + 8;
     float r[4];
     for (uint s = 0; s < 4; ++s)
         r[s] = R[s * a.n_embd + i];
@@ -175,40 +189,52 @@ kernel void hc_expand(device const float* x [[buffer(0)]], device const float* R
     }
 }
 
-// Mean of the 4 streams.
+// Mean of the 4 streams; grid (n_embd, tokens).
 kernel void hc_mean(device const float* R [[buffer(0)]], device float* x [[buffer(1)]],
-                    constant HcArgs& a [[buffer(2)]], uint i [[thread_position_in_grid]])
+                    constant HcArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
+    const uint i = gid.x;
     if (i >= a.n_embd)
         return;
+    R += uint64_t(gid.y) * 4 * a.n_embd;
+    x += uint64_t(gid.y) * a.n_embd;
     x[i] = 0.25f * (R[i] + R[a.n_embd + i] + R[2 * a.n_embd + i] + R[3 * a.n_embd + i]);
 }
 
 struct ConvArgs {
     uint channels;   // per projection
-    uint kernel_len; // taps, the last one multiplies the current token
+    uint kernel_len; // taps, the last one multiplies the current token (at most 8)
+    uint tokens;     // x and y are [tokens][3 * channels]
 };
 
-// Causal depthwise conv over q|k|v (3 * channels) for one token, then SiLU. The state holds the
-// previous kernel_len - 1 inputs per channel, oldest first, and is shifted in place.
+// Causal depthwise conv over q|k|v (3 * channels), then SiLU, for consecutive tokens. The state holds the
+// previous kernel_len - 1 inputs per channel, oldest first; one thread per channel walks the tokens.
 kernel void kda_conv(device const float* x [[buffer(0)]], device const float* wq [[buffer(1)]],
                      device const float* wk [[buffer(2)]], device const float* wv [[buffer(3)]],
                      device float* state [[buffer(4)]], device float* y [[buffer(5)]],
                      constant ConvArgs& a [[buffer(6)]], uint c [[thread_position_in_grid]])
 {
-    if (c >= 3 * a.channels)
+    const uint width = 3 * a.channels;
+    if (c >= width)
         return;
-    const uint proj = c / a.channels, ch = c % a.channels;
+    const uint proj = c / a.channels, ch = c % a.channels, taps = a.kernel_len - 1;
     device const float* w = (proj == 0 ? wq : proj == 1 ? wk : wv) + uint64_t(ch) * a.kernel_len;
-    device float* s = state + uint64_t(c) * (a.kernel_len - 1);
-    const float xc = x[c];
-    float acc = w[a.kernel_len - 1] * xc;
-    for (uint j = 0; j + 1 < a.kernel_len; ++j)
-        acc += w[j] * s[j];
-    for (uint j = 0; j + 2 < a.kernel_len; ++j)
-        s[j] = s[j + 1];
-    s[a.kernel_len - 2] = xc;
-    y[c] = acc * sigmoidf(acc);
+    device float* s = state + uint64_t(c) * taps;
+    float hist[7];
+    for (uint j = 0; j < taps; ++j)
+        hist[j] = s[j];
+    for (uint t = 0; t < a.tokens; ++t) {
+        const float xc = x[uint64_t(t) * width + c];
+        float acc = w[taps] * xc;
+        for (uint j = 0; j < taps; ++j)
+            acc += w[j] * hist[j];
+        for (uint j = 0; j + 1 < taps; ++j)
+            hist[j] = hist[j + 1];
+        hist[taps - 1] = xc;
+        y[uint64_t(t) * width + c] = acc * sigmoidf(acc);
+    }
+    for (uint j = 0; j < taps; ++j)
+        s[j] = hist[j];
 }
 
 struct GateArgs {
@@ -218,11 +244,17 @@ struct GateArgs {
 };
 
 // g = lower_bound * sigmoid(-(A[h] * (raw + dt_bias))) per channel; beta = sigmoid(raw_beta) per head.
+// Grid (channels, tokens); raw, g [tokens][channels], raw_beta, beta [tokens][heads].
 kernel void kda_gate(device const float* raw [[buffer(0)]], device const float* dt_bias [[buffer(1)]],
                      device const float* A [[buffer(2)]], device const float* raw_beta [[buffer(3)]],
                      device float* g [[buffer(4)]], device float* beta [[buffer(5)]],
-                     constant GateArgs& a [[buffer(6)]], uint c [[thread_position_in_grid]])
+                     constant GateArgs& a [[buffer(6)]], uint2 gid [[thread_position_in_grid]])
 {
+    const uint c = gid.x, inner = a.head_dim * a.heads;
+    raw += uint64_t(gid.y) * inner;
+    g += uint64_t(gid.y) * inner;
+    raw_beta += gid.y * a.heads;
+    beta += gid.y * a.heads;
     if (c < a.heads)
         beta[c] = sigmoidf(raw_beta[c]);
     if (c >= a.head_dim * a.heads)
@@ -234,14 +266,16 @@ kernel void kda_gate(device const float* raw [[buffer(0)]], device const float* 
 struct L2Args {
     uint n;
     float eps;
+    uint token_stride; // elements between tokens
 };
 
-// x / max(||x||, eps) per row, in place.
+// x / max(||x||, eps) per row of n, in place; threadgroups (rows, tokens).
 kernel void l2_norm(device float* x [[buffer(0)]], constant L2Args& a [[buffer(1)]],
-                    uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+                    uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
-    device float* xr = x + uint64_t(row) * a.n;
+    const uint tid = tid2.x;
+    device float* xr = x + uint64_t(tg.y) * a.token_stride + uint64_t(tg.x) * a.n;
     float s = 0.0f;
     for (uint i = tid; i < a.n; i += TG)
         s += xr[i] * xr[i];
@@ -251,13 +285,17 @@ kernel void l2_norm(device float* x [[buffer(0)]], constant L2Args& a [[buffer(1
 }
 
 struct ScanArgs {
-    uint head_dim; // 128
+    uint head_dim;   // 128
+    uint tokens;
+    uint qkv_stride; // q, k, v elements between tokens
+    uint inner;      // g and o elements between tokens
+    uint heads;      // beta elements between tokens
 };
 
 // One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
 //   S[i][:] *= exp(g[i]); delta[j] = (v[j] - sum_i S[i][j] k[i]) * beta
 //   S[i][j] += k[i] * delta[j];   o[j] = sum_i S[i][j] q[i] / sqrt(head_dim)
-// One threadgroup of head_dim threads per head; thread j owns row j of M.
+// One threadgroup of head_dim threads per head, stepping through the tokens; thread j owns row j of M.
 kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
                      device const float* v [[buffer(2)]], device const float* g [[buffer(3)]],
                      device const float* beta [[buffer(4)]], device float* state [[buffer(5)]],
@@ -267,26 +305,29 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
     threadgroup float qs[128], ks[128], eg[128];
     const uint D = a.head_dim;
     const uint base = h * D;
-    qs[j] = q[base + j];
-    ks[j] = k[base + j];
-    eg[j] = exp(g[base + j]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     device float* M = state + uint64_t(h) * D * D + uint64_t(j) * D;
-    float sum = 0.0f;
-    for (uint i = 0; i < D; ++i) {
-        const float m = M[i] * eg[i];
-        M[i] = m;
-        sum += m * ks[i];
+    for (uint t = 0; t < a.tokens; ++t) {
+        const uint64_t qo = uint64_t(t) * a.qkv_stride + base, go = uint64_t(t) * a.inner + base;
+        qs[j] = q[qo + j];
+        ks[j] = k[qo + j];
+        eg[j] = exp(g[go + j]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float sum = 0.0f;
+        for (uint i = 0; i < D; ++i) {
+            const float m = M[i] * eg[i];
+            M[i] = m;
+            sum += m * ks[i];
+        }
+        const float delta = (v[qo + j] - sum) * beta[t * a.heads + h];
+        float out = 0.0f;
+        for (uint i = 0; i < D; ++i) {
+            const float m = M[i] + ks[i] * delta;
+            M[i] = m;
+            out += m * qs[i];
+        }
+        o[go + j] = out * rsqrt(float(D));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const float delta = (v[base + j] - sum) * beta[h];
-    float out = 0.0f;
-    for (uint i = 0; i < D; ++i) {
-        const float m = M[i] + ks[i] * delta;
-        M[i] = m;
-        out += m * qs[i];
-    }
-    o[base + j] = out * rsqrt(float(D));
 }
 
 // y = rms_norm(x) * w * sigmoid(gate), one threadgroup per head row.
@@ -492,11 +533,15 @@ kernel void add(device const float* x [[buffer(0)]], device const float* z [[buf
 }
 
 // R[h] = x for every stream h.
+// Grid (n_embd, tokens).
 kernel void hc_init(device const float* x [[buffer(0)]], device float* R [[buffer(1)]],
-                    constant HcArgs& a [[buffer(2)]], uint i [[thread_position_in_grid]])
+                    constant HcArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
+    const uint i = gid.x;
     if (i >= a.n_embd)
         return;
+    x += uint64_t(gid.y) * a.n_embd;
+    R += uint64_t(gid.y) * 4 * a.n_embd;
     for (uint h = 0; h < 4; ++h)
         R[h * a.n_embd + i] = x[i];
 }

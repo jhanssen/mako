@@ -1,10 +1,12 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
 //            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
-//            [--stats summary|steps|layers|kernels] [--stats-out FILE]
+//            [--stats summary|steps|layers|kernels] [--stats-out FILE] [--prefill-chunk N]
 // The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
 // another; --save-counts writes this run's routing counts, --learn adds them to the model's profile.
 // --stats prints a Markdown telemetry summary at the end; --stats-out also writes its records as JSON lines.
+// The prompt runs through prefill() in chunks of --prefill-chunk tokens (default 512; 0: token by token, as it
+// always does with --ref, --dump or --force).
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
@@ -130,6 +132,8 @@ int main(int argc, char** argv)
             opts.expert_counts = v;
         else if (a == "--save-counts")
             save_counts = v;
+        else if (a == "--prefill-chunk")
+            opts.prefill_chunk = uint32_t(std::stoul(v));
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(v);
         else if (a == "--dump")
@@ -277,7 +281,16 @@ int main(int argc, char** argv)
     };
 
     std::vector<float> logits;
-    for (size_t i = 0; i < ids.size(); ++i) {
+    const bool batched = opts.prefill_chunk > 0 && ids.size() > 1 && ref_dir.empty() && dump_dir.empty() &&
+                         force_dir.empty() && route_dir.empty();
+    if (batched) {
+        auto t = std::chrono::steady_clock::now();
+        logits = engine.prefill(ids);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+        std::println("prefill {} tokens in {:.0f} ms ({:.1f} tok/s), chunks of {}  top{}", ids.size(), ms,
+                     ids.size() / ms * 1e3, opts.prefill_chunk, show(logits));
+    }
+    for (size_t i = 0; i < (batched ? 0 : ids.size()); ++i) {
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(ids[i]);
         telemetry.step(engine.last_step());

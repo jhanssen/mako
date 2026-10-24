@@ -70,8 +70,11 @@ public:
     void prefill();
     // Makes the selected experts of a layer resident, reading the misses into the slots of the least used experts
     // (profile counts plus selections so far; ties: least recently used), and writes their slots to `slots_out`.
-    // Never evicts a selected expert, so the GPU may read those meanwhile; no other slot of the layer may be in use.
-    void ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out);
+    // Never evicts a selected or pinned expert, so the GPU may read those meanwhile; no other slot of the layer may
+    // be in use. With `pin` the selected slots stay pinned until unpin(). Returns false, changing nothing, when the
+    // misses do not fit in the unpinned slots.
+    bool ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin = false);
+    void unpin(uint32_t layer);
 
     const Stats& stats() const { return stats_; }
     // How often each expert was selected since construction, [layer][expert].
@@ -94,6 +97,7 @@ private:
     mtl::Ref<MTL::Buffer> table_buf_;
     std::vector<std::vector<int32_t>> slot_expert_; // [layer][slot] -> expert, -1 free
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]
+    std::vector<std::vector<char>> pinned_;         // [layer][slot]
     uint64_t clock_ = 0;
     Stats stats_;
     std::unique_ptr<Readers> readers_;
