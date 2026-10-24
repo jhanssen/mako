@@ -312,7 +312,14 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     built_chunk_ = opts_.prefill_chunk;
     built_group_ = std::max(opts_.prefill_chunk, opts_.prefill_group);
     arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk, std::max(opts_.prefill_chunk, opts_.prefill_group)));
-    arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
+    // The context caches are allocated for max_ctx but only fill (and count in the footprint) as the context grows.
+    uint64_t context_bytes = 0;
+    for (const auto* caches : {&kv_cache_, &idx_cache_, &idx_pooled_})
+        for (const auto& b : *caches)
+            if (b)
+                context_bytes += b->length();
+    arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9
+                                             : std::max(1e9, arena_budget(arena_plan_.mem) - double(context_bytes));
     auto t_phase = Clock::now();
     routing_key_ = glm::routing_key(model_, cfg_);
     load_.key_ms = ms_since(t_phase);
