@@ -525,6 +525,31 @@ kernel void moe_combine_split(device const float* x_hit [[buffer(0)]], device co
     y[i] = acc;
 }
 
+// y[i] = x[idx[i]], rows of n; grid (n, rows of y).
+kernel void gather_rows(device const float* x [[buffer(0)]], device const int* idx [[buffer(1)]],
+                        device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
+                        uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < n)
+        y[uint64_t(gid.y) * n + gid.x] = x[uint64_t(idx[gid.y]) * n + gid.x];
+}
+
+// Per token t: y[t] = shared[t] + sum_e w[t][e] * x[pos[t][e]], over n_used experts (w, pos rows of 16);
+// grid (n, tokens).
+kernel void moe_combine_rows(device const float* x [[buffer(0)]], device const int* pos [[buffer(1)]],
+                             device const float* w [[buffer(2)]], device const float* shared [[buffer(3)]],
+                             device float* y [[buffer(4)]], constant CombineArgs& a [[buffer(5)]],
+                             uint2 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x, t = gid.y;
+    if (i >= a.n)
+        return;
+    float acc = shared[uint64_t(t) * a.n + i];
+    for (uint e = 0; e < a.n_used; ++e)
+        acc += w[t * 16 + e] * x[uint64_t(pos[t * 16 + e]) * a.n + i];
+    y[uint64_t(t) * a.n + i] = acc;
+}
+
 kernel void add(device const float* x [[buffer(0)]], device const float* z [[buffer(1)]],
                 device float* y [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]])
 {

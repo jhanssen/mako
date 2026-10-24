@@ -1145,7 +1145,6 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 MTL::Buffer* rlog = scratch("p_rlog", uint64_t(T) * cfg_.n_expert * 4);
                 MTL::Buffer* sel = scratch("p_sel", uint64_t(T) * 16 * 4);
                 MTL::Buffer* ew = scratch("p_ew", uint64_t(T) * 16 * 4);
-                MTL::Buffer* ids = scratch("p_ids", uint64_t(T) * 16 * 4);
                 proj(enc, L.router, xn, 0, rlog, 0, T);
                 ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], T);
                 // The kernel's slot lookup is not used here: the CPU assigns slots after this sync.
@@ -1168,61 +1167,115 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 submit(cb, enc);
                 cur_cb_ = cb;
 
-                // Expert passes for tokens [t0, t1), all of whose experts are pinned resident.
-                auto experts = [&](uint32_t t0, uint32_t t1) {
-                    MTL::Buffer* eg = scratch("p_eg", k * nff * 4);
-                    MTL::Buffer* eu = scratch("p_eu", k * nff * 4);
-                    MTL::Buffer* em = scratch("p_em", k * nff * 4);
-                    MTL::Buffer* ed = scratch("p_ed", k * E * 4);
-                    const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
-                    const CombineArgs ca{E, k};
-                    for (uint32_t t = t0; t < t1; ++t) {
-                        auto run = [&](int part, MTL::Buffer* in, uint64_t in_off, MTL::Buffer* out) {
-                            const ExpertArena::Part& e = arena_->part(il, part);
-                            const ExpertArena::Region& r = arena_->region(il, part);
-                            mtl::Gemv::Args a;
-                            a.type = e.type;
-                            a.k = e.k;
-                            a.n = e.n;
-                            a.batch = k;
-                            a.x_shared = part < 2;
-                            gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, uint64_t(t) * 64, in, in_off,
-                                                  out, 0);
-                        };
-                        run(0, xn, uint64_t(t) * E * 4, eg);
-                        run(1, xn, uint64_t(t) * E * 4, eu);
-                        dispatch(enc, "swiglu", {eg, eu, em}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1),
-                                 MTL::Size(256, 1, 1));
-                        run(2, em, 0, ed);
-                        enc->setComputePipelineState(pso("moe_combine"));
-                        enc->setBuffer(ed, 0, 0);
-                        enc->setBuffer(ew, uint64_t(t) * 64, 1);
-                        enc->setBuffer(sho, uint64_t(t) * E * 4, 2);
-                        enc->setBuffer(ffo, uint64_t(t) * E * 4, 3);
-                        enc->setBytes(&ca, sizeof(ca), 4);
-                        enc->dispatchThreads(MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
-                    }
-                };
+                // Group the chunk's (token, expert) pairs by expert, resident experts first, and run each expert
+                // once over all its tokens.
                 const auto* selp = static_cast<const int*>(sel->contents());
-                auto* idp = static_cast<int32_t*>(ids->contents());
+                const auto* table = static_cast<const int32_t*>(arena_->slot_table()->contents()) +
+                                    uint64_t(il) * cfg_.n_expert;
+                std::vector<std::vector<uint32_t>> users(cfg_.n_expert); // per expert: t * 16 + j
+                for (uint32_t t = 0; t < T; ++t)
+                    for (uint32_t j = 0; j < k; ++j)
+                        users[selp[t * 16 + j]].push_back(t * 16 + j);
+                std::vector<int> order;
+                for (int e = 0; e < int(cfg_.n_expert); ++e)
+                    if (!users[e].empty() && table[e] >= 0)
+                        order.push_back(e);
+                for (int e = 0; e < int(cfg_.n_expert); ++e)
+                    if (!users[e].empty() && table[e] < 0)
+                        order.push_back(e);
+                const uint32_t rows = T * k;
+                MTL::Buffer* tok = scratch("p_tok", uint64_t(rows) * 4);
+                MTL::Buffer* pos = scratch("p_pos", uint64_t(T) * 16 * 4);
+                auto* tokp = static_cast<int32_t*>(tok->contents());
+                auto* posp = static_cast<int32_t*>(pos->contents());
+                std::vector<uint32_t> start(cfg_.n_expert);
+                uint32_t row = 0;
+                for (int e : order) {
+                    start[e] = row;
+                    for (uint32_t u : users[e]) {
+                        tokp[row] = int32_t(u / 16);
+                        posp[u] = int32_t(row++);
+                    }
+                }
+                MTL::Buffer* xg = scratch("p_xg", uint64_t(rows) * E * 4);
+                MTL::Buffer* gg = scratch("p_gg", uint64_t(rows) * nff * 4);
+                MTL::Buffer* ug = scratch("p_ug", uint64_t(rows) * nff * 4);
+                MTL::Buffer* mg = scratch("p_mg", uint64_t(rows) * nff * 4);
+                MTL::Buffer* yg = scratch("p_yg", uint64_t(rows) * E * 4);
+                const SwigluArgs sa0{0, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
+
+                // Experts [b0, b1) of order, all pinned resident, in a concurrent encoder: gate and up of every
+                // expert, then the SwiGLU over their rows, then every down.
+                auto run = [&](size_t b0, size_t b1, const std::vector<int32_t>& slot) {
+                    if (b0 == b1)
+                        return;
+                    enc->endEncoding();
+                    enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+                    auto gemm_part = [&](int part, int e, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
+                        const ExpertArena::Part& p = arena_->part(il, part);
+                        const ExpertArena::Region& r = arena_->region(il, part);
+                        gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), r.buf,
+                                      r.off + uint64_t(slot[e]) * r.stride, x, uint64_t(start[e]) * xw * 4, y,
+                                      uint64_t(start[e]) * yw * 4);
+                    };
+                    for (size_t i = b0; i < b1; ++i) {
+                        gemm_part(0, order[i], xg, E, gg, nff);
+                        gemm_part(1, order[i], xg, E, ug, nff);
+                    }
+                    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+                    const uint32_t r0 = start[order[b0]], r1 = start[order[b1 - 1]] + uint32_t(users[order[b1 - 1]].size());
+                    SwigluArgs sa = sa0;
+                    sa.n = (r1 - r0) * nff;
+                    enc->setComputePipelineState(pso("swiglu"));
+                    enc->setBuffer(gg, uint64_t(r0) * nff * 4, 0);
+                    enc->setBuffer(ug, uint64_t(r0) * nff * 4, 1);
+                    enc->setBuffer(mg, uint64_t(r0) * nff * 4, 2);
+                    enc->setBytes(&sa, sizeof(sa), 3);
+                    enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
+                    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+                    for (size_t i = b0; i < b1; ++i)
+                        gemm_part(2, order[i], mg, nff, yg, E);
+                    enc->endEncoding();
+                    enc = cb->computeCommandEncoder();
+                };
+
+                const uint32_t ne = E;
+                enc->setComputePipelineState(pso("gather_rows"));
+                enc->setBuffer(xn, 0, 0);
+                enc->setBuffer(tok, 0, 1);
+                enc->setBuffer(xg, 0, 2);
+                enc->setBytes(&ne, sizeof(ne), 3);
+                enc->dispatchThreads(MTL::Size(E, rows, 1), MTL::Size(256, 1, 1));
+
                 const auto t_ensure = Clock::now();
-                uint32_t t0 = 0;
-                for (uint32_t t = 0; t < T; ++t) {
-                    const std::span<const int> s(selp + uint64_t(t) * 16, k);
-                    if (arena_->ensure(il, s, idp + uint64_t(t) * 16, true))
+                std::vector<int32_t> slot(cfg_.n_expert, -1);
+                size_t b0 = 0;
+                for (size_t i = 0; i < order.size(); ++i) {
+                    const int e = order[i];
+                    if (arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true))
                         continue;
-                    // This token's experts do not fit beside the pinned ones: run the tokens so far first.
-                    experts(t0, t);
+                    // No unpinned slot left: run the experts so far, then their slots are free again.
+                    run(b0, i, slot);
                     submit(cb, enc);
                     cur_cb_ = cb;
                     arena_->unpin(il);
-                    t0 = t;
-                    if (!arena_->ensure(il, s, idp + uint64_t(t) * 16, true))
-                        throw std::runtime_error("expert arena smaller than one token's experts");
+                    b0 = i;
+                    if (!arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true))
+                        throw std::runtime_error("expert arena has no slot for one expert");
                 }
                 last_step_.ensure_ms += ms_since(t_ensure);
-                experts(t0, T);
+                run(b0, order.size(), slot);
                 arena_->unpin(il);
+
+                const CombineArgs ca{E, k};
+                enc->setComputePipelineState(pso("moe_combine_rows"));
+                enc->setBuffer(yg, 0, 0);
+                enc->setBuffer(pos, 0, 1);
+                enc->setBuffer(ew, 0, 2);
+                enc->setBuffer(sho, 0, 3);
+                enc->setBuffer(ffo, 0, 4);
+                enc->setBytes(&ca, sizeof(ca), 5);
+                enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
             }
             hc_post(enc, ffo, R, R2, pc, T);
             std::swap(R, R2);
