@@ -151,6 +151,50 @@ int main(int argc, char** argv)
     }
     report("handshake", hs_us);
 
+    // One command buffer of `segs` segments, each a dispatch, a signal to the CPU and a wait for its reply,
+    // as a decode step with one CPU binding per MoE layer; the CPU serves the segments while it runs.
+    // Two events (GPU->CPU, CPU->GPU) or one shared by both directions.
+    for (auto [two, delay_us] : {std::pair{true, 0}, {false, 0}, {true, 200}, {true, 1000}, {true, 3000}}) {
+        constexpr int segs = 42;
+        mako::mtl::Ref<MTL::SharedEvent> up(ctx.device()->newSharedEvent()), down(ctx.device()->newSharedEvent());
+        MTL::SharedEvent* to_cpu = up.get();
+        MTL::SharedEvent* to_gpu = two ? down.get() : up.get();
+        std::vector<double> seg_us, step_ms;
+        uint64_t u = 0;
+        for (int it = 0; it < std::min(iters, 50); ++it) {
+            NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+            auto* cb = q->commandBuffer();
+            std::vector<std::pair<uint64_t, uint64_t>> marks; // (GPU signals, CPU replies)
+            for (int s = 0; s < segs; ++s) {
+                encode_touch(cb, touch.get(), buf.get());
+                const uint64_t sig = two ? ++u : (u += 2) - 1, rep = two ? u : u;
+                cb->encodeSignalEvent(to_cpu, sig);
+                cb->encodeWait(to_gpu, rep);
+                marks.emplace_back(sig, rep);
+            }
+            encode_touch(cb, touch.get(), buf.get());
+            const auto t0 = Clock::now();
+            cb->commit();
+            auto t = Clock::now();
+            for (auto [sig, rep] : marks) {
+                while (to_cpu->signaledValue() < sig) {
+                }
+                seg_us.push_back(us_since(t));
+                for (auto d = Clock::now(); us_since(d) < delay_us;) {
+                }
+                t = Clock::now();
+                to_gpu->setSignaledValue(rep);
+            }
+            cb->waitUntilCompleted();
+            step_ms.push_back(us_since(t0) / 1e3);
+            pool->release();
+        }
+        std::println("chain, {} event(s), CPU replies after {} us:", two ? 2 : 1, delay_us);
+        report("  GPU seg", seg_us);
+        std::ranges::sort(step_ms);
+        std::println("  {} segments per command buffer: p50 {:.2f} ms per buffer", segs, step_ms[step_ms.size() / 2]);
+    }
+
     auto* f = static_cast<std::atomic<uint32_t>*>(flag->contents());
     auto* out = static_cast<uint32_t*>(buf->contents());
     uint32_t target = 0;

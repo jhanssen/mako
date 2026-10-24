@@ -392,6 +392,71 @@ kernel void moe_combine(device const float* x [[buffer(0)]], device const float*
     y[i] = acc;
 }
 
+struct RouteArgs {
+    uint n_expert, n_used, norm;
+    float scale;
+};
+
+// Router top-k over sigmoid scores, the bias added for the selection only; ties keep the lower expert index.
+// Weights are the unbiased scores of the selected experts, normalized when a.norm, times a.scale.
+// One threadgroup of TG threads; sel and w get n_used (<= 16) entries, biased gets n_expert.
+kernel void moe_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
+                      device int* sel [[buffer(2)]], device float* w [[buffer(3)]], device float* biased [[buffer(4)]],
+                      constant RouteArgs& a [[buffer(5)]], uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float best_v[TG / 32];
+    threadgroup uint best_i[TG / 32];
+    threadgroup uint chosen[16];
+    for (uint e = tid; e < a.n_expert; e += TG)
+        biased[e] = 1.0f / (1.0f + precise::exp(-logits[e])) + bias[e];
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint r = 0; r < a.n_used; ++r) {
+        float v = -INFINITY;
+        uint idx = 0xffffffffu;
+        for (uint e = tid; e < a.n_expert; e += TG) {
+            bool taken = false;
+            for (uint j = 0; j < r; ++j)
+                taken |= chosen[j] == e;
+            const float b = biased[e];
+            if (!taken && (b > v || (b == v && e < idx))) {
+                v = b;
+                idx = e;
+            }
+        }
+        const float m = simd_max(v);
+        const uint mi = simd_min(v == m ? idx : 0xffffffffu);
+        if (tid % 32 == 0) {
+            best_v[tid / 32] = m;
+            best_i[tid / 32] = mi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float bv = -INFINITY;
+            uint bi = 0xffffffffu;
+            for (uint s = 0; s < TG / 32; ++s)
+                if (best_v[s] > bv || (best_v[s] == bv && best_i[s] < bi)) {
+                    bv = best_v[s];
+                    bi = best_i[s];
+                }
+            chosen[r] = bi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float p[16], sum = 0.0f;
+        for (uint j = 0; j < a.n_used; ++j) {
+            p[j] = 1.0f / (1.0f + precise::exp(-logits[chosen[j]]));
+            sum += p[j];
+        }
+        if (a.norm)
+            sum = max(sum, 6.103515625e-5f);
+        for (uint j = 0; j < a.n_used; ++j) {
+            sel[j] = int(chosen[j]);
+            w[j] = (a.norm ? p[j] / sum : p[j]) * a.scale;
+        }
+    }
+}
+
 kernel void add(device const float* x [[buffer(0)]], device const float* z [[buffer(1)]],
                 device float* y [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]])
 {

@@ -156,19 +156,6 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     table_buf_ = mtl::Ref<MTL::Buffer>(
         dev->newBuffer(std::max<uint64_t>(layers_.size() * n_expert_ * 4, 16), MTL::ResourceStorageModeShared));
 
-    // Without this the first command buffer that touches the arena pays for mapping all of it (~1 s for 71 GB).
-    mtl::Ref<MTL::ResidencySetDescriptor> rd(MTL::ResidencySetDescriptor::alloc()->init());
-    rd->setInitialCapacity(bufs_.size() + 1);
-    NS::Error* err = nullptr;
-    residency_ = mtl::Ref<MTL::ResidencySet>(dev->newResidencySet(rd.get(), &err));
-    if (!residency_)
-        throw std::runtime_error(std::format("newResidencySet: {}",
-                                             err ? err->localizedDescription()->utf8String() : "?"));
-    for (const auto& b : bufs_)
-        residency_->addAllocation(b.get());
-    residency_->addAllocation(table_buf_.get());
-    residency_->commit();
-    residency_->requestResidency();
     std::fill_n(static_cast<int32_t*>(table_buf_->contents()), layers_.size() * n_expert_, -1);
     slot_expert_.assign(layers_.size(), std::vector<int32_t>(slots_, -1));
     last_use_.assign(layers_.size(), std::vector<uint64_t>(slots_, 0));

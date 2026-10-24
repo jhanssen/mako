@@ -59,6 +59,10 @@ struct SwigluArgs {
 struct CombineArgs {
     uint32_t n, n_used;
 };
+struct RouteArgs {
+    uint32_t n_expert, n_used, norm;
+    float scale;
+};
 struct PoolArgs {
     uint32_t dim, kpool, pool;
 };
@@ -97,7 +101,7 @@ struct Engine::Layer {
     // FFN
     DevTensor ffn_gate, ffn_up, ffn_down;
     DevTensor router, sh_gate, sh_up, sh_down;
-    std::vector<float> router_bias;
+    DevTensor router_bias;
     ExpertArena::LayerParts experts{};
 };
 
@@ -192,17 +196,17 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             L->sh_gate = upload(p + "ffn_gate_shexp.weight");
             L->sh_up = upload(p + "ffn_up_shexp.weight");
             L->sh_down = upload(p + "ffn_down_shexp.weight");
-            auto bias = model_.find(p + "exp_probs_b.bias");
-            if (!bias || bias.tensor->type != gguf::Type::F32)
-                throw std::runtime_error(p + "exp_probs_b.bias missing or not F32");
-            L->router_bias.resize(cfg_.n_expert);
-            read_exact(bias.file->fd(), L->router_bias.data(), cfg_.n_expert * 4, bias.tensor->offset);
+            L->router_bias = upload(p + "exp_probs_b.bias");
+            if (L->router_bias.type != gguf::Type::F32 || L->router_bias.dims[0] != cfg_.n_expert)
+                throw std::runtime_error(p + "exp_probs_b.bias is not F32 [n_expert]");
             L->experts = {expert(p + "ffn_gate_exps.weight"), expert(p + "ffn_up_exps.weight"),
                           expert(p + "ffn_down_exps.weight")};
         }
         layers_.push_back(std::move(L));
     }
     logits_.resize(cfg_.n_vocab);
+    routed_ = mtl::Ref<MTL::SharedEvent>(ctx_.device()->newSharedEvent());
+    ready_ = mtl::Ref<MTL::SharedEvent>(ctx_.device()->newSharedEvent());
 
     std::vector<ExpertArena::LayerParts> parts;
     for (const auto& L : layers_)
@@ -212,7 +216,6 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     arena_ = std::make_unique<ExpertArena>(ctx_.device(), ctx_.info().max_buffer, std::move(parts), cfg_.n_expert,
                                            cfg_.n_expert_used, arena_plan_.budget);
     arena_->prefill();
-    ctx_.queue()->addResidencySet(arena_->residency());
 
     // The first compute pass that reads an arena buffer pays a driver cost that grows with its size (~0.5 s for
     // 75 GB); pay it here instead of in the first step.
@@ -236,7 +239,6 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
 
 Engine::~Engine()
 {
-    ctx_.queue()->removeResidencySet(arena_->residency());
     arena_.reset();
     for (auto& [path, fd] : nocache_fds_)
         ::close(fd);
@@ -574,47 +576,53 @@ void Engine::ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, c
     gemv(enc, down, m, 0, out, 0);
 }
 
-void Engine::route(const Layer& L, uint32_t il, std::array<int, 16>& sel, std::array<float, 16>& w)
+// Serves the MoE layers of a committed command buffer in order: waits until a layer's router has run, makes its
+// selected experts resident and writes their slots, then lets the GPU continue.
+void Engine::serve_moe(MTL::CommandBuffer* cb)
 {
-    const auto* logits = static_cast<const float*>(scratch("rlog", cfg_.n_expert * 4)->contents());
-    const uint32_t E = cfg_.n_expert, k = cfg_.n_expert_used;
-    std::vector<float> probs(E), biased(E);
-    for (uint32_t e = 0; e < E; ++e) {
-        probs[e] = 1.0f / (1.0f + std::exp(-logits[e]));
-        biased[e] = probs[e] + L.router_bias[e];
+    const uint32_t k = cfg_.n_expert_used;
+    auto* sel = static_cast<int*>(scratch("msel", 16 * 4)->contents());
+    auto* w = static_cast<float*>(scratch("ew", 16 * 4)->contents());
+    auto* ids = static_cast<int32_t*>(scratch("eids", 16 * 4)->contents());
+    for (const auto [il, v] : pending_moe_) {
+        for (uint32_t spins = 0; routed_->signaledValue() < v; ++spins)
+            if (spins % 4096 == 4095 && cb->status() == MTL::CommandBufferStatusError)
+                throw std::runtime_error(std::format("command buffer failed: {}",
+                                                     cb->error() ? cb->error()->localizedDescription()->utf8String()
+                                                                 : "?"));
+        if (probe_) {
+            probe_("ffn_moe_probs_biased", int(il),
+                   static_cast<const float*>(scratch("mbiased", cfg_.n_expert * 4)->contents()), cfg_.n_expert);
+            std::array<float, 16> self{};
+            std::copy_n(sel, k, self.begin());
+            probe_("moe_sel", int(il), self.data(), k);
+        }
+        if (route_override_)
+            route_override_(int(il), sel, w, k);
+        arena_->ensure(il, std::span<const int>(sel, k), ids);
+        ready_->setSignaledValue(v);
     }
-    if (probe_)
-        probe_("ffn_moe_probs_biased", int(il), biased.data(), E);
-    std::vector<int> idx(E);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                      [&](int a, int b) { return biased[a] > biased[b] || (biased[a] == biased[b] && a < b); });
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < k; ++i) {
-        sel[i] = idx[i];
-        w[i] = probs[idx[i]];
-        sum += w[i];
-    }
-    if (cfg_.expert_weights_norm) {
-        sum = std::max(sum, 6.103515625e-5f);
-        for (uint32_t i = 0; i < k; ++i)
-            w[i] /= sum;
-    }
-    for (uint32_t i = 0; i < k; ++i)
-        w[i] *= cfg_.expert_weights_scale;
+    pending_moe_.clear();
+}
+
+void Engine::finish(MTL::CommandBuffer* cb)
+{
+    auto t0 = Clock::now();
+    cb->commit();
+    serve_moe(cb);
+    cb->waitUntilCompleted();
+    stats_.gpu_wait_ms += ms_since(t0);
+    stats_.gpu_exec_ms += (cb->GPUEndTime() - cb->GPUStartTime()) * 1e3;
+    if (cb->status() != MTL::CommandBufferStatusCompleted)
+        throw std::runtime_error(std::format("command buffer failed: {}",
+                                             cb->error() ? cb->error()->localizedDescription()->utf8String() : "?"));
+    deliver_probes();
 }
 
 void Engine::submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc)
 {
     enc->endEncoding();
-    auto t0 = Clock::now();
-    cb->commit();
-    cb->waitUntilCompleted();
-    stats_.gpu_wait_ms += ms_since(t0);
-    if (cb->status() != MTL::CommandBufferStatusCompleted)
-        throw std::runtime_error(std::format("command buffer failed: {}",
-                                             cb->error() ? cb->error()->localizedDescription()->utf8String() : "?"));
-    deliver_probes();
+    finish(cb);
     cb = ctx_.queue()->commandBuffer();
     enc = cb->computeCommandEncoder();
 }
@@ -699,24 +707,26 @@ const std::vector<float>& Engine::step(int32_t token)
         } else {
             const uint32_t k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
             MTL::Buffer* sho = scratch("sho", E * 4);
-            gemv(enc, L.router, xn, 0, scratch("rlog", cfg_.n_expert * 4), 0);
-            ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, sho, cfg_.swiglu_clamp_shexp[il]);
-            submit(cb, enc);
-
-            std::array<int, 16> sel{};
-            std::array<float, 16> w{};
-            route(L, il, sel, w);
-            if (probe_) {
-                std::array<float, 16> self{};
-                std::copy_n(sel.begin(), k, self.begin());
-                probe_("moe_sel", int(il), self.data(), k);
-            }
-            if (route_override_)
-                route_override_(int(il), sel.data(), w.data(), k);
+            MTL::Buffer* rlog = scratch("rlog", cfg_.n_expert * 4);
             MTL::Buffer* ids = scratch("eids", 16 * 4);
-            arena_->ensure(il, std::span<const int>(sel.data(), k), static_cast<int32_t*>(ids->contents()));
             MTL::Buffer* ew = scratch("ew", 16 * 4);
-            std::memcpy(ew->contents(), w.data(), k * 4);
+            gemv(enc, L.router, xn, 0, rlog, 0);
+            ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, sho, cfg_.swiglu_clamp_shexp[il]);
+            const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale};
+            enc->setComputePipelineState(pso("moe_route"));
+            enc->setBuffer(rlog, 0, 0);
+            enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
+            enc->setBuffer(scratch("msel", 16 * 4), 0, 2);
+            enc->setBuffer(ew, 0, 3);
+            enc->setBuffer(scratch("mbiased", cfg_.n_expert * 4), 0, 4);
+            enc->setBytes(&ra, sizeof(ra), 5);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+            enc->endEncoding();
+            const uint64_t v = ++event_value_;
+            cb->encodeSignalEvent(routed_.get(), v);
+            cb->encodeWait(ready_.get(), v);
+            enc = cb->computeCommandEncoder();
+            pending_moe_.emplace_back(il, v);
 
             MTL::Buffer* eg = scratch("eg", k * nff * 4);
             MTL::Buffer* eu = scratch("eu", k * nff * 4);
@@ -751,13 +761,7 @@ const std::vector<float>& Engine::step(int32_t token)
     MTL::Buffer* lg = scratch("logits", uint64_t(cfg_.n_vocab) * 4);
     gemv(enc, output_, xn, 0, lg, 0);
     enc->endEncoding();
-    auto t0 = Clock::now();
-    cb->commit();
-    cb->waitUntilCompleted();
-    stats_.gpu_wait_ms += ms_since(t0);
-    if (cb->status() != MTL::CommandBufferStatusCompleted)
-        throw std::runtime_error("command buffer failed");
-    deliver_probes();
+    finish(cb);
     std::memcpy(logits_.data(), lg->contents(), uint64_t(cfg_.n_vocab) * 4);
     stats_.expert_read_ms = arena_->stats().read_ms;
     stats_.expert_bytes = arena_->stats().read_bytes;

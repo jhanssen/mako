@@ -60,8 +60,6 @@ public:
     const Region& region(uint32_t layer, int p) const { return regions_[layer][p]; }
     // Expert -> slot (-1: not resident), [n_layer][n_expert] int32, kept current for GPU-side lookup.
     MTL::Buffer* slot_table() const { return table_buf_.get(); }
-    // All arena buffers, made resident at construction; attach to every queue that reads experts.
-    MTL::ResidencySet* residency() const { return residency_.get(); }
     const std::vector<mtl::Ref<MTL::Buffer>>& buffers() const { return bufs_; }
 
     // Loads experts 0..slots-1 of every MoE layer.
@@ -82,7 +80,6 @@ private:
     std::vector<std::pair<void*, uint64_t>> chunks_;
     std::vector<mtl::Ref<MTL::Buffer>> bufs_;
     mtl::Ref<MTL::Buffer> table_buf_;
-    mtl::Ref<MTL::ResidencySet> residency_;
     std::vector<std::vector<int32_t>> slot_expert_; // [layer][slot] -> expert, -1 free
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]
     uint64_t clock_ = 0;

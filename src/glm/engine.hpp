@@ -46,7 +46,7 @@ public:
     void set_route_override(RouteOverride f) { route_override_ = std::move(f); }
 
     struct Stats {
-        double expert_read_ms = 0, gpu_wait_ms = 0;
+        double expert_read_ms = 0, gpu_wait_ms = 0, gpu_exec_ms = 0; // exec: GPU start to end, summed
         uint64_t expert_bytes = 0;
     };
     const Stats& stats() const { return stats_; }
@@ -88,7 +88,8 @@ private:
     bool indexer(MTL::ComputeCommandEncoder* enc, const Layer& L, uint32_t il);
     void ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* out, float limit);
-    void route(const Layer& L, uint32_t il, std::array<int, 16>& sel, std::array<float, 16>& w);
+    void serve_moe(MTL::CommandBuffer* cb);
+    void finish(MTL::CommandBuffer* cb);
     void probe(MTL::ComputeCommandEncoder* enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
     void deliver_probes();
@@ -116,6 +117,12 @@ private:
 
     uint32_t pos_ = 0;
     std::vector<float> logits_;
+    // Each MoE layer signals routed_ after its router ran and waits for ready_, which the CPU signals once the
+    // selected experts are resident and their slots written (serve_moe).
+    mtl::Ref<MTL::SharedEvent> routed_, ready_;
+    uint64_t event_value_ = 0;
+    std::vector<std::pair<uint32_t, uint64_t>> pending_moe_; // (layer, event value) not yet served
+
     Probe probe_;
     StreamOverride stream_override_;
     RouteOverride route_override_;

@@ -261,5 +261,7 @@ int main(int argc, char** argv)
     std::println("expert hits {} misses {} ({:.1f}% hit), reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", as.hits,
                  as.misses, 100.0 * as.hits / std::max<uint64_t>(1, as.hits + as.misses), st.expert_read_ms,
                  st.expert_bytes / 1e9, st.gpu_wait_ms);
+    std::println("gpu exec {:.0f} ms over {} steps ({:.1f} ms/step)", st.gpu_exec_ms, ids.size() + gen_ids.size(),
+                 st.gpu_exec_ms / double(ids.size() + gen_ids.size()));
     return 0;
 }
