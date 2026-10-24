@@ -62,6 +62,7 @@ struct CombineArgs {
 struct RouteArgs {
     uint32_t n_expert, n_used, norm;
     float scale;
+    uint32_t lookup;
 };
 struct PoolArgs {
     uint32_t dim, kpool, pool;
@@ -237,6 +238,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     for (const auto& L : layers_)
         parts.push_back(L->experts);
     arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
+    arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk));
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
     auto t_phase = Clock::now();
     routing_key_ = glm::routing_key(model_, cfg_);
@@ -251,7 +253,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         counts = load_profile(loaded_profile_, cfg_.n_layer, cfg_.n_expert);
     t_phase = Clock::now();
     arena_ = std::make_unique<ExpertArena>(ctx_.device(), ctx_.info().max_buffer, std::move(parts), cfg_.n_expert,
-                                           cfg_.n_expert_used, arena_plan_.budget, counts);
+                                           cfg_.n_expert_used, arena_plan_.budget, counts, arena_plan_.lendable);
     load_.arena_ms = ms_since(t_phase);
     arena_->prefill();
 
@@ -262,9 +264,14 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
     const uint32_t one = 1;
-    for (const auto& b : arena_->buffers()) {
+    std::vector<MTL::Buffer*> arena_bufs;
+    for (const auto& b : arena_->buffers())
+        arena_bufs.push_back(b.get());
+    if (arena_->tail_buffer())
+        arena_bufs.push_back(arena_->tail_buffer());
+    for (MTL::Buffer* b : arena_bufs) {
         enc->setComputePipelineState(pso("copy_f32"));
-        enc->setBuffer(b.get(), 0, 0);
+        enc->setBuffer(b, 0, 0);
         enc->setBuffer(sink, 0, 1);
         enc->setBytes(&one, sizeof(one), 2);
         enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
@@ -384,6 +391,21 @@ void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
     }
     timed_.clear();
     next_sample_ = 0;
+}
+
+// Scratch bytes a prefill chunk allocates: the per-token buffers of every stage it runs, plus the attention scores
+// and partial sums (bounded by the query group size, not the chunk) and the decode scratch.
+uint64_t Engine::prefill_scratch(uint32_t chunk) const
+{
+    const uint64_t E = cfg_.n_embd, hd = uint64_t(cfg_.hc) * E, inner = cfg_.kda_inner(), D = cfg_.kda_head_dim;
+    const uint64_t H = cfg_.n_head, R = cfg_.kv_lora_rank, k = cfg_.n_expert_used;
+    const uint64_t per_token = 5 * E + 3 * hd + 48                                            // streams, hc
+                               + 11 * inner + 2 * D + 2 * H                                     // KDA
+                               + 2 * cfg_.q_lora_rank + H * cfg_.head_k + 2 * R + 2 * H * R + H * cfg_.head_v
+                               + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) + cfg_.indexer_dim // MLA
+                               + 3 * uint64_t(cfg_.n_ff)                                        // dense FFN
+                               + 2 * cfg_.n_expert + 32 + 2 * k * E + 3 * k * cfg_.n_ff_exp;    // MoE
+    return uint64_t(chunk) * per_token * 4 + (96ull << 20);
 }
 
 void Engine::save_profile(const std::filesystem::path& path, bool merge) const
@@ -1066,7 +1088,7 @@ const std::vector<float>& Engine::step(int32_t token)
 
             gemv(enc, L.router, xn, 0, rlog, 0);
             ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], 1);
-            const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale};
+            const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale, 1};
             enc->setComputePipelineState(pso("moe_route"));
             enc->setBuffer(rlog, 0, 0);
             enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
@@ -1102,7 +1124,8 @@ const std::vector<float>& Engine::step(int32_t token)
                                                        : "";
                     for (int rep = repeats(label); rep > 0; --rep)
                         gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, 0, in, 0, out, 0,
-                                              miss ? indirect : nullptr, ind_off + uint64_t(part) * 12);
+                                              miss ? indirect : nullptr, ind_off + uint64_t(part) * 12,
+                                              {r.tail, r.tail_off, r.split});
                     if (opts_.telemetry == Telemetry::kernels)
                         after(enc, label);
                 };
@@ -1189,6 +1212,32 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         }
     }
 
+    // A long prompt's scratch buffers take the memory of the arena's lendable slots; afterwards the buffers go and
+    // the slots come back. Shorter prompts' scratch (under kLendBelow) is left to the budget's headroom.
+    constexpr uint64_t kLendBelow = 256ull << 20;
+    const bool lend = prefill_scratch(uint32_t(std::min<size_t>(chunk, tokens.size()))) > kLendBelow;
+    std::map<std::string, MTL::Buffer*> kept;
+    if (lend) {
+        for (const auto& [name, b] : scratch_)
+            kept.emplace(name, b.get());
+        arena_->lend();
+    }
+    struct Restore {
+        Engine& e;
+        bool lend;
+        std::map<std::string, MTL::Buffer*>& kept;
+        ~Restore()
+        {
+            if (!lend)
+                return;
+            std::erase_if(e.scratch_, [&](const auto& kv) {
+                auto it = kept.find(kv.first);
+                return it == kept.end() || it->second != kv.second.get();
+            });
+            e.arena_->reclaim();
+        }
+    } restore{*this, lend, kept};
+
     for (size_t c0 = 0; c0 < tokens.size(); c0 += chunk) {
         const uint32_t T = uint32_t(std::min<size_t>(chunk, tokens.size() - c0));
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
@@ -1220,6 +1269,18 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         cur_layer_ = cfg_.n_layer;
         MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
         const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
+        // Command buffers committed without waiting (the resident experts' work); drain() waits for them.
+        std::vector<MTL::CommandBuffer*> committed;
+        auto drain = [&] {
+            for (MTL::CommandBuffer* c : committed) {
+                c->waitUntilCompleted();
+                if (c->status() != MTL::CommandBufferStatusCompleted)
+                    throw std::runtime_error("command buffer failed");
+                stats_.gpu_exec_ms += (c->GPUEndTime() - c->GPUStartTime()) * 1e3;
+                c->release();
+            }
+            committed.clear();
+        };
         dispatch(enc, "hc_init", {x, R}, &ha, sizeof(ha), MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
 
         for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
@@ -1252,22 +1313,21 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 MTL::Buffer* ew = scratch("p_ew", uint64_t(T) * 16 * 4);
                 proj(enc, L.router, xn, 0, rlog, 0, T);
                 ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], T);
-                // The kernel's slot lookup is not used here: the CPU assigns slots after this sync.
-                const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale};
-                for (uint32_t t = 0; t < T; ++t) {
-                    enc->setComputePipelineState(pso("moe_route"));
-                    enc->setBuffer(rlog, uint64_t(t) * cfg_.n_expert * 4, 0);
-                    enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
-                    enc->setBuffer(sel, uint64_t(t) * 64, 2);
-                    enc->setBuffer(ew, uint64_t(t) * 64, 3);
-                    enc->setBuffer(scratch("mbiased", cfg_.n_expert * 4), 0, 4);
-                    enc->setBytes(&ra, sizeof(ra), 5);
-                    enc->setBuffer(arena_->slot_table(), uint64_t(il) * cfg_.n_expert * 4, 6);
-                    enc->setBuffer(scratch("p_hit", 64), 0, 7);
-                    enc->setBuffer(scratch("p_mrank", 64), 0, 8);
-                    enc->setBuffer(scratch("p_ind", 64), 0, 9);
-                    enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
-                }
+                // Routing only; the CPU assigns slots after this sync.
+                const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale, 0};
+                MTL::Buffer* unused = scratch("p_unused", 64);
+                enc->setComputePipelineState(pso("moe_route"));
+                enc->setBuffer(rlog, 0, 0);
+                enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
+                enc->setBuffer(sel, 0, 2);
+                enc->setBuffer(ew, 0, 3);
+                enc->setBuffer(scratch("p_biased", uint64_t(T) * cfg_.n_expert * 4), 0, 4);
+                enc->setBytes(&ra, sizeof(ra), 5);
+                enc->setBuffer(unused, 0, 6);
+                enc->setBuffer(unused, 0, 7);
+                enc->setBuffer(unused, 0, 8);
+                enc->setBuffer(unused, 0, 9);
+                enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
                 after(enc, "moe_route");
                 submit(cb, enc);
                 cur_cb_ = cb;
@@ -1318,10 +1378,9 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     enc = encoder(cb, il, 2, MTL::DispatchTypeConcurrent);
                     auto gemm_part = [&](int part, int e, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
                         const ExpertArena::Part& p = arena_->part(il, part);
-                        const ExpertArena::Region& r = arena_->region(il, part);
-                        gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), r.buf,
-                                      r.off + uint64_t(slot[e]) * r.stride, x, uint64_t(start[e]) * xw * 4, y,
-                                      uint64_t(start[e]) * yw * 4);
+                        const auto [wb, wo] = arena_->region(il, part).at(uint32_t(slot[e]));
+                        gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, x,
+                                      uint64_t(start[e]) * xw * 4, y, uint64_t(start[e]) * yw * 4);
                     };
                     for (size_t i = b0; i < b1; ++i) {
                         gemm_part(0, order[i], xg, E, gg, nff);
@@ -1354,8 +1413,21 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
 
                 const auto t_ensure = Clock::now();
                 std::vector<int32_t> slot(cfg_.n_expert, -1);
+                // Resident experts need no reads: commit their work now so the GPU runs it while the misses are
+                // read (pinned slots are never evicted).
                 size_t b0 = 0;
-                for (size_t i = 0; i < order.size(); ++i) {
+                while (b0 < order.size() && table[order[b0]] >= 0) {
+                    arena_->ensure(il, std::span<const int>(&order[b0], 1), &slot[order[b0]], true);
+                    ++b0;
+                }
+                run(0, b0, slot);
+                enc->endEncoding();
+                cb->commit();
+                committed.push_back(cb->retain());
+                cb = ctx_.queue()->commandBuffer();
+                cur_cb_ = cb;
+                enc = encoder(cb, cur_layer_, -1);
+                for (size_t i = b0; i < order.size(); ++i) {
                     const int e = order[i];
                     if (arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true))
                         continue;
@@ -1363,6 +1435,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     run(b0, i, slot);
                     submit(cb, enc);
                     cur_cb_ = cb;
+                    drain();
                     arena_->unpin(il);
                     b0 = i;
                     if (!arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true))
@@ -1402,6 +1475,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         proj(enc, output_, xnl, 0, lg, 0, nl);
         enc->endEncoding();
         finish(cb);
+        drain();
         const auto* lgp = static_cast<const float*>(lg->contents());
         if (logits_sink_)
             for (uint32_t i = 0; i < T; ++i)

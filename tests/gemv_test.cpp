@@ -163,7 +163,27 @@ int main(int argc, char** argv)
                 err += double(yf[i] - rf[i]) * (yf[i] - rf[i]);
                 ref += double(rf[i]) * rf[i];
             }
-            const double rel = std::sqrt(err / ref);
+            // Slots from `split` on in a second buffer (the arena's lendable slots); the main buffer's copies of
+            // those are zeroed so reading the wrong one shows.
+            constexpr uint32_t split = 5;
+            auto main = buffer(stride * n_sel), tail = buffer(stride * (n_sel - split) + 16384);
+            std::memcpy(main->contents(), slots->contents(), stride * split);
+            std::memset(static_cast<char*>(main->contents()) + stride * split, 0, stride * (n_sel - split));
+            std::memcpy(static_cast<char*>(tail->contents()) + 16384, static_cast<char*>(slots->contents()) + stride * split,
+                        stride * (n_sel - split));
+            auto y2 = buffer(uint64_t(n) * n_sel * 4);
+            cb = ctx.queue()->commandBuffer();
+            enc = cb->computeCommandEncoder();
+            gemv.encode_indexed(enc, a, main.get(), 0, stride, ids.get(), 0, x.get(), 0, y2.get(), 0, nullptr, 0,
+                                {tail.get(), 16384, split});
+            enc->endEncoding();
+            cb->commit();
+            cb->waitUntilCompleted();
+            const auto* y2f = static_cast<const float*>(y2->contents());
+            double err2 = 0;
+            for (uint64_t i = 0; i < uint64_t(n) * n_sel; ++i)
+                err2 += double(y2f[i] - rf[i]) * (y2f[i] - rf[i]);
+            const double rel = std::sqrt(std::max(err, err2) / ref);
             const bool ok = rel < 1e-6;
             failures += !ok;
             std::string timing;

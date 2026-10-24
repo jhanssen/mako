@@ -200,9 +200,9 @@ int main(int argc, char** argv)
         const auto& p = engine.arena_plan();
         const auto& a = engine.arena();
         std::println("memory: RAM {:.1f} GB, working set {:.1f} GB, footprint {:.1f} GB, file-cache floor {:.1f} GB, "
-                     "available {:.1f} GB",
+                     "available {:.1f} GB, lendable to prefill {:.1f} GB",
                      p.mem.phys / 1e9, p.mem.working_set / 1e9, p.mem.footprint / 1e9, p.mem.filecache_min / 1e9,
-                     p.mem.available / 1e9);
+                     p.mem.available / 1e9, engine.arena().lendable_bytes() / 1e9);
         uint32_t lo = UINT32_MAX, hi = 0, moe = 0;
         for (uint32_t l = 0; l < cfg->n_layer; ++l)
             if (a.slots(l)) {

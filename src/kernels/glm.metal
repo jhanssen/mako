@@ -457,6 +457,7 @@ kernel void moe_combine(device const float* x [[buffer(0)]], device const float*
 struct RouteArgs {
     uint n_expert, n_used, norm;
     float scale;
+    uint lookup; // look the selection up in slots (one token)
 };
 
 // Router top-k over sigmoid scores, the bias added for the selection only; ties keep the lower expert index.
@@ -464,13 +465,19 @@ struct RouteArgs {
 // Then each selected expert is looked up in `slots` (this layer's expert -> arena slot, -1 absent): a resident
 // one gets its slot in hit_ids and miss_rank -1; a missing one slot 0 (its result is not used) and its index
 // among the misses. The miss count goes to the z of the three indirect dispatches (gate, up, down).
-// One threadgroup of TG threads; sel, w, hit_ids, miss_rank get n_used (<= 16) entries, biased n_expert.
+// One threadgroup of TG threads per token t: logits and biased rows of n_expert, sel and w rows of 16 (n_used
+// <= 16 used); hit_ids, miss_rank and indirect only with a.lookup.
 kernel void moe_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
                       device int* sel [[buffer(2)]], device float* w [[buffer(3)]], device float* biased [[buffer(4)]],
                       constant RouteArgs& a [[buffer(5)]], device const int* slots [[buffer(6)]],
                       device int* hit_ids [[buffer(7)]], device int* miss_rank [[buffer(8)]],
-                      device uint* indirect [[buffer(9)]], uint tid [[thread_position_in_threadgroup]])
+                      device uint* indirect [[buffer(9)]], uint tid [[thread_position_in_threadgroup]],
+                      uint t [[threadgroup_position_in_grid]])
 {
+    logits += uint64_t(t) * a.n_expert;
+    biased += uint64_t(t) * a.n_expert;
+    sel += t * 16;
+    w += t * 16;
     threadgroup float best_v[TG / 32];
     threadgroup uint best_i[TG / 32];
     threadgroup uint chosen[16];
@@ -521,12 +528,15 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
         for (uint j = 0; j < a.n_used; ++j) {
             sel[j] = int(chosen[j]);
             w[j] = (a.norm ? p[j] / sum : p[j]) * a.scale;
-            const int s = slots[chosen[j]];
-            hit_ids[j] = max(s, 0);
-            miss_rank[j] = s >= 0 ? -1 : int(misses++);
+            if (a.lookup) {
+                const int s = slots[chosen[j]];
+                hit_ids[j] = max(s, 0);
+                miss_rank[j] = s >= 0 ? -1 : int(misses++);
+            }
         }
-        for (uint d = 0; d < 3; ++d)
-            indirect[d * 3 + 2] = misses;
+        if (a.lookup)
+            for (uint d = 0; d < 3; ++d)
+                indirect[d * 3 + 2] = misses;
     }
 }
 

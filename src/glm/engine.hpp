@@ -70,6 +70,7 @@ public:
     struct ArenaPlan {
         MemInfo mem;
         double budget = 0;
+        double lendable = 0; // arena bytes prefill's scratch buffers borrow
         double warm_ms = 0; // first GPU pass over the arena, at load
     };
     const ArenaPlan& arena_plan() const { return arena_plan_; }
@@ -77,6 +78,14 @@ public:
     const LoadStats& load_stats() const { return load_; }
     const StepStats& last_step() const { return last_step_; }
     const StepStats& last_prefill() const { return last_prefill_; } // layers summed over its chunks
+    // Bytes of all scratch buffers allocated so far.
+    uint64_t scratch_bytes() const
+    {
+        uint64_t n = 0;
+        for (const auto& [name, b] : scratch_)
+            n += b->length();
+        return n;
+    }
 
     const std::string& routing_key() const { return routing_key_; }
     const std::filesystem::path& default_profile() const { return default_profile_; }
@@ -123,6 +132,7 @@ private:
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T);
     void serve_moe(MTL::CommandBuffer* cb);
+    uint64_t prefill_scratch(uint32_t chunk) const;
     // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
     MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section,
                                         MTL::DispatchType type = MTL::DispatchTypeSerial);

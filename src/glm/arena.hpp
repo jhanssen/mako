@@ -28,8 +28,11 @@ MemInfo query_memory(uint64_t working_set);
 double arena_budget(const MemInfo& m);
 
 // Routed experts kept resident in mlock'ed anonymous memory, wrapped no-copy into Metal buffers. Each MoE layer
-// and part (gate, up, down) has a region of equal-stride slots: slot s is at region.buf + region.off + s * stride,
-// and the same s holds one expert's three parts. Kernels consume (region, slot ids), whichever family they target.
+// and part (gate, up, down) has a region of equal-stride slots: slot s < split is at buf + off + s * stride, a
+// lendable slot s >= split at tail + tail_off + (s - split) * stride; the same s holds one expert's three parts.
+// Kernels consume (region, slot ids), whichever family they target.
+// The lendable slots of all layers share one buffer that lend() releases, returning its memory to the system (a
+// wrapped page stays held by Metal while its buffer lives), and reclaim() rebuilds.
 class ExpertArena {
 public:
     struct Part {
@@ -43,6 +46,14 @@ public:
     struct Region {
         MTL::Buffer* buf = nullptr;
         uint64_t off = 0, stride = 0;
+        MTL::Buffer* tail = nullptr; // null while lent
+        uint64_t tail_off = 0;
+        uint32_t split = 0;
+        std::pair<MTL::Buffer*, uint64_t> at(uint32_t slot) const
+        {
+            return slot < split ? std::pair{buf, off + uint64_t(slot) * stride}
+                                : std::pair{tail, tail_off + uint64_t(slot - split) * stride};
+        }
     };
     struct Stats {
         uint64_t hits = 0, misses = 0, read_bytes = 0;
@@ -52,8 +63,10 @@ public:
     // `counts` (per layer, n_expert routing counts from a profile; may be empty) decides which experts start
     // resident and how many slots each layer gets: slots go to the most used (layer, expert) pairs per byte, at
     // least n_used per layer. Without counts every layer gets the same number of slots, filled in id order.
+    // At least `lendable_bytes` of the budget become lendable slots, the same number in every layer.
     ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<LayerParts> layers, uint32_t n_expert,
-                uint32_t n_used, double budget_bytes, const std::vector<std::vector<uint64_t>>& counts = {});
+                uint32_t n_used, double budget_bytes, const std::vector<std::vector<uint64_t>>& counts = {},
+                double lendable_bytes = 0);
     ~ExpertArena();
     ExpertArena(const ExpertArena&) = delete;
     ExpertArena& operator=(const ExpertArena&) = delete;
@@ -65,6 +78,14 @@ public:
     // Expert -> slot (-1: not resident), [n_layer][n_expert] int32, kept current for GPU-side lookup.
     MTL::Buffer* slot_table() const { return table_buf_.get(); }
     const std::vector<mtl::Ref<MTL::Buffer>>& buffers() const { return bufs_; }
+    MTL::Buffer* tail_buffer() const { return tail_buf_.get(); }
+    uint64_t lendable_bytes() const { return tail_bytes_; }
+
+    // Evicts the experts in the lendable slots and frees their memory; ensure() then uses only the other slots.
+    void lend();
+    // Rebuilds the lendable slots and reads back the experts lend() evicted, unless resident by now.
+    void reclaim();
+    bool lent() const { return lent_; }
 
     // Loads each MoE layer's first slots(layer) experts in profile order (id order without a profile).
     void prefill();
@@ -94,6 +115,12 @@ private:
     uint64_t bytes_ = 0;
     std::vector<std::pair<void*, uint64_t>> chunks_;
     std::vector<mtl::Ref<MTL::Buffer>> bufs_;
+    MTL::Device* dev_ = nullptr;
+    void* tail_mem_ = nullptr;
+    uint64_t tail_bytes_ = 0;
+    mtl::Ref<MTL::Buffer> tail_buf_;
+    bool lent_ = false;
+    std::vector<std::vector<int32_t>> evicted_; // [layer] experts lend() evicted
     mtl::Ref<MTL::Buffer> table_buf_;
     std::vector<std::vector<int32_t>> slot_expert_; // [layer][slot] -> expert, -1 free
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]
