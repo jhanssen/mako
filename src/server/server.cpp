@@ -4,6 +4,7 @@
 
 #include <httplib.h>
 
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <mutex>
@@ -46,7 +47,7 @@ struct Server::Impl {
     glm::Session session;
     std::mutex gen_mutex; // one generation at a time
     httplib::Server http;
-    uint64_t next_id = 0;
+    std::atomic<uint64_t> next_id = 0; // handlers run on several threads
 
     Impl(glm::Engine& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
         : engine(e), tok(t), tmpl(tm), opts(std::move(o)), session(e)

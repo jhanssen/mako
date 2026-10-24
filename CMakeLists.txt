@@ -13,6 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
+    message(STATUS "CMAKE_BUILD_TYPE not set: using RelWithDebInfo")
 endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
