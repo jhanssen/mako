@@ -96,6 +96,7 @@ public:
     // misses do not fit in the unpinned slots.
     bool ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin = false);
     void unpin(uint32_t layer);
+    void unpin(uint32_t layer, std::span<const int32_t> slots);
 
     const Stats& stats() const { return stats_; }
     // How often each expert was selected since construction, [layer][expert].

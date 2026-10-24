@@ -348,6 +348,12 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
 
 void ExpertArena::unpin(uint32_t layer) { std::ranges::fill(pinned_[layer], 0); }
 
+void ExpertArena::unpin(uint32_t layer, std::span<const int32_t> slots)
+{
+    for (int32_t s : slots)
+        pinned_[layer][s] = 0;
+}
+
 void ExpertArena::prefill()
 {
     const auto t0 = Clock::now();

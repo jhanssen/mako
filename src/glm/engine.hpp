@@ -24,7 +24,8 @@ struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
-    uint32_t prefill_chunk = 512; // tokens prefill() runs through each layer together
+    uint32_t prefill_chunk = 512; // tokens prefill() runs through each layer's attention together
+    uint32_t prefill_group = 4096; // tokens whose routed experts run together, each loaded once per layer
     std::string expert_counts;  // routing profile placing experts in the arena; empty: the model's default profile
                                 // (default_profile_path), when it exists
     Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
@@ -50,6 +51,8 @@ public:
     void reset();
     // At most the chunk size the engine was built with, which sized the arena's lendable slots.
     void set_prefill_chunk(uint32_t chunk);
+    // At most the group size the engine was built with.
+    void set_prefill_group(uint32_t group);
 
     // Called after each named stage of a step with the fp32 values it produced (for parity checks).
     using Probe = std::function<void(const std::string& name, int layer, const float* data, size_t n)>;
@@ -119,11 +122,12 @@ private:
     void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
                   const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads = true);
     void norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
-              uint32_t n, uint32_t wn, float eps);
+              uint32_t n, uint32_t wn, float eps, uint64_t x_off = 0);
+    // R (and out) at byte offset r_off: a chunk's rows of a longer stream.
     void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
-                MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T);
+                MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T, uint64_t r_off = 0);
     void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out, MTL::Buffer* pc,
-                 uint32_t T);
+                 uint32_t T, uint64_t r_off = 0);
     void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
              uint32_t T);
     void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
@@ -134,12 +138,13 @@ private:
                          MTL::Buffer* qrn, uint32_t T, uint32_t pos0);
     bool indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos);
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
-                   const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T);
+                   const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
+                   uint64_t x_off = 0, uint64_t out_off = 0);
     void serve_moe(MTL::CommandBuffer* cb);
     // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
     MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                         uint32_t ld);
-    uint64_t prefill_scratch(uint32_t chunk) const;
+    uint64_t prefill_scratch(uint32_t chunk, uint32_t group) const;
     // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
     MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section,
                                         MTL::DispatchType type = MTL::DispatchTypeSerial);
@@ -177,7 +182,7 @@ private:
     std::vector<mtl::Ref<MTL::Buffer>> kda_state_, conv_state_, kv_cache_, idx_cache_, idx_pooled_;
 
     uint32_t pos_ = 0;
-    uint32_t built_chunk_ = 0;
+    uint32_t built_chunk_ = 0, built_group_ = 0;
     std::vector<float> logits_;
     // Each MoE layer signals routed_ after its router ran and waits for ready_, which the CPU signals once the
     // selected experts are resident and their slots written (serve_moe).

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -27,6 +28,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 constexpr uint64_t kAlign = 256;
 constexpr uint64_t kChunkBytes = 1ull << 30;
 constexpr NS::UInteger kSamplesPerBuffer = 4096; // the largest counter sample buffer is 32 KiB
+constexpr uint32_t kBatchRows = 8192;            // prefill expert rows (token, expert pairs) run and combined together
 
 struct NormArgs {
     uint32_t n, wn;
@@ -239,7 +241,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         parts.push_back(L->experts);
     arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
     built_chunk_ = opts_.prefill_chunk;
-    arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk));
+    built_group_ = std::max(opts_.prefill_chunk, opts_.prefill_group);
+    arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk, std::max(opts_.prefill_chunk, opts_.prefill_group)));
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
     auto t_phase = Clock::now();
     routing_key_ = glm::routing_key(model_, cfg_);
@@ -303,7 +306,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
                 ts = sets->object<MTL::CounterSet>(i);
         const uint64_t want = opts_.telemetry == Telemetry::kernels ? uint64_t(cfg_.n_layer) * 240 + 64
-                                                                    : uint64_t(cfg_.n_layer) * 24 + 64;
+                                                                    : uint64_t(cfg_.n_layer) * 64 + 64;
         mtl::Ref<MTL::CounterSampleBufferDescriptor> d(MTL::CounterSampleBufferDescriptor::alloc()->init());
         d->setCounterSet(ts);
         d->setSampleCount(kSamplesPerBuffer);
@@ -394,20 +397,22 @@ void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
     next_sample_ = 0;
 }
 
-// Scratch bytes a prefill chunk allocates: the per-token buffers of every stage it runs, plus the attention scores
-// and partial sums (bounded by the query group size, not the chunk) and the decode scratch.
-uint64_t Engine::prefill_scratch(uint32_t chunk) const
+// Scratch bytes a prefill allocates: per token of a chunk (the attention stages and the dense FFNs), per token of a
+// group (the residual streams and the routed FFN's inputs and outputs), the expert batch buffers, and the attention
+// scores and partial sums (bounded by the query group size, not the chunk) plus the decode scratch.
+uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
 {
     const uint64_t E = cfg_.n_embd, hd = uint64_t(cfg_.hc) * E, inner = cfg_.kda_inner(), D = cfg_.kda_head_dim;
-    const uint64_t H = cfg_.n_head, R = cfg_.kv_lora_rank, k = cfg_.n_expert_used;
-    const uint64_t per_token = 5 * E + 3 * hd + 48                                            // streams, hc
-                               + 11 * inner + 2 * D + 2 * H                                     // KDA
-                               + 2 * cfg_.q_lora_rank + H * cfg_.head_k + 2 * R + 2 * H * R + H * cfg_.head_v
-                               + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) + cfg_.indexer_dim // MLA
-                               + 3 * uint64_t(cfg_.n_ff)                                        // dense FFN
-                               + 2 * cfg_.n_expert + 32 + 2 * k * E + 3 * k * cfg_.n_ff_exp     // MoE
-                               + std::max<uint64_t>({cfg_.n_ff, H * R, H * cfg_.head_k, inner}) / 2; // GEMM input
-    return uint64_t(chunk) * per_token * 4 + (96ull << 20);
+    const uint64_t H = cfg_.n_head, R = cfg_.kv_lora_rank, k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
+    const uint64_t per_chunk_token = 3 * E + 24 + hd                                         // streams, hc
+                                     + 11 * inner + 2 * D + 2 * H                                // KDA
+                                     + 2 * cfg_.q_lora_rank + H * cfg_.head_k + 2 * R + 2 * H * R + H * cfg_.head_v
+                                     + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) + cfg_.indexer_dim // MLA
+                                     + 3 * uint64_t(cfg_.n_ff)                                   // dense FFNs
+                                     + std::max<uint64_t>({cfg_.n_ff, H * R, H * cfg_.head_k, inner}) / 2; // GEMM input
+    const uint64_t per_group_token = 3 * E + 3 * hd + 48 + 2 * cfg_.n_expert + 32 + k + 16 + E / 2 + k * E;
+    const uint64_t batch = uint64_t(kBatchRows) * (E / 2 + 2 * nff + nff / 2);
+    return (uint64_t(chunk) * per_chunk_token + uint64_t(group) * per_group_token + batch) * 4 + (96ull << 20);
 }
 
 void Engine::reset()
@@ -426,6 +431,13 @@ void Engine::set_prefill_chunk(uint32_t chunk)
     if (chunk > built_chunk_)
         throw std::runtime_error(std::format("prefill chunk {} above the {} the engine was built with", chunk, built_chunk_));
     opts_.prefill_chunk = chunk;
+}
+
+void Engine::set_prefill_group(uint32_t group)
+{
+    if (group > built_group_)
+        throw std::runtime_error(std::format("prefill group {} above the {} the engine was built with", group, built_group_));
+    opts_.prefill_group = group;
 }
 
 void Engine::save_profile(const std::filesystem::path& path, bool merge) const
@@ -585,11 +597,11 @@ void Engine::dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, s
 }
 
 void Engine::norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
-                  uint32_t n, uint32_t wn, float eps)
+                  uint32_t n, uint32_t wn, float eps, uint64_t x_off)
 {
     const NormArgs a{n, w ? wn : 0, eps};
     enc->setComputePipelineState(pso("rms_norm"));
-    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(x, x_off, 0);
     enc->setBuffer(w ? w->buf : x, w ? w->off : 0, 1);
     enc->setBuffer(y, 0, 2);
     enc->setBytes(&a, sizeof(a), 3);
@@ -600,12 +612,12 @@ void Engine::norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTen
 
 // x = mHC pre-mix of the streams R for T tokens; pc keeps each token's pre/post/comb for hc_post.
 void Engine::hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
-                    MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T)
+                    MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T, uint64_t r_off)
 {
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E;
     MTL::Buffer* flat = scratch("flat", uint64_t(T) * hd * 4);
     MTL::Buffer* mixes = scratch("mixes", uint64_t(T) * 24 * 4);
-    norm(enc, R, nullptr, flat, T, hd, 0, cfg_.rms_eps);
+    norm(enc, R, nullptr, flat, T, hd, 0, cfg_.rms_eps, r_off);
     proj(enc, fn, flat, 0, mixes, 0, T);
     const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
     enc->setComputePipelineState(pso("hc_mix"));
@@ -616,15 +628,28 @@ void Engine::hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const
     enc->setBytes(&ha, sizeof(ha), 4);
     enc->dispatchThreads(MTL::Size(T, 1, 1), MTL::Size(std::min<uint32_t>(T, 64), 1, 1));
     after(enc, "hc_mix");
-    dispatch(enc, "hc_collapse", {R, pc, x}, &ha, sizeof(ha), MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    enc->setComputePipelineState(pso("hc_collapse"));
+    enc->setBuffer(R, r_off, 0);
+    enc->setBuffer(pc, 0, 1);
+    enc->setBuffer(x, 0, 2);
+    enc->setBytes(&ha, sizeof(ha), 3);
+    enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    after(enc, "hc_collapse");
 }
 
 // out = mHC post-mix of x into the streams R for T tokens, with hc_pre's pc.
 void Engine::hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out, MTL::Buffer* pc,
-                     uint32_t T)
+                     uint32_t T, uint64_t r_off)
 {
     const HcArgs ha{cfg_.n_embd, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
-    dispatch(enc, "hc_expand", {x, R, pc, out}, &ha, sizeof(ha), MTL::Size(cfg_.n_embd, T, 1), MTL::Size(256, 1, 1));
+    enc->setComputePipelineState(pso("hc_expand"));
+    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(R, r_off, 1);
+    enc->setBuffer(pc, 0, 2);
+    enc->setBuffer(out, r_off, 3);
+    enc->setBytes(&ha, sizeof(ha), 4);
+    enc->dispatchThreads(MTL::Size(cfg_.n_embd, T, 1), MTL::Size(256, 1, 1));
+    after(enc, "hc_expand");
 }
 
 void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
@@ -893,17 +918,18 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
 }
 
 void Engine::ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
-                       const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T)
+                       const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
+                       uint64_t x_off, uint64_t out_off)
 {
     const uint32_t nff = uint32_t(gate.dims[1]);
     MTL::Buffer* g = scratch("ffg", uint64_t(T) * nff * 4);
     MTL::Buffer* u = scratch("ffu", uint64_t(T) * nff * 4);
     MTL::Buffer* m = scratch("ffm", uint64_t(T) * nff * 4);
-    proj(enc, gate, xn, 0, g, 0, T);
-    proj(enc, up, xn, 0, u, 0, T);
+    proj(enc, gate, xn, x_off, g, 0, T);
+    proj(enc, up, xn, x_off, u, 0, T);
     const SwigluArgs sa{T * nff, limit > 1e-6f ? limit : 0.0f};
     dispatch(enc, "swiglu", {g, u, m}, &sa, sizeof(sa), MTL::Size(T * nff, 1, 1), MTL::Size(256, 1, 1));
-    proj(enc, down, m, 0, out, 0, T);
+    proj(enc, down, m, 0, out, out_off, T);
 }
 
 // Serves the MoE layers of a committed command buffer in order: waits until a layer's router has run, makes its
@@ -1244,7 +1270,9 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
     // A long prompt's scratch buffers take the memory of the arena's lendable slots; afterwards the buffers go and
     // the slots come back. Shorter prompts' scratch (under kLendBelow) is left to the budget's headroom.
     constexpr uint64_t kLendBelow = 256ull << 20;
-    const bool lend = prefill_scratch(uint32_t(std::min<size_t>(chunk, tokens.size()))) > kLendBelow;
+    const uint32_t group = std::max(chunk, opts_.prefill_group);
+    const bool lend = prefill_scratch(uint32_t(std::min<size_t>(chunk, tokens.size())),
+                                      uint32_t(std::min<size_t>(group, tokens.size()))) > kLendBelow;
     std::map<std::string, MTL::Buffer*> kept;
     if (lend) {
         for (const auto& [name, b] : scratch_)
@@ -1267,25 +1295,29 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         }
     } restore{*this, lend, kept};
 
-    for (size_t c0 = 0; c0 < tokens.size(); c0 += chunk) {
-        const uint32_t T = uint32_t(std::min<size_t>(chunk, tokens.size() - c0));
+    // Groups of up to `group` tokens go through the layers together: each layer's attention in chunks of `chunk`
+    // tokens, then its FFN for the whole group, so a routed expert is loaded at most once per layer and group.
+    for (size_t g0 = 0; g0 < tokens.size(); g0 += group) {
+        const uint32_t G = uint32_t(std::min<size_t>(group, tokens.size() - g0));
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-        MTL::Buffer* x = scratch("p_x", uint64_t(T) * E * 4);
-        MTL::Buffer* xn = scratch("p_xn", uint64_t(T) * E * 4);
-        MTL::Buffer* att = scratch("p_att", uint64_t(T) * E * 4);
-        MTL::Buffer* ffo = scratch("p_ffo", uint64_t(T) * E * 4);
-        MTL::Buffer* sho = scratch("p_sho", uint64_t(T) * E * 4);
-        MTL::Buffer* R = scratch("p_R", uint64_t(T) * hd * 4);
-        MTL::Buffer* R2 = scratch("p_R2", uint64_t(T) * hd * 4);
-        MTL::Buffer* pc = scratch("p_pc", uint64_t(T) * 24 * 4);
+        MTL::Buffer* xg_in = scratch("p_xin", uint64_t(G) * E * 4);
+        MTL::Buffer* xn_g = scratch("p_xng", uint64_t(G) * E * 4);
+        MTL::Buffer* ffo = scratch("p_ffo", uint64_t(G) * E * 4);
+        MTL::Buffer* R = scratch("p_R", uint64_t(G) * hd * 4);
+        MTL::Buffer* R2 = scratch("p_R2", uint64_t(G) * hd * 4);
+        MTL::Buffer* pc_g = scratch("p_pcg", uint64_t(G) * 24 * 4);
+        MTL::Buffer* x = scratch("p_x", uint64_t(std::min(chunk, G)) * E * 4);
+        MTL::Buffer* xn = scratch("p_xn", uint64_t(std::min(chunk, G)) * E * 4);
+        MTL::Buffer* att = scratch("p_att", uint64_t(std::min(chunk, G)) * E * 4);
+        MTL::Buffer* pc = scratch("p_pc", uint64_t(std::min(chunk, G)) * 24 * 4);
 
         {
             const gguf::Tensor& t = *token_embd_.tensor;
             const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
             std::vector<std::byte> row(rb);
-            for (uint32_t i = 0; i < T; ++i) {
-                read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[c0 + i]) * rb);
-                quant::dequant_row(t.type, row.data(), static_cast<float*>(x->contents()) + uint64_t(i) * E, E);
+            for (uint32_t i = 0; i < G; ++i) {
+                read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i]) * rb);
+                quant::dequant_row(t.type, row.data(), static_cast<float*>(xg_in->contents()) + uint64_t(i) * E, E);
             }
         }
 
@@ -1297,7 +1329,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         cur_cb_ = cb;
         cur_layer_ = cfg_.n_layer;
         MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
-        const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
+        const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, G};
         // Command buffers committed without waiting (the resident experts' work); drain() waits for them.
         std::vector<MTL::CommandBuffer*> committed;
         auto drain = [&] {
@@ -1310,38 +1342,46 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
             }
             committed.clear();
         };
-        dispatch(enc, "hc_init", {x, R}, &ha, sizeof(ha), MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+        dispatch(enc, "hc_init", {xg_in, R}, &ha, sizeof(ha), MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
 
         for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
             const Layer& L = *layers_[il];
             cur_layer_ = il;
-            if (!samples_.empty()) {
-                enc->endEncoding();
-                enc = encoder(cb, il, 0);
+            for (uint32_t c0 = 0; c0 < G; c0 += chunk) {
+                const uint32_t T = std::min(chunk, G - c0);
+                const uint64_t r_off = uint64_t(c0) * hd * 4;
+                if (!samples_.empty()) {
+                    enc->endEncoding();
+                    enc = encoder(cb, il, 0);
+                }
+                hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pc, T, r_off);
+                norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
+                if (L.kda)
+                    kda(enc, L, il, xn, att, T);
+                else
+                    mla(enc, L, il, xn, att, T, pos_ + uint32_t(g0) + c0);
+                hc_post(enc, att, R, R2, pc, T, r_off);
             }
-            hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pc, T);
-            norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
-            if (L.kda)
-                kda(enc, L, il, xn, att, T);
-            else
-                mla(enc, L, il, xn, att, T, pos_);
-            hc_post(enc, att, R, R2, pc, T);
             std::swap(R, R2);
             if (!samples_.empty()) {
                 enc->endEncoding();
                 enc = encoder(cb, il, 1);
             }
 
-            hc_pre(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, x, pc, T);
-            norm(enc, x, &L.ffn_norm, xn, T, E, E, cfg_.rms_eps);
-            if (L.dense) {
-                ffn_dense(enc, L.ffn_gate, L.ffn_up, L.ffn_down, xn, ffo, cfg_.swiglu_clamp_shexp[il], T);
-            } else {
-                MTL::Buffer* rlog = scratch("p_rlog", uint64_t(T) * cfg_.n_expert * 4);
-                MTL::Buffer* sel = scratch("p_sel", uint64_t(T) * 16 * 4);
-                MTL::Buffer* ew = scratch("p_ew", uint64_t(T) * 16 * 4);
-                proj(enc, L.router, xn, 0, rlog, 0, T);
-                ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], T);
+            hc_pre(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg_in, pc_g, G);
+            norm(enc, xg_in, &L.ffn_norm, xn_g, G, E, E, cfg_.rms_eps);
+            // Dense FFNs (the leading layers' and the shared expert) in chunks: their intermediates are wide.
+            const DevTensor& fg = L.dense ? L.ffn_gate : L.sh_gate;
+            const DevTensor& fu = L.dense ? L.ffn_up : L.sh_up;
+            const DevTensor& fd = L.dense ? L.ffn_down : L.sh_down;
+            for (uint32_t c0 = 0; c0 < G; c0 += chunk)
+                ffn_dense(enc, fg, fu, fd, xn_g, ffo, cfg_.swiglu_clamp_shexp[il], std::min(chunk, G - c0),
+                          uint64_t(c0) * E * 4, uint64_t(c0) * E * 4);
+            if (!L.dense) {
+                MTL::Buffer* rlog = scratch("p_rlog", uint64_t(G) * cfg_.n_expert * 4);
+                MTL::Buffer* sel = scratch("p_sel", uint64_t(G) * 16 * 4);
+                MTL::Buffer* ew = scratch("p_ew", uint64_t(G) * 16 * 4);
+                proj(enc, L.router, xn_g, 0, rlog, 0, G);
                 // Routing only; the CPU assigns slots after this sync.
                 const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale, 0};
                 MTL::Buffer* unused = scratch("p_unused", 64);
@@ -1350,39 +1390,40 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 enc->setBuffer(L.router_bias.buf, L.router_bias.off, 1);
                 enc->setBuffer(sel, 0, 2);
                 enc->setBuffer(ew, 0, 3);
-                enc->setBuffer(scratch("p_biased", uint64_t(T) * cfg_.n_expert * 4), 0, 4);
+                enc->setBuffer(scratch("p_biased", uint64_t(G) * cfg_.n_expert * 4), 0, 4);
                 enc->setBytes(&ra, sizeof(ra), 5);
                 enc->setBuffer(unused, 0, 6);
                 enc->setBuffer(unused, 0, 7);
                 enc->setBuffer(unused, 0, 8);
                 enc->setBuffer(unused, 0, 9);
-                enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+                enc->dispatchThreadgroups(MTL::Size(G, 1, 1), MTL::Size(256, 1, 1));
                 after(enc, "moe_route");
                 submit(cb, enc);
                 cur_cb_ = cb;
 
-                // Group the chunk's (token, expert) pairs by expert, resident experts first, and run each expert
-                // once over all its tokens.
+                // Group the (token, expert) pairs by expert, resident experts first, and run each expert once over
+                // all its tokens.
                 const auto* selp = static_cast<const int*>(sel->contents());
                 const auto* table = static_cast<const int32_t*>(arena_->slot_table()->contents()) +
                                     uint64_t(il) * cfg_.n_expert;
                 std::vector<std::vector<uint32_t>> users(cfg_.n_expert); // per expert: t * 16 + j
-                for (uint32_t t = 0; t < T; ++t)
+                for (uint32_t t = 0; t < G; ++t)
                     for (uint32_t j = 0; j < k; ++j)
                         users[selp[t * 16 + j]].push_back(t * 16 + j);
                 std::vector<int> order;
                 for (int e = 0; e < int(cfg_.n_expert); ++e)
                     if (!users[e].empty() && table[e] >= 0)
                         order.push_back(e);
+                const size_t n_resident = order.size();
                 for (int e = 0; e < int(cfg_.n_expert); ++e)
                     if (!users[e].empty() && table[e] < 0)
                         order.push_back(e);
-                const uint32_t rows = T * k;
+                const uint32_t rows = G * k;
                 MTL::Buffer* tok = scratch("p_tok", uint64_t(rows) * 4);
-                MTL::Buffer* pos = scratch("p_pos", uint64_t(T) * 16 * 4);
+                MTL::Buffer* pos = scratch("p_pos", uint64_t(G) * 16 * 4);
                 auto* tokp = static_cast<int32_t*>(tok->contents());
                 auto* posp = static_cast<int32_t*>(pos->contents());
-                std::vector<uint32_t> start(cfg_.n_expert);
+                std::vector<uint32_t> start(cfg_.n_expert + 1);
                 uint32_t row = 0;
                 for (int e : order) {
                     start[e] = row;
@@ -1391,87 +1432,132 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                         posp[u] = int32_t(row++);
                     }
                 }
-                MTL::Buffer* xg = scratch("p_xg", uint64_t(rows) * E * 2); // half, for the GEMMs
-                MTL::Buffer* gg = scratch("p_gg", uint64_t(rows) * nff * 4);
-                MTL::Buffer* ug = scratch("p_ug", uint64_t(rows) * nff * 4);
-                MTL::Buffer* mg = scratch("p_mg", uint64_t(rows) * nff * 2); // half
+                const uint32_t brows = std::min(rows, kBatchRows);
+                MTL::Buffer* xb = scratch("p_xb", uint64_t(brows) * E * 2); // half, for the GEMMs
+                MTL::Buffer* gb = scratch("p_gb", uint64_t(brows) * nff * 4);
+                MTL::Buffer* ub = scratch("p_ub", uint64_t(brows) * nff * 4);
+                MTL::Buffer* mb = scratch("p_mb", uint64_t(brows) * nff * 2); // half
+                // Expert outputs for all rows, combined once: an order of the sum that does not depend on the batches
+                // (and so on which experts happened to be resident).
                 MTL::Buffer* yg = scratch("p_yg", uint64_t(rows) * E * 4);
                 const SwigluArgs sa0{0, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
+                auto rows_of = [&](size_t b0, size_t b1) {
+                    return b0 == b1 ? 0u : start[order[b1 - 1]] + uint32_t(users[order[b1 - 1]].size()) - start[order[b0]];
+                };
 
-                // Experts [b0, b1) of order, all pinned resident, in a concurrent encoder: gate and up of every
-                // expert, then the SwiGLU over their rows, then every down.
+                // Experts [b0, b1) of order (rows within kBatchRows), all pinned resident: gather their rows, then
+                // in a concurrent encoder gate and up of every expert, the SwiGLU, every down into yg.
                 auto run = [&](size_t b0, size_t b1, const std::vector<int32_t>& slot) {
                     if (b0 == b1)
                         return;
+                    const uint32_t r0 = start[order[b0]], nr = rows_of(b0, b1);
+                    const uint32_t ne = E;
+                    enc->setComputePipelineState(pso("gather_rows_half"));
+                    enc->setBuffer(xn_g, 0, 0);
+                    enc->setBuffer(tok, uint64_t(r0) * 4, 1);
+                    enc->setBuffer(xb, 0, 2);
+                    enc->setBytes(&ne, sizeof(ne), 3);
+                    enc->dispatchThreads(MTL::Size(E, nr, 1), MTL::Size(256, 1, 1));
                     enc->endEncoding();
                     enc = encoder(cb, il, 2, MTL::DispatchTypeConcurrent);
-                    auto gemm_part = [&](int part, int e, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
+                    auto gemm_part = [&](int part, int e, MTL::Buffer* xin, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
                         const ExpertArena::Part& p = arena_->part(il, part);
                         const auto [wb, wo] = arena_->region(il, part).at(uint32_t(slot[e]));
-                        gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, x,
-                                      uint64_t(start[e]) * xw * 2, y, uint64_t(start[e]) * yw * 4);
+                        gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, xin,
+                                      uint64_t(start[e] - r0) * xw * 2, y, uint64_t(start[e] - r0) * yw * 4);
                     };
                     for (size_t i = b0; i < b1; ++i) {
-                        gemm_part(0, order[i], xg, E, gg, nff);
-                        gemm_part(1, order[i], xg, E, ug, nff);
+                        gemm_part(0, order[i], xb, E, gb, nff);
+                        gemm_part(1, order[i], xb, E, ub, nff);
                     }
                     enc->memoryBarrier(MTL::BarrierScopeBuffers);
-                    const uint32_t r0 = start[order[b0]], r1 = start[order[b1 - 1]] + uint32_t(users[order[b1 - 1]].size());
                     SwigluArgs sa = sa0;
-                    sa.n = (r1 - r0) * nff;
+                    sa.n = nr * nff;
                     enc->setComputePipelineState(pso("swiglu_half"));
-                    enc->setBuffer(gg, uint64_t(r0) * nff * 4, 0);
-                    enc->setBuffer(ug, uint64_t(r0) * nff * 4, 1);
-                    enc->setBuffer(mg, uint64_t(r0) * nff * 2, 2);
+                    enc->setBuffer(gb, 0, 0);
+                    enc->setBuffer(ub, 0, 1);
+                    enc->setBuffer(mb, 0, 2);
                     enc->setBytes(&sa, sizeof(sa), 3);
                     enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
                     enc->memoryBarrier(MTL::BarrierScopeBuffers);
-                    for (size_t i = b0; i < b1; ++i)
-                        gemm_part(2, order[i], mg, nff, yg, E);
+                    for (size_t i = b0; i < b1; ++i) {
+                        const int e = order[i];
+                        const ExpertArena::Part& p = arena_->part(il, 2);
+                        const auto [wb, wo] = arena_->region(il, 2).at(uint32_t(slot[e]));
+                        gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, mb,
+                                      uint64_t(start[e] - r0) * nff * 2, yg, uint64_t(start[e]) * E * 4);
+                    }
                     enc->endEncoding();
                     enc = encoder(cb, il, 3);
                 };
 
-                const uint32_t ne = E;
-                enc->setComputePipelineState(pso("gather_rows_half"));
-                enc->setBuffer(xn, 0, 0);
-                enc->setBuffer(tok, 0, 1);
-                enc->setBuffer(xg, 0, 2);
-                enc->setBytes(&ne, sizeof(ne), 3);
-                enc->dispatchThreads(MTL::Size(E, rows, 1), MTL::Size(256, 1, 1));
-
                 const auto t_ensure = Clock::now();
                 std::vector<int32_t> slot(cfg_.n_expert, -1);
-                // Resident experts need no reads: commit their work now so the GPU runs it while the misses are
-                // read (pinned slots are never evicted).
-                size_t b0 = 0;
-                while (b0 < order.size() && table[order[b0]] >= 0) {
-                    arena_->ensure(il, std::span<const int>(&order[b0], 1), &slot[order[b0]], true);
-                    ++b0;
-                }
-                run(0, b0, slot);
-                enc->endEncoding();
-                cb->commit();
-                committed.push_back(cb->retain());
-                cb = ctx_.queue()->commandBuffer();
-                cur_cb_ = cb;
-                enc = encoder(cb, cur_layer_, -1);
-                for (size_t i = b0; i < order.size(); ++i) {
-                    const int e = order[i];
-                    if (arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true))
-                        continue;
-                    // No unpinned slot left: run the experts so far, then their slots are free again.
-                    run(b0, i, slot);
-                    submit(cb, enc);
+                // Batches go to the GPU in command buffers of their own, so that when the misses run out of
+                // unpinned slots only the oldest needs to finish: its experts' slots are then unpinned and reused.
+                // Resident experts come first, so the GPU runs them while the misses are read.
+                struct InFlight {
+                    MTL::CommandBuffer* cb;
+                    std::vector<int32_t> slots;
+                };
+                std::deque<InFlight> inflight;
+                auto commit = [&](size_t b0, size_t b1) {
+                    if (b0 == b1)
+                        return;
+                    run(b0, b1, slot);
+                    enc->endEncoding();
+                    cb->commit();
+                    InFlight f{cb->retain(), {}};
+                    for (size_t i = b0; i < b1; ++i)
+                        f.slots.push_back(slot[order[i]]);
+                    inflight.push_back(std::move(f));
+                    cb = ctx_.queue()->commandBuffer();
                     cur_cb_ = cb;
-                    drain();
-                    arena_->unpin(il);
-                    b0 = i;
-                    if (!arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true))
-                        throw std::runtime_error("expert arena has no slot for one expert");
+                    enc = encoder(cb, cur_layer_, -1);
+                };
+                auto retire = [&] {
+                    InFlight& f = inflight.front();
+                    f.cb->waitUntilCompleted();
+                    if (f.cb->status() != MTL::CommandBufferStatusCompleted)
+                        throw std::runtime_error("command buffer failed");
+                    stats_.gpu_exec_ms += (f.cb->GPUEndTime() - f.cb->GPUStartTime()) * 1e3;
+                    f.cb->release();
+                    arena_->unpin(il, f.slots);
+                    inflight.pop_front();
+                };
+                constexpr size_t kExpertsPerCommit = 32;
+                size_t b0 = 0;
+                for (size_t i = 0; i < n_resident; ++i) {
+                    if (rows_of(b0, i + 1) > kBatchRows || i - b0 == kExpertsPerCommit) {
+                        commit(b0, i);
+                        b0 = i;
+                    }
+                    arena_->ensure(il, std::span<const int>(&order[i], 1), &slot[order[i]], true);
+                }
+                commit(b0, n_resident);
+                b0 = n_resident;
+                for (size_t i = n_resident; i < order.size(); ++i) {
+                    const int e = order[i];
+                    if (rows_of(b0, i + 1) > kBatchRows) {
+                        commit(b0, i);
+                        b0 = i;
+                    }
+                    while (!arena_->ensure(il, std::span<const int>(&e, 1), &slot[e], true)) {
+                        // No unpinned slot: free the oldest batch's, or run the pending misses to free theirs.
+                        if (inflight.empty()) {
+                            if (b0 == i)
+                                throw std::runtime_error("expert arena has no slot for one expert");
+                            commit(b0, i);
+                            b0 = i;
+                        }
+                        retire();
+                    }
                 }
                 last_step_.ensure_ms += ms_since(t_ensure);
                 run(b0, order.size(), slot);
+                // This layer's slots are only touched again after the group's work is drained.
+                for (InFlight& f : inflight)
+                    committed.push_back(f.cb);
                 arena_->unpin(il);
 
                 const CombineArgs ca{E, k};
@@ -1479,38 +1565,46 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 enc->setBuffer(yg, 0, 0);
                 enc->setBuffer(pos, 0, 1);
                 enc->setBuffer(ew, 0, 2);
-                enc->setBuffer(sho, 0, 3);
+                enc->setBuffer(ffo, 0, 3);
                 enc->setBuffer(ffo, 0, 4);
                 enc->setBytes(&ca, sizeof(ca), 5);
-                enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+                enc->dispatchThreads(MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
             }
-            hc_post(enc, ffo, R, R2, pc, T);
+            hc_post(enc, ffo, R, R2, pc_g, G);
             std::swap(R, R2);
         }
 
-        // Logits of the chunk's last token, or of every token for a logits sink.
+        // Logits of the group's last token, or of every token (in chunks) for a logits sink.
         cur_layer_ = cfg_.n_layer;
-        const uint32_t nl = logits_sink_ ? T : 1;
+        const uint32_t nl = logits_sink_ ? std::min(chunk, G) : 1;
         MTL::Buffer* xl = scratch("p_xl", uint64_t(nl) * E * 4);
         MTL::Buffer* xnl = scratch("p_xnl", uint64_t(nl) * E * 4);
-        const HcArgs h1{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, nl};
-        enc->setComputePipelineState(pso("hc_mean"));
-        enc->setBuffer(R, uint64_t(T - nl) * hd * 4, 0);
-        enc->setBuffer(xl, 0, 1);
-        enc->setBytes(&h1, sizeof(h1), 2);
-        enc->dispatchThreads(MTL::Size(E, nl, 1), MTL::Size(256, 1, 1));
-        norm(enc, xl, &output_norm_, xnl, nl, E, E, cfg_.rms_eps);
         MTL::Buffer* lg = scratch("p_logits", uint64_t(nl) * cfg_.n_vocab * 4);
-        proj(enc, output_, xnl, 0, lg, 0, nl);
+        for (uint32_t l0 = logits_sink_ ? 0 : G - 1; l0 < G; l0 += nl) {
+            const uint32_t n = std::min(nl, G - l0);
+            const HcArgs h1{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, n};
+            enc->setComputePipelineState(pso("hc_mean"));
+            enc->setBuffer(R, uint64_t(l0) * hd * 4, 0);
+            enc->setBuffer(xl, 0, 1);
+            enc->setBytes(&h1, sizeof(h1), 2);
+            enc->dispatchThreads(MTL::Size(E, n, 1), MTL::Size(256, 1, 1));
+            norm(enc, xl, &output_norm_, xnl, n, E, E, cfg_.rms_eps);
+            proj(enc, output_, xnl, 0, lg, 0, n);
+            enc->endEncoding();
+            finish(cb);
+            drain();
+            const auto* lgp = static_cast<const float*>(lg->contents());
+            if (logits_sink_)
+                for (uint32_t i = 0; i < n; ++i)
+                    logits_sink_(pos_ + uint32_t(g0) + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
+            if (l0 + n == G)
+                std::memcpy(logits_.data(), lgp + uint64_t(n - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
+            cb = ctx_.queue()->commandBuffer();
+            cur_cb_ = cb;
+            enc = encoder(cb, cur_layer_, -1);
+        }
         enc->endEncoding();
         finish(cb);
-        drain();
-        const auto* lgp = static_cast<const float*>(lg->contents());
-        if (logits_sink_)
-            for (uint32_t i = 0; i < T; ++i)
-                logits_sink_(pos_ + i, lgp + uint64_t(i) * cfg_.n_vocab);
-        std::memcpy(logits_.data(), lgp + uint64_t(nl - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
-        pos_ += T;
         total.ensure_ms += last_step_.ensure_ms;
         if (!samples_.empty()) {
             resolve_layer_times(cpu0, gpu0);
@@ -1523,6 +1617,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         }
         pool->release();
     }
+    pos_ += uint32_t(tokens.size());
     stats_.expert_read_ms = arena_->stats().read_ms;
     stats_.expert_bytes = arena_->stats().read_bytes;
     const ExpertArena::Stats& arena_after = arena_->stats();

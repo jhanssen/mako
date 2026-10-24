@@ -345,11 +345,12 @@ int main(int argc, char** argv)
         const bool have_ref = load_ref(kData / "long_ref.bin", ref) && ref.positions == ids.size();
         Parity all{ref}, sparse{ref, 2048};
         engine.reset();
-        if (have_ref)
-            engine.set_logits_sink([&](uint32_t pos, const float* l) {
+        engine.set_logits_sink([&](uint32_t pos, const float* l) {
+            if (have_ref) {
                 all.add(pos, l, cfg->n_vocab);
                 sparse.add(pos, l, cfg->n_vocab);
-            });
+            }
+        });
         const auto l = engine.prefill(ids);
         engine.set_logits_sink({});
         check(!engine.arena().lent(), "arena slots reclaimed after prefill");
@@ -370,6 +371,16 @@ int main(int argc, char** argv)
                   std::format("top logit {}:{:.3f}, recorded {}:{:.3f} (limit {})", top, l[top], etop, ev, kLongTopDiff));
         }
         compare("long_greedy", join(greedy(engine, l, 8)), "greedy tokens after the prompt");
+
+        // Groups of 1024 tokens (experts loaded per group, in different batches): the same logits, bit for bit. With
+        // a sink both times: the last position's logits then come from the same kernel.
+        engine.reset();
+        engine.set_prefill_group(1024);
+        engine.set_logits_sink([](uint32_t, const float*) {});
+        const auto l2 = engine.prefill(ids);
+        engine.set_logits_sink({});
+        engine.set_prefill_group(4096);
+        check(l2 == l, "identical logits with 1024-token groups");
     }
 
     if (update) {
