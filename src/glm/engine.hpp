@@ -41,6 +41,9 @@ public:
     const std::vector<float>& step(int32_t token);
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     const std::vector<float>& prefill(std::span<const int32_t> tokens);
+    // When set, prefill() computes the logits of every position and passes each here (for evaluations).
+    using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;
+    void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
 
     uint32_t position() const { return pos_; }
 
@@ -73,6 +76,7 @@ public:
     const ExpertArena& arena() const { return *arena_; }
     const LoadStats& load_stats() const { return load_; }
     const StepStats& last_step() const { return last_step_; }
+    const StepStats& last_prefill() const { return last_prefill_; } // layers summed over its chunks
 
     const std::string& routing_key() const { return routing_key_; }
     const std::filesystem::path& default_profile() const { return default_profile_; }
@@ -111,15 +115,17 @@ private:
              uint32_t T);
     void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
              uint32_t T, uint32_t pos0);
-    void attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, MTL::Buffer* out, uint32_t n_kv,
-                bool sparse);
-    bool indexer(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, uint64_t xn_off,
-                 MTL::Buffer* qrn, uint64_t qrn_off, uint32_t pos);
+    void attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off, MTL::Buffer* out,
+                uint64_t out_off, uint32_t tokens, uint32_t first_kv, bool sparse);
+    void indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
+                         MTL::Buffer* qrn, uint32_t T, uint32_t pos0);
+    bool indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos);
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T);
     void serve_moe(MTL::CommandBuffer* cb);
     // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
-    MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section);
+    MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section,
+                                        MTL::DispatchType type = MTL::DispatchTypeSerial);
     // At the kernels telemetry level, closes the encoder holding the dispatch just encoded, labelled `kernel`,
     // and opens the next one.
     void after(MTL::ComputeCommandEncoder*& enc, std::string_view kernel);
@@ -162,10 +168,11 @@ private:
     std::vector<std::pair<uint32_t, uint64_t>> pending_moe_; // (layer, event value) not yet served
 
     Probe probe_;
+    LogitsSink logits_sink_;
     StreamOverride stream_override_;
     std::chrono::steady_clock::time_point step_start_;
     LoadStats load_;
-    StepStats last_step_;
+    StepStats last_step_, last_prefill_;
     // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
     struct Timed {
         uint32_t layer;

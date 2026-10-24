@@ -73,6 +73,19 @@ struct ScoreArgs {
 struct SelectArgs {
     uint32_t n_pool, n_top, kpool, n_kv;
 };
+struct LayerNormArgs {
+    uint32_t n;
+    float eps;
+    uint32_t ystride;
+};
+struct SoftmaxArgs {
+    uint32_t n_kv;
+    float scale;
+    uint32_t masked, first_kv, heads;
+};
+struct PvArgs {
+    uint32_t heads, dim, n_kv, keys_per_split;
+};
 
 void read_exact(int fd, void* dst, uint64_t bytes, uint64_t offset)
 {
@@ -282,7 +295,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
                 ts = sets->object<MTL::CounterSet>(i);
         const uint64_t want = opts_.telemetry == Telemetry::kernels ? uint64_t(cfg_.n_layer) * 240 + 64
-                                                                    : uint64_t(cfg_.n_layer) * 8 + 16;
+                                                                    : uint64_t(cfg_.n_layer) * 24 + 64;
         mtl::Ref<MTL::CounterSampleBufferDescriptor> d(MTL::CounterSampleBufferDescriptor::alloc()->init());
         d->setCounterSet(ts);
         d->setSampleCount(kSamplesPerBuffer);
@@ -298,13 +311,14 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     load_.total_ms = ms_since(t_load);
 }
 
-MTL::ComputeCommandEncoder* Engine::encoder(MTL::CommandBuffer* cb, uint32_t layer, int section)
+MTL::ComputeCommandEncoder* Engine::encoder(MTL::CommandBuffer* cb, uint32_t layer, int section, MTL::DispatchType type)
 {
     if (samples_.empty() || (opts_.telemetry == Telemetry::layers && section < 0))
-        return cb->computeCommandEncoder();
+        return cb->computeCommandEncoder(type);
     if (opts_.telemetry == Telemetry::kernels)
         section = -1;
     MTL::ComputePassDescriptor* d = MTL::ComputePassDescriptor::computePassDescriptor();
+    d->setDispatchType(type);
     auto* att = d->sampleBufferAttachments()->object(0);
     if (next_sample_ + 2 > samples_.size() * kSamplesPerBuffer)
         throw std::runtime_error("telemetry: too many timed encoders in one step");
@@ -345,8 +359,10 @@ void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
     }
     if (opts_.telemetry == Telemetry::layers) {
         last_step_.layers.assign(cfg_.n_layer, LayerTimes{});
-        for (uint32_t l = 0; l < cfg_.n_layer; ++l)
+        for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
             last_step_.layers[l].layer = l;
+            last_step_.layers[l].mla = !layers_[l]->kda;
+        }
     }
     for (const Timed& t : timed_) {
         const uint64_t a = ts[t.start], b = ts[t.end];
@@ -486,7 +502,7 @@ void Engine::proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buf
                   uint64_t y_off, uint32_t T, uint32_t ldy)
 {
     const uint32_t k = uint32_t(w.dims[0]), n = uint32_t(w.dims[1]);
-    if (T > 1 && n >= 256 && k % 64 == 0 && mtl::Gemm::supports(w.type)) {
+    if (T > 1 && (n >= 256 || (ldy && ldy != n)) && k % 64 == 0 && mtl::Gemm::supports(w.type)) {
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, x, x_off, y, y_off, ldy);
         if (opts_.telemetry == Telemetry::kernels)
             after(enc, std::format("gemm {} {}x{}", gguf::traits(w.type).name, k, n));
@@ -566,6 +582,8 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
 {
     const uint32_t inner = cfg_.kda_inner(), D = cfg_.kda_head_dim, H = cfg_.n_head;
     const bool probes = T == 1;
+    if (D != 128)
+        throw std::runtime_error("the KDA scan kernel needs head_dim 128");
     MTL::Buffer* qkv = scratch("qkv", uint64_t(T) * 3 * inner * 4);
     MTL::Buffer* qkvc = scratch("qkvc", uint64_t(T) * 3 * inner * 4);
     proj(enc, L.wq, xn, 0, qkv, 0, T, 3 * inner);
@@ -625,7 +643,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setBuffer(kda_state_[il].get(), 0, 5);
     enc->setBuffer(o, 0, 6);
     enc->setBytes(&sa, sizeof(sa), 7);
-    enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(D, 1, 1));
+    enc->dispatchThreadgroups(MTL::Size(H, D / 32, 1), MTL::Size(128, 1, 1));
     after(enc, "kda_scan");
     if (probes) {
         probe(enc, "kda_g1", int(il), g, inner);
@@ -654,61 +672,59 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     proj(enc, L.wo, gated, 0, att, 0, T);
 }
 
-// Attention of one query position (H heads of q, latent width R) over the first n_kv rows of a half latent
-// cache, read once for all heads: scores by GEMM, softmax (only the indexer's selected cells when sparse), then
-// the output split over key ranges and summed.
-void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, MTL::Buffer* out,
-                    uint32_t n_kv, bool sparse)
+// Attention of `tokens` consecutive query positions (rows of H heads of q, latent width R) over a half latent cache
+// read once for all heads: scores by GEMM, softmax over each row's visible keys (row r of token i sees
+// first_kv + i keys; only the indexer's selected cells when sparse), then the output split over key ranges and summed.
+void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off,
+                    MTL::Buffer* out, uint64_t out_off, uint32_t tokens, uint32_t first_kv, bool sparse)
 {
-    const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, keys_per_split = 256;
+    const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, rows = tokens * H;
+    const uint32_t n_kv = first_kv + tokens - 1;
+    // At most 16 splits of at least 256 keys, whole 64-key tiles.
+    const uint32_t keys_per_split = std::max<uint32_t>(256, ((n_kv + 15) / 16 + 63) / 64 * 64);
     const uint32_t splits = (n_kv + keys_per_split - 1) / keys_per_split;
-    MTL::Buffer* scores = scratch("scores", uint64_t(H) * opts_.max_ctx * 4);
-    MTL::Buffer* partial = scratch("pv_part", uint64_t(opts_.max_ctx / keys_per_split + 1) * H * R * 4);
-    gemm_->encode(enc, gguf::Type::F16, R, n_kv, H, cache, 0, q, 0, scores, 0);
+    MTL::Buffer* scores = scratch("scores", uint64_t(rows) * n_kv * 4);
+    MTL::Buffer* partial = scratch("pv_part", uint64_t(splits) * rows * R * 4);
+    gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, cache, 0, q, q_off, scores, 0);
     after(enc, "attn_scores");
-    const struct {
-        uint32_t n_kv;
-        float scale;
-        uint32_t masked;
-    } sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u};
+    const SoftmaxArgs sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u, first_kv, H};
     enc->setComputePipelineState(pso("attn_softmax"));
     enc->setBuffer(scores, 0, 0);
     enc->setBuffer(scratch("idx_mask", opts_.max_ctx), 0, 1);
     enc->setBytes(&sa, sizeof(sa), 2);
-    enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(256, 1, 1));
+    enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "attn_softmax");
-    const struct {
-        uint32_t heads, dim, n_kv, keys_per_split;
-    } pa{H, R, n_kv, keys_per_split};
+    const PvArgs pa{rows, R, n_kv, keys_per_split};
     enc->setComputePipelineState(pso("attn_pv"));
     enc->setBuffer(scores, 0, 0);
     enc->setBuffer(cache, 0, 1);
     enc->setBuffer(partial, 0, 2);
     enc->setBytes(&pa, sizeof(pa), 3);
-    enc->dispatchThreadgroups(MTL::Size(R / 64, (H + 63) / 64, splits), MTL::Size(128, 1, 1));
+    enc->dispatchThreadgroups(MTL::Size(R / 64, (rows + 63) / 64, splits), MTL::Size(128, 1, 1));
     after(enc, "attn_pv");
-    const uint32_t sum[2] = {H * R, splits};
+    const uint32_t sum[2] = {rows * R, splits};
     enc->setComputePipelineState(pso("sum_splits"));
     enc->setBuffer(partial, 0, 0);
-    enc->setBuffer(out, 0, 1);
+    enc->setBuffer(out, out_off, 1);
     enc->setBytes(sum, sizeof(sum), 2);
-    enc->dispatchThreads(MTL::Size(H * R, 1, 1), MTL::Size(256, 1, 1));
+    enc->dispatchThreads(MTL::Size(rows * R, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "sum_splits");
 }
 
-// MLA for T tokens at positions pos0.. : projections over all of them, then attention token by token.
+// MLA for T tokens at positions pos0..: projections over all of them; attention in groups of query tokens while
+// the indexer keeps every key, token by token once it selects.
 void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
                  uint32_t T, uint32_t pos0)
 {
     const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, QR = cfg_.q_lora_rank;
-    const uint64_t qrow = uint64_t(H) * cfg_.head_k, vrow = uint64_t(H) * cfg_.head_v;
+    const uint64_t qrow = uint64_t(H) * cfg_.head_k, vrow = uint64_t(H) * cfg_.head_v, lrow = uint64_t(H) * R;
     MTL::Buffer* qr = scratch("qr", uint64_t(T) * QR * 4);
     MTL::Buffer* qrn = scratch("qrn", uint64_t(T) * QR * 4);
     MTL::Buffer* q = scratch("q", T * qrow * 4);
     MTL::Buffer* kv = scratch("kv", uint64_t(T) * R * 4);
     MTL::Buffer* kvn = scratch("kvn", uint64_t(T) * R * 4);
-    MTL::Buffer* qabs = scratch("qabs", H * R * 4);
-    MTL::Buffer* lat = scratch("lat", H * R * 4);
+    MTL::Buffer* qabs = scratch("qabs", T * lrow * 4);
+    MTL::Buffer* lat = scratch("lat", T * lrow * 4);
     MTL::Buffer* vout = scratch("vout", T * vrow * 4);
 
     proj(enc, L.q_a, xn, 0, qr, 0, T);
@@ -725,60 +741,98 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "store_half");
 
-    for (uint32_t t = 0; t < T; ++t) {
-        const uint32_t pos = pos0 + t;
-        gemv(enc, L.k_b, q, t * qrow * 4, qabs, 0, H);
-        const bool sparse = indexer(enc, L, il, xn, uint64_t(t) * cfg_.n_embd * 4, qrn, uint64_t(t) * QR * 4, pos);
-        attend(enc, kv_cache_[il].get(), qabs, lat, pos + 1, sparse);
-        gemv(enc, L.v_b, lat, 0, vout, t * vrow * 4, H);
+    // Per-head matrices (k_b: head_k -> R, v_b: R -> head_v): one GEMM per head over all tokens, or the batched
+    // GEMV for one token.
+    auto per_head = [&](const DevTensor& w, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
+        if (T == 1) {
+            gemv(enc, w, x, 0, y, 0, H);
+            return;
+        }
+        const uint32_t k = uint32_t(w.dims[0]), nr = uint32_t(w.dims[1]);
+        const uint64_t mat = mtl::Gemv::row_bytes(w.type, k) * nr;
+        for (uint32_t h = 0; h < H; ++h)
+            gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off + h * mat, x, uint64_t(h) * xw * 4, y,
+                          uint64_t(h) * yw * 4, H * yw, H * xw);
+        after(enc, "per_head_gemm");
+    };
+    per_head(L.k_b, q, cfg_.head_k, qabs, R);
+    indexer_project(enc, L, il, xn, qrn, T, pos0);
+    const uint32_t kp = cfg_.indexer_kpool, n_top = cfg_.indexer_top_k / kp;
+    // Query tokens per attention group: up to 16, fewer when the scores would pass 4M floats.
+    const uint32_t group = std::clamp<uint32_t>((4u << 20) / (H * (pos0 + T)), 1, 16);
+    uint32_t t = 0;
+    while (t < T && (pos0 + t + 1) / kp <= n_top) {
+        uint32_t g = 1;
+        while (g < group && t + g < T && (pos0 + t + g + 1) / kp <= n_top)
+            ++g;
+        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, false);
+        t += g;
     }
+    for (; t < T; ++t) {
+        const bool sparse = indexer_select(enc, il, t, pos0 + t);
+        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, 1, pos0 + t + 1, sparse);
+    }
+    per_head(L.v_b, lat, R, vout, cfg_.head_v);
     proj(enc, L.wo, vout, 0, att, 0, T);
 }
 
-// Updates the layer's indexer cache with this token and, once more pools are complete than the selection
-// keeps, writes the cell mask of the top pools plus the incomplete tail. Returns whether the mask applies.
-bool Engine::indexer(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, uint64_t xn_off,
-                     MTL::Buffer* qrn, uint64_t qrn_off, uint32_t pos)
+// Indexer inputs for T tokens at positions pos0..: their query and weight projections, their key|gate rows of the
+// layer's indexer cache, and the pools those rows complete.
+void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
+                             MTL::Buffer* qrn, uint32_t T, uint32_t pos0)
 {
     const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads, kp = cfg_.indexer_kpool;
-    MTL::Buffer* iq = scratch("iq", Hi * Di * 4);
-    MTL::Buffer* ikr = scratch("ikr", Di * 4);
-    MTL::Buffer* iw = scratch("iw", Hi * 4);
+    MTL::Buffer* iq = scratch("iq", uint64_t(T) * Hi * Di * 4);
+    MTL::Buffer* ikr = scratch("ikr", uint64_t(T) * Di * 4);
+    MTL::Buffer* iw = scratch("iw", uint64_t(T) * Hi * 4);
     MTL::Buffer* cache = idx_cache_[il].get();
-    MTL::Buffer* pooled = idx_pooled_[il].get();
-    const uint64_t row = uint64_t(pos) * 2 * Di * 4;
+    const uint64_t row = uint64_t(pos0) * 2 * Di * 4;
 
-    gemv(enc, L.idx_q_b, qrn, qrn_off, iq, 0);
-    gemv(enc, L.idx_k, xn, xn_off, ikr, 0);
-    const NormArgs na{Di, Di, cfg_.norm_eps};
+    proj(enc, L.idx_q_b, qrn, 0, iq, 0, T);
+    proj(enc, L.idx_k, xn, 0, ikr, 0, T);
+    const LayerNormArgs na{Di, cfg_.norm_eps, 2 * Di};
     enc->setComputePipelineState(pso("layer_norm"));
     enc->setBuffer(ikr, 0, 0);
     enc->setBuffer(L.idx_k_norm.buf, L.idx_k_norm.off, 1);
     enc->setBuffer(L.idx_k_norm_b.buf, L.idx_k_norm_b.off, 2);
     enc->setBuffer(cache, row, 3);
     enc->setBytes(&na, sizeof(na), 4);
-    enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+    enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "layer_norm");
-    gemv(enc, L.idx_gate, xn, xn_off, cache, row + Di * 4);
-    gemv(enc, L.idx_proj, xn, xn_off, iw, 0);
+    proj(enc, L.idx_gate, xn, 0, cache, row + Di * 4, T, 2 * Di);
+    proj(enc, L.idx_proj, xn, 0, iw, 0, T);
 
-    if ((pos + 1) % kp == 0) {
-        const PoolArgs pa{Di, kp, pos / kp};
+    const uint32_t first = pos0 / kp, last = (pos0 + T) / kp;
+    if (last > first) {
+        const PoolArgs pa{Di, kp, first};
         enc->setComputePipelineState(pso("idx_pool"));
         enc->setBuffer(cache, 0, 0);
         enc->setBuffer(L.idx_ape.buf, L.idx_ape.off, 1);
-        enc->setBuffer(pooled, 0, 2);
+        enc->setBuffer(idx_pooled_[il].get(), 0, 2);
         enc->setBytes(&pa, sizeof(pa), 3);
-        enc->dispatchThreads(MTL::Size(Di, 1, 1), MTL::Size(Di, 1, 1));
+        enc->dispatchThreads(MTL::Size(Di, last - first, 1), MTL::Size(Di, 1, 1));
         after(enc, "idx_pool");
     }
+}
 
+// For token t (at position pos) of the last indexer_project: once more pools are complete than the selection keeps,
+// writes the cell mask of its top pools plus the incomplete tail. Returns whether the mask applies.
+bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos)
+{
+    const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads, kp = cfg_.indexer_kpool;
     const uint32_t n_pool = (pos + 1) / kp, n_top = cfg_.indexer_top_k / kp;
     if (n_pool <= n_top)
         return false;
     MTL::Buffer* score = scratch("idx_score", uint64_t(opts_.max_ctx / kp + 1) * 4);
     const ScoreArgs sa{Di, Hi, n_pool, 1.0f / std::sqrt(float(Di * Hi))};
-    dispatch(enc, "idx_score", {iq, iw, pooled, score}, &sa, sizeof(sa), MTL::Size(n_pool, 1, 1), MTL::Size(64, 1, 1));
+    enc->setComputePipelineState(pso("idx_score"));
+    enc->setBuffer(scratch("iq", 0), uint64_t(t) * Hi * Di * 4, 0);
+    enc->setBuffer(scratch("iw", 0), uint64_t(t) * Hi * 4, 1);
+    enc->setBuffer(idx_pooled_[il].get(), 0, 2);
+    enc->setBuffer(score, 0, 3);
+    enc->setBytes(&sa, sizeof(sa), 4);
+    enc->dispatchThreads(MTL::Size(n_pool, 1, 1), MTL::Size(64, 1, 1));
+    after(enc, "idx_score");
     if (pos == pos_)
         probe(enc, "indexer_score", int(il), score, n_pool);
     const SelectArgs sel{n_pool, n_top, kp, pos + 1};
@@ -1110,7 +1164,7 @@ const std::vector<float>& Engine::step(int32_t token)
 // resident. Leaves the same caches and state as step() would token by token.
 const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
 {
-    if (tokens.size() < 2 || probe_ || stream_override_ || route_override_ || !samples_.empty()) {
+    if (tokens.size() < 2 || probe_ || stream_override_ || route_override_ || opts_.telemetry == Telemetry::kernels) {
         for (int32_t t : tokens)
             step(t);
         return logits_;
@@ -1122,6 +1176,18 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         throw std::runtime_error("context full");
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
     const uint32_t chunk = std::max<uint32_t>(1, opts_.prefill_chunk);
+    const auto t_start = Clock::now();
+    const ExpertArena::Stats arena_before = arena_->stats();
+    const double gpu_before = stats_.gpu_exec_ms;
+    StepStats total;
+    total.pos = pos_;
+    if (!samples_.empty()) {
+        total.layers.assign(cfg_.n_layer, LayerTimes{});
+        for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+            total.layers[l].layer = l;
+            total.layers[l].mla = !layers_[l]->kda;
+        }
+    }
 
     for (size_t c0 = 0; c0 < tokens.size(); c0 += chunk) {
         const uint32_t T = uint32_t(std::min<size_t>(chunk, tokens.size() - c0));
@@ -1145,6 +1211,10 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
             }
         }
 
+        MTL::Timestamp cpu0 = 0, gpu0 = 0;
+        if (!samples_.empty())
+            ctx_.device()->sampleTimestamps(&cpu0, &gpu0);
+        last_step_ = StepStats{};
         MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
         cur_cb_ = cb;
         cur_layer_ = cfg_.n_layer;
@@ -1155,6 +1225,10 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
         for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
             const Layer& L = *layers_[il];
             cur_layer_ = il;
+            if (!samples_.empty()) {
+                enc->endEncoding();
+                enc = encoder(cb, il, 0);
+            }
             hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pc, T);
             norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
             if (L.kda)
@@ -1163,6 +1237,10 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 mla(enc, L, il, xn, att, T, pos_);
             hc_post(enc, att, R, R2, pc, T);
             std::swap(R, R2);
+            if (!samples_.empty()) {
+                enc->endEncoding();
+                enc = encoder(cb, il, 1);
+            }
 
             hc_pre(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, x, pc, T);
             norm(enc, x, &L.ffn_norm, xn, T, E, E, cfg_.rms_eps);
@@ -1237,7 +1315,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     if (b0 == b1)
                         return;
                     enc->endEncoding();
-                    enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+                    enc = encoder(cb, il, 2, MTL::DispatchTypeConcurrent);
                     auto gemm_part = [&](int part, int e, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
                         const ExpertArena::Part& p = arena_->part(il, part);
                         const ExpertArena::Region& r = arena_->region(il, part);
@@ -1263,7 +1341,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     for (size_t i = b0; i < b1; ++i)
                         gemm_part(2, order[i], mg, nff, yg, E);
                     enc->endEncoding();
-                    enc = cb->computeCommandEncoder();
+                    enc = encoder(cb, il, 3);
                 };
 
                 const uint32_t ne = E;
@@ -1308,27 +1386,50 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
             std::swap(R, R2);
         }
 
-        // Logits of the chunk's last token.
+        // Logits of the chunk's last token, or of every token for a logits sink.
         cur_layer_ = cfg_.n_layer;
-        MTL::Buffer* xl = scratch("x", E * 4);
-        MTL::Buffer* xnl = scratch("xn", E * 4);
-        const HcArgs h1{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, 1};
+        const uint32_t nl = logits_sink_ ? T : 1;
+        MTL::Buffer* xl = scratch("p_xl", uint64_t(nl) * E * 4);
+        MTL::Buffer* xnl = scratch("p_xnl", uint64_t(nl) * E * 4);
+        const HcArgs h1{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, nl};
         enc->setComputePipelineState(pso("hc_mean"));
-        enc->setBuffer(R, uint64_t(T - 1) * hd * 4, 0);
+        enc->setBuffer(R, uint64_t(T - nl) * hd * 4, 0);
         enc->setBuffer(xl, 0, 1);
         enc->setBytes(&h1, sizeof(h1), 2);
-        enc->dispatchThreads(MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
-        norm(enc, xl, &output_norm_, xnl, 1, E, E, cfg_.rms_eps);
-        MTL::Buffer* lg = scratch("logits", uint64_t(cfg_.n_vocab) * 4);
-        gemv(enc, output_, xnl, 0, lg, 0);
+        enc->dispatchThreads(MTL::Size(E, nl, 1), MTL::Size(256, 1, 1));
+        norm(enc, xl, &output_norm_, xnl, nl, E, E, cfg_.rms_eps);
+        MTL::Buffer* lg = scratch("p_logits", uint64_t(nl) * cfg_.n_vocab * 4);
+        proj(enc, output_, xnl, 0, lg, 0, nl);
         enc->endEncoding();
         finish(cb);
-        std::memcpy(logits_.data(), lg->contents(), uint64_t(cfg_.n_vocab) * 4);
+        const auto* lgp = static_cast<const float*>(lg->contents());
+        if (logits_sink_)
+            for (uint32_t i = 0; i < T; ++i)
+                logits_sink_(pos_ + i, lgp + uint64_t(i) * cfg_.n_vocab);
+        std::memcpy(logits_.data(), lgp + uint64_t(nl - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
         pos_ += T;
+        total.ensure_ms += last_step_.ensure_ms;
+        if (!samples_.empty()) {
+            resolve_layer_times(cpu0, gpu0);
+            for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+                total.layers[l].attn_ms += last_step_.layers[l].attn_ms;
+                total.layers[l].ffn_ms += last_step_.layers[l].ffn_ms;
+                total.layers[l].hit_ms += last_step_.layers[l].hit_ms;
+                total.layers[l].miss_ms += last_step_.layers[l].miss_ms;
+            }
+        }
         pool->release();
     }
     stats_.expert_read_ms = arena_->stats().read_ms;
     stats_.expert_bytes = arena_->stats().read_bytes;
+    const ExpertArena::Stats& arena_after = arena_->stats();
+    total.wall_ms = ms_since(t_start);
+    total.gpu_ms = stats_.gpu_exec_ms - gpu_before;
+    total.read_ms = arena_after.read_ms - arena_before.read_ms;
+    total.hits = arena_after.hits - arena_before.hits;
+    total.misses = arena_after.misses - arena_before.misses;
+    total.read_bytes = arena_after.read_bytes - arena_before.read_bytes;
+    last_prefill_ = std::move(total);
     return logits_;
 }
 

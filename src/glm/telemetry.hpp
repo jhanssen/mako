@@ -37,8 +37,10 @@ struct LoadStats {
 // GPU time of one layer's sections, from encoder-boundary timestamps.
 struct LayerTimes {
     uint32_t layer = 0;
+    bool mla = false;               // attention kind: MLA, else KDA
     double attn_ms = 0, ffn_ms = 0; // ffn: up to routing for MoE layers, the whole FFN for dense ones
-    double hit_ms = 0, miss_ms = 0; // MoE: resident experts, then the misses and the combine
+    double hit_ms = 0, miss_ms = 0; // MoE: resident experts, then the misses and the combine (prefill: all
+                                    // experts, then the combine)
 };
 
 struct KernelTime {
@@ -67,6 +69,8 @@ public:
     void machine(const MachineInfo& m);
     void load(const LoadStats& l);
     void step(const StepStats& s);
+    // One prefill: its token count and totals (pos: first position; layers summed over its chunks).
+    void prefill(const StepStats& s, uint32_t tokens);
     // Averages leave out the first `skip` steps (first-use costs).
     std::string markdown(size_t skip = 1) const;
 
@@ -76,6 +80,7 @@ private:
     MachineInfo machine_;
     LoadStats load_;
     std::vector<StepStats> steps_;
+    std::vector<std::pair<StepStats, uint32_t>> prefills_;
 };
 
 } // namespace mako::glm

@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -114,7 +115,7 @@ int main(int argc, char** argv)
     if (!model)
         return 1;
     auto cp = llama_context_default_params();
-    cp.n_ctx = 512;
+    cp.n_ctx = std::max<uint32_t>(512, uint32_t(ids.size() + id_arg.size() / 2 + 16));
     cp.n_batch = 1;
     cp.n_ubatch = 1;
     cp.cb_eval = on_tensor;

@@ -65,7 +65,9 @@ int main(int argc, char** argv)
             for (size_t i = 0; i < rows.size(); ++i)
                 mako::quant::dequant_row(t->type, data.data() + rows[i] * rb, deq[i].data(), k);
 
+        for (bool exact : {false, true})
         for (uint32_t tokens : {1u, 37u, 64u, 200u}) {
+            gemm.set_exact_activations(exact);
             auto x = buffer(uint64_t(k) * tokens * 4), y = buffer(uint64_t(n) * tokens * 4);
             auto* xf = static_cast<float*>(x->contents());
             for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
@@ -99,11 +101,13 @@ int main(int argc, char** argv)
             const double rel = std::sqrt(err / ref);
             const bool ok = rel < 5e-3;
             failures += !ok;
-            std::println("{:28} {:7} k={:5} n={:6} t={:4}  rel err {:.2e} vs {}  {}", name, tr.name, k, n, tokens,
-                         rel, cpu_ref ? "CPU" : "GEMV", ok ? "ok" : "FAIL");
+            std::println("{:28} {:7} k={:5} n={:6} t={:4} {}  rel err {:.2e} vs {}  {}", name, tr.name, k, n,
+                         tokens, exact ? "x32" : "x16", rel, cpu_ref ? "CPU" : "GEMV", ok ? "ok" : "FAIL");
         }
 
         // Speed at 512 tokens.
+        for (bool exact : {false, true}) {
+        gemm.set_exact_activations(exact);
         const uint32_t tokens = 512;
         auto x = buffer(uint64_t(k) * tokens * 4), y = buffer(uint64_t(n) * tokens * 4);
         std::fill_n(static_cast<float*>(x->contents()), uint64_t(k) * tokens, 0.01f);
@@ -117,7 +121,9 @@ int main(int argc, char** argv)
             cb->waitUntilCompleted();
             best = std::min(best, cb->GPUEndTime() - cb->GPUStartTime());
         }
-        std::println("{:28} t=512: {:8.1f} us, {:6.2f} TFLOP/s", name, best * 1e6, 2.0 * k * n * tokens / best / 1e12);
+        std::println("{:28} t=512 {}: {:8.1f} us, {:6.2f} TFLOP/s", name, exact ? "x32" : "x16", best * 1e6,
+                     2.0 * k * n * tokens / best / 1e12);
+        }
     }
     return failures ? 1 : 0;
 }

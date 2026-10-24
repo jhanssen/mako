@@ -136,6 +136,27 @@ void Report::step(const StepStats& s)
                              (s.kernels.empty() ? std::string() : ",\"kernels\":[" + kernels + "]"));
 }
 
+void Report::prefill(const StepStats& s, uint32_t tokens)
+{
+    prefills_.emplace_back(s, tokens);
+    if (!out_)
+        return;
+    double sums[2][4] = {};
+    for (const LayerTimes& t : s.layers) {
+        double* row = sums[t.mla ? 1 : 0];
+        row[0] += t.attn_ms;
+        row[1] += t.ffn_ms;
+        row[2] += t.hit_ms;
+        row[3] += t.miss_ms;
+    }
+    *out_ << std::format("{{\"type\":\"prefill\",\"pos\":{},\"tokens\":{},\"wall_ms\":{:.1f},\"gpu_ms\":{:.1f},"
+                         "\"ensure_ms\":{:.1f},\"read_ms\":{:.1f},\"misses\":{},\"read_bytes\":{},"
+                         "\"kda_attn_ms\":{:.1f},\"mla_attn_ms\":{:.1f},\"ffn_ms\":{:.1f},\"experts_ms\":{:.1f},"
+                         "\"combine_ms\":{:.1f}}}\n",
+                         s.pos, tokens, s.wall_ms, s.gpu_ms, s.ensure_ms, s.read_ms, s.misses, s.read_bytes, sums[0][0],
+                         sums[1][0], sums[0][1] + sums[1][1], sums[0][2] + sums[1][2], sums[0][3] + sums[1][3]);
+}
+
 std::string Report::markdown(size_t skip) const
 {
     const MachineInfo& m = machine_;
@@ -154,6 +175,24 @@ std::string Report::markdown(size_t skip) const
                       l.total_ms / 1e3, l.dense_bytes / 1e9, l.dense_ms / 1e3, l.key_ms / 1e3, l.arena_bytes / 1e9,
                       l.arena_budget / 1e9, l.slots_min, l.slots_max, l.arena_ms / 1e3, l.prefill_ms / 1e3,
                       l.warm_ms / 1e3, l.profile.empty() ? "none" : l.profile);
+    for (const auto& [p, tokens] : prefills_) {
+        md += std::format("- prefill, {} tokens at position {}: {:.0f} ms ({:.1f} tok/s), GPU {:.0f} ms, making experts "
+                          "resident {:.0f} ms ({} misses, {:.1f} GB read in {:.0f} ms)\n",
+                          tokens, p.pos, p.wall_ms, tokens / p.wall_ms * 1e3, p.gpu_ms, p.ensure_ms, p.misses,
+                          p.read_bytes / 1e9, p.read_ms);
+        if (!p.layers.empty()) {
+            double kda = 0, mla = 0, ffn = 0, ex = 0, comb = 0;
+            for (const LayerTimes& t : p.layers) {
+                (t.mla ? mla : kda) += t.attn_ms;
+                ffn += t.ffn_ms;
+                ex += t.hit_ms;
+                comb += t.miss_ms;
+            }
+            md += std::format("  - GPU by section: KDA attention {:.0f} ms, MLA attention {:.0f} ms, FFN to routing "
+                              "{:.0f} ms, experts {:.0f} ms, combine and rest {:.0f} ms\n",
+                              kda, mla, ffn, ex, comb);
+        }
+    }
     if (steps_.size() <= skip) {
         md += "- no decode steps measured\n";
         return md;

@@ -56,14 +56,20 @@ kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w 
 }
 
 // y = (x - mean) / sqrt(var + eps) * w + b, one threadgroup per row.
+struct LayerNormArgs {
+    uint n;
+    float eps;
+    uint ystride; // y row stride in elements
+};
+
 kernel void layer_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                        device const float* b [[buffer(2)]], device float* y [[buffer(3)]],
-                       constant NormArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                       constant LayerNormArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
                        uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
     device const float* xr = x + uint64_t(row) * a.n;
-    device float* yr = y + uint64_t(row) * a.n;
+    device float* yr = y + uint64_t(row) * a.ystride;
     float s = 0.0f;
     for (uint i = tid; i < a.n; i += TG)
         s += xr[i];
@@ -295,39 +301,51 @@ struct ScanArgs {
 // One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
 //   S[i][:] *= exp(g[i]); delta[j] = (v[j] - sum_i S[i][j] k[i]) * beta
 //   S[i][j] += k[i] * delta[j];   o[j] = sum_i S[i][j] q[i] / sqrt(head_dim)
-// One threadgroup of head_dim threads per head, stepping through the tokens; thread j owns row j of M.
+// Threadgroups (heads, head_dim / 32) of 128 threads: each keeps rows j0..j0+31 of its head's M in threadgroup
+// memory for all the tokens (rows are independent: row j needs only the shared q, k, g and its own v[j]); four
+// threads per row, thread lane covering columns lane, lane + 4, ... . head_dim must be 128.
 kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
                      device const float* v [[buffer(2)]], device const float* g [[buffer(3)]],
                      device const float* beta [[buffer(4)]], device float* state [[buffer(5)]],
                      device float* o [[buffer(6)]], constant ScanArgs& a [[buffer(7)]],
-                     uint h [[threadgroup_position_in_grid]], uint j [[thread_position_in_threadgroup]])
+                     uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]])
 {
-    threadgroup float qs[128], ks[128], eg[128];
-    const uint D = a.head_dim;
+    constexpr uint D = 128, ROWS = 32, STRIDE = 132; // padded rows: the 4 lanes x 8 rows of a simdgroup hit distinct banks
+    threadgroup float Ms[ROWS * STRIDE];
+    threadgroup float qs[D], ks[D], eg[D];
+    const uint tid = tid2.x, h = tg.x, j0 = tg.y * ROWS, row = tid / 4, lane = tid % 4;
     const uint base = h * D;
-    device float* M = state + uint64_t(h) * D * D + uint64_t(j) * D;
+    device float* Mg = state + uint64_t(h) * D * D + uint64_t(j0) * D;
+    for (uint idx = tid; idx < ROWS * D; idx += 128)
+        Ms[(idx / D) * STRIDE + idx % D] = Mg[idx];
+    threadgroup float* M = Ms + row * STRIDE;
     for (uint t = 0; t < a.tokens; ++t) {
         const uint64_t qo = uint64_t(t) * a.qkv_stride + base, go = uint64_t(t) * a.inner + base;
-        qs[j] = q[qo + j];
-        ks[j] = k[qo + j];
-        eg[j] = exp(g[go + j]);
+        qs[tid] = q[qo + tid];
+        ks[tid] = k[qo + tid];
+        eg[tid] = exp(g[go + tid]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float sum = 0.0f;
-        for (uint i = 0; i < D; ++i) {
+        for (uint i = lane; i < D; i += 4) {
             const float m = M[i] * eg[i];
             M[i] = m;
             sum += m * ks[i];
         }
-        const float delta = (v[qo + j] - sum) * beta[t * a.heads + h];
+        sum = quad_sum(sum);
+        const float delta = (v[qo + j0 + row] - sum) * beta[t * a.heads + h];
         float out = 0.0f;
-        for (uint i = 0; i < D; ++i) {
+        for (uint i = lane; i < D; i += 4) {
             const float m = M[i] + ks[i] * delta;
             M[i] = m;
             out += m * qs[i];
         }
-        o[go + j] = out * rsqrt(float(D));
+        out = quad_sum(out);
+        if (lane == 0)
+            o[go + j0 + row] = out * rsqrt(float(D));
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    for (uint idx = tid; idx < ROWS * D; idx += 128)
+        Mg[idx] = Ms[(idx / D) * STRIDE + idx % D];
 }
 
 // y = rms_norm(x) * w * sigmoid(gate), one threadgroup per head row.
@@ -347,26 +365,30 @@ kernel void rms_norm_gate(device const float* x [[buffer(0)]], device const floa
 }
 
 struct SoftmaxArgs {
-    uint n_kv;
+    uint n_kv;      // row length
     float scale;
-    uint masked; // mask[t] == 0 drops key t
+    uint masked;    // mask[t] == 0 drops key t
+    uint first_kv;  // keys visible to row 0; row r sees first_kv + r / heads (causal across query tokens)
+    uint heads;
 };
 
-// In place, per head row of n_kv scores: p = softmax(scores * scale). One threadgroup per head.
+// In place, per row of n_kv scores (rows: query tokens x heads): p = softmax(scores * scale) over the row's
+// visible keys, zero beyond. One threadgroup per row.
 kernel void attn_softmax(device float* scores [[buffer(0)]], device const uchar* mask [[buffer(1)]],
-                         constant SoftmaxArgs& a [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
+                         constant SoftmaxArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
                          uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
-    device float* sh = scores + uint64_t(h) * a.n_kv;
+    device float* sh = scores + uint64_t(row) * a.n_kv;
+    const uint vis = min(a.n_kv, a.first_kv + row / a.heads);
     float m = -INFINITY;
-    for (uint t = tid; t < a.n_kv; t += TG)
+    for (uint t = tid; t < vis; t += TG)
         if (!a.masked || mask[t])
             m = max(m, sh[t] * a.scale);
     m = tg_max(m, scratch, tid);
     float s = 0.0f;
     for (uint t = tid; t < a.n_kv; t += TG) {
-        const float e = (!a.masked || mask[t]) ? exp(sh[t] * a.scale - m) : 0.0f;
+        const float e = (t < vis && (!a.masked || mask[t])) ? exp(sh[t] * a.scale - m) : 0.0f;
         sh[t] = e;
         s += e;
     }
@@ -578,13 +600,15 @@ struct PoolArgs {
 
 // pooled[d] = sum_m softmax_m(gate[m][d] + ape[m][d]) * key[m][d] over the pool's members m.
 // cache rows are key | gate per token.
+// Pools a.pool, a.pool + 1, ... ; grid (dim, pools).
 kernel void idx_pool(device const float* cache [[buffer(0)]], device const float* ape [[buffer(1)]],
                      device float* pooled [[buffer(2)]], constant PoolArgs& a [[buffer(3)]],
-                     uint d [[thread_position_in_grid]])
+                     uint2 gid [[thread_position_in_grid]])
 {
+    const uint d = gid.x, pool = a.pool + gid.y;
     if (d >= a.dim)
         return;
-    const uint first = a.pool * a.kpool;
+    const uint first = pool * a.kpool;
     float m = -INFINITY;
     for (uint j = 0; j < a.kpool; ++j)
         m = max(m, cache[uint64_t(first + j) * 2 * a.dim + a.dim + d] + ape[j * a.dim + d]);
@@ -595,7 +619,7 @@ kernel void idx_pool(device const float* cache [[buffer(0)]], device const float
         s += e;
         acc += e * row[d];
     }
-    pooled[uint64_t(a.pool) * a.dim + d] = acc / s;
+    pooled[uint64_t(pool) * a.dim + d] = acc / s;
 }
 
 struct ScoreArgs {

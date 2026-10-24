@@ -13,6 +13,8 @@ set_source_files_properties(mako_calibrate.cpp PROPERTIES
     COMPILE_OPTIONS "--embed-dir=${PROJECT_SOURCE_DIR}/data;-Wno-c23-extensions"
     OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/data/calibration.txt")
 
+add_executable(logit_compare logit_compare.cpp)
+
 add_executable(ffn_check ffn_check.cpp)
 target_link_libraries(ffn_check PRIVATE mako_glm)
 
