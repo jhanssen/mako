@@ -1,8 +1,10 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
 //            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
+//            [--stats summary|steps|layers] [--stats-out FILE]
 // The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
 // another; --save-counts writes this run's routing counts, --learn adds them to the model's profile.
+// --stats prints a Markdown telemetry summary at the end; --stats-out also writes its records as JSON lines.
 // With --ref, every probed intermediate is compared against <DIR>/<name>-<layer>.<pos>.f32 and the
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
@@ -100,7 +102,7 @@ int main(int argc, char** argv)
         return 2;
     }
     int n_gen = 8, top = 5;
-    std::string ref_dir, dump_dir, force_dir, route_dir, save_counts;
+    std::string ref_dir, dump_dir, force_dir, route_dir, save_counts, stats_out;
     bool learn = false;
     mako::glm::Options opts;
     for (int i = 3; i < argc; ++i) {
@@ -136,6 +138,15 @@ int main(int argc, char** argv)
             force_dir = v;
         else if (a == "--force-route")
             route_dir = v;
+        else if (a == "--stats") {
+            const auto t = mako::glm::parse_telemetry(v);
+            if (!t) {
+                std::println(stderr, "--stats takes summary, steps or layers");
+                return 2;
+            }
+            opts.telemetry = *t;
+        } else if (a == "--stats-out")
+            stats_out = v;
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
@@ -168,6 +179,14 @@ int main(int argc, char** argv)
     auto t0 = std::chrono::steady_clock::now();
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (!stats_out.empty() && opts.telemetry == mako::glm::Telemetry::off)
+        opts.telemetry = mako::glm::Telemetry::summary;
+    std::ofstream stats_file;
+    if (!stats_out.empty())
+        stats_file.open(stats_out, std::ios::trunc);
+    mako::glm::Report telemetry(opts.telemetry, stats_out.empty() ? nullptr : &stats_file);
+    telemetry.machine(mako::glm::query_machine(ctx.info()));
+    telemetry.load(engine.load_stats());
     {
         const auto& p = engine.arena_plan();
         const auto& a = engine.arena();
@@ -261,6 +280,7 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < ids.size(); ++i) {
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(ids[i]);
+        telemetry.step(engine.last_step());
         if (!dump_dir.empty())
             dump(std::filesystem::path(dump_dir) / std::format("logits.{}.f32", i), logits.data(), logits.size());
         if (!ref_dir.empty()) {
@@ -280,6 +300,7 @@ int main(int argc, char** argv)
         gen_ids.push_back(next);
         auto t = std::chrono::steady_clock::now();
         logits = engine.step(next);
+        telemetry.step(engine.last_step());
         std::println("gen {:4} in {:7} {:7.0f} ms  top{}", g, next,
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(),
                      show(logits));
@@ -289,6 +310,8 @@ int main(int argc, char** argv)
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
+    if (opts.telemetry != mako::glm::Telemetry::off)
+        std::print("\n{}", telemetry.markdown());
     if (!save_counts.empty())
         engine.save_profile(save_counts, false);
     if (learn) {

@@ -108,6 +108,7 @@ struct Engine::Layer {
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : model_(model), cfg_(cfg), opts_(opts), ctx_(ctx)
 {
+    const auto t_load = Clock::now();
     gemv_ = std::make_unique<mtl::Gemv>(ctx_);
     lib_ = ctx_.load(mtl::kernels_metallib());
 
@@ -208,12 +209,16 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     routed_ = mtl::Ref<MTL::SharedEvent>(ctx_.device()->newSharedEvent());
     ready_ = mtl::Ref<MTL::SharedEvent>(ctx_.device()->newSharedEvent());
 
+    load_.dense_ms = ms_since(t_load);
+    load_.dense_bytes = dense_bytes_;
     std::vector<ExpertArena::LayerParts> parts;
     for (const auto& L : layers_)
         parts.push_back(L->experts);
     arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9 : arena_budget(arena_plan_.mem);
+    auto t_phase = Clock::now();
     routing_key_ = glm::routing_key(model_, cfg_);
+    load_.key_ms = ms_since(t_phase);
     default_profile_ = default_profile_path(routing_key_);
     if (!opts_.expert_counts.empty())
         loaded_profile_ = opts_.expert_counts;
@@ -222,8 +227,10 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     Counts counts;
     if (!loaded_profile_.empty())
         counts = load_profile(loaded_profile_, cfg_.n_layer, cfg_.n_expert);
+    t_phase = Clock::now();
     arena_ = std::make_unique<ExpertArena>(ctx_.device(), ctx_.info().max_buffer, std::move(parts), cfg_.n_expert,
                                            cfg_.n_expert_used, arena_plan_.budget, counts);
+    load_.arena_ms = ms_since(t_phase);
     arena_->prefill();
 
     // The first compute pass that reads an arena buffer pays a driver cost that grows with its size (~0.5 s for
@@ -244,6 +251,77 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     cb->commit();
     cb->waitUntilCompleted();
     arena_plan_.warm_ms = ms_since(t0);
+
+    load_.prefill_ms = arena_->stats().prefill_ms;
+    load_.warm_ms = arena_plan_.warm_ms;
+    load_.arena_bytes = arena_->bytes();
+    load_.arena_budget = arena_plan_.budget;
+    load_.slots_min = UINT32_MAX;
+    for (uint32_t l = 0; l < cfg_.n_layer; ++l)
+        if (arena_->slots(l)) {
+            load_.slots_min = std::min(load_.slots_min, arena_->slots(l));
+            load_.slots_max = std::max(load_.slots_max, arena_->slots(l));
+        }
+    load_.profile = loaded_profile_.string();
+    if (opts_.telemetry == Telemetry::layers) {
+        if (!ctx_.info().counters_stage || !ctx_.info().timestamp_set)
+            throw std::runtime_error("this GPU has no timestamps at encoder boundaries; per-layer telemetry is "
+                                     "unavailable");
+        NS::Array* sets = ctx_.device()->counterSets();
+        MTL::CounterSet* ts = nullptr;
+        for (NS::UInteger i = 0; i < sets->count(); ++i)
+            if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
+                ts = sets->object<MTL::CounterSet>(i);
+        mtl::Ref<MTL::CounterSampleBufferDescriptor> d(MTL::CounterSampleBufferDescriptor::alloc()->init());
+        d->setCounterSet(ts);
+        d->setSampleCount(uint64_t(cfg_.n_layer) * 8 + 16);
+        d->setStorageMode(MTL::StorageModeShared);
+        NS::Error* err = nullptr;
+        samples_ = mtl::Ref<MTL::CounterSampleBuffer>(ctx_.device()->newCounterSampleBuffer(d.get(), &err));
+        if (!samples_)
+            throw std::runtime_error(std::format("newCounterSampleBuffer: {}",
+                                                 err ? err->localizedDescription()->utf8String() : "?"));
+    }
+    load_.total_ms = ms_since(t_load);
+}
+
+MTL::ComputeCommandEncoder* Engine::encoder(MTL::CommandBuffer* cb, uint32_t layer, int section)
+{
+    if (!samples_)
+        return cb->computeCommandEncoder();
+    MTL::ComputePassDescriptor* d = MTL::ComputePassDescriptor::computePassDescriptor();
+    auto* att = d->sampleBufferAttachments()->object(0);
+    att->setSampleBuffer(samples_.get());
+    att->setStartOfEncoderSampleIndex(next_sample_);
+    att->setEndOfEncoderSampleIndex(next_sample_ + 1);
+    timed_.push_back({layer, section, next_sample_, next_sample_ + 1});
+    next_sample_ += 2;
+    return cb->computeCommandEncoder(d);
+}
+
+// Turns the step's encoder timestamps into per-layer section times. GPU ticks are converted with the CPU clock
+// over the step, from timestamp pairs taken at its start and end.
+void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
+{
+    MTL::Timestamp cpu1 = 0, gpu1 = 0;
+    ctx_.device()->sampleTimestamps(&cpu1, &gpu1); // the CPU side is in nanoseconds
+    const double ns_per_tick = gpu1 > gpu0 ? double(cpu1 - cpu0) / double(gpu1 - gpu0) : 1.0;
+    NS::Data* data = samples_->resolveCounterRange(NS::Range(0, next_sample_));
+    const auto* ts = data ? static_cast<const MTL::CounterResultTimestamp*>(data->mutableBytes()) : nullptr;
+    last_step_.layers.assign(cfg_.n_layer, LayerTimes{});
+    for (uint32_t l = 0; l < cfg_.n_layer; ++l)
+        last_step_.layers[l].layer = l;
+    if (ts)
+        for (const Timed& t : timed_) {
+            const uint64_t a = ts[t.start].timestamp, b = ts[t.end].timestamp;
+            if (a == MTL::CounterErrorValue || b == MTL::CounterErrorValue || b < a)
+                continue;
+            const double ms = double(b - a) * ns_per_tick / 1e6;
+            LayerTimes& lt = last_step_.layers[t.layer];
+            (t.section == 0 ? lt.attn_ms : t.section == 1 ? lt.ffn_ms : t.section == 2 ? lt.hit_ms : lt.miss_ms) += ms;
+        }
+    timed_.clear();
+    next_sample_ = 0;
 }
 
 void Engine::save_profile(const std::filesystem::path& path, bool merge) const
@@ -290,6 +368,7 @@ Engine::DevTensor Engine::upload(const std::string& name)
     d.dims = t.dims;
     read_exact(ref.file->fd(), static_cast<char*>(d.buf->contents()) + d.off, t.bytes, t.offset);
     chunk_used_ += (t.bytes + kAlign - 1) / kAlign * kAlign;
+    dense_bytes_ += t.bytes;
     return d;
 }
 
@@ -612,6 +691,7 @@ void Engine::serve_moe(MTL::CommandBuffer* cb)
     auto* miss_rank = static_cast<int32_t*>(scratch("mrank", 16 * 4)->contents());
     auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(cfg_.n_layer) * 36)->contents());
     for (const auto [il, v] : pending_moe_) {
+        const auto t_wait = Clock::now();
         for (uint32_t spins = 0; routed_->signaledValue() < v; ++spins)
             if (spins % 4096 == 4095 && cb->status() == MTL::CommandBufferStatusError)
                 throw std::runtime_error(std::format("command buffer failed: {}",
@@ -628,8 +708,11 @@ void Engine::serve_moe(MTL::CommandBuffer* cb)
         const bool overridden = bool(route_override_);
         if (overridden)
             route_override_(int(il), sel, w, k);
+        last_step_.route_wait_ms += ms_since(t_wait);
+        const auto t_ensure = Clock::now();
         std::array<int32_t, 16> slots{};
         arena_->ensure(il, std::span<const int>(sel, k), slots.data());
+        last_step_.ensure_ms += ms_since(t_ensure);
         for (uint32_t j = 0; j < k; ++j) {
             if (overridden) {
                 miss_rank[j] = int32_t(j);
@@ -708,6 +791,11 @@ const std::vector<float>& Engine::step(int32_t token)
 
     step_start_ = Clock::now();
     encoding_ = true;
+    const ExpertArena::Stats before = arena_->stats();
+    const Stats stats_before = stats_;
+    last_step_ = StepStats{};
+    last_step_.pos = pos_;
+    last_step_.token = token;
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     MTL::Buffer* x = scratch("x", E * 4);
     MTL::Buffer* xn = scratch("xn", E * 4);
@@ -726,6 +814,9 @@ const std::vector<float>& Engine::step(int32_t token)
 
     if (probe_)
         probe_("inp_embd", -1, static_cast<const float*>(x->contents()), E);
+    MTL::Timestamp cpu0 = 0, gpu0 = 0;
+    if (samples_)
+        ctx_.device()->sampleTimestamps(&cpu0, &gpu0);
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
     dispatch(enc, "hc_init", {x, scratch("R", hd * 4)}, &ha, sizeof(ha), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
@@ -735,6 +826,10 @@ const std::vector<float>& Engine::step(int32_t token)
         if (stream_override_) {
             submit(cb, enc);
             stream_override_(int(il), static_cast<float*>(scratch("R", hd * 4)->contents()), hd);
+        }
+        if (samples_) {
+            enc->endEncoding();
+            enc = encoder(cb, il, 0);
         }
         hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base);
         probe(enc, "hc_attn_pre", int(il), x, E);
@@ -746,6 +841,10 @@ const std::vector<float>& Engine::step(int32_t token)
             mla(enc, L, il);
         probe(enc, L.kda ? "kda_out" : "attn_out", int(il), att, E);
         hc_post(enc, att);
+        if (samples_) {
+            enc->endEncoding();
+            enc = encoder(cb, il, 1);
+        }
 
         hc_pre(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base);
         probe(enc, "hc_ffn_pre", int(il), x, E);
@@ -801,7 +900,7 @@ const std::vector<float>& Engine::step(int32_t token)
             const uint64_t v = ++event_value_;
             cb->encodeSignalEvent(routed_.get(), v);
             pending_moe_.emplace_back(il, v);
-            enc = cb->computeCommandEncoder();
+            enc = encoder(cb, il, 2);
 
             // Resident experts run while the CPU reads the misses; the miss pass waits for it.
             const SwigluArgs sa{k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
@@ -825,7 +924,7 @@ const std::vector<float>& Engine::step(int32_t token)
             MTL::Buffer* ed_hit = pass(hit_ids, false, "h");
             enc->endEncoding();
             cb->encodeWait(ready_.get(), v);
-            enc = cb->computeCommandEncoder();
+            enc = encoder(cb, il, 3);
             MTL::Buffer* ed_miss = pass(miss_ids, true, "m");
             const CombineArgs ca{E, k};
             dispatch(enc, "moe_combine_split", {ed_hit, ed_miss, miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
@@ -836,6 +935,10 @@ const std::vector<float>& Engine::step(int32_t token)
         probe(enc, "l_out", int(il), scratch("R", hd * 4), hd);
     }
 
+    if (samples_) {
+        enc->endEncoding();
+        enc = cb->computeCommandEncoder();
+    }
     dispatch(enc, "hc_mean", {scratch("R", hd * 4), x}, &ha, sizeof(ha), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
     norm(enc, x, &output_norm_, xn, 1, E, E, cfg_.rms_eps);
     MTL::Buffer* lg = scratch("logits", uint64_t(cfg_.n_vocab) * 4);
@@ -848,6 +951,16 @@ const std::vector<float>& Engine::step(int32_t token)
     ++pos_;
     pool->release();
     stats_.step_ms += ms_since(step_start_);
+    const ExpertArena::Stats& after = arena_->stats();
+    last_step_.wall_ms = ms_since(step_start_);
+    last_step_.encode_ms = stats_.encode_ms - stats_before.encode_ms;
+    last_step_.gpu_ms = stats_.gpu_exec_ms - stats_before.gpu_exec_ms;
+    last_step_.read_ms = after.read_ms - before.read_ms;
+    last_step_.hits = after.hits - before.hits;
+    last_step_.misses = after.misses - before.misses;
+    last_step_.read_bytes = after.read_bytes - before.read_bytes;
+    if (samples_)
+        resolve_layer_times(cpu0, gpu0);
     return logits_;
 }
 

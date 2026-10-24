@@ -24,8 +24,15 @@ add_custom_command(OUTPUT ${MAKO_METALLIB}
     COMMENT "Linking mako.metallib")
 add_custom_target(mako_metallib DEPENDS ${MAKO_METALLIB})
 
-add_library(mako_glm STATIC glm/arena.cpp glm/config.cpp glm/engine.cpp glm/profile.cpp)
+add_custom_target(mako_version
+    COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/generated/mako_version.hpp
+            -P ${PROJECT_SOURCE_DIR}/cmake/version.cmake
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp)
+
+add_library(mako_glm STATIC glm/arena.cpp glm/config.cpp glm/engine.cpp glm/profile.cpp glm/telemetry.cpp)
 target_link_libraries(mako_glm PUBLIC mako_mtl mako_gguf)
+target_include_directories(mako_glm PRIVATE ${CMAKE_BINARY_DIR}/generated)
+add_dependencies(mako_glm mako_version)
 
 set_source_files_properties(mtl/embedded.cpp PROPERTIES
     COMPILE_OPTIONS "--embed-dir=${CMAKE_BINARY_DIR};-Wno-c23-extensions"

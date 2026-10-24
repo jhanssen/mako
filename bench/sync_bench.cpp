@@ -80,6 +80,8 @@ int main(int argc, char** argv)
     std::println("{}  apple9={} apple10={} metal4={}  maxBuffer={:.1f} GB  workingSet={:.1f} GB  tgMem={} B",
                  info.name, info.apple9, info.apple10, info.metal4, info.max_buffer / 1e9,
                  info.recommended_working_set / 1e9, info.max_threadgroup_memory);
+    std::println("counter sampling: stage boundary {}, dispatch boundary {}, blit boundary {}, timestamp set {}",
+                 info.counters_stage, info.counters_dispatch, info.counters_blit, info.timestamp_set);
 
     auto lib = ctx.compile(kSource);
     auto touch = ctx.pipeline(lib.get(), "touch");

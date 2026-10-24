@@ -3,6 +3,7 @@
 #include "glm/arena.hpp"
 #include "glm/config.hpp"
 #include "glm/profile.hpp"
+#include "glm/telemetry.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemv.hpp"
@@ -23,6 +24,7 @@ struct Options {
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
     std::string expert_counts;  // routing profile placing experts in the arena; empty: the model's default profile
                                 // (default_profile_path), when it exists
+    Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
 };
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
@@ -64,6 +66,8 @@ public:
     };
     const ArenaPlan& arena_plan() const { return arena_plan_; }
     const ExpertArena& arena() const { return *arena_; }
+    const LoadStats& load_stats() const { return load_; }
+    const StepStats& last_step() const { return last_step_; }
 
     const std::string& routing_key() const { return routing_key_; }
     const std::filesystem::path& default_profile() const { return default_profile_; }
@@ -100,6 +104,9 @@ private:
     void ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* out, float limit);
     void serve_moe(MTL::CommandBuffer* cb);
+    // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
+    MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section);
+    void resolve_layer_times(uint64_t cpu0, uint64_t gpu0);
     void finish(MTL::CommandBuffer* cb);
     void probe(MTL::ComputeCommandEncoder* enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
@@ -139,6 +146,17 @@ private:
     Probe probe_;
     StreamOverride stream_override_;
     std::chrono::steady_clock::time_point step_start_;
+    LoadStats load_;
+    StepStats last_step_;
+    // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
+    struct Timed {
+        uint32_t layer;
+        int section; // 0 attention, 1 FFN (to routing), 2 resident experts, 3 misses and the rest
+        NS::UInteger start, end;
+    };
+    mtl::Ref<MTL::CounterSampleBuffer> samples_;
+    std::vector<Timed> timed_;
+    NS::UInteger next_sample_ = 0;
     uint64_t dense_bytes_ = 0;
     bool encoding_ = false;
     RouteOverride route_override_;
