@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <format>
 #include <print>
 #include <thread>
 #include <vector>
@@ -229,6 +230,32 @@ int main(int argc, char** argv)
         pool->release();
     }
     report("poll", poll_us);
+
+    // Per-dispatch cost inside one encoder: n tiny dispatches that each depend on the previous one (a serial
+    // encoder orders them), against n independent ones in a concurrent encoder; GPU time per dispatch.
+    {
+        constexpr int n = 1000;
+        mako::mtl::Ref<MTL::Buffer> many(ctx.device()->newBuffer(n * 4096, MTL::ResourceStorageModeShared));
+        for (auto [type, label] : {std::pair{MTL::DispatchTypeSerial, "serial, dependent"},
+                                   {MTL::DispatchTypeConcurrent, "concurrent, independent"}}) {
+            std::vector<double> per;
+            for (int it = 0; it < 20; ++it) {
+                auto* cb = q->commandBuffer();
+                auto* enc = cb->computeCommandEncoder(type);
+                enc->setComputePipelineState(touch.get());
+                for (int d = 0; d < n; ++d) {
+                    enc->setBuffer(type == MTL::DispatchTypeSerial ? buf.get() : many.get(),
+                                   type == MTL::DispatchTypeSerial ? 0 : uint64_t(d) * 4096, 0);
+                    enc->dispatchThreads(MTL::Size(32, 1, 1), MTL::Size(32, 1, 1));
+                }
+                enc->endEncoding();
+                cb->commit();
+                cb->waitUntilCompleted();
+                per.push_back((cb->GPUEndTime() - cb->GPUStartTime()) * 1e6 / n);
+            }
+            report(std::format("dispatch ({})", label).c_str(), per);
+        }
+    }
     std::println("poll timeouts: {} of {}", timeouts, poll_iters);
     return 0;
 }

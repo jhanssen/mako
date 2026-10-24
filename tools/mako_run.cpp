@@ -1,7 +1,7 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
 //            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
-//            [--stats summary|steps|layers] [--stats-out FILE]
+//            [--stats summary|steps|layers|kernels] [--stats-out FILE]
 // The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
 // another; --save-counts writes this run's routing counts, --learn adds them to the model's profile.
 // --stats prints a Markdown telemetry summary at the end; --stats-out also writes its records as JSON lines.
@@ -141,7 +141,7 @@ int main(int argc, char** argv)
         else if (a == "--stats") {
             const auto t = mako::glm::parse_telemetry(v);
             if (!t) {
-                std::println(stderr, "--stats takes summary, steps or layers");
+                std::println(stderr, "--stats takes summary, steps, layers or kernels");
                 return 2;
             }
             opts.telemetry = *t;

@@ -90,25 +90,28 @@ private:
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
     MTL::ComputePipelineState* pso(const std::string& fn);
 
-    void gemv(MTL::ComputeCommandEncoder* enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
+    void gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
               uint64_t y_off, uint32_t batch = 1);
-    void dispatch(MTL::ComputeCommandEncoder* enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
+    void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
                   const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads = true);
-    void norm(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
+    void norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
               uint32_t n, uint32_t wn, float eps);
-    void hc_pre(MTL::ComputeCommandEncoder* enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base);
-    void hc_post(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x);
-    void kda(MTL::ComputeCommandEncoder* enc, const Layer& L, uint32_t il);
-    void mla(MTL::ComputeCommandEncoder* enc, const Layer& L, uint32_t il);
-    bool indexer(MTL::ComputeCommandEncoder* enc, const Layer& L, uint32_t il);
-    void ffn_dense(MTL::ComputeCommandEncoder* enc, const DevTensor& gate, const DevTensor& up,
+    void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base);
+    void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x);
+    void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il);
+    void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il);
+    bool indexer(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il);
+    void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* out, float limit);
     void serve_moe(MTL::CommandBuffer* cb);
     // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
     MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section);
+    // At the kernels telemetry level, closes the encoder holding the dispatch just encoded, labelled `kernel`,
+    // and opens the next one.
+    void after(MTL::ComputeCommandEncoder*& enc, std::string_view kernel);
     void resolve_layer_times(uint64_t cpu0, uint64_t gpu0);
     void finish(MTL::CommandBuffer* cb);
-    void probe(MTL::ComputeCommandEncoder* enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
+    void probe(MTL::ComputeCommandEncoder*& enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
     void deliver_probes();
     void submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
@@ -151,10 +154,13 @@ private:
     // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
     struct Timed {
         uint32_t layer;
-        int section; // 0 attention, 1 FFN (to routing), 2 resident experts, 3 misses and the rest
+        int section; // 0 attention, 1 FFN (to routing), 2 resident experts, 3 misses and the rest; -1 one kernel
         NS::UInteger start, end;
+        std::string kernel; // kernels level; empty: the encoder held no dispatch
     };
-    mtl::Ref<MTL::CounterSampleBuffer> samples_;
+    MTL::CommandBuffer* cur_cb_ = nullptr;
+    uint32_t cur_layer_ = 0;
+    std::vector<mtl::Ref<MTL::CounterSampleBuffer>> samples_; // kSamplesPerBuffer each; index / that picks one
     std::vector<Timed> timed_;
     NS::UInteger next_sample_ = 0;
     uint64_t dense_bytes_ = 0;

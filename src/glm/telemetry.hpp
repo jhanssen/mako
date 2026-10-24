@@ -12,8 +12,9 @@
 namespace mako::glm {
 
 // How much the engine measures and reports: summary (machine, load, per-token averages), steps (every step too),
-// layers (every step's per-layer GPU time too).
-enum class Telemetry { off, summary, steps, layers };
+// layers (every step's per-layer GPU time too), kernels (GPU time per kernel instead of per layer; every dispatch
+// gets its own encoder, which adds overhead, so absolute times run high).
+enum class Telemetry { off, summary, steps, layers, kernels };
 std::optional<Telemetry> parse_telemetry(std::string_view s);
 
 struct MachineInfo {
@@ -39,6 +40,12 @@ struct LayerTimes {
     double hit_ms = 0, miss_ms = 0; // MoE: resident experts, then the misses and the combine
 };
 
+struct KernelTime {
+    std::string kernel;
+    double ms = 0;
+    uint32_t count = 0;
+};
+
 struct StepStats {
     uint32_t pos = 0;
     int32_t token = 0;
@@ -48,6 +55,7 @@ struct StepStats {
     double read_ms = 0;
     uint64_t hits = 0, misses = 0, read_bytes = 0;
     std::vector<LayerTimes> layers;
+    std::vector<KernelTime> kernels;
 };
 
 // Collects telemetry and writes it as JSON lines (one object per record) and as a Markdown summary.

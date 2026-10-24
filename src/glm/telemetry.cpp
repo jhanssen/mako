@@ -66,6 +66,8 @@ std::optional<Telemetry> parse_telemetry(std::string_view s)
         return Telemetry::steps;
     if (s == "layers")
         return Telemetry::layers;
+    if (s == "kernels")
+        return Telemetry::kernels;
     return std::nullopt;
 }
 
@@ -121,12 +123,17 @@ void Report::step(const StepStats& s)
     for (const LayerTimes& t : s.layers)
         layers += std::format("{}{{\"layer\":{},\"attn_ms\":{:.3f},\"ffn_ms\":{:.3f},\"hit_ms\":{:.3f},\"miss_ms\":{:.3f}}}",
                               layers.empty() ? "" : ",", t.layer, t.attn_ms, t.ffn_ms, t.hit_ms, t.miss_ms);
+    std::string kernels;
+    for (const KernelTime& k : s.kernels)
+        kernels += std::format("{}{{\"kernel\":{},\"ms\":{:.4f},\"count\":{}}}", kernels.empty() ? "" : ",",
+                               json_str(k.kernel), k.ms, k.count);
     *out_ << std::format("{{\"type\":\"step\",\"pos\":{},\"token\":{},\"wall_ms\":{:.2f},\"encode_ms\":{:.2f},"
                          "\"gpu_ms\":{:.2f},\"route_wait_ms\":{:.2f},\"ensure_ms\":{:.2f},\"read_ms\":{:.2f},"
                          "\"hits\":{},\"misses\":{},\"read_bytes\":{}{}}}\n",
                          s.pos, s.token, s.wall_ms, s.encode_ms, s.gpu_ms, s.route_wait_ms, s.ensure_ms, s.read_ms,
                          s.hits, s.misses, s.read_bytes,
-                         s.layers.empty() ? std::string() : ",\"layers\":[" + layers + "]");
+                         (s.layers.empty() ? std::string() : ",\"layers\":[" + layers + "]") +
+                             (s.kernels.empty() ? std::string() : ",\"kernels\":[" + kernels + "]"));
 }
 
 std::string Report::markdown(size_t skip) const
@@ -173,7 +180,28 @@ std::string Report::markdown(size_t skip) const
                       mean(wait), mean(ensure));
     md += std::format("- experts: {:.1f}% resident, {:.1f} misses/token, {:.1f} MB/token read in {:.1f} ms\n",
                       100.0 * hits / std::max<uint64_t>(1, hits + misses), misses / n, bytes / n / 1e6, mean(read));
-    if (level_ >= Telemetry::layers && !steps_[skip].layers.empty()) {
+    if (level_ >= Telemetry::kernels) {
+        std::vector<KernelTime> agg;
+        for (size_t i = skip; i < steps_.size(); ++i)
+            for (const KernelTime& k : steps_[i].kernels) {
+                auto it = std::ranges::find(agg, k.kernel, &KernelTime::kernel);
+                if (it == agg.end())
+                    it = agg.insert(agg.end(), KernelTime{k.kernel, 0, 0});
+                it->ms += k.ms;
+                it->count += k.count;
+            }
+        std::ranges::sort(agg, [](const KernelTime& a, const KernelTime& b) { return a.ms > b.ms; });
+        double total = 0;
+        for (const KernelTime& k : agg)
+            total += k.ms;
+        md += std::format("\n| kernel | ms/token | share | dispatches/token | us/dispatch |\n|---|---|---|---|---|\n");
+        for (size_t i = 0; i < std::min<size_t>(agg.size(), 30); ++i)
+            md += std::format("| {} | {:.3f} | {:.1f}% | {:.0f} | {:.1f} |\n", agg[i].kernel, agg[i].ms / n,
+                              100 * agg[i].ms / total, agg[i].count / n, 1e3 * agg[i].ms / agg[i].count);
+        md += std::format("| all kernels | {:.2f} | | {:.0f} | |\n", total / n,
+                          std::accumulate(agg.begin(), agg.end(), 0.0, [](double a, const KernelTime& k) { return a + k.count; }) / n);
+    }
+    if (level_ == Telemetry::layers && !steps_[skip].layers.empty()) {
         md += "\n| layer | attention ms | FFN ms | resident experts ms | misses + combine ms |\n|---|---|---|---|---|\n";
         for (size_t j = 0; j < steps_[skip].layers.size(); ++j) {
             double a = 0, f = 0, h = 0, mi = 0;
