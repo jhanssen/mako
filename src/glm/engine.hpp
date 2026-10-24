@@ -33,6 +33,7 @@ struct Options {
                                 // (default_profile_path), when it exists
     Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
     bool mtp = false; // load the next-token block (speculative decoding): its weights, caches and expert slots
+    uint32_t checkpoints = 4; // checkpoints (checkpoint()) the memory budget reserves room for
     // Nonzero: behave as on a Mac with this much RAM (GB): the difference is locked before loading, and the memory
     // budget uses this RAM size and a proportionally smaller GPU working set.
     double simulate_ram_gb = 0;
@@ -87,6 +88,9 @@ public:
     // The logits after the last step's (or prefill's) last token.
     const std::vector<float>& logits() const { return logits_; }
     uint32_t max_context() const { return opts_.max_ctx; }
+    uint32_t checkpoint_slots() const { return opts_.checkpoints; }
+    // Size of one checkpoint().
+    uint64_t checkpoint_bytes() const;
     const Config& config() const { return cfg_; }
     // Back to position 0 with empty recurrent state (the expert arena keeps its contents).
     void reset();

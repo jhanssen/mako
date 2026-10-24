@@ -33,7 +33,9 @@ struct GenerateResult {
 // state taken at the end of an earlier prompt (a chat template that rewrites the last answer diverges there).
 class Session {
 public:
-    explicit Session(Engine& engine, size_t max_checkpoints = 4) : e_(engine), max_checkpoints_(max_checkpoints) {}
+    // max_checkpoints beyond the engine's checkpoint_slots() use memory its budget did not reserve.
+    explicit Session(Engine& engine) : Session(engine, engine.checkpoint_slots()) {}
+    Session(Engine& engine, size_t max_checkpoints) : e_(engine), max_checkpoints_(max_checkpoints) {}
 
     // on_token gets each generated token once decided; returning false stops (Finish::cancelled).
     GenerateResult generate(std::span<const int32_t> prompt, const GenerateParams& p,

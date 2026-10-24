@@ -312,12 +312,14 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     built_chunk_ = opts_.prefill_chunk;
     built_group_ = std::max(opts_.prefill_chunk, opts_.prefill_group);
     arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk, std::max(opts_.prefill_chunk, opts_.prefill_group)));
-    // The context caches are allocated for max_ctx but only fill (and count in the footprint) as the context grows.
+    // The context caches are allocated for max_ctx but only fill (and count in the footprint) as the context grows;
+    // the checkpoints a Session keeps add to them.
     uint64_t context_bytes = 0;
     for (const auto* caches : {&kv_cache_, &idx_cache_, &idx_pooled_})
         for (const auto& b : *caches)
             if (b)
                 context_bytes += b->length();
+    context_bytes += uint64_t(opts_.checkpoints) * checkpoint_bytes();
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9
                                              : std::max(1e9, arena_budget(arena_plan_.mem) - double(context_bytes));
     auto t_phase = Clock::now();
@@ -1569,6 +1571,16 @@ void Engine::mtp_seed(int32_t next)
         return;
     const int32_t t[1] = {next};
     mtp_run(t, pos_ - 1 - last_pos0_);
+}
+
+uint64_t Engine::checkpoint_bytes() const
+{
+    uint64_t n = has_mtp() ? uint64_t(cfg_.n_embd) * 4 : 0;
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il)
+        for (const auto* b : {kda_state_[il].get(), conv_state_[il].get()})
+            if (b)
+                n += b->length();
+    return n;
 }
 
 Engine::Checkpoint Engine::checkpoint()
