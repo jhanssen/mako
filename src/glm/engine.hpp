@@ -136,7 +136,7 @@ private:
                 uint64_t out_off, uint32_t tokens, uint32_t first_kv, bool sparse);
     void indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
                          MTL::Buffer* qrn, uint32_t T, uint32_t pos0);
-    bool indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos);
+    bool indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos, uint32_t count = 1);
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
                    uint64_t x_off = 0, uint64_t out_off = 0);

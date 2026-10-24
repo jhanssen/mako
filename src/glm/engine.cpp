@@ -70,11 +70,12 @@ struct PoolArgs {
     uint32_t dim, kpool, pool;
 };
 struct ScoreArgs {
-    uint32_t dim, heads, n_pool;
+    uint32_t dim, heads, first, kpool;
     float w_scale;
+    uint32_t stride;
 };
 struct SelectArgs {
-    uint32_t n_pool, n_top, kpool, n_kv;
+    uint32_t first, n_top, kpool, score_stride, mask_stride;
 };
 struct LayerNormArgs {
     uint32_t n;
@@ -84,7 +85,7 @@ struct LayerNormArgs {
 struct SoftmaxArgs {
     uint32_t n_kv;
     float scale;
-    uint32_t masked, first_kv, heads;
+    uint32_t masked, first_kv, heads, mask_stride;
 };
 struct PvArgs {
     uint32_t heads, dim, n_kv, keys_per_split;
@@ -753,6 +754,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
 void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off,
                     MTL::Buffer* out, uint64_t out_off, uint32_t tokens, uint32_t first_kv, bool sparse)
 {
+    // Sparse: query token i's mask row (indexer_select) is i * max_ctx bytes into idx_mask.
     const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, rows = tokens * H;
     const uint32_t n_kv = first_kv + tokens - 1;
     // At most 16 splits of at least 256 keys, whole 64-key tiles.
@@ -762,10 +764,10 @@ void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::B
     MTL::Buffer* partial = scratch("pv_part", uint64_t(splits) * rows * R * 4);
     gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, cache, 0, halves(enc, q, q_off, rows, R, 0), 0, scores, 0);
     after(enc, "attn_scores");
-    const SoftmaxArgs sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u, first_kv, H};
+    const SoftmaxArgs sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u, first_kv, H, opts_.max_ctx};
     enc->setComputePipelineState(pso("attn_softmax"));
     enc->setBuffer(scores, 0, 0);
-    enc->setBuffer(scratch("idx_mask", opts_.max_ctx), 0, 1);
+    enc->setBuffer(scratch("idx_mask", uint64_t(tokens) * opts_.max_ctx), 0, 1);
     enc->setBytes(&sa, sizeof(sa), 2);
     enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "attn_softmax");
@@ -844,9 +846,11 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, false);
         t += g;
     }
-    for (; t < T; ++t) {
-        const bool sparse = indexer_select(enc, il, t, pos0 + t);
-        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, 1, pos0 + t + 1, sparse);
+    while (t < T) {
+        const uint32_t g = std::min(group, T - t);
+        const bool sparse = indexer_select(enc, il, t, pos0 + t, g);
+        attend(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g, pos0 + t + 1, sparse);
+        t += g;
     }
     per_head(L.v_b, lat, R, vout, cfg_.head_v);
     proj(enc, L.wo, vout, 0, att, 0, T);
@@ -891,29 +895,31 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     }
 }
 
-// For token t (at position pos) of the last indexer_project: once more pools are complete than the selection keeps,
-// writes the cell mask of its top pools plus the incomplete tail. Returns whether the mask applies.
-bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos)
+// For tokens t..t+count-1 (at positions pos..) of the last indexer_project: once more pools are complete than the
+// selection keeps, writes each token's cell mask (rows of max_ctx bytes) of its top pools plus the incomplete tail.
+// Returns whether the masks apply (whether token t has more pools; later tokens then do too).
+bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos, uint32_t count)
 {
     const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads, kp = cfg_.indexer_kpool;
     const uint32_t n_pool = (pos + 1) / kp, n_top = cfg_.indexer_top_k / kp;
     if (n_pool <= n_top)
         return false;
-    MTL::Buffer* score = scratch("idx_score", uint64_t(opts_.max_ctx / kp + 1) * 4);
-    const ScoreArgs sa{Di, Hi, n_pool, 1.0f / std::sqrt(float(Di * Hi))};
+    const uint32_t stride = opts_.max_ctx / kp + 1, last_pools = (pos + count) / kp;
+    MTL::Buffer* score = scratch("idx_score", uint64_t(count) * stride * 4);
+    const ScoreArgs sa{Di, Hi, pos + 1, kp, 1.0f / std::sqrt(float(Di * Hi)), stride};
     enc->setComputePipelineState(pso("idx_score"));
     enc->setBuffer(scratch("iq", 0), uint64_t(t) * Hi * Di * 4, 0);
     enc->setBuffer(scratch("iw", 0), uint64_t(t) * Hi * 4, 1);
     enc->setBuffer(idx_pooled_[il].get(), 0, 2);
     enc->setBuffer(score, 0, 3);
     enc->setBytes(&sa, sizeof(sa), 4);
-    enc->dispatchThreads(MTL::Size(n_pool, 1, 1), MTL::Size(64, 1, 1));
+    enc->dispatchThreads(MTL::Size(last_pools, count, 1), MTL::Size(64, 1, 1));
     after(enc, "idx_score");
-    if (pos == pos_)
+    if (pos == pos_ && count == 1)
         probe(enc, "indexer_score", int(il), score, n_pool);
-    const SelectArgs sel{n_pool, n_top, kp, pos + 1};
-    dispatch(enc, "idx_select", {score, scratch("idx_mask", opts_.max_ctx)}, &sel, sizeof(sel), MTL::Size(1, 1, 1),
-             MTL::Size(256, 1, 1), false);
+    const SelectArgs sel{pos + 1, n_top, kp, stride, opts_.max_ctx};
+    dispatch(enc, "idx_select", {score, scratch("idx_mask", uint64_t(count) * opts_.max_ctx)}, &sel, sizeof(sel),
+             MTL::Size(count, 1, 1), MTL::Size(256, 1, 1), false);
     return true;
 }
 

@@ -367,9 +367,10 @@ kernel void rms_norm_gate(device const float* x [[buffer(0)]], device const floa
 struct SoftmaxArgs {
     uint n_kv;      // row length
     float scale;
-    uint masked;    // mask[t] == 0 drops key t
+    uint masked;    // mask[t] == 0 drops key t (query token i's mask row at mask + i * mask_stride)
     uint first_kv;  // keys visible to row 0; row r sees first_kv + r / heads (causal across query tokens)
     uint heads;
+    uint mask_stride;
 };
 
 // In place, per row of n_kv scores (rows: query tokens x heads): p = softmax(scores * scale) over the row's
@@ -381,6 +382,7 @@ kernel void attn_softmax(device float* scores [[buffer(0)]], device const uchar*
     threadgroup float scratch[TG / 32];
     device float* sh = scores + uint64_t(row) * a.n_kv;
     const uint vis = min(a.n_kv, a.first_kv + row / a.heads);
+    mask += uint64_t(row / a.heads) * a.mask_stride;
     float m = -INFINITY;
     for (uint t = tid; t < vis; t += TG)
         if (!a.masked || mask[t])
@@ -645,17 +647,24 @@ kernel void idx_pool(device const float* cache [[buffer(0)]], device const float
 struct ScoreArgs {
     uint dim;
     uint heads;
-    uint n_pool;
+    uint first;  // cells token 0 sees (its position + 1); token j sees first + j, so (first + j) / kpool pools
+    uint kpool;
     float w_scale;
+    uint stride; // floats between tokens' score rows
 };
 
-// score[p] = sum_h relu(q_h . pooled_p) * w_h
+// For consecutive tokens j (q, w rows): score[j][p] = sum_h relu(q_h . pooled_p) * w_h over token j's complete
+// pools; grid (pools of the last token, tokens).
 kernel void idx_score(device const float* q [[buffer(0)]], device const float* w [[buffer(1)]],
                       device const float* pooled [[buffer(2)]], device float* score [[buffer(3)]],
-                      constant ScoreArgs& a [[buffer(4)]], uint p [[thread_position_in_grid]])
+                      constant ScoreArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
 {
-    if (p >= a.n_pool)
+    const uint p = gid.x, j = gid.y;
+    if (p >= (a.first + j) / a.kpool)
         return;
+    q += uint64_t(j) * a.heads * a.dim;
+    w += uint64_t(j) * a.heads;
+    score += uint64_t(j) * a.stride;
     device const float* k = pooled + uint64_t(p) * a.dim;
     float total = 0.0f;
     for (uint h = 0; h < a.heads; ++h) {
@@ -668,10 +677,14 @@ kernel void idx_score(device const float* q [[buffer(0)]], device const float* w
 }
 
 struct SelectArgs {
-    uint n_pool;   // complete pools
-    uint n_top;    // pools to keep
+    uint first;        // cells token 0 sees, itself included; token j sees first + j
+    uint n_top;        // pools to keep
     uint kpool;
-    uint n_kv;     // cells, the current token included
+    uint score_stride; // floats between tokens' score rows
+    uint mask_stride;  // bytes between tokens' mask rows
+};
+struct SelectRow {
+    uint n_pool, n_top, kpool, n_kv;
 };
 
 static uint order_key(float f)
@@ -680,11 +693,15 @@ static uint order_key(float f)
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// mask[cell] = 1 for the members of the n_top best pools and for the incomplete tail; one threadgroup.
+// mask[cell] = 1 for the members of the n_top best pools and for the incomplete tail; one threadgroup per token.
 // Ties at the threshold keep the lowest pool indices.
 kernel void idx_select(device const float* score [[buffer(0)]], device uchar* mask [[buffer(1)]],
-                       constant SelectArgs& a [[buffer(2)]], uint tid [[thread_position_in_threadgroup]])
+                       constant SelectArgs& sa [[buffer(2)]], uint tid [[thread_position_in_threadgroup]],
+                       uint j [[threadgroup_position_in_grid]])
 {
+    score += uint64_t(j) * sa.score_stride;
+    mask += uint64_t(j) * sa.mask_stride;
+    const SelectRow a{(sa.first + j) / sa.kpool, sa.n_top, sa.kpool, sa.first + j};
     threadgroup atomic_uint hist[256];
     threadgroup uint sh_prefix, sh_need;
     const uint all = a.n_pool <= a.n_top;
