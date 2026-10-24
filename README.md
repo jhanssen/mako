@@ -8,9 +8,9 @@ It is tuned for M5 and meant to run on M3 and later (GPU family Apple9); so far 
 
 ## Status
 
-Early. GLM-5.3-Flash decodes one token at a time and matches a reference implementation to within that
-reference's own precision. Routed experts are read from the SSD for every token (no cache yet), there is no tokenizer
-(input is token ids), no batched prompt processing and no speculative decoding. Expect it to be slow.
+Early. GLM-5.3-Flash runs end to end: tokenizer and chat template, batched prompt processing, an expert cache in
+unified memory, sampling and speculative decoding with the model's next-token block, matching a reference
+implementation to within that reference's own precision. There is no HTTP server yet.
 
 ## Requirements
 
@@ -25,7 +25,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-The first configure downloads pinned dependencies (metal-cpp and third-party GEMV kernels).
+The first configure downloads pinned dependencies (metal-cpp, third-party GEMV kernels and a Jinja engine).
 
 ## Run
 
@@ -67,8 +67,9 @@ numerical change, `regress_test <model> --update` re-records `tests/data/regress
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
 | `src/glm` | GLM-5.3-Flash config, engine and generation session |
+| `src/chat` | chat templates (the GGUF's Jinja template) |
 | `src/gen` | sampling |
 | `src/text` | tokenizer, UTF-8 streaming detokenizer |
 | `tools` | `mako_run`, `mako_calibrate`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
-| `tests` | kernel, tokenizer and end-to-end regression tests (ctest) |
+| `tests` | kernel, tokenizer, chat template, sampler and end-to-end regression tests (ctest) |
 | `bench` | SSD, sync, matmul and quantization-format microbenchmarks |

@@ -30,6 +30,10 @@ add_custom_target(mako_version
             -P ${PROJECT_SOURCE_DIR}/cmake/version.cmake
     BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp)
 
+add_library(mako_chat STATIC chat/template.cpp)
+target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_chat PRIVATE jinja_engine)
+
 add_library(mako_gen STATIC gen/sampler.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

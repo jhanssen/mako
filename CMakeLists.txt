@@ -30,6 +30,7 @@ target_link_libraries(metal_cpp INTERFACE
     "-framework Foundation" "-framework Metal" "-framework QuartzCore")
 
 include(cmake/gemv_kernels.cmake)
+include(cmake/jinja.cmake)
 
 add_subdirectory(src)
 add_subdirectory(bench)
