@@ -1061,15 +1061,27 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     const uint32_t stride = opts_.max_ctx / kp + 1, last_pools = (pos + count) / kp;
     MTL::Buffer* score = scratch("idx_score", uint64_t(count) * stride * 4);
     const ScoreArgs sa{Di, Hi, pos + 1, kp, 1.0f / std::sqrt(float(Di * Hi)), stride};
-    enc->setComputePipelineState(pso("idx_score"));
+    // Dot products of every head with every pool as a float matmul, then the relu-weighted sum over heads.
+    if (Hi != 32)
+        throw std::runtime_error("the indexer's matmul expects 32 heads");
+    MTL::Buffer* dots = scratch("idx_dots", uint64_t(count) * Hi * stride * 4);
+    const uint32_t da[4] = {Hi, Di, last_pools, stride};
+    enc->setComputePipelineState(pso("idx_dots"));
     enc->setBuffer(scratch("iq", 0), uint64_t(t) * Hi * Di * 4, 0);
+    enc->setBuffer(idx_pooled_[il].get(), 0, 1);
+    enc->setBuffer(dots, 0, 2);
+    enc->setBytes(da, sizeof(da), 3);
+    for (int rep_ = repeats("idx_dots"); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size((last_pools + 63) / 64, 1, count), MTL::Size(128, 1, 1));
+    after(enc, "idx_dots");
+    enc->setComputePipelineState(pso("idx_reduce"));
+    enc->setBuffer(dots, 0, 0);
     enc->setBuffer(scratch("iw", 0), uint64_t(t) * Hi * 4, 1);
-    enc->setBuffer(idx_pooled_[il].get(), 0, 2);
-    enc->setBuffer(score, 0, 3);
-    enc->setBytes(&sa, sizeof(sa), 4);
+    enc->setBuffer(score, 0, 2);
+    enc->setBytes(&sa, sizeof(sa), 3);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size((last_pools + 255) / 256, count, 1), MTL::Size(256, 1, 1));
-    after(enc, "idx_score");
+        enc->dispatchThreads(MTL::Size(last_pools, count, 1), MTL::Size(256, 1, 1));
+    after(enc, "idx_reduce");
     if (pos == pos_ && count == 1)
         probe(enc, "indexer_score", int(il), score, n_pool);
     const SelectArgs sel{pos + 1, n_top, kp, stride, sparse_list_stride()};

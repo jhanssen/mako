@@ -855,6 +855,23 @@ kernel void idx_score(device const float* q [[buffer(0)]], device const float* w
     score[uint64_t(j) * a.stride + p] = total * a.w_scale;
 }
 
+// score[j][p] = w_scale * sum_h relu(dots[j][h][p]) * w[j][h] over token j's complete pools; grid (pools of the
+// last token, tokens).
+kernel void idx_reduce(device const float* dots [[buffer(0)]], device const float* w [[buffer(1)]],
+                       device float* score [[buffer(2)]], constant ScoreArgs& a [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]])
+{
+    const uint p = gid.x, j = gid.y;
+    if (p >= (a.first + j) / a.kpool)
+        return;
+    dots += uint64_t(j) * a.heads * a.stride + p;
+    w += uint64_t(j) * a.heads;
+    float total = 0.0f;
+    for (uint h = 0; h < a.heads; ++h)
+        total += max(dots[uint64_t(h) * a.stride], 0.0f) * w[h];
+    score[uint64_t(j) * a.stride + p] = total * a.w_scale;
+}
+
 struct SelectArgs {
     uint first;        // cells token 0 sees, itself included; token j sees first + j
     uint n_top;        // pools to keep
