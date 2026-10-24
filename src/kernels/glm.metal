@@ -199,6 +199,116 @@ kernel void hc_expand(device const float* x [[buffer(0)]], device const float* R
     }
 }
 
+// One token's stream step, as hc_post then the next hc_pre (norm, mixing GEMV, hc_mix, hc_collapse) would do it, in
+// two dispatches. A: threadgroups over the flattened stream (j = h * n_embd + i): with `expand`, R_new[j] = x[i] *
+// post[h] + sum_s comb[s][h] * R[s][i] is written to out (else R_new = R); each threadgroup writes its partial sum
+// of R_new^2 and of the 24 dot products fn[m] . R_new to part[tg][25].
+struct HcStepArgs {
+    uint n_embd;
+    uint expand;
+    uint parts; // threadgroups of A, at most 64
+    uint iters;
+    float eps;  // hc
+    float rms_eps;
+};
+constant uint HC_TG = 256;
+
+kernel void hc_step_a(device const float* x [[buffer(0)]], device const float* R [[buffer(1)]],
+                      device const float* pc [[buffer(2)]], device float* out [[buffer(3)]],
+                      device const float* fn [[buffer(4)]], device float* part [[buffer(5)]],
+                      constant HcStepArgs& a [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float red[25][HC_TG / 32];
+    const uint hd = 4 * a.n_embd, per = (hd + a.parts - 1) / a.parts;
+    const uint j0 = tg * per, j1 = min(hd, j0 + per);
+    float acc[25] = {};
+    for (uint j = j0 + tid; j < j1; j += HC_TG) {
+        float r;
+        if (a.expand) {
+            const uint h = j / a.n_embd, i = j % a.n_embd;
+            r = x[i] * pc[4 + h];
+            for (uint src = 0; src < 4; ++src)
+                r += pc[8 + src * 4 + h] * R[src * a.n_embd + i];
+            out[j] = r;
+        } else {
+            r = R[j];
+        }
+        acc[24] += r * r;
+        for (uint m = 0; m < 24; ++m)
+            acc[m] += fn[uint64_t(m) * hd + j] * r;
+    }
+    for (uint m = 0; m < 25; ++m) {
+        const float v = simd_sum(acc[m]);
+        if (tid % 32 == 0)
+            red[m][tid / 32] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 25) {
+        float v = 0.0f;
+        for (uint w = 0; w < HC_TG / 32; ++w)
+            v += red[tid][w];
+        part[tg * 25 + tid] = v;
+    }
+}
+
+// B, one threadgroup: mixes = (sum of the partial dots) / rms(R_new), then hc_mix -> pc, then x = sum_h pre[h] *
+// R_new[h].
+kernel void hc_step_b(device const float* part [[buffer(0)]], device const float* Rn [[buffer(1)]],
+                      device const float* scale [[buffer(2)]], device const float* base [[buffer(3)]],
+                      device float* pc [[buffer(4)]], device float* x [[buffer(5)]],
+                      constant HcStepArgs& a [[buffer(6)]], uint tid [[thread_position_in_threadgroup]],
+                      uint nt [[threads_per_threadgroup]])
+{
+    threadgroup float mixes[25];
+    threadgroup float pre[4];
+    threadgroup float parts[64 * 25];
+    // One load per thread (parts <= 64), then the sums from threadgroup memory: dependent device loads are slow.
+    for (uint i = tid; i < a.parts * 25; i += nt)
+        parts[i] = part[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 25) {
+        float v = 0.0f;
+        for (uint p = 0; p < a.parts; ++p)
+            v += parts[p * 25 + tid];
+        mixes[tid] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Lanes 0..15 of the first simdgroup hold comb element (src, dst) = (lane / 4, lane % 4); row and column sums
+    // go through shuffles. Lanes 0..3 also produce pre and post.
+    if (tid < 32) {
+        const uint lane = tid, s = (lane / 4) % 4, d = lane % 4;
+        const float inv = rsqrt(mixes[24] / float(4 * a.n_embd) + a.rms_eps);
+        if (lane < 4) {
+            pre[lane] = sigmoidf(mixes[lane] * inv * scale[0] + base[lane]) + a.eps;
+            pc[lane] = pre[lane];
+            pc[4 + lane] = 2.0f * sigmoidf(mixes[4 + lane] * inv * scale[1] + base[4 + lane]);
+        }
+        float c = mixes[8 + (lane % 16)] * inv * scale[2] + base[8 + (lane % 16)];
+        // softmax over dst within each src row (lanes 4s..4s+3), then +eps
+        const float mx = max(max(simd_shuffle(c, s * 4), simd_shuffle(c, s * 4 + 1)),
+                             max(simd_shuffle(c, s * 4 + 2), simd_shuffle(c, s * 4 + 3)));
+        c = exp(c - mx);
+        float sum = simd_shuffle(c, s * 4) + simd_shuffle(c, s * 4 + 1) + simd_shuffle(c, s * 4 + 2) +
+                    simd_shuffle(c, s * 4 + 3);
+        c = c / sum + a.eps;
+        for (uint it = 0; it < a.iters; ++it) {
+            if (it > 0) {
+                sum = simd_shuffle(c, s * 4) + simd_shuffle(c, s * 4 + 1) + simd_shuffle(c, s * 4 + 2) +
+                      simd_shuffle(c, s * 4 + 3);
+                c /= sum + a.eps;
+            }
+            sum = simd_shuffle(c, d) + simd_shuffle(c, 4 + d) + simd_shuffle(c, 8 + d) + simd_shuffle(c, 12 + d);
+            c /= sum + a.eps;
+        }
+        if (lane < 16)
+            pc[8 + lane] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < a.n_embd; i += nt)
+        x[i] = Rn[i] * pre[0] + Rn[a.n_embd + i] * pre[1] + Rn[2 * a.n_embd + i] * pre[2] + Rn[3 * a.n_embd + i] * pre[3];
+}
+
 // Mean of the 4 streams; grid (n_embd, tokens).
 kernel void hc_mean(device const float* R [[buffer(0)]], device float* x [[buffer(1)]],
                     constant HcArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])

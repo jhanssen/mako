@@ -128,6 +128,10 @@ private:
                 MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T, uint64_t r_off = 0);
     void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out, MTL::Buffer* pc,
                  uint32_t T, uint64_t r_off = 0);
+    // One token: hc_post(post_x, R -> R_out, pc) when post_x is set (else R_out is R), then hc_pre of the next block
+    // on the new stream (fn, scale, base) into x and pc, in two dispatches.
+    void hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
+                 const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc);
     void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
              uint32_t T);
     void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
@@ -207,6 +211,7 @@ private:
     // step time measures their cost in place (they all recompute their output from their inputs).
     std::string repeat_label_;
     int repeat_n_ = 1;
+    std::string last_pso_; // the kernel a direct dispatch runs, for repeats()
     int repeats(std::string_view label) const
     {
         return repeat_n_ > 1 && label.find(repeat_label_) != std::string_view::npos ? repeat_n_ : 1;

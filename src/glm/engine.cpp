@@ -279,7 +279,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         enc->setBuffer(b, 0, 0);
         enc->setBuffer(sink, 0, 1);
         enc->setBytes(&one, sizeof(one), 2);
-        enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
     }
     enc->endEncoding();
     cb->commit();
@@ -528,6 +529,8 @@ MTL::Buffer* Engine::scratch(const std::string& name, uint64_t bytes)
 
 MTL::ComputePipelineState* Engine::pso(const std::string& fn)
 {
+    if (repeat_n_ > 1)
+        last_pso_ = fn;
     auto it = psos_.find(fn);
     if (it == psos_.end())
         it = psos_.emplace(fn, ctx_.pipeline(lib_.get(), fn)).first;
@@ -627,14 +630,16 @@ void Engine::hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const
     enc->setBuffer(base.buf, base.off, 2);
     enc->setBuffer(pc, 0, 3);
     enc->setBytes(&ha, sizeof(ha), 4);
-    enc->dispatchThreads(MTL::Size(T, 1, 1), MTL::Size(std::min<uint32_t>(T, 64), 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(T, 1, 1), MTL::Size(std::min<uint32_t>(T, 64), 1, 1));
     after(enc, "hc_mix");
     enc->setComputePipelineState(pso("hc_collapse"));
     enc->setBuffer(R, r_off, 0);
     enc->setBuffer(pc, 0, 1);
     enc->setBuffer(x, 0, 2);
     enc->setBytes(&ha, sizeof(ha), 3);
-    enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
     after(enc, "hc_collapse");
 }
 
@@ -649,7 +654,8 @@ void Engine::hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buff
     enc->setBuffer(pc, 0, 2);
     enc->setBuffer(out, r_off, 3);
     enc->setBytes(&ha, sizeof(ha), 4);
-    enc->dispatchThreads(MTL::Size(cfg_.n_embd, T, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(cfg_.n_embd, T, 1), MTL::Size(256, 1, 1));
     after(enc, "hc_expand");
 }
 
@@ -674,7 +680,8 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setBuffer(conv_state_[il].get(), 0, 4);
     enc->setBuffer(qkvc, 0, 5);
     enc->setBytes(&ca, sizeof(ca), 6);
-    enc->dispatchThreads(MTL::Size(3 * inner, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(3 * inner, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "kda_conv");
     if (probes) {
         probe(enc, "kda_q_conv", int(il), qkvc, inner);
@@ -698,14 +705,16 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setBuffer(g, 0, 4);
     enc->setBuffer(beta, 0, 5);
     enc->setBytes(&ga, sizeof(ga), 6);
-    enc->dispatchThreads(MTL::Size(inner, T, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(inner, T, 1), MTL::Size(256, 1, 1));
     after(enc, "kda_gate");
 
     const L2Args la{D, 1e-6f, 3 * inner};
     enc->setComputePipelineState(pso("l2_norm"));
     enc->setBuffer(qkvc, 0, 0);
     enc->setBytes(&la, sizeof(la), 1);
-    enc->dispatchThreadgroups(MTL::Size(2 * H, T, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(2 * H, T, 1), MTL::Size(256, 1, 1));
     after(enc, "l2_norm");
 
     MTL::Buffer* o = scratch("o", uint64_t(T) * inner * 4);
@@ -719,7 +728,8 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setBuffer(kda_state_[il].get(), 0, 5);
     enc->setBuffer(o, 0, 6);
     enc->setBytes(&sa, sizeof(sa), 7);
-    enc->dispatchThreadgroups(MTL::Size(H, D / 32, 1), MTL::Size(128, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(H, D / 32, 1), MTL::Size(128, 1, 1));
     after(enc, "kda_scan");
     if (probes) {
         probe(enc, "kda_g1", int(il), g, inner);
@@ -741,7 +751,8 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setBuffer(g2, 0, 2);
     enc->setBuffer(gated, 0, 3);
     enc->setBytes(&na, sizeof(na), 4);
-    enc->dispatchThreadgroups(MTL::Size(T * H, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(T * H, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "rms_norm_gate");
     if (probes)
         probe(enc, "attn_output", int(il), gated, inner);
@@ -769,7 +780,8 @@ void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::B
     enc->setBuffer(scores, 0, 0);
     enc->setBuffer(scratch("idx_mask", uint64_t(tokens) * opts_.max_ctx), 0, 1);
     enc->setBytes(&sa, sizeof(sa), 2);
-    enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "attn_softmax");
     const PvArgs pa{rows, R, n_kv, keys_per_split};
     enc->setComputePipelineState(pso("attn_pv"));
@@ -777,14 +789,16 @@ void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::B
     enc->setBuffer(cache, 0, 1);
     enc->setBuffer(partial, 0, 2);
     enc->setBytes(&pa, sizeof(pa), 3);
-    enc->dispatchThreadgroups(MTL::Size(R / 64, (rows + 63) / 64, splits), MTL::Size(128, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(R / 64, (rows + 63) / 64, splits), MTL::Size(128, 1, 1));
     after(enc, "attn_pv");
     const uint32_t sum[2] = {rows * R, splits};
     enc->setComputePipelineState(pso("sum_splits"));
     enc->setBuffer(partial, 0, 0);
     enc->setBuffer(out, out_off, 1);
     enc->setBytes(sum, sizeof(sum), 2);
-    enc->dispatchThreads(MTL::Size(rows * R, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(rows * R, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "sum_splits");
 }
 
@@ -815,7 +829,8 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setBuffer(kvn, 0, 0);
     enc->setBuffer(kv_cache_[il].get(), uint64_t(pos0) * R * 2, 1);
     enc->setBytes(&n, sizeof(n), 2);
-    enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "store_half");
 
     // Per-head matrices (k_b: head_k -> R, v_b: R -> head_v): one GEMM per head over all tokens, or the batched
@@ -877,7 +892,8 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     enc->setBuffer(L.idx_k_norm_b.buf, L.idx_k_norm_b.off, 2);
     enc->setBuffer(cache, row, 3);
     enc->setBytes(&na, sizeof(na), 4);
-    enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "layer_norm");
     proj(enc, L.idx_gate, xn, 0, cache, row + Di * 4, T, 2 * Di);
     proj(enc, L.idx_proj, xn, 0, iw, 0, T);
@@ -890,7 +906,8 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
         enc->setBuffer(L.idx_ape.buf, L.idx_ape.off, 1);
         enc->setBuffer(idx_pooled_[il].get(), 0, 2);
         enc->setBytes(&pa, sizeof(pa), 3);
-        enc->dispatchThreads(MTL::Size(Di, last - first, 1), MTL::Size(Di, 1, 1));
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreads(MTL::Size(Di, last - first, 1), MTL::Size(Di, 1, 1));
         after(enc, "idx_pool");
     }
 }
@@ -913,7 +930,8 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     enc->setBuffer(idx_pooled_[il].get(), 0, 2);
     enc->setBuffer(score, 0, 3);
     enc->setBytes(&sa, sizeof(sa), 4);
-    enc->dispatchThreads(MTL::Size(last_pools, count, 1), MTL::Size(64, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(last_pools, count, 1), MTL::Size(64, 1, 1));
     after(enc, "idx_score");
     if (pos == pos_ && count == 1)
         probe(enc, "indexer_score", int(il), score, n_pool);
@@ -921,6 +939,41 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     dispatch(enc, "idx_select", {score, scratch("idx_mask", uint64_t(count) * opts_.max_ctx)}, &sel, sizeof(sel),
              MTL::Size(count, 1, 1), MTL::Size(256, 1, 1), false);
     return true;
+}
+
+struct HcStepArgs {
+    uint32_t n_embd, expand, parts, iters;
+    float eps, rms_eps;
+};
+
+void Engine::hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
+                     const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc)
+{
+    constexpr uint32_t kParts = 32; // at most 64 (hc_step_b)
+    const HcStepArgs a{cfg_.n_embd, post_x ? 1u : 0u, kParts, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps};
+    MTL::Buffer* part = scratch("hc_part", kParts * 25 * 4);
+    enc->setComputePipelineState(pso("hc_step_a"));
+    enc->setBuffer(post_x ? post_x : R, 0, 0);
+    enc->setBuffer(R, 0, 1);
+    enc->setBuffer(pc, 0, 2);
+    enc->setBuffer(post_x ? R_out : part, 0, 3);
+    enc->setBuffer(fn.buf, fn.off, 4);
+    enc->setBuffer(part, 0, 5);
+    enc->setBytes(&a, sizeof(a), 6);
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(kParts, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "hc_step_a");
+    enc->setComputePipelineState(pso("hc_step_b"));
+    enc->setBuffer(part, 0, 0);
+    enc->setBuffer(post_x ? R_out : R, 0, 1);
+    enc->setBuffer(scale.buf, scale.off, 2);
+    enc->setBuffer(base.buf, base.off, 3);
+    enc->setBuffer(pc, 0, 4);
+    enc->setBuffer(x, 0, 5);
+    enc->setBytes(&a, sizeof(a), 6);
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+    after(enc, "hc_step_b");
 }
 
 void Engine::ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
@@ -1029,7 +1082,8 @@ void Engine::probe(MTL::ComputeCommandEncoder*& enc, const std::string& name, in
     enc->setBuffer(buf, off, 0);
     enc->setBuffer(p.copy.get(), 0, 1);
     enc->setBytes(&count, sizeof(count), 2);
-    enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+        enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "probe copy");
     pending_probes_.push_back(std::move(p));
 }
@@ -1085,6 +1139,8 @@ const std::vector<float>& Engine::step(int32_t token)
     MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
     dispatch(enc, "hc_init", {x, scratch("R", hd * 4)}, &ha, sizeof(ha), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
 
+    // Stream steps fused (hc_step) unless something observes the stream between them.
+    const bool fused = !probe_ && !stream_override_;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const Layer& L = *layers_[il];
         cur_layer_ = il;
@@ -1096,7 +1152,10 @@ const std::vector<float>& Engine::step(int32_t token)
             enc->endEncoding();
             enc = encoder(cb, il, 0);
         }
-        hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, scratch("R", hd * 4), x, pc, 1);
+        if (!fused)
+            hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, scratch("R", hd * 4), x, pc, 1);
+        else if (il == 0)
+            hc_step(enc, nullptr, scratch("R", hd * 4), nullptr, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, x, pc);
         probe(enc, "hc_attn_pre", int(il), x, E);
         norm(enc, x, &L.attn_norm, xn, 1, E, E, cfg_.rms_eps);
         probe(enc, "attn_norm", int(il), xn, E);
@@ -1105,14 +1164,19 @@ const std::vector<float>& Engine::step(int32_t token)
         else
             mla(enc, L, il, xn, att, 1, pos_);
         probe(enc, L.kda ? "kda_out" : "attn_out", int(il), att, E);
-        hc_post(enc, att, scratch("R", hd * 4), scratch("R2", hd * 4), pc, 1);
-        std::swap(scratch_["R"], scratch_["R2"]);
         if (!samples_.empty()) {
             enc->endEncoding();
             enc = encoder(cb, il, 1);
         }
-
-        hc_pre(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, scratch("R", hd * 4), x, pc, 1);
+        if (fused) {
+            hc_step(enc, att, scratch("R", hd * 4), scratch("R2", hd * 4), L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base,
+                    x, pc);
+            std::swap(scratch_["R"], scratch_["R2"]);
+        } else {
+            hc_post(enc, att, scratch("R", hd * 4), scratch("R2", hd * 4), pc, 1);
+            std::swap(scratch_["R"], scratch_["R2"]);
+            hc_pre(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, scratch("R", hd * 4), x, pc, 1);
+        }
         probe(enc, "hc_ffn_pre", int(il), x, E);
         probe(enc, "hc_mixes", int(il), scratch("mixes", 32 * 4), 24);
         norm(enc, x, &L.ffn_norm, xn, 1, E, E, cfg_.rms_eps);
@@ -1161,7 +1225,8 @@ const std::vector<float>& Engine::step(int32_t token)
             enc->setBuffer(hit_ids, 0, 7);
             enc->setBuffer(miss_rank, 0, 8);
             enc->setBuffer(indirect, ind_off, 9);
-            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+            for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
             after(enc, "moe_route");
             enc->endEncoding();
             const uint64_t v = ++event_value_;
@@ -1207,7 +1272,13 @@ const std::vector<float>& Engine::step(int32_t token)
                      MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
         }
         probe(enc, "ffn_out", int(il), ffo, E);
-        hc_post(enc, ffo, scratch("R", hd * 4), scratch("R2", hd * 4), pc, 1);
+        if (fused && il + 1 < cfg_.n_layer) {
+            const Layer& N = *layers_[il + 1];
+            hc_step(enc, ffo, scratch("R", hd * 4), scratch("R2", hd * 4), N.hc_attn_fn, N.hc_attn_scale,
+                    N.hc_attn_base, x, pc);
+        } else {
+            hc_post(enc, ffo, scratch("R", hd * 4), scratch("R2", hd * 4), pc, 1);
+        }
         std::swap(scratch_["R"], scratch_["R2"]);
         probe(enc, "l_out", int(il), scratch("R", hd * 4), hd);
     }
@@ -1402,7 +1473,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 enc->setBuffer(unused, 0, 7);
                 enc->setBuffer(unused, 0, 8);
                 enc->setBuffer(unused, 0, 9);
-                enc->dispatchThreadgroups(MTL::Size(G, 1, 1), MTL::Size(256, 1, 1));
+                for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                    enc->dispatchThreadgroups(MTL::Size(G, 1, 1), MTL::Size(256, 1, 1));
                 after(enc, "moe_route");
                 submit(cb, enc);
                 cur_cb_ = cb;
@@ -1463,7 +1535,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     enc->setBuffer(tok, uint64_t(r0) * 4, 1);
                     enc->setBuffer(xb, 0, 2);
                     enc->setBytes(&ne, sizeof(ne), 3);
-                    enc->dispatchThreads(MTL::Size(E, nr, 1), MTL::Size(256, 1, 1));
+                    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                        enc->dispatchThreads(MTL::Size(E, nr, 1), MTL::Size(256, 1, 1));
                     enc->endEncoding();
                     enc = encoder(cb, il, 2, MTL::DispatchTypeConcurrent);
                     auto gemm_part = [&](int part, int e, MTL::Buffer* xin, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
@@ -1484,7 +1557,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                     enc->setBuffer(ub, 0, 1);
                     enc->setBuffer(mb, 0, 2);
                     enc->setBytes(&sa, sizeof(sa), 3);
-                    enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
+                    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                        enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
                     enc->memoryBarrier(MTL::BarrierScopeBuffers);
                     for (size_t i = b0; i < b1; ++i) {
                         const int e = order[i];
@@ -1574,7 +1648,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
                 enc->setBuffer(ffo, 0, 3);
                 enc->setBuffer(ffo, 0, 4);
                 enc->setBytes(&ca, sizeof(ca), 5);
-                enc->dispatchThreads(MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
+                for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                    enc->dispatchThreads(MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
             }
             hc_post(enc, ffo, R, R2, pc_g, G);
             std::swap(R, R2);
@@ -1593,7 +1668,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens)
             enc->setBuffer(R, uint64_t(l0) * hd * 4, 0);
             enc->setBuffer(xl, 0, 1);
             enc->setBytes(&h1, sizeof(h1), 2);
-            enc->dispatchThreads(MTL::Size(E, n, 1), MTL::Size(256, 1, 1));
+            for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                enc->dispatchThreads(MTL::Size(E, n, 1), MTL::Size(256, 1, 1));
             norm(enc, xl, &output_norm_, xnl, n, E, E, cfg_.rms_eps);
             proj(enc, output_, xnl, 0, lg, 0, n);
             enc->endEncoding();
