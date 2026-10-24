@@ -346,46 +346,45 @@ kernel void rms_norm_gate(device const float* x [[buffer(0)]], device const floa
         y[off + i] = x[off + i] * inv * w[i % a.wn] * sigmoidf(gate[off + i]);
 }
 
-struct AttnArgs {
-    uint dim;     // latent width, 512
-    uint n_kv;    // cached tokens, the current one included
+struct SoftmaxArgs {
+    uint n_kv;
     float scale;
+    uint masked; // mask[t] == 0 drops key t
 };
 
-// Decode attention of one head over the latent cache: p = softmax(q . K * scale), out = p . K.
-kernel void mla_attn(device const float* q [[buffer(0)]], device const half* kv [[buffer(1)]],
-                     device float* out [[buffer(2)]], device float* scores [[buffer(3)]],
-                     constant AttnArgs& a [[buffer(4)]], uint h [[threadgroup_position_in_grid]],
-                     uint tid [[thread_position_in_threadgroup]])
+// In place, per head row of n_kv scores: p = softmax(scores * scale). One threadgroup per head.
+kernel void attn_softmax(device float* scores [[buffer(0)]], device const uchar* mask [[buffer(1)]],
+                         constant SoftmaxArgs& a [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
+                         uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
-    device const float* qh = q + uint64_t(h) * a.dim;
     device float* sh = scores + uint64_t(h) * a.n_kv;
     float m = -INFINITY;
-    for (uint t = tid; t < a.n_kv; t += TG) {
-        device const half* kt = kv + uint64_t(t) * a.dim;
-        float d = 0.0f;
-        for (uint i = 0; i < a.dim; ++i)
-            d += qh[i] * float(kt[i]);
-        d *= a.scale;
-        sh[t] = d;
-        m = max(m, d);
-    }
+    for (uint t = tid; t < a.n_kv; t += TG)
+        if (!a.masked || mask[t])
+            m = max(m, sh[t] * a.scale);
     m = tg_max(m, scratch, tid);
     float s = 0.0f;
     for (uint t = tid; t < a.n_kv; t += TG) {
-        const float e = exp(sh[t] - m);
+        const float e = (!a.masked || mask[t]) ? exp(sh[t] * a.scale - m) : 0.0f;
         sh[t] = e;
         s += e;
     }
-    threadgroup_barrier(mem_flags::mem_device);
     const float inv = 1.0f / tg_sum(s, scratch, tid);
-    for (uint i = tid; i < a.dim; i += TG) {
-        float acc = 0.0f;
-        for (uint t = 0; t < a.n_kv; ++t)
-            acc += sh[t] * float(kv[uint64_t(t) * a.dim + i]);
-        out[uint64_t(h) * a.dim + i] = acc * inv;
-    }
+    for (uint t = tid; t < a.n_kv; t += TG)
+        sh[t] *= inv;
+}
+
+// y[i] = sum over splits of partial[split][i].
+kernel void sum_splits(device const float* partial [[buffer(0)]], device float* y [[buffer(1)]],
+                       constant uint2& a [[buffer(2)]], uint i [[thread_position_in_grid]])
+{
+    if (i >= a.x)
+        return;
+    float acc = 0.0f;
+    for (uint s = 0; s < a.y; ++s)
+        acc += partial[uint64_t(s) * a.x + i];
+    y[i] = acc;
 }
 
 kernel void store_half(device const float* x [[buffer(0)]], device half* y [[buffer(1)]],
@@ -700,47 +699,6 @@ kernel void idx_select(device const float* score [[buffer(0)]], device uchar* ma
     }
     for (uint c = a.n_pool * a.kpool + tid; c < a.n_kv; c += TG)
         mask[c] = 1;
-}
-
-// Decode attention like mla_attn over the cells whose mask is set.
-kernel void mla_attn_masked(device const float* q [[buffer(0)]], device const half* kv [[buffer(1)]],
-                            device float* out [[buffer(2)]], device float* scores [[buffer(3)]],
-                            device const uchar* mask [[buffer(4)]], constant AttnArgs& a [[buffer(5)]],
-                            uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
-{
-    threadgroup float scratch[TG / 32];
-    device const float* qh = q + uint64_t(h) * a.dim;
-    device float* sh = scores + uint64_t(h) * a.n_kv;
-    float m = -INFINITY;
-    for (uint t = tid; t < a.n_kv; t += TG) {
-        if (!mask[t]) {
-            sh[t] = -INFINITY;
-            continue;
-        }
-        device const half* kt = kv + uint64_t(t) * a.dim;
-        float d = 0.0f;
-        for (uint i = 0; i < a.dim; ++i)
-            d += qh[i] * float(kt[i]);
-        d *= a.scale;
-        sh[t] = d;
-        m = max(m, d);
-    }
-    m = tg_max(m, scratch, tid);
-    float s = 0.0f;
-    for (uint t = tid; t < a.n_kv; t += TG) {
-        const float e = mask[t] ? exp(sh[t] - m) : 0.0f;
-        sh[t] = e;
-        s += e;
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-    const float inv = 1.0f / tg_sum(s, scratch, tid);
-    for (uint i = tid; i < a.dim; i += TG) {
-        float acc = 0.0f;
-        for (uint t = 0; t < a.n_kv; ++t)
-            if (mask[t])
-                acc += sh[t] * float(kv[uint64_t(t) * a.dim + i]);
-        out[uint64_t(h) * a.dim + i] = acc * inv;
-    }
 }
 
 kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],

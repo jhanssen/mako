@@ -52,10 +52,6 @@ struct L2Args {
 struct ScanArgs {
     uint32_t head_dim, tokens, qkv_stride, inner, heads;
 };
-struct AttnArgs {
-    uint32_t dim, n_kv;
-    float scale;
-};
 struct SwigluArgs {
     uint32_t n;
     float limit;
@@ -658,6 +654,48 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     proj(enc, L.wo, gated, 0, att, 0, T);
 }
 
+// Attention of one query position (H heads of q, latent width R) over the first n_kv rows of a half latent
+// cache, read once for all heads: scores by GEMM, softmax (only the indexer's selected cells when sparse), then
+// the output split over key ranges and summed.
+void Engine::attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, MTL::Buffer* out,
+                    uint32_t n_kv, bool sparse)
+{
+    const uint32_t H = cfg_.n_head, R = cfg_.kv_lora_rank, keys_per_split = 256;
+    const uint32_t splits = (n_kv + keys_per_split - 1) / keys_per_split;
+    MTL::Buffer* scores = scratch("scores", uint64_t(H) * opts_.max_ctx * 4);
+    MTL::Buffer* partial = scratch("pv_part", uint64_t(opts_.max_ctx / keys_per_split + 1) * H * R * 4);
+    gemm_->encode(enc, gguf::Type::F16, R, n_kv, H, cache, 0, q, 0, scores, 0);
+    after(enc, "attn_scores");
+    const struct {
+        uint32_t n_kv;
+        float scale;
+        uint32_t masked;
+    } sa{n_kv, 1.0f / std::sqrt(float(cfg_.head_k)), sparse ? 1u : 0u};
+    enc->setComputePipelineState(pso("attn_softmax"));
+    enc->setBuffer(scores, 0, 0);
+    enc->setBuffer(scratch("idx_mask", opts_.max_ctx), 0, 1);
+    enc->setBytes(&sa, sizeof(sa), 2);
+    enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "attn_softmax");
+    const struct {
+        uint32_t heads, dim, n_kv, keys_per_split;
+    } pa{H, R, n_kv, keys_per_split};
+    enc->setComputePipelineState(pso("attn_pv"));
+    enc->setBuffer(scores, 0, 0);
+    enc->setBuffer(cache, 0, 1);
+    enc->setBuffer(partial, 0, 2);
+    enc->setBytes(&pa, sizeof(pa), 3);
+    enc->dispatchThreadgroups(MTL::Size(R / 64, (H + 63) / 64, splits), MTL::Size(128, 1, 1));
+    after(enc, "attn_pv");
+    const uint32_t sum[2] = {H * R, splits};
+    enc->setComputePipelineState(pso("sum_splits"));
+    enc->setBuffer(partial, 0, 0);
+    enc->setBuffer(out, 0, 1);
+    enc->setBytes(sum, sizeof(sum), 2);
+    enc->dispatchThreads(MTL::Size(H * R, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "sum_splits");
+}
+
 // MLA for T tokens at positions pos0.. : projections over all of them, then attention token by token.
 void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
                  uint32_t T, uint32_t pos0)
@@ -672,7 +710,6 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* qabs = scratch("qabs", H * R * 4);
     MTL::Buffer* lat = scratch("lat", H * R * 4);
     MTL::Buffer* vout = scratch("vout", T * vrow * 4);
-    MTL::Buffer* scores = scratch("scores", uint64_t(H) * opts_.max_ctx * 4);
 
     proj(enc, L.q_a, xn, 0, qr, 0, T);
     norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
@@ -692,17 +729,7 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         const uint32_t pos = pos0 + t;
         gemv(enc, L.k_b, q, t * qrow * 4, qabs, 0, H);
         const bool sparse = indexer(enc, L, il, xn, uint64_t(t) * cfg_.n_embd * 4, qrn, uint64_t(t) * QR * 4, pos);
-        const AttnArgs aa{R, pos + 1, 1.0f / std::sqrt(float(cfg_.head_k))};
-        enc->setComputePipelineState(pso(sparse ? "mla_attn_masked" : "mla_attn"));
-        enc->setBuffer(qabs, 0, 0);
-        enc->setBuffer(kv_cache_[il].get(), 0, 1);
-        enc->setBuffer(lat, 0, 2);
-        enc->setBuffer(scores, 0, 3);
-        if (sparse)
-            enc->setBuffer(scratch("idx_mask", opts_.max_ctx), 0, 4);
-        enc->setBytes(&aa, sizeof(aa), sparse ? 5 : 4);
-        enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(256, 1, 1));
-        after(enc, sparse ? "mla_attn_masked" : "mla_attn");
+        attend(enc, kv_cache_[il].get(), qabs, lat, pos + 1, sparse);
         gemv(enc, L.v_b, lat, 0, vout, t * vrow * 4, H);
     }
     proj(enc, L.wo, vout, 0, att, 0, T);

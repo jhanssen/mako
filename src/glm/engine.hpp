@@ -111,6 +111,8 @@ private:
              uint32_t T);
     void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
              uint32_t T, uint32_t pos0);
+    void attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, MTL::Buffer* out, uint32_t n_kv,
+                bool sparse);
     bool indexer(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, uint64_t xn_off,
                  MTL::Buffer* qrn, uint64_t qrn_off, uint32_t pos);
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
