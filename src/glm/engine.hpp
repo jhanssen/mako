@@ -30,6 +30,9 @@ struct Options {
                                 // (default_profile_path), when it exists
     Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
     bool mtp = false; // load the next-token block (speculative decoding): its weights, caches and expert slots
+    // Nonzero: behave as on a Mac with this much RAM (GB): the difference is locked before loading, and the memory
+    // budget uses this RAM size and a proportionally smaller GPU working set.
+    double simulate_ram_gb = 0;
 };
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
@@ -198,6 +201,7 @@ private:
     std::map<std::string, mtl::Ref<MTL::Buffer>> scratch_;
     std::vector<std::unique_ptr<Layer>> layers_;
     std::map<std::string, int> nocache_fds_; // shard path -> descriptor for expert reads
+    std::unique_ptr<LockedMemory> simulated_; // before arena_: released after it
     std::unique_ptr<ExpertArena> arena_;
     ArenaPlan arena_plan_;
     std::string routing_key_;

@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <sys/sysctl.h>
+
 #include <algorithm>
 #include <deque>
 #include <chrono>
@@ -271,7 +273,33 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     std::vector<ExpertArena::LayerParts> parts;
     for (const auto& L : layers_)
         parts.push_back(L->experts);
-    arena_plan_.mem = query_memory(ctx_.info().recommended_working_set);
+    uint64_t working_set = ctx_.info().recommended_working_set;
+    uint64_t simulated_lock = 0;
+    if (opts_.simulate_ram_gb > 0) {
+        const double phys = query_memory(0).phys, ram = opts_.simulate_ram_gb * 1e9;
+        if (ram >= phys)
+            throw std::runtime_error("--simulate-ram must be below the machine's RAM");
+        // Locking all of phys - ram would also leave less lockable memory than the smaller Mac has (macOS lets
+        // processes lock RAM minus a reserve, ~85%): lock at most what keeps that much lockable.
+        uint64_t wire_limit = 0;
+        size_t len = sizeof(wire_limit);
+        if (sysctlbyname("vm.global_user_wire_limit", &wire_limit, &len, nullptr, 0) != 0)
+            wire_limit = uint64_t(0.85 * phys);
+        const double lock = std::min(phys - ram, double(wire_limit) - 0.85 * ram);
+        if (lock < phys - ram)
+            std::fprintf(stderr, "mako: simulating %.0f GB with %.1f GB locked (not %.1f): %.1f GB more free than such a "
+                                 "Mac would have\n",
+                         opts_.simulate_ram_gb, lock / 1e9, (phys - ram) / 1e9, (phys - ram - lock) / 1e9);
+        simulated_lock = uint64_t(std::max(0.0, lock)) / 16384 * 16384;
+        simulated_ = std::make_unique<LockedMemory>(simulated_lock);
+        working_set = uint64_t(double(working_set) * ram / phys);
+    }
+    arena_plan_.mem = query_memory(working_set);
+    if (opts_.simulate_ram_gb > 0) {
+        // The locked difference is not this process's own use on the simulated machine.
+        arena_plan_.mem.footprint -= double(simulated_lock);
+        arena_plan_.mem.phys = opts_.simulate_ram_gb * 1e9;
+    }
     built_chunk_ = opts_.prefill_chunk;
     built_group_ = std::max(opts_.prefill_chunk, opts_.prefill_group);
     arena_plan_.lendable = double(prefill_scratch(opts_.prefill_chunk, std::max(opts_.prefill_chunk, opts_.prefill_group)));
@@ -458,7 +486,7 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
                                      + 3 * uint64_t(cfg_.n_ff)                                   // dense FFNs
                                      + std::max<uint64_t>({cfg_.n_ff, H * R, H * cfg_.head_k, inner}) / 2; // GEMM input
     const uint64_t per_group_token = 3 * E + 3 * hd + 48 + 2 * cfg_.n_expert + 32 + k + 16 + E / 2 + k * E;
-    const uint64_t batch = uint64_t(kBatchRows) * (E / 2 + 2 * nff + nff / 2);
+    const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (E / 2 + 2 * nff + nff / 2);
     return (uint64_t(chunk) * per_chunk_token + uint64_t(group) * per_group_token + batch) * 4 + (96ull << 20);
 }
 

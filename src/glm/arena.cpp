@@ -13,6 +13,7 @@
 #include <functional>
 #include <condition_variable>
 #include <exception>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <numeric>
@@ -30,6 +31,23 @@ constexpr int kReaders = 8;              // reads in flight: the SSD's plateau n
 constexpr uint64_t kReadChunk = 1 << 20; // a miss's parts are read in chunks of this size
 
 uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+
+// mlock in bounded pieces: one call over tens of GB is long, uninterruptible VM work and fails without saying
+// where. On failure the locked part is unlocked again; returns errno or 0.
+int lock_chunked(void* mem, uint64_t size)
+{
+    constexpr uint64_t kPiece = 256ull << 20;
+    auto* p = static_cast<char*>(mem);
+    for (uint64_t off = 0; off < size; off += kPiece) {
+        if (::mlock(p + off, std::min(kPiece, size - off)) != 0) {
+            const int err = errno;
+            if (off)
+                ::munlock(p, off);
+            return err;
+        }
+    }
+    return 0;
+}
 
 uint64_t sysctl_u64(const char* name)
 {
@@ -144,6 +162,29 @@ MemInfo query_memory(uint64_t working_set)
         m.available = (double(vs.free_count) + vs.purgeable_count + clean) * double(page);
     }
     return m;
+}
+
+LockedMemory::LockedMemory(uint64_t bytes)
+{
+    if (!bytes)
+        return;
+    void* mem = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED)
+        throw std::runtime_error(std::format("mmap {:.1f} GB: {}", bytes / 1e9, std::strerror(errno)));
+    if (const int err = lock_chunked(mem, bytes)) {
+        ::munmap(mem, bytes);
+        throw std::runtime_error(std::format("locking {:.1f} GB failed: {}", bytes / 1e9, std::strerror(err)));
+    }
+    mem_ = mem;
+    bytes_ = bytes;
+}
+
+LockedMemory::~LockedMemory()
+{
+    if (mem_) {
+        ::munlock(mem_, bytes_);
+        ::munmap(mem_, bytes_);
+    }
 }
 
 double arena_budget(const MemInfo& m)
@@ -275,8 +316,10 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
             throw std::runtime_error(std::format("mmap {} bytes: {}", size, std::strerror(errno)));
         chunks_.emplace_back(mem, size);
         // Unwired, idle arena memory gets compressed under pressure; the GPU only wires it while it runs.
-        if (::mlock(mem, size) != 0)
-            throw std::runtime_error(std::format("mlock {} bytes: {}", size, std::strerror(errno)));
+        if (const int err = lock_chunked(mem, size))
+            throw std::runtime_error(std::format("locking {:.1f} GB of expert arena failed ({}); try a smaller "
+                                                 "--arena-gb",
+                                                 size / 1e9, std::strerror(err)));
         mtl::Ref<MTL::Buffer> b(dev->newBuffer(mem, size, MTL::ResourceStorageModeShared, nullptr));
         if (!b)
             throw std::runtime_error("wrapping the expert arena in a Metal buffer failed");
@@ -480,16 +523,21 @@ void ExpertArena::lend()
     lent_ = true;
 }
 
-void ExpertArena::reclaim()
+bool ExpertArena::reclaim()
 {
     if (tail_mem_ || !tail_bytes_)
-        return;
+        return true;
     void* mem = ::mmap(nullptr, tail_bytes_, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (mem == MAP_FAILED)
-        throw std::runtime_error(std::format("mmap {} bytes: {}", tail_bytes_, std::strerror(errno)));
-    if (::mlock(mem, tail_bytes_) != 0) {
-        ::munmap(mem, tail_bytes_);
-        throw std::runtime_error(std::format("mlock {} bytes: {}", tail_bytes_, std::strerror(errno)));
+    const int err = mem == MAP_FAILED ? errno : lock_chunked(mem, tail_bytes_);
+    if (err) {
+        if (mem != MAP_FAILED)
+            ::munmap(mem, tail_bytes_);
+        // At construction the arena needs its slots; afterwards they can stay lent (unused) and come back later.
+        if (!lent_)
+            throw std::runtime_error(std::format("locking the lendable expert slots failed: {}", std::strerror(err)));
+        std::fprintf(stderr, "mako: taking back %.1f GB of lent expert slots failed (%s); running without them\n",
+                     tail_bytes_ / 1e9, std::strerror(err));
+        return false;
     }
     tail_mem_ = mem;
     tail_buf_ = mtl::Ref<MTL::Buffer>(dev_->newBuffer(mem, tail_bytes_, MTL::ResourceStorageModeShared, nullptr));
@@ -520,6 +568,7 @@ void ExpertArena::reclaim()
             read_into(l, loads);
     }
     evicted_.clear();
+    return true;
 }
 
 } // namespace mako::glm

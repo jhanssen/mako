@@ -27,6 +27,19 @@ MemInfo query_memory(uint64_t working_set);
 // memory into the compressor and froze the machine. Never less than 1 GB.
 double arena_budget(const MemInfo& m);
 
+// Anonymous memory locked for the object's lifetime (to make the machine look smaller than it is).
+class LockedMemory {
+public:
+    explicit LockedMemory(uint64_t bytes);
+    ~LockedMemory();
+    LockedMemory(const LockedMemory&) = delete;
+    LockedMemory& operator=(const LockedMemory&) = delete;
+
+private:
+    void* mem_ = nullptr;
+    uint64_t bytes_ = 0;
+};
+
 // Routed experts kept resident in mlock'ed anonymous memory, wrapped no-copy into Metal buffers. Each MoE layer
 // and part (gate, up, down) has a region of equal-stride slots: slot s < split is at buf + off + s * stride, a
 // lendable slot s >= split at tail + tail_off + (s - split) * stride; the same s holds one expert's three parts.
@@ -83,8 +96,9 @@ public:
 
     // Evicts the experts in the lendable slots and frees their memory; ensure() then uses only the other slots.
     void lend();
-    // Rebuilds the lendable slots and reads back the experts lend() evicted, unless resident by now.
-    void reclaim();
+    // Rebuilds the lendable slots and reads back the experts lend() evicted, unless resident by now. Returns false,
+    // leaving them lent, when their memory cannot be locked again.
+    bool reclaim();
     bool lent() const { return lent_; }
 
     // Loads each MoE layer's first slots(layer) experts in profile order (id order without a profile).

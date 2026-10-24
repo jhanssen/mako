@@ -146,6 +146,8 @@ int main(int argc, char** argv)
             opts.prefill_chunk = uint32_t(std::stoul(v));
         else if (a == "--prefill-group")
             opts.prefill_group = uint32_t(std::stoul(v));
+        else if (a == "--simulate-ram")
+            opts.simulate_ram_gb = std::stod(v);
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(v);
         else if (a == "--dump")
