@@ -33,6 +33,10 @@ The first configure downloads pinned dependencies (metal-cpp and third-party GEM
 ./build/tools/mako_run <model-00001-of-0000N.gguf> <token,ids,...> [-n tokens-to-generate]
 ```
 
+`--spec` decodes speculatively with the model's next-token (MTP) block: each step verifies the pending token and one
+draft (about 14% faster on an M5 Max at ~67% of drafts accepted; output equals greedy decoding except where a
+near-tied routing choice flips). It loads the block's weights and gives its experts cache slots.
+
 The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e.g. the Maya-S quantization
 (`peasantsmith/GLM-5.3-Flash-Maya-GGUF`, `Maya-S-v2-IQ2_XXS`).
 

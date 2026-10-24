@@ -296,6 +296,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
                     sum += c;
                     ++n;
                 }
+            // (Measured: half or a quarter of the mean saves the trunk a few slots but slows the drafts more.)
             if (n)
                 counts[cfg_.n_layer].assign(cfg_.n_expert, std::max<uint64_t>(1, sum / n));
         }

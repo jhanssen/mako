@@ -262,6 +262,7 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     mako::glm::Options opts;
     opts.prefill_chunk = 1024;
+    opts.mtp = true; // for spec; results do not depend on which experts are resident
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     auto expected = load_expected();
     std::map<std::string, std::string> recorded;
@@ -374,6 +375,36 @@ int main(int argc, char** argv)
         const auto again = engine.step2(b, c);
         close(again.data(), rb, "after a rollback, first token");
         close(again.data() + nv, rc, "after a rollback, second token");
+
+        // Speculative greedy decoding: every emitted token is the verifier's greedy choice; the next-token block's
+        // drafts are accepted at a plausible rate.
+        if (engine.has_mtp()) {
+            auto argmax_row = [&](const float* l) { return int32_t(std::max_element(l, l + nv) - l); };
+            engine.reset();
+            const auto& lp = engine.prefill(prompt);
+            int32_t pending = argmax_row(lp.data()), draft = engine.mtp_draft(pending);
+            int rounds = 0, accepted = 0, emitted = 0;
+            while (emitted < 48) {
+                const auto& two = engine.step2(pending, draft);
+                const int32_t g1 = argmax_row(two.data());
+                ++emitted;
+                ++rounds;
+                if (g1 == draft) {
+                    ++accepted;
+                    ++emitted;
+                    const int32_t g2 = argmax_row(two.data() + nv);
+                    const int32_t both[2] = {draft, g2};
+                    draft = engine.mtp_draft(std::span<const int32_t>(both));
+                    pending = g2;
+                } else {
+                    engine.rollback();
+                    draft = engine.mtp_draft(g1);
+                    pending = g1;
+                }
+            }
+            // Measured when set: ~67-75% on similar text.
+            check(accepted > rounds / 2, std::format("drafts accepted: {} of {} rounds (limit half)", accepted, rounds));
+        }
     }
 
     if (want("long")) {
