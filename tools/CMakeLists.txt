@@ -28,3 +28,6 @@ target_link_libraries(mako_serve PRIVATE mako_server)
 add_executable(prefill_sweep prefill_sweep.cpp)
 target_link_libraries(prefill_sweep PRIVATE mako_glm mako_text)
 target_compile_definitions(prefill_sweep PRIVATE MAKO_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+add_executable(render_template render_template.cpp)
+target_link_libraries(render_template PRIVATE mako_chat mako_gguf)

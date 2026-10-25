@@ -93,7 +93,7 @@ only the tests that need no GPU work.
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<model-00001-of-0000N.gguf>   # or MAKO_MODEL in the environment at configure
 ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | sampler | server | e2e
-# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> (at configure) adds the DeepSeek tokenizer test
+# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> (at configure) adds the DeepSeek tokenizer and template tests
 ```
 
 Every test but `sampler` needs the model and reports as skipped without it. The `e2e` tests (about a minute) check
@@ -114,6 +114,6 @@ numerical change, `regress_test <model> --update` re-records `tests/data/regress
 | `src/server` | OpenAI-compatible HTTP server |
 | `src/gen` | sampling |
 | `src/text` | tokenizer, UTF-8 streaming detokenizer |
-| `tools` | `mako_run`, `mako_serve`, `prefill_sweep`, `mako_calibrate`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
+| `tools` | `mako_run`, `mako_serve`, `prefill_sweep`, `render_template`, `mako_calibrate`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
 | `tests` | kernel, tokenizer, chat template, server, sampler and end-to-end regression tests (ctest) |
 | `bench` | SSD, sync, matmul and quantization-format microbenchmarks |
