@@ -404,8 +404,9 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         for (NS::UInteger i = 0; i < sets->count(); ++i)
             if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
                 ts = sets->object<MTL::CounterSet>(i);
+        // Layers: a prefill group's MoE layers commit their misses a few experts at a time, each in a timed encoder.
         const uint64_t want = opts_.telemetry == Telemetry::kernels ? uint64_t(cfg_.n_layer) * 240 + 64
-                                                                    : uint64_t(cfg_.n_layer) * 64 + 64;
+                                                                    : uint64_t(cfg_.n_layer) * 256 + 64;
         mtl::Ref<MTL::CounterSampleBufferDescriptor> d(MTL::CounterSampleBufferDescriptor::alloc()->init());
         d->setCounterSet(ts);
         d->setSampleCount(kSamplesPerBuffer);

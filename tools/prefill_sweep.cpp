@@ -1,11 +1,14 @@
 // Prefill time of reads of several sizes on top of a base context, as an agent turn reading a tool result.
 //   prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] [--steps N] [--prefill-group N]
+//                 [--decode N]
 // The text is this repository's sources, tokenized. Each size runs `repeats` times (default 2), each from a checkpoint
 // of the base context; the experts left resident by the runs before stay. --layers adds per-layer GPU timestamps
 // (GPU time by section; extra encoder boundaries slow it somewhat). --steps N also times sizes up to N as decode
-// steps, one token at a time.
+// steps, one token at a time. --decode N instead generates N tokens after the base context through a Session
+// (greedy, speculative) and summarizes its steps.
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "glm/session.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
@@ -43,6 +46,59 @@ double ms_since(std::chrono::steady_clock::time_point t)
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
 }
 
+// Generates n tokens after the prompt (greedy, speculative) and summarizes the engine steps: per step its wall,
+// GPU, routing-wait and expert-read times, misses and (with layer telemetry) GPU time by section; the time between
+// steps (drafting, sampling) is the rest of the decode's wall time.
+int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint32_t n)
+{
+    mako::glm::Session session(engine);
+    mako::glm::GenerateParams gp;
+    gp.sampling.temperature = 0;
+    gp.max_tokens = n;
+    std::vector<mako::glm::StepStats> steps;
+    uint32_t seen = uint32_t(prompt.size());
+    const auto r = session.generate(prompt, gp, [&](int32_t) {
+        if (engine.position() != seen) {
+            steps.push_back(engine.last_step());
+            seen = engine.position();
+        }
+        return true;
+    });
+    std::println("prompt {} tokens in {:.0f} ms; {} tokens in {:.0f} ms ({:.1f} ms/token), {} steps, {} of {} drafts kept",
+                 prompt.size(), r.prefill_ms, r.tokens.size(), r.decode_ms, r.decode_ms / r.tokens.size(), steps.size(),
+                 r.accepted, r.drafts);
+    // The first steps after a long prompt pay for the experts it displaced; both halves are shown.
+    auto summary = [&](size_t b, size_t e, const char* what) {
+        double wall = 0, gpu = 0, wait = 0, ensure = 0, read = 0, enc = 0, misses = 0;
+        double kda = 0, mla = 0, ffn = 0, hit = 0, miss = 0;
+        for (size_t i = b; i < e; ++i) {
+            const auto& s = steps[i];
+            wall += s.wall_ms, gpu += s.gpu_ms, wait += s.route_wait_ms, ensure += s.ensure_ms, read += s.read_ms;
+            enc += s.encode_ms, misses += double(s.misses);
+            for (const auto& l : s.layers) {
+                (l.mla ? mla : kda) += l.attn_ms;
+                ffn += l.ffn_ms, hit += l.hit_ms, miss += l.miss_ms;
+            }
+        }
+        const double k = double(e - b);
+        std::println("{} (steps {}-{}), per step: wall {:.1f} ms, GPU {:.1f}, CPU waiting for routing {:.1f}, making "
+                     "experts resident {:.1f} (reads {:.1f}, {:.1f} misses), encode {:.2f}",
+                     what, b, e, wall / k, gpu / k, wait / k, ensure / k, read / k, misses / k, enc / k);
+        if (kda + mla > 0)
+            std::println("  GPU by section per step: KDA attention {:.1f} ms, MLA attention {:.1f}, FFN to routing {:.1f}, "
+                         "resident experts {:.1f}, misses and combine {:.1f}",
+                         kda / k, mla / k, ffn / k, hit / k, miss / k);
+    };
+    const size_t half = steps.size() / 2;
+    summary(1, half, "first half");
+    summary(half, steps.size(), "second half");
+    double step_wall = 0;
+    for (const auto& s : steps)
+        step_wall += s.wall_ms;
+    std::println("between steps (drafting, sampling): {:.1f} ms per step", (r.decode_ms - step_wall) / steps.size());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -52,7 +108,7 @@ int main(int argc, char** argv)
                              "[--steps N] [--prefill-group N]");
         return 2;
     }
-    uint32_t base = 15000, repeats = 2, step_max = 0;
+    uint32_t base = 15000, repeats = 2, step_max = 0, decode = 0;
     std::vector<uint32_t> sizes{16, 64, 256, 512, 1024, 2048, 4096};
     mako::glm::Options opts;
     opts.telemetry = mako::glm::Telemetry::summary;
@@ -73,6 +129,8 @@ int main(int argc, char** argv)
             repeats = uint32_t(std::stoul(v));
         else if (a == "--steps")
             step_max = uint32_t(std::stoul(v));
+        else if (a == "--decode")
+            decode = uint32_t(std::stoul(v));
         else if (a == "--prefill-group")
             opts.prefill_group = uint32_t(std::stoul(v));
         else if (a == "--sizes") {
@@ -102,8 +160,12 @@ int main(int argc, char** argv)
     while (ids.size() < base + most)
         ids.insert(ids.end(), text.begin(), text.end());
     opts.max_ctx = base + most + 16;
+    opts.mtp = decode > 0;
+    opts.max_ctx = std::max(opts.max_ctx, base + decode + 16);
     mako::mtl::Context ctx;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
+    if (decode)
+        return run_decode(engine, std::span(ids).first(base), decode);
 
     auto t = std::chrono::steady_clock::now();
     engine.prefill(std::span(ids).first(base));
