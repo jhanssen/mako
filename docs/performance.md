@@ -148,6 +148,11 @@ KL 0.0114, top-1 94.5%), so it is used; the GLM prefill-vs-decode limit was re-b
 session check's failure was a Session bug (a new session over a used engine did not reset it). More rows per simdgroup (8, 16) is slower for both: the kernels are bound
 by per-weight work, not by re-reading the activations.
 
+Decode at long context (code text, 100 greedy tokens after the prompt): 16K tokens 54.5 ms a step (18.9 tok/s), 32K
+54.3 ms (18.8); short prompts ~41 ms. Attention grows modestly (core 1.8 -> 2.8 ms, indexer 0 -> 1.4 / 2.4 ms); most
+of the difference is misses (17-18 a step against ~11). Leaving prefill out of the eviction scores made decode after a
+16K prompt worse (19.8 vs 15.4 misses a step, 18.6 vs 20.7 tok/s), as it did on GLM.
+
 Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
 projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
 GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against
