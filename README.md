@@ -2,7 +2,7 @@
 
 An inference engine for very large mixture-of-experts language models on Apple Silicon Macs, written in C++ and Metal.
 
-Targets: **GLM-5.3-Flash** (first) and **DeepSeek-V4.1-Flash-1017** (next), on Macs with 64-256 GB of unified memory.
+Targets: **GLM-5.3-Flash** and **DeepSeek-V4.1-Flash-1017**, on Macs with 64-256 GB of unified memory.
 Weights that don't fit in memory stream from the internal SSD into a unified-memory cache that the GPU reads directly.
 It is tuned for M5 and meant to run on M3 and later (GPU family Apple9); so far it has only been tested on M4, and M3 is untested.
 
@@ -11,6 +11,24 @@ It is tuned for M5 and meant to run on M3 and later (GPU family Apple9); so far 
 Early. GLM-5.3-Flash runs end to end: tokenizer and chat template, batched prompt processing, an expert cache in
 unified memory, sampling and speculative decoding with the model's next-token block, matching a reference
 implementation to within that reference's own precision. It serves an OpenAI-compatible API (`mako_serve`).
+
+DeepSeek-V4.1-Flash-1017 runs decode and batched prompt processing (no speculative drafter yet), with its Engram
+tables read per token, and serves through the same API. On a 128 GB M5 Max with the Maya-S IQ2_XXS quant (about 40%
+of the experts resident) it decodes at 13-21 tokens/s; a prompt costs about 8 s of expert reads plus ~1.8 ms a token.
+
+### DeepSeek-V4.1
+
+The Engram tables live in their own GGUF (the MXFP8 shard of the full model); `mako_serve`, `mako_calibrate` and
+`ds_run` find it in an `Engram` folder next to the model's folder (or inside it), or take `--engram FILE`.
+
+```sh
+build/tools/mako_calibrate <DeepSeek shard 1>                    # routing profile (once): which experts start resident
+build/tools/mako_serve <DeepSeek shard 1> --ctx 65536 --port 8080
+build/tools/ds_run <DeepSeek shard 1> <engram.gguf> --ids 0,671,6102 -n 32   # token ids in, greedy tokens out
+```
+
+`--ablate FILE` takes DeepSeek's sites `attn_out` (a layer's attention output) and `shexp_out` (its shared expert's
+output).
 
 ## Requirements
 
@@ -95,7 +113,8 @@ only the tests that need no GPU work.
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<model-00001-of-0000N.gguf>   # or MAKO_MODEL in the environment at configure
 ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | sampler | server | e2e
-# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> (at configure) adds the DeepSeek tokenizer and template tests
+# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> and MAKO_DS41_ENGRAM=<its Engram GGUF> (at configure) add the DeepSeek
+# tokenizer, template, Engram, GEMM and server tests
 ```
 
 Every test but `sampler` needs the model and reports as skipped without it. The `e2e` tests (about a minute) check
@@ -111,11 +130,13 @@ numerical change, `regress_test <model> --update` re-records `tests/data/regress
 | `src/gguf` | GGUF reader, multi-file models |
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
-| `src/glm` | GLM-5.3-Flash config, engine and generation session |
+| `src/core` | what the engines share: GPU runtime base, expert arena, routing profiles, telemetry |
+| `src/glm` | GLM-5.3-Flash config and engine |
+| `src/dsv41` | DeepSeek-V4.1 config, Engram tables and engine |
 | `src/chat` | chat templates (the GGUF's Jinja template) |
-| `src/server` | OpenAI-compatible HTTP server |
-| `src/gen` | sampling |
+| `src/server` | OpenAI- and Anthropic-compatible HTTP server |
+| `src/gen` | the model interface, generation session, sampling |
 | `src/text` | tokenizer, UTF-8 streaming detokenizer |
-| `tools` | `mako_run`, `mako_serve`, `prefill_sweep`, `render_template`, `mako_calibrate`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
+| `tools` | `mako_run`, `mako_serve`, `prefill_sweep`, `render_template`, `mako_calibrate`, `ds_run`, `engram_rows`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
 | `tests` | kernel, tokenizer, chat template, server, sampler and end-to-end regression tests (ctest) |
 | `bench` | SSD, sync, matmul and quantization-format microbenchmarks |
