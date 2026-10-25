@@ -416,8 +416,10 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     enc->setComputePipelineState(pso("l2_norm"));
     enc->setBuffer(qkvc, 0, 0);
     enc->setBytes(&la, sizeof(la), 1);
+    const uint32_t l2_rows = 2 * H; // q and k heads
+    enc->setBytes(&l2_rows, sizeof(l2_rows), 2);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size(2 * H, T, 1), MTL::Size(256, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size((l2_rows + 3) / 4, T, 1), MTL::Size(128, 1, 1));
     after(enc, "l2_norm");
 
     MTL::Buffer* o = scratch("o", uint64_t(T) * inner * 4);

@@ -406,18 +406,24 @@ struct L2Args {
     uint token_stride; // elements between tokens
 };
 
-// x / max(||x||, eps) per row of n, in place; threadgroups (rows, tokens).
-kernel void l2_norm(device float* x [[buffer(0)]], constant L2Args& a [[buffer(1)]],
-                    uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]])
+// x / max(||x||, eps) per row of n, in place; one simdgroup per row, threadgroups of 4 rows: (ceil(rows / 4), tokens).
+kernel void l2_norm(device float* x [[buffer(0)]], constant L2Args& a [[buffer(1)]], constant uint& rows [[buffer(2)]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]])
 {
-    threadgroup float scratch[TG / 32];
-    const uint tid = tid2.x;
-    device float* xr = x + uint64_t(tg.y) * a.token_stride + uint64_t(tg.x) * a.n;
-    float s = 0.0f;
-    for (uint i = tid; i < a.n; i += TG)
-        s += xr[i] * xr[i];
-    const float scale = 1.0f / max(sqrt(tg_sum(s, scratch, tid)), a.eps);
-    for (uint i = tid; i < a.n; i += TG)
+    const uint r = tg.x * 4 + sg;
+    if (r >= rows)
+        return;
+    device float* xr = x + uint64_t(tg.y) * a.token_stride + uint64_t(r) * a.n;
+    // Each 32 columns summed across the simdgroup, then the partial sums (in this order; at most 32 of them).
+    float part = 0.0f;
+    for (uint i = 0; i < a.n; i += 32) {
+        const float p = simd_sum(i + lane < a.n ? xr[i + lane] * xr[i + lane] : 0.0f);
+        if (lane == i / 32)
+            part = p;
+    }
+    const float scale = 1.0f / max(sqrt(simd_sum(part)), a.eps);
+    for (uint i = lane; i < a.n; i += 32)
         xr[i] *= scale;
 }
 
