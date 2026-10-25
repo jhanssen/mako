@@ -155,6 +155,11 @@ protected:
                     MTL::Buffer* xn, MTL::Buffer* ffo, uint32_t T,
                     const std::function<void(MTL::ComputeCommandEncoder*&, MTL::Buffer* sho)>& between = {});
     void serve_moe(MTL::CommandBuffer* cb);
+    // G tokens' routed experts of arena row il (rows of xn_g) added into ffo, which holds their shared expert's
+    // output. Command buffers it commits go to `committed`: they must complete before the row's slots are used again.
+    void moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,
+                     MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, std::vector<MTL::CommandBuffer*>& committed);
+    static constexpr uint32_t kBatchRows = 8192; // prefill expert rows (token, expert pairs) run and combined together
     // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
     MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                         uint32_t ld);
