@@ -2,7 +2,7 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--max-ctx N] [--ablate FILE] [-n N]
+//          [--max-ctx N] [--ablate FILE] [--top-k N] [-n N]
 // -n N: then N greedy tokens.
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
@@ -58,6 +58,8 @@ int main(int argc, char** argv)
             opts.arena_gb = std::stod(v);
         else if (a == "--max-ctx")
             opts.max_ctx = uint32_t(std::stoul(v));
+        else if (a == "--top-k")
+            opts.indexer_top_k = uint32_t(std::stoul(v));
         else if (a == "--ablate")
             ablate = v;
         else if (a == "-n")
@@ -132,11 +134,20 @@ int main(int argc, char** argv)
     int32_t next = int32_t(std::max_element(engine.logits().begin(), engine.logits().end()) - engine.logits().begin());
     std::vector<int32_t> gen_ids;
     const auto g0 = std::chrono::steady_clock::now();
+    double wall = 0, gpu = 0, wait = 0, ensure = 0, read = 0;
+    uint64_t misses = 0;
     for (int i = 0; i < gen; ++i) {
         gen_ids.push_back(next);
         const auto& lg = engine.step(next);
         next = int32_t(std::max_element(lg.begin(), lg.end()) - lg.begin());
+        const auto& st = engine.last_step();
+        wall += st.wall_ms, gpu += st.gpu_ms, wait += st.route_wait_ms, ensure += st.ensure_ms, read += st.read_ms;
+        misses += st.misses;
     }
+    if (gen > 0)
+        std::println("per step: wall {:.1f} ms, GPU {:.1f}, CPU waiting for routing {:.1f}, making experts resident {:.1f} "
+                     "(reads {:.1f}, {:.1f} misses)",
+                     wall / gen, gpu / gen, wait / gen, ensure / gen, read / gen, double(misses) / gen);
     if (gen > 0) {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count();
         std::print("generated:");

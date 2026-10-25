@@ -108,6 +108,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     dims_ = {cfg_.n_embd, cfg_.n_layer, cfg_.hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
              cfg_.n_expert, cfg_.n_expert_used, cfg_.n_ff_exp};
     routing_ = {core::Routing::Score::sqrt_softplus, cfg_.expert_weights_norm, cfg_.expert_weights_scale};
+    if (opts_.indexer_top_k)
+        cfg_.indexer_top_k = opts_.indexer_top_k;
 
     token_embd_ = model_.find("token_embd.weight");
     if (!token_embd_ || !quant::can_dequant(token_embd_.tensor->type))
