@@ -31,5 +31,11 @@
     "description": "DeepSeek, dense weights re-quantized to Q6_K at load: KL 0.0076",
     "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
     "--dense-quant": "q6_k"
+  },
+  "ds-prefetch": {
+    "description": "DeepSeek, experts read ahead from the router two layers ahead (story +3.5%, long code neutral)",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "--prefetch": 4,
+    "--prefetch-ahead": 2
   }
 }

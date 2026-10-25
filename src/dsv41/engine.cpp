@@ -877,11 +877,15 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         if (G == 1)
             probe(enc, "ffn_in", int(il), xn_g, E);
         if (decode) {
-            moe_decode(cb, enc, L.moe, il, xn_g, ffo, G, [&](MTL::ComputeCommandEncoder*& e, MTL::Buffer* sho) {
-                if (G == 1)
-                    probe(e, "shexp_out", int(il), sho, E);
-                ablate(e, il, ablate_shexp_, sho, 0, G);
-            });
+            moe_decode(
+                cb, enc, L.moe, il, xn_g, ffo, G,
+                [&](MTL::ComputeCommandEncoder*& e, MTL::Buffer* sho) {
+                    if (G == 1)
+                        probe(e, "shexp_out", int(il), sho, E);
+                    ablate(e, il, ablate_shexp_, sho, 0, G);
+                },
+                il + opts_.prefetch_ahead < cfg_.n_layer ? &layers_[il + opts_.prefetch_ahead]->moe : nullptr,
+                opts_.prefetch_k, opts_.prefetch_ahead);
         } else {
             // The shared expert in chunks (its intermediates are wide), then the routed experts added in.
             for (uint32_t c0 = 0; c0 < G; c0 += chunk)

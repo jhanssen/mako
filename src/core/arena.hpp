@@ -5,10 +5,15 @@
 #include "mtl/context.hpp"
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mako::core {
@@ -73,6 +78,8 @@ public:
     struct Stats {
         uint64_t hits = 0, misses = 0, read_bytes = 0;
         double read_ms = 0, prefill_ms = 0;
+        uint64_t prefetched = 0, prefetch_used = 0; // experts read ahead; of those, selected before eviction
+        double prefetch_wait_ms = 0;                // ensure() waiting for a read ahead still in flight
     };
 
     // `counts` (per layer, n_expert routing counts from a profile; may be empty) decides which experts start
@@ -123,6 +130,16 @@ public:
     void unpin(uint32_t layer);
     void unpin(uint32_t layer, std::span<const int32_t> slots);
 
+    // Starts reading these experts of a layer in the background into the least scored slots (none selected or
+    // pinned, none being read); each becomes resident in the slot table when its read completes. An ensure() that
+    // selects one still in flight waits for it. Experts already resident or in flight are skipped.
+    void prefetch(uint32_t layer, std::span<const int> experts);
+    // Waits until no read ahead is in flight.
+    void prefetch_wait();
+    // Whether reads ahead have been paying off lately (a decayed share of them selected before eviction of at least
+    // 30%); while not, only one call in eight goes ahead, to keep measuring.
+    bool prefetch_worthwhile();
+
     const Stats& stats() const { return stats_; }
     // How often each expert was selected since construction, [layer][expert].
     const std::vector<std::vector<uint64_t>>& usage() const { return usage_; }
@@ -156,6 +173,25 @@ private:
     uint64_t clock_ = 0;
     Stats stats_;
     std::unique_ptr<gguf::ReadPool> readers_;
+
+    // Reads ahead: jobs (layer, expert, slot) done in order by one thread with its own readers. loading_ marks
+    // slots being read (owner already set, table entry not yet); guarded by pf_m_, as are the jobs.
+    struct PrefetchJob {
+        uint32_t layer;
+        int expert;
+        int32_t slot;
+    };
+    void prefetch_loop(std::stop_token st);
+    std::mutex pf_m_;
+    std::condition_variable_any pf_cv_;
+    std::deque<PrefetchJob> pf_jobs_;
+    std::vector<std::vector<char>> loading_;           // [layer][slot]
+    std::vector<std::vector<char>> prefetched_slot_;   // [layer][slot]: read ahead, not selected since
+    size_t pf_active_ = 0;
+    double pf_recent_ = 0, pf_recent_used_ = 0; // decayed counts of reads ahead and of those selected
+    uint64_t pf_calls_ = 0;
+    std::unique_ptr<gguf::ReadPool> pf_readers_;
+    std::jthread pf_thread_;
 };
 
 } // namespace mako::core

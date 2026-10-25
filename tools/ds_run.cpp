@@ -4,7 +4,7 @@
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
-//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [-n N]
+//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [-n N]
 // --route-study N: N greedy tokens without drafts, then how well each expert-miss predictor would have done: layer
 // l+1's router on layer l's FFN input (one and two layers ahead), the previous token's experts, and the experts the
 // same input token used earlier (misses caught, and reads of experts neither resident nor selected wasted).
@@ -107,6 +107,10 @@ int main(int argc, char** argv)
             save_profile = v;
         else if (a == "--profile")
             opts.expert_counts = v;
+        else if (a == "--prefetch")
+            opts.prefetch_k = uint32_t(std::stoul(v));
+        else if (a == "--prefetch-ahead")
+            opts.prefetch_ahead = uint32_t(std::stoul(v));
         else if (a == "--miss-penalty")
             opts.miss_penalty = std::stof(v);
         else if (a == "--dense-quant") {
@@ -381,6 +385,10 @@ int main(int argc, char** argv)
                      ss.verifies ? double(ss.verify_misses) / ss.verifies : 0.0,
                      ss.verifies ? ss.verify_read_ms / ss.verifies : 0.0, ss.steps, ss.steps ? ss.step_ms / ss.steps : 0.0,
                      ss.steps ? double(ss.step_misses) / ss.steps : 0.0, ss.steps ? ss.step_read_ms / ss.steps : 0.0);
+        if (const auto& as = engine.arena().stats(); as.prefetched)
+            std::println("read ahead {} experts, {} selected before eviction ({:.0f}%), waited {:.0f} ms for reads in flight",
+                         as.prefetched, as.prefetch_used, 100.0 * double(as.prefetch_used) / double(as.prefetched),
+                         as.prefetch_wait_ms);
         if (ss.steps) {
             const double n = double(ss.steps);
             std::println("per step: wall {:.1f} ms = inputs read {:.1f} + encoding {:.1f} + ...; GPU {:.1f} ms; CPU waiting "

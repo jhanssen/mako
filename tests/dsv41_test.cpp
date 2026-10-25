@@ -247,6 +247,24 @@ int main(int argc, char** argv)
         check(off.logits == plain.logits, "switched off: the same logits, bit for bit");
     }
 
+    // Reading experts ahead changes where they are read from, never the results.
+    {
+        engine.set_ablation(std::nullopt);
+        auto steps = [&]() {
+            engine.reset();
+            std::vector<std::vector<float>> l;
+            for (int32_t t : ids)
+                l.push_back(engine.step(t));
+            return l;
+        };
+        const auto off = steps();
+        engine.set_prefetch(4, 2);
+        const auto on = steps();
+        engine.set_prefetch(0, 1);
+        check(on == off, std::format("reading ahead: the same logits, bit for bit ({} experts read ahead, {} used)",
+                                     engine.arena().stats().prefetched, engine.arena().stats().prefetch_used));
+    }
+
     // Speculative verification: rows of a verify() against the same tokens step by step, and keep()'s rollback
     // (continuing after it as if the rejected tokens had never run), with the next position odd and even (a
     // ratio-2 compressor's pair open or closed).

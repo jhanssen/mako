@@ -776,7 +776,7 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
     const uint32_t arena_rows = uint32_t(arena_->usage().size());
     auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(arena_rows) * kMaxDecodeTokens * 36)->contents());
     size_t served = 0;
-    for (const auto [il, v, T] : pending_moe_) {
+    for (const auto [il, v, T, predicted] : pending_moe_) {
         if (!block && routed_->signaledValue() < v)
             break;
         ++served;
@@ -840,6 +840,15 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
             for (int d = 0; d < 3; ++d)
                 ind[d * 3 + 2] = k;
         ready_->setSignaledValue(v);
+        if (predicted) { // arena row il + predicted
+            const auto* pred = static_cast<const int32_t*>(scratch("mpred", uint64_t(arena_rows) * 64)->contents()) +
+                               uint64_t(il) * 16;
+            std::vector<int> ahead;
+            for (int i = 0; i < 16 && pred[i] >= 0; ++i)
+                ahead.push_back(pred[i]);
+            if (!ahead.empty())
+                arena_->prefetch(il + predicted, ahead);
+        }
     }
     pending_moe_.erase(pending_moe_.begin(), pending_moe_.begin() + ptrdiff_t(served));
 }
@@ -899,7 +908,8 @@ void EngineBase::deliver_probes()
 // at once and the misses after the CPU has read them (serve_moe).
 void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& mw,
                             uint32_t il, MTL::Buffer* xn, MTL::Buffer* ffo, uint32_t T,
-                            const std::function<void(MTL::ComputeCommandEncoder*&, MTL::Buffer*)>& between)
+                            const std::function<void(MTL::ComputeCommandEncoder*&, MTL::Buffer*)>& between,
+                            const MoeWeights* next, uint32_t predict_k, uint32_t ahead)
 {
     if (T > kMaxDecodeTokens)
         throw std::runtime_error("too many tokens for a decode step");
@@ -955,10 +965,25 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(32, 1, 1));
     after(enc, "moe_route");
+    // The prediction costs a router GEMV: skipped while reads ahead are not paying off (ExpertArena decides).
+    const bool predict = next && predict_k && T == 1 && il + ahead < arena_rows && arena_->prefetch_worthwhile();
+    if (predict) {
+        MTL::Buffer* rnext = scratch("rlog_next", uint64_t(dims_.n_expert) * 4);
+        gemv(enc, next->router, xn, 0, rnext, 0, 1, 1);
+        const uint32_t pa[3] = {dims_.n_expert, std::min<uint32_t>(predict_k, 16), uint32_t(routing_.score)};
+        enc->setComputePipelineState(pso("moe_predict"));
+        enc->setBuffer(rnext, 0, 0);
+        enc->setBuffer(next->bias.buf, next->bias.off, 1);
+        enc->setBuffer(arena_->slot_table(), uint64_t(il + ahead) * dims_.n_expert * 4, 2);
+        enc->setBuffer(scratch("mpred", uint64_t(arena_rows) * 64), uint64_t(il) * 64, 3);
+        enc->setBytes(pa, sizeof(pa), 4);
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(32, 1, 1));
+        after(enc, "moe_predict");
+    }
     enc->endEncoding();
     const uint64_t v = ++event_value_;
     cb->encodeSignalEvent(routed_.get(), v);
-    pending_moe_.push_back({il, v, T});
+    pending_moe_.push_back({il, v, T, predict ? ahead : 0u});
     enc = encoder(cb, tl, il < dims_.n_layer ? 2 : -1);
     part(enc, "moe shared expert");
     // The CPU starts on the misses as soon as the route is known; the shared expert runs meanwhile.

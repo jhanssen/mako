@@ -281,10 +281,21 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
         last_use_[l].assign(slots_[l], 0);
         pinned_[l].assign(slots_[l], 0);
     }
+    loading_.resize(nl);
+    prefetched_slot_.resize(nl);
+    for (size_t l = 0; l < nl; ++l) {
+        loading_[l].assign(slots_[l], 0);
+        prefetched_slot_[l].assign(slots_[l], 0);
+    }
 }
 
 ExpertArena::~ExpertArena()
 {
+    if (pf_thread_.joinable()) {
+        pf_thread_.request_stop();
+        pf_cv_.notify_all();
+        pf_thread_.join();
+    }
     bufs_.clear();
     for (Tail& t : tails_) {
         t.buf = {};
@@ -378,6 +389,27 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     auto& last = last_use_[layer];
     const uint32_t n_slots = slots_[layer];
     std::vector<char> taken(pinned_[layer]);
+    if (pf_thread_.joinable()) {
+        std::unique_lock lock(pf_m_);
+        // A selected expert still being read ahead: wait for it (it is then resident).
+        for (int e : experts)
+            for (uint32_t s = 0; s < n_slots; ++s)
+                if (owner[s] == e && loading_[layer][s]) {
+                    const auto t0 = Clock::now();
+                    pf_cv_.wait(lock, [&] { return !loading_[layer][s]; });
+                    stats_.prefetch_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                }
+        for (uint32_t s = 0; s < n_slots; ++s) {
+            if (loading_[layer][s])
+                taken[s] = 1;
+        }
+        for (int e : experts)
+            if (table[e] >= 0 && prefetched_slot_[layer][table[e]]) {
+                prefetched_slot_[layer][table[e]] = 0;
+                ++stats_.prefetch_used;
+                pf_recent_used_ += 1.0;
+            }
+    }
     if (tails_[layer].bytes && !tails_[layer].mem)
         std::fill(taken.begin() + regions_[layer][0].split, taken.end(), 1);
     size_t misses = 0;
@@ -437,6 +469,7 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
             table[owner[victim]] = -1;
         owner[victim] = experts[i];
         table[experts[i]] = victim;
+        prefetched_slot_[layer][victim] = 0;
         taken[victim] = 1;
         last[victim] = clock_;
         slots_out[i] = victim;
@@ -447,6 +480,112 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     }
     read_into(layer, loads);
     return true;
+}
+
+void ExpertArena::prefetch(uint32_t layer, std::span<const int> experts)
+{
+    if (!pf_thread_.joinable()) {
+        pf_readers_ = std::make_unique<gguf::ReadPool>(kReaders);
+        pf_thread_ = std::jthread([this](std::stop_token st) { prefetch_loop(st); });
+    }
+    auto* table = static_cast<int32_t*>(table_buf_->contents()) + uint64_t(layer) * n_expert_;
+    auto& owner = slot_expert_[layer];
+    auto& last = last_use_[layer];
+    const uint32_t n_slots = slots_[layer];
+    std::lock_guard lock(pf_m_);
+    std::vector<char> taken(pinned_[layer]);
+    if (tails_[layer].bytes && !tails_[layer].mem)
+        std::fill(taken.begin() + regions_[layer][0].split, taken.end(), 1);
+    for (uint32_t s = 0; s < n_slots; ++s)
+        if (loading_[layer][s])
+            taken[s] = 1;
+    for (int e : experts) {
+        if (e < 0 || uint32_t(e) >= n_expert_ || table[e] >= 0 || std::ranges::find(owner, e) != owner.end())
+            continue;
+        int32_t victim = -1;
+        for (uint32_t s = 0; s < n_slots; ++s) {
+            if (taken[s])
+                continue;
+            if (owner[s] < 0) {
+                victim = int32_t(s);
+                break;
+            }
+            if (victim < 0)
+                victim = int32_t(s);
+            const double us = score_[layer][owner[s]], uv = score_[layer][owner[victim]];
+            if (us < uv || (us == uv && last[s] < last[victim]))
+                victim = int32_t(s);
+        }
+        if (victim < 0)
+            return;
+        if (owner[victim] >= 0)
+            table[owner[victim]] = -1;
+        owner[victim] = e;
+        last[victim] = clock_;
+        taken[victim] = 1;
+        loading_[layer][victim] = 1;
+        prefetched_slot_[layer][victim] = 1;
+        pf_recent_ = pf_recent_ * 0.998 + 1.0;
+        pf_recent_used_ *= 0.998;
+        pf_jobs_.push_back({layer, e, victim});
+        ++pf_active_;
+        ++stats_.prefetched;
+    }
+    pf_cv_.notify_all();
+}
+
+void ExpertArena::prefetch_loop(std::stop_token st)
+{
+    for (;;) {
+        PrefetchJob job;
+        {
+            std::unique_lock lock(pf_m_);
+            pf_cv_.wait(lock, st, [&] { return !pf_jobs_.empty(); });
+            if (st.stop_requested())
+                return;
+            job = pf_jobs_.front();
+            pf_jobs_.pop_front();
+        }
+        const LayerParts& L = layers_[job.layer];
+        struct Chunk {
+            int part;
+            uint64_t off, bytes;
+        };
+        std::vector<Chunk> chunks;
+        for (int p = 0; p < 3; ++p)
+            for (uint64_t off = 0; off < L[p].bytes; off += kReadChunk)
+                chunks.push_back({p, off, std::min(kReadChunk, L[p].bytes - off)});
+        pf_readers_->run(chunks.size(), [&](size_t i) {
+            const Chunk& c = chunks[i];
+            const Part& p = L[c.part];
+            const auto [buf, off] = regions_[job.layer][c.part].at(uint32_t(job.slot));
+            gguf::read_exact(p.fd, static_cast<char*>(buf->contents()) + off + c.off, c.bytes,
+                             p.file_off + uint64_t(job.expert) * p.bytes + c.off);
+        });
+        {
+            std::lock_guard lock(pf_m_);
+            auto* table = static_cast<int32_t*>(table_buf_->contents()) + uint64_t(job.layer) * n_expert_;
+            table[job.expert] = job.slot;
+            loading_[job.layer][job.slot] = 0;
+            --pf_active_;
+        }
+        pf_cv_.notify_all();
+    }
+}
+
+bool ExpertArena::prefetch_worthwhile()
+{
+    ++pf_calls_;
+    std::lock_guard lock(pf_m_);
+    return pf_recent_ < 100 || pf_recent_used_ >= 0.35 * pf_recent_ || pf_calls_ % 16 == 0;
+}
+
+void ExpertArena::prefetch_wait()
+{
+    if (!pf_thread_.joinable())
+        return;
+    std::unique_lock lock(pf_m_);
+    pf_cv_.wait(lock, [&] { return pf_active_ == 0; });
 }
 
 std::vector<MTL::Buffer*> ExpertArena::tail_buffers() const
@@ -465,6 +604,7 @@ bool ExpertArena::lent() const
 
 void ExpertArena::lend(uint64_t bytes)
 {
+    prefetch_wait();
     uint64_t lent = 0;
     for (const Tail& t : tails_)
         if (t.bytes && !t.mem)
@@ -515,6 +655,7 @@ bool ExpertArena::map_tail(uint32_t layer)
 
 bool ExpertArena::reclaim()
 {
+    prefetch_wait();
     if (!lent())
         return true;
     bool all = true;

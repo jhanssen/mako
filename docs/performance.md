@@ -164,9 +164,24 @@ resident nor selected counts as a wasted read):
 | 2-ahead top 8 that is also in 1-ahead top 8 | 47% | 7.4 |
 
 After a 16K code prompt (15.4 misses a step) 1-ahead top 6 catches 39% (21 wasted). Recently used experts are
-resident, so misses are experts not used for a while; only the router predicts them. A prediction is ready about one
-layer (~0.7 ms) before it is needed, competing with that layer's own misses for the SSD: estimated 2-3 ms a step on
-the story. Not built yet.
+resident, so misses are experts not used for a while; only the router predicts them.
+
+Built as an option (`--prefetch K --prefetch-ahead D`): each MoE layer runs layer l+D's router on its FFN input,
+the top K not resident are read in the background into the least scored slots (published in the slot table when
+complete; a selection still in flight waits for it), and the prediction is skipped while under 35% of recent reads
+ahead were selected (one layer in 16 still predicts, to keep measuring). Results are bit-identical (dsv41 test).
+
+| Story, 200 tokens | tok/s | misses waited on |
+| --- | ---: | ---: |
+| off | 24.7-24.8 | 10.7 |
+| 1 ahead, top 2 / 4 / 6 / 8 | 24.7 / 25.2 / 24.7 / 22.8 | 9.0 / 7.0 / 5.2 / 4.2 |
+| 2 ahead, top 3 / 4 / 5 / 6 | 25.2 / 25.5 / 25.3 / 24.7 | 8.3 / 7.5 / 6.8 / 6.2 |
+| 3 ahead, top 4 | 25.4 | 7.8 |
+| 2 ahead, top 4, with the gate | 25.6 (+3.5%) | 7.5 |
+
+One layer ahead the reads often had not finished (0.4-1.5 s of waits over 200 steps); two ahead, ~0.1 s. After a 16K
+code prompt only 21-31% of reads ahead are used: without the gate -2.7%, with it -0.3% (21.18 -> 21.11). Off by
+default.
 
 Decode steps committed every 4 layers, with layers whose routing is back served between encodes (`serve_moe` without
 blocking), and no empty command buffer after the logits: the GPU starts while the CPU still encodes. 41.4 -> 41.0 ms a

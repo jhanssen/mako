@@ -170,9 +170,12 @@ protected:
     // T (<= kMaxDecodeTokens) tokens' routed FFN plus shared expert of arena row il, rows of xn into rows of ffo.
     // With `sho_out` the shared expert's output stays there and goes through `between` (an encoder hook, e.g. an
     // ablation) before it is combined.
+    // With `next` (arena row il + ahead's weights) and predict_k, one token's step also predicts that layer's top
+    // predict_k experts from this layer's FFN input, and the ones not resident are read ahead (ExpertArena::prefetch).
     void moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,
                     MTL::Buffer* xn, MTL::Buffer* ffo, uint32_t T,
-                    const std::function<void(MTL::ComputeCommandEncoder*&, MTL::Buffer* sho)>& between = {});
+                    const std::function<void(MTL::ComputeCommandEncoder*&, MTL::Buffer* sho)>& between = {},
+                    const MoeWeights* next = nullptr, uint32_t predict_k = 0, uint32_t ahead = 1);
     // block false: only the layers whose routing has already been signaled, stopping at the first that has not.
     void serve_moe(MTL::CommandBuffer* cb, bool block = true);
     // G tokens' routed experts of arena row il (rows of xn_g) added into ffo, which holds their shared expert's
@@ -270,6 +273,7 @@ protected:
         uint32_t layer;
         uint64_t value; // event value
         uint32_t tokens;
+        uint32_t ahead; // nonzero: arena row layer + ahead's likely misses are in scratch "mpred" (read them ahead)
     };
     std::vector<PendingMoe> pending_moe_; // not yet served
     std::unique_ptr<Stager> stager_;

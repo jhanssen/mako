@@ -35,6 +35,10 @@ struct Options {
     // Dense Q8_0 matrices re-quantized at load to this type (Q4_K, Q5_K or Q6_K); unset: as stored.
     std::optional<gguf::Type> dense_quant;
     float miss_penalty = 0.0f; // core::Routing::miss_penalty
+    // Decode: each layer predicts the next layer's top prefetch_k experts from its FFN input and reads the missing
+    // ones ahead (0: off).
+    uint32_t prefetch_k = 0;
+    uint32_t prefetch_ahead = 1; // predicting the layer this many ahead
 };
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from
@@ -75,6 +79,12 @@ public:
     // expert's output (shexp_out), each before it is added in.
     static constexpr std::array<std::string_view, 2> kAblationSites{"attn_out", "shexp_out"};
     void set_ablation(std::optional<mtl::Ablation> ablation);
+    // Options::prefetch_k and prefetch_ahead.
+    void set_prefetch(uint32_t k, uint32_t ahead)
+    {
+        opts_.prefetch_k = k;
+        opts_.prefetch_ahead = ahead;
+    }
 
     // DSpark: three small blocks fed the trunk's streams entering its last layers, proposing the tokens after the
     // next one, each with a confidence.

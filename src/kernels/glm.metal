@@ -717,6 +717,47 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
     }
 }
 
+struct PredictArgs {
+    uint n_expert, k, score;
+};
+
+// The k best experts by selection score (route_score + bias) of a layer's router logits that its slot table lacks,
+// in score order, then -1 (rows of 16). One simdgroup.
+kernel void moe_predict(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
+                        device const int* slots [[buffer(2)]], device int* out [[buffer(3)]],
+                        constant PredictArgs& a [[buffer(4)]], uint lane [[thread_position_in_threadgroup]])
+{
+    constexpr uint K = 16;
+    float v[K];
+    for (uint k = 0; k < K; ++k) {
+        const uint e = lane + 32 * k;
+        v[k] = e < a.n_expert ? route_score(logits[e], a.score) + bias[e] : -INFINITY;
+    }
+    uint mine = 0xffffffffu;
+    for (uint r = 0; r < a.k; ++r) {
+        float bv = -INFINITY;
+        uint bk = 0;
+        for (uint k = 0; k < K; ++k)
+            if (v[k] > bv) {
+                bv = v[k];
+                bk = k;
+            }
+        const float m = simd_max(bv);
+        const uint e = simd_min(bv == m && bv > -INFINITY ? lane + 32 * bk : 0xffffffffu);
+        if (e % 32 == lane)
+            v[e / 32] = -INFINITY;
+        if (lane == r)
+            mine = e;
+    }
+    const uint want = lane < a.k && mine < a.n_expert && slots[mine] < 0 ? 1u : 0u;
+    const uint rank = simd_prefix_exclusive_sum(want);
+    if (want)
+        out[rank] = int(mine);
+    const uint total = simd_sum(want);
+    if (lane == 0 && total < 16)
+        out[total] = -1;
+}
+
 // moe_combine over results split into resident experts (x_hit, row e) and misses (x_miss, row miss_rank[e]).
 // Grid (n, tokens): token t's rows are x_hit[t * n_used + e], x_miss[t * n_used + rank], miss_rank and w rows of
 // 16, shared and y rows of n.
