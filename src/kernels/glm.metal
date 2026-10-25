@@ -433,9 +433,9 @@ struct ScanArgs {
 // One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
 //   S[i][:] *= exp(g[i]); delta[j] = (v[j] - sum_i S[i][j] k[i]) * beta
 //   S[i][j] += k[i] * delta[j];   o[j] = sum_i S[i][j] q[i] / sqrt(head_dim)
-// Threadgroups (heads, head_dim / 32) of 128 threads: each keeps rows j0..j0+31 of its head's M in threadgroup
-// memory for all the tokens (rows are independent: row j needs only the shared q, k, g and its own v[j]); four
-// threads per row, thread lane covering columns lane, lane + 4, ... . head_dim must be 128.
+// Threadgroups (heads, head_dim / 32) of 128 threads for rows j0..j0+31 of a head's M (rows are independent: row j
+// needs only the shared q, k, g and its own v[j]); four threads per row, each holding columns lane, lane + 4, ...
+// of it in registers for all the tokens. head_dim must be 128.
 kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
                      device const float* v [[buffer(2)]], device const float* g [[buffer(3)]],
                      device const float* beta [[buffer(4)]], device float* state [[buffer(5)]],
@@ -443,15 +443,14 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
                      device float* snap_state [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
                      uint2 tid2 [[thread_position_in_threadgroup]])
 {
-    constexpr uint D = 128, ROWS = 32, STRIDE = 132; // padded rows: the 4 lanes x 8 rows of a simdgroup hit distinct banks
-    threadgroup float Ms[ROWS * STRIDE];
+    constexpr uint D = 128, ROWS = 32, LANES = 4, N = D / LANES;
     threadgroup float qs[D], ks[D], eg[D];
-    const uint tid = tid2.x, h = tg.x, j0 = tg.y * ROWS, row = tid / 4, lane = tid % 4;
+    const uint tid = tid2.x, h = tg.x, j0 = tg.y * ROWS, row = tid / LANES, lane = tid % LANES;
     const uint base = h * D;
-    device float* Mg = state + uint64_t(h) * D * D + uint64_t(j0) * D;
-    for (uint idx = tid; idx < ROWS * D; idx += 128)
-        Ms[(idx / D) * STRIDE + idx % D] = Mg[idx];
-    threadgroup float* M = Ms + row * STRIDE;
+    device float* Mg = state + uint64_t(h) * D * D + uint64_t(j0 + row) * D;
+    float M[N];
+    for (uint n = 0; n < N; ++n)
+        M[n] = Mg[lane + n * LANES];
     for (uint t = 0; t < a.tokens; ++t) {
         const uint64_t qo = uint64_t(t) * a.qkv_stride + base, go = uint64_t(t) * a.inner + base;
         qs[tid] = q[qo + tid];
@@ -459,31 +458,29 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
         eg[tid] = exp(g[go + tid]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float sum = 0.0f;
-        for (uint i = lane; i < D; i += 4) {
-            const float m = M[i] * eg[i];
-            M[i] = m;
-            sum += m * ks[i];
+        for (uint n = 0; n < N; ++n) {
+            M[n] *= eg[lane + n * LANES];
+            sum += M[n] * ks[lane + n * LANES];
         }
         sum = quad_sum(sum);
         const float delta = (v[qo + j0 + row] - sum) * beta[t * a.heads + h];
         float out = 0.0f;
-        for (uint i = lane; i < D; i += 4) {
-            const float m = M[i] + ks[i] * delta;
-            M[i] = m;
-            out += m * qs[i];
+        for (uint n = 0; n < N; ++n) {
+            M[n] += ks[lane + n * LANES] * delta;
+            out += M[n] * qs[lane + n * LANES];
         }
         out = quad_sum(out);
         if (lane == 0)
             o[go + j0 + row] = out * rsqrt(float(D));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (t + 1 == a.snap) {
-            device float* Ss = snap_state + uint64_t(h) * D * D + uint64_t(j0) * D;
-            for (uint idx = tid; idx < ROWS * D; idx += 128)
-                Ss[idx] = Ms[(idx / D) * STRIDE + idx % D];
+            device float* Ss = snap_state + uint64_t(h) * D * D + uint64_t(j0 + row) * D;
+            for (uint n = 0; n < N; ++n)
+                Ss[lane + n * LANES] = M[n];
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint idx = tid; idx < ROWS * D; idx += 128)
-        Mg[idx] = Ms[(idx / D) * STRIDE + idx % D];
+    for (uint n = 0; n < N; ++n)
+        Mg[lane + n * LANES] = M[n];
 }
 
 // y = rms_norm(x) * w * sigmoid(gate), one threadgroup per head row.

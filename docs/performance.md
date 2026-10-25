@@ -18,6 +18,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | Speculative decoding with the next-token block (two-token verify, rollback of the recurrent state) | 15-25% faster than plain decode at 83-100% acceptance; break-even ~35-45% |
 | Router before the shared expert in decode (the CPU starts on misses earlier) | -0.5 ms/token |
 | Busy-spin on the routing event instead of a blocking wait | blocking was +1 ms/token; no throttling seen |
+| KDA scan with each thread's 32 state columns in registers (was threadgroup memory, read and written twice per token: ~2.2 TB/s of traffic) | scan ~1.05 s -> ~0.3 s on 4096 tokens; prefill +6-8% (562 -> 609, 464 -> 493 tok/s in A/B pairs); logits unchanged against the reference |
 
 Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
 10-19 ms (not overlapped), drafting ~2.3 ms. The big GEMVs already run at ~400 GB/s of the 553 GB/s measured (614
@@ -35,6 +36,10 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 | De-duplicating experts shared by the two verify tokens | they share 1.68 of 8 experts a layer (~10% pairs): not worth it |
 | Two-draft chaining | estimated +5-10% (each extra verify token ~15 ms/step); not built |
 | MTLIO instead of pread for expert reads | no faster at large blocks, much slower at small blocks or low concurrency |
+| KDA scan loading 8 tokens' q/k/g at once (one barrier per 8) | KDA section +15%: 30 KB of threadgroup memory halves occupancy |
+| KDA scan prefetching the next token into registers, double-buffered (one barrier per token) | no change |
+| KDA scan with 8 threads per row (16 rows a threadgroup) | KDA section +9% against 4 threads per row; it also moved the second token of a two-token step by KL 4e-6 against single steps (cause not found) |
+| GEMM instead of the GEMV for small-output projections at >= 256 tokens (router, KDA gates) | prefill +3.5%, but KL against the reference 0.00719 -> 0.00845 (half-precision activations into the router and gates) |
 | Per-kernel telemetry to find slow kernels | timestamps around each dispatch inflate small kernels several-fold (one "slow" shared-expert GEMV was 93 us measured, 13 us real); repeat-in-place costs (`MAKO_REPEAT`) replaced it |
 
 ### Open
