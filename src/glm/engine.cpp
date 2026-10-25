@@ -551,11 +551,18 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         }
         const uint32_t k = uint32_t(w.dims[0]), nr = uint32_t(w.dims[1]);
         const uint64_t mat = mtl::Gemv::row_bytes(w.type, k) * nr;
+        part(enc, "mla k_b v_b to half");
         MTL::Buffer* xh = halves(enc, x, 0, T, H * xw, 0);
+        // The heads write disjoint columns of y: one concurrent encoder, so their GEMMs overlap.
+        enc->endEncoding();
+        enc = encoder(cur_cb_, cur_layer_, 0, MTL::DispatchTypeConcurrent);
+        if (part_timing_ && !timed_.empty())
+            timed_.back().kernel = "mla k_b v_b";
         for (uint32_t h = 0; h < H; ++h)
             gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off + h * mat, xh, uint64_t(h) * xw * 2, y,
                           uint64_t(h) * yw * 4, H * yw, H * xw);
-        after(enc, "per_head_gemm");
+        enc->endEncoding();
+        enc = encoder(cur_cb_, cur_layer_, 0);
     };
     part(enc, "mla k_b v_b");
     per_head(L.k_b, q, cfg_.head_k, qabs, R);
