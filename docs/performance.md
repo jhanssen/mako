@@ -19,6 +19,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | Router before the shared expert in decode (the CPU starts on misses earlier) | -0.5 ms/token |
 | Busy-spin on the routing event instead of a blocking wait | blocking was +1 ms/token; no throttling seen |
 | 128- and 256-token GEMM tiles for IQ weights where they pad no more than 64-token ones (each weight dequantized once per tile; the dequantization does not overlap the multiply and cost ~21%) | `bench/gemm_bench` (288 experts, GLM shapes): 114 tokens each 39.5 -> 33.0 ms a layer, 1024 tokens 312 -> 248 ms (48 -> 60 TFLOP/s of the 63 half x half reaches); GLM prefill +7-8% (547 -> 592, 546 -> 586 tok/s in A/B pairs), experts section -19%; logits unchanged |
+| The same tiles for Q6_K, Q8_0, F16 and F32 weights (dense projections: 4096 tokens were 64 tiles, each dequantizing every weight) | Q6_K 4096x8192 at 4096 tokens 13.7 -> 10.3 ms (40 -> 53 TFLOP/s), 8192x4096 8.6 -> 5.8 ms; GLM prefill +6-10% (534 -> 586, 549 -> 581 tok/s), KDA section -13%, FFN -15%; logits unchanged |
 | KDA scan with each thread's 32 state columns in registers (was threadgroup memory, read and written twice per token: ~2.2 TB/s of traffic) | scan ~1.05 s -> ~0.3 s on 4096 tokens; prefill +6-8% (562 -> 609, 464 -> 493 tok/s in A/B pairs); logits unchanged against the reference |
 
 Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
