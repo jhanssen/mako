@@ -534,7 +534,7 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     // Per-head matrices (k_b: head_k -> R, v_b: R -> head_v): one GEMM per head over all tokens, or the batched
     // GEMV for one token.
     auto per_head = [&](const DevTensor& w, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
-        if (T <= kMaxDecodeTokens) {
+        if (T < gemm_min_tokens_) {
             for (uint32_t t = 0; t < T; ++t)
                 gemv(enc, w, x, uint64_t(t) * H * xw * 4, y, uint64_t(t) * H * yw * 4, H);
             return;

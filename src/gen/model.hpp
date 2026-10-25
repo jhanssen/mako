@@ -50,6 +50,15 @@ public:
     virtual void mtp_seed(int32_t) {}
     virtual const std::vector<float>& step2(int32_t, int32_t) { throw std::logic_error("no two-token steps"); }
     virtual void rollback() { throw std::logic_error("no two-token steps"); }
+
+    // Speculative decoding with a multi-token drafter: draft(next) proposes the tokens likely to follow `next`, the
+    // token at position() not yet run (empty when the drafter is unsure); verify(tokens) runs `next` and drafts at
+    // the next positions, returning their logits (a row each); keep(n) keeps the first n of them (n >= 1), undoing
+    // the rest. Without a drafter has_drafter() is false and the rest is not called.
+    virtual bool has_drafter() const { return false; }
+    virtual std::vector<int32_t> draft(int32_t) { return {}; }
+    virtual const std::vector<float>& verify(std::span<const int32_t>) { throw std::logic_error("no drafter"); }
+    virtual void keep(uint32_t) { throw std::logic_error("no drafter"); }
 };
 
 } // namespace mako::gen

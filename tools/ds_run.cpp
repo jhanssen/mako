@@ -3,13 +3,17 @@
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
-//          [--save-profile F|default] [--split S --width W] [-n N]
+//          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
+//          [--draft-conf F]] [-n N]
+// --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one and
+// --spec is not 0), with the tokens, speed and drafts kept.
 // --split S --width W: prefills the first S ids, then runs the rest W at a time (as a speculative verify step whose
 // drafts were all right would) and reports the time and expert misses per step and per token.
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
+#include "gen/session.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -50,7 +54,8 @@ int main(int argc, char** argv)
     mako::dsv41::Options opts;
     int gen = 0;
     bool use_prefill = false;
-    uint32_t split = 0, width = 0;
+    uint32_t split = 0, width = 0, session_n = 0;
+    bool spec = true;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--ids") {
@@ -79,6 +84,16 @@ int main(int argc, char** argv)
             save_profile = v;
         else if (a == "--profile")
             opts.expert_counts = v;
+        else if (a == "--dspark")
+            opts.dspark = v;
+        else if (a == "--gen")
+            session_n = uint32_t(std::stoul(v));
+        else if (a == "--spec")
+            spec = v != "0";
+        else if (a == "--max-drafts")
+            opts.max_drafts = uint32_t(std::stoul(v));
+        else if (a == "--draft-conf")
+            opts.draft_conf = std::stof(v);
         else if (a == "--split")
             split = uint32_t(std::stoul(v));
         else if (a == "--width")
@@ -152,6 +167,51 @@ int main(int argc, char** argv)
             std::println("pos {:4} token {:6}: top {:6} ({:.3f})  {:.1f} ms", t, ids[t], top, lg[top], ms);
         }
     };
+    if (std::getenv("DS_TIME_DRAFT") && engine.has_drafter()) {
+        engine.prefill(ids);
+        const int32_t y = int32_t(std::max_element(engine.logits().begin(), engine.logits().end()) - engine.logits().begin());
+        for (int i = 0; i < 3; ++i)
+            engine.draft(y);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i)
+            engine.draft(y);
+        std::println("draft(): {:.2f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20);
+        const std::vector<int32_t> v2{y, 1}, v4{y, 1, 2, 3}, v5{y, 1, 2, 3, 4};
+        for (const auto* v : {&v2, &v4, &v5}) {
+            const uint32_t p0 = engine.position();
+            const auto s0 = std::chrono::steady_clock::now();
+            engine.verify(*v);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+            engine.keep(1);
+            std::println("verify of {}: {:.1f} ms (position {} -> {})", v->size(), ms, p0, engine.position());
+            engine.reset();
+            engine.prefill(ids);
+        }
+        return 0;
+    }
+    if (session_n > 0) {
+        mako::gen::Session session(engine);
+        mako::gen::GenerateParams gp;
+        gp.sampling.temperature = 0;
+        gp.max_tokens = session_n;
+        gp.speculative = spec;
+        const auto r = session.generate(ids, gp);
+        std::print("generated:");
+        for (int32_t t : r.tokens)
+            std::print(" {}", t);
+        std::println("\n{} tokens in {:.0f} ms ({:.2f} tok/s); prompt {:.0f} ms; drafts {} kept {} ({:.0f}%)", r.tokens.size(),
+                     r.decode_ms, r.tokens.size() / r.decode_ms * 1e3, r.prefill_ms, r.drafts, r.accepted,
+                     r.drafts ? 100.0 * r.accepted / r.drafts : 0.0);
+        const auto& ss = engine.spec_stats();
+        std::println("drafts {} ({:.1f} ms each), verifies {} of {:.1f} tokens ({:.1f} ms, {:.1f} misses, {:.1f} ms making "
+                     "them resident each), steps {} ({:.1f} ms, {:.1f} misses, {:.1f} ms each)",
+                     ss.drafts, ss.drafts ? ss.draft_ms / ss.drafts : 0.0, ss.verifies,
+                     ss.verifies ? double(ss.verified_tokens) / ss.verifies : 0.0, ss.verifies ? ss.verify_ms / ss.verifies : 0.0,
+                     ss.verifies ? double(ss.verify_misses) / ss.verifies : 0.0,
+                     ss.verifies ? ss.verify_read_ms / ss.verifies : 0.0, ss.steps, ss.steps ? ss.step_ms / ss.steps : 0.0,
+                     ss.steps ? double(ss.step_misses) / ss.steps : 0.0, ss.steps ? ss.step_read_ms / ss.steps : 0.0);
+        return 0;
+    }
     if (split > 0 && width > 0) {
         engine.prefill(std::span<const int32_t>(ids).first(std::min<size_t>(split, ids.size())));
         double ms = 0;

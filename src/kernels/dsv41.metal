@@ -104,14 +104,16 @@ struct PoolArgs {
     uint dim;
     uint tokens;
     uint pos0; // position of the first token
+    uint hist; // the first this many tokens also leave the state after them in hist (rows of k then g)
 };
 
 // Ratio-2 compressor over consecutive tokens: per channel, a group's two tokens (positions 2j, 2j + 1) give row j,
 // the kv projections weighted by the softmax over the two of the gate. state holds the pending first token's k then
 // g (from before pos0, or left for the next call). Rows go to y in order, one per completed group. Grid (dim).
+// (After an odd position the state is stale and unused; hist keeps it as it was.)
 kernel void ds_pool2(device const float* k [[buffer(0)]], device const float* g [[buffer(1)]],
                      device float* state [[buffer(2)]], device float* y [[buffer(3)]], constant PoolArgs& a [[buffer(4)]],
-                     uint c [[thread_position_in_grid]])
+                     device float* hist [[buffer(5)]], uint c [[thread_position_in_grid]])
 {
     if (c >= a.dim)
         return;
@@ -119,6 +121,10 @@ kernel void ds_pool2(device const float* k [[buffer(0)]], device const float* g 
     uint row = 0;
     for (uint t = 0; t < a.tokens; ++t) {
         const float kt = k[uint64_t(t) * a.dim + c], gt = g[uint64_t(t) * a.dim + c];
+        if (t < a.hist) { // the state after token t, should the tokens after it be undone
+            hist[uint64_t(t) * 2 * a.dim + c] = (a.pos0 + t) % 2 == 0 ? kt : k0;
+            hist[(uint64_t(t) * 2 + 1) * a.dim + c] = (a.pos0 + t) % 2 == 0 ? gt : g0;
+        }
         if ((a.pos0 + t) % 2 == 0) {
             k0 = kt;
             g0 = gt;
@@ -142,18 +148,30 @@ struct AttnArgs {
     uint ratio;   // compressed rows: one per `ratio` tokens; 0: none
     uint top;     // at most this many compressed rows; more visible: the selection's
     float scale;
+    uint block;   // nonzero: a draft block of this many rows (see keys_of)
 };
 
 // Token t's keys: its window (positions max(0, p - ring + 1) .. p, from the chunk's rows at or after pos0, else the
-// ring), then its compressed rows (all visible ones while at most `top`, else sel's).
+// ring), then its compressed rows (all visible ones while at most `top`, else sel's). A draft block's rows instead
+// all see the ring's positions before pos0 and every row of the block (the chunk's).
 struct Keys {
     uint p, nw, first, nc;
-    bool identity;
+    bool identity, block;
 };
 
 static Keys keys_of(constant AttnArgs& a, uint t)
 {
     Keys k;
+    if (a.block) {
+        k.p = a.pos0 + t;
+        k.nw = min(a.pos0, a.ring);
+        k.first = a.pos0 - k.nw;
+        k.nc = a.block;
+        k.identity = true;
+        k.block = true;
+        return k;
+    }
+    k.block = false;
     k.p = a.pos0 + t;
     k.nw = min(k.p + 1, a.ring);
     k.first = k.p + 1 - k.nw;
@@ -173,6 +191,8 @@ static uint2 key_row(constant AttnArgs& a, Keys kk, uint t, uint j, device const
     }
     if (j < kk.nw + kk.nc) {
         const uint c = j - kk.nw;
+        if (kk.block)
+            return uint2(0, c);
         return uint2(2, kk.identity ? c : uint(sel[uint64_t(t) * a.top + c]));
     }
     return uint2(3, 0);
@@ -594,4 +614,100 @@ kernel void ds_engram_gate(device float* R [[buffer(0)]], device const float* kv
     const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(fabs(d), 1e-6f)), d)));
     for (uint i = tid; i < a.dim; i += 256)
         h[i] += gate * value[i];
+}
+
+// taps[t][slot] = the mean of token t's 4 streams (rows of 4 * dim), into rows of `width` floats at slot * dim.
+// Grid (dim, tokens).
+kernel void ds_tap(device const float* R [[buffer(0)]], device float* taps [[buffer(1)]], constant uint4& a [[buffer(2)]],
+                   uint2 gid [[thread_position_in_grid]])
+{
+    const uint dim = a.x, width = a.y, slot = a.z;
+    if (gid.x >= dim)
+        return;
+    device const float* r = R + uint64_t(gid.y) * 4 * dim;
+    taps[uint64_t(gid.y) * width + slot * dim + gid.x] = 0.25f * (r[gid.x] + r[dim + gid.x] + r[2 * dim + gid.x] + r[3 * dim + gid.x]);
+}
+
+struct MarkovArgs {
+    uint vocab, rank;
+    uint step; // the draft being chosen: prev is drafts[step - 1], or y at step 0
+    int y;
+};
+
+// scores[v] = logits[v] + head[v] . embed[prev] (the Markov bias of the previous draft). One simdgroup per 8 rows.
+kernel void ds_markov(device const float* logits [[buffer(0)]], device const float* head [[buffer(1)]],
+                      device const float* embed [[buffer(2)]], device const int* drafts [[buffer(3)]],
+                      device float* scores [[buffer(4)]], constant MarkovArgs& a [[buffer(5)]],
+                      uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]])
+{
+    const uint v0 = (gid / 32) * 8;
+    const int prev = a.step ? drafts[a.step - 1] : a.y;
+    device const float* e = embed + uint64_t(prev) * a.rank;
+    for (uint r = 0; r < 8; ++r) {
+        const uint v = v0 + r;
+        if (v >= a.vocab)
+            return;
+        float acc = 0.0f;
+        for (uint i = lane; i < a.rank; i += 32)
+            acc += head[uint64_t(v) * a.rank + i] * e[i];
+        acc = simd_sum(acc);
+        if (lane == 0)
+            scores[v] = logits[v] + acc;
+    }
+}
+
+// drafts[step] = argmax of scores (lowest index on ties); conf[step] = sigmoid([x, embed[prev]] . w), x the block's
+// row `step` of dim floats. One threadgroup of 1024 threads.
+kernel void ds_draft_pick(device const float* scores [[buffer(0)]], device int* drafts [[buffer(1)]],
+                          device float* conf [[buffer(2)]], device const float* x [[buffer(3)]],
+                          device const float* embed [[buffer(4)]], device const float* w [[buffer(5)]],
+                          constant MarkovArgs& a [[buffer(6)]], constant uint& dim [[buffer(7)]],
+                          uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float best_v[32];
+    threadgroup uint best_i[32];
+    threadgroup float part[32];
+    float bv = -INFINITY;
+    uint bi = 0;
+    for (uint v = tid; v < a.vocab; v += 1024) {
+        const float s = scores[v];
+        if (s > bv) {
+            bv = s;
+            bi = v;
+        }
+    }
+    for (uint o = 16; o > 0; o >>= 1) {
+        const float ov = simd_shuffle_down(bv, o);
+        const uint oi = simd_shuffle_down(bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    const int prev = a.step ? drafts[a.step - 1] : a.y;
+    device const float* e = embed + uint64_t(prev) * a.rank;
+    device const float* xr = x + uint64_t(a.step) * dim;
+    float d = 0.0f;
+    for (uint i = tid; i < dim + a.rank; i += 1024)
+        d += w[i] * (i < dim ? xr[i] : e[i - dim]);
+    d = simd_sum(d);
+    if (tid % 32 == 0) {
+        best_v[tid / 32] = bv;
+        best_i[tid / 32] = bi;
+        part[tid / 32] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float v = best_v[0], s = part[0];
+        uint i = best_i[0];
+        for (uint k = 1; k < 32; ++k) {
+            if (best_v[k] > v || (best_v[k] == v && best_i[k] < i)) {
+                v = best_v[k];
+                i = best_i[k];
+            }
+            s += part[k];
+        }
+        drafts[a.step] = int(i);
+        conf[a.step] = 1.0f / (1.0f + exp(-s));
+    }
 }

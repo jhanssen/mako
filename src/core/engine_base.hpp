@@ -98,7 +98,10 @@ public:
     void save_profile(const std::filesystem::path& path, bool merge) const;
 
 protected:
-    static constexpr uint32_t kMaxDecodeTokens = 4;
+    static constexpr uint32_t kMaxDecodeTokens = 8;
+    // proj() of at least this many tokens uses the GEMM (fewer: the GEMV, which reads each weight once for them and
+    // gives every token the same result as alone).
+    uint32_t gemm_min_tokens_ = 5;
 
     EngineBase(const gguf::ModelFiles& model, mtl::Context& ctx, Telemetry telemetry);
     ~EngineBase();
@@ -107,6 +110,11 @@ protected:
 
     // Reads a dense tensor into the resident weight buffers (BF16 becomes F32).
     DevTensor upload(const std::string& name);
+    // The same from `bytes` at `offset` of a file (tensors outside the GGUF, e.g. a drafter's own file).
+    DevTensor upload_raw(int fd, uint64_t offset, uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims,
+                         const std::string& what);
+    // Room for `bytes` in the resident weight buffers, for the caller to fill.
+    DevTensor reserve(uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims);
     // A routed experts tensor [k, n, n_expert] as the arena reads it; `prefill`: it also needs the prefill GEMM.
     ExpertArena::Part expert(const std::string& name, bool prefill);
 

@@ -3,6 +3,11 @@
 #include "gguf/read_pool.hpp"
 #include "quant/dequant.hpp"
 
+#include <glaze/glaze.hpp>
+
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -10,6 +15,11 @@
 #include <format>
 #include <numbers>
 #include <stdexcept>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <tuple>
 
 namespace mako::dsv41 {
 
@@ -33,11 +43,28 @@ struct RoundArgs {
     uint32_t n, kind, out_half;
 };
 struct PoolArgs {
-    uint32_t dim, tokens, pos0;
+    uint32_t dim, tokens, pos0, hist;
 };
 struct AttnArgs {
     uint32_t dim, heads, stride, ring, pos0, t0, ratio, top;
     float scale;
+    uint32_t block;
+};
+struct RouteArgs {
+    uint32_t n_expert, n_used, norm;
+    float scale;
+    uint32_t lookup, score;
+};
+struct SwigluArgs {
+    uint32_t n;
+    float limit;
+};
+struct CombineArgs {
+    uint32_t n, n_used;
+};
+struct MarkovArgs {
+    uint32_t vocab, rank, step;
+    int32_t y;
 };
 struct IdxArgs {
     uint32_t dim, heads, stride, pos0, t0, ratio;
@@ -58,6 +85,7 @@ struct EngramDecodeArgs {
 };
 
 constexpr uint32_t kFp8 = 0, kFp4E4m3 = 1, kFp4Pow2 = 2; // ds_round kinds
+constexpr uint32_t kHistTokens = 8; // verify() runs at most this many tokens (the compressors keep a state per token)
 constexpr uint32_t kAttnGroup = 64; // query tokens per attention dispatch (bounds its key copies and scores)
 
 // RoPE frequencies for n_rot dims: base^(-2i/n_rot), with YaRN's ramp toward freq / factor when orig_ctx > 0.
@@ -97,6 +125,23 @@ struct Engine::Layer {
     ExpertArena::LayerParts experts{};
 };
 
+struct Engine::Drafter {
+    static constexpr uint32_t kBlocks = 3, kRows = 5, kExperts = 128, kUsed = 3, kRank = 256;
+    static constexpr int32_t kNoise = 128799; // the block's rows after the first
+    static constexpr std::array<uint32_t, 3> kTargets{37, 38, 39};
+    std::array<Layer, kBlocks> blocks;
+    std::array<std::array<DevTensor, 3>, kBlocks> experts; // gate, up, down: kExperts matrices each, contiguous
+    std::array<uint64_t, 3> part_bytes{};
+    DevTensor main_proj, main_norm, norm, markov_embed, markov_head, conf_w;
+    std::array<mtl::Ref<MTL::Buffer>, kBlocks> rings;
+    int fd = -1;
+    ~Drafter()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : EngineBase(model, ctx, opts.telemetry), cfg_(cfg), opts_(opts)
 {
@@ -109,6 +154,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     dims_ = {cfg_.n_embd, cfg_.n_layer, cfg_.hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
              cfg_.n_expert, cfg_.n_expert_used, cfg_.n_ff_exp};
     routing_ = {core::Routing::Score::sqrt_softplus, cfg_.expert_weights_norm, cfg_.expert_weights_scale};
+    // A verify of up to kMaxDecodeTokens tokens on the GEMVs and decode's MoE: each row as a step would compute it.
+    gemm_min_tokens_ = kMaxDecodeTokens + 1;
     if (opts_.indexer_top_k)
         cfg_.indexer_top_k = opts_.indexer_top_k;
     opts_.prefill_chunk = std::max(1u, opts_.prefill_chunk);
@@ -220,9 +267,12 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         ckv_.push_back(buffer(rows * D * 2));
         ik_.push_back(buffer(rows * cfg_.indexer_dim * 4));
         comp_state_.push_back(buffer(2 * D * 4));
+        comp_hist_.push_back(buffer(uint64_t(kHistTokens) * 2 * D * 4));
         context_bytes += ckv_.back()->length() + ik_.back()->length();
     }
     logits_.resize(cfg_.n_vocab);
+    if (!opts_.dspark.empty())
+        load_drafter(opts_.dspark);
 
     load_.dense_ms = ms_since(t_load);
     set_staging_limit(opts_.stage_gb);
@@ -274,6 +324,9 @@ uint64_t Engine::checkpoint_bytes() const
     for (const auto* v : {&ring_, &comp_state_})
         for (const auto& b : *v)
             n += b->length();
+    if (drafter_)
+        for (const auto& b : drafter_->rings)
+            n += b->length();
     return n;
 }
 
@@ -284,6 +337,11 @@ Engine::Checkpoint Engine::checkpoint()
     cp.state.reserve(checkpoint_bytes());
     for (const auto* v : {&ring_, &comp_state_})
         for (const auto& b : *v) {
+            const auto* p = static_cast<const std::byte*>(b->contents());
+            cp.state.insert(cp.state.end(), p, p + b->length());
+        }
+    if (drafter_)
+        for (const auto& b : drafter_->rings) {
             const auto* p = static_cast<const std::byte*>(b->contents());
             cp.state.insert(cp.state.end(), p, p + b->length());
         }
@@ -299,6 +357,11 @@ void Engine::restore(const Checkpoint& cp)
     size_t off = 0;
     for (const auto* v : {&ring_, &comp_state_})
         for (const auto& b : *v) {
+            std::memcpy(b->contents(), cp.state.data() + off, b->length());
+            off += b->length();
+        }
+    if (drafter_)
+        for (const auto& b : drafter_->rings) {
             std::memcpy(b->contents(), cp.state.data() + off, b->length());
             off += b->length();
         }
@@ -379,8 +442,9 @@ void Engine::hc_lagged(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, co
 // (all of them up to indexer_top_k, else the indexer's selection), a sink per head, then the grouped output
 // projection.
 void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
-                       uint32_t T, uint32_t pos0, uint32_t g0)
+                       uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring, bool block)
 {
+    MTL::Buffer* ringb = ring ? ring : ring_[il].get();
     const uint32_t H = cfg_.n_head, D = cfg_.head_dim, QR = cfg_.q_lora_rank, W = cfg_.sliding_window;
     const uint32_t Hi = cfg_.indexer_heads, Di = cfg_.indexer_dim, top = cfg_.indexer_top_k, HD = H * D;
     const uint32_t ratio = uint32_t(L.ratio);
@@ -416,9 +480,16 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             MTL::Buffer* cg = scratch("ds_cg", uint64_t(T) * D * 4);
             proj(enc, L.comp_kv, xn, 0, ck, 0, T);
             proj(enc, L.comp_gate, xn, 0, cg, 0, T);
-            const PoolArgs pa{D, T, pos0};
-            dispatch(enc, "ds_pool2", {ck, cg, comp_state_[src].get(), lat}, &pa, sizeof(pa), MTL::Size(D, 1, 1),
-                     MTL::Size(256, 1, 1));
+            const PoolArgs pa{D, T, pos0, verifying_ ? std::min<uint32_t>(T, kHistTokens) : 0u};
+            enc->setComputePipelineState(pso("ds_pool2"));
+            enc->setBuffer(ck, 0, 0);
+            enc->setBuffer(cg, 0, 1);
+            enc->setBuffer(comp_state_[src].get(), 0, 2);
+            enc->setBuffer(lat, 0, 3);
+            enc->setBytes(&pa, sizeof(pa), 4);
+            enc->setBuffer(comp_hist_[src].get(), 0, 5);
+            enc->dispatchThreads(MTL::Size(D, 1, 1), MTL::Size(256, 1, 1));
+            after(enc, "ds_pool2");
         }
         if (n_emit) {
             norm(enc, lat, &L.comp_norm, latn, n_emit, D, D, cfg_.rms_eps);
@@ -494,21 +565,21 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     }
 
     MTL::Buffer* o = scratch("ds_o", uint64_t(T) * HD * 4);
-    const uint32_t stride = (W + top + 63) / 64 * 64; // whole tiles of 64 keys for the matmuls
+    const uint32_t stride = (W + std::max(top, T) + 63) / 64 * 64; // whole tiles of 64 keys for the matmuls
     const uint32_t ng = std::min(T, kAttnGroup);
     MTL::Buffer* qh = scratch("ds_qh", uint64_t(T) * HD * 2);
     MTL::Buffer* sc = scratch("ds_sc", uint64_t(ng) * H * stride * 4);
     MTL::Buffer* ph = scratch("ds_ph", uint64_t(ng) * H * stride * 2);
-    MTL::Buffer* cbuf = comp ? ckv_[L.owner].get() : ring_[il].get();
+    MTL::Buffer* cbuf = comp ? ckv_[L.owner].get() : ringb;
     gemm_->to_half(enc, q, 0, T, HD, 0, qh, 0);
     after(enc, "to_half");
     for (uint32_t t0 = 0; t0 < T; t0 += kAttnGroup) {
         const uint32_t n = std::min(kAttnGroup, T - t0);
-        const AttnArgs aa{D, H, stride, W, pos0, t0, ratio, top, 1.0f / std::sqrt(float(D))};
+        const AttnArgs aa{D, H, stride, W, pos0, t0, ratio, top, 1.0f / std::sqrt(float(D)), block ? T : 0u};
         auto keys = [&](const char* fn) {
             enc->setComputePipelineState(pso(fn));
             enc->setBuffer(kvc, 0, 1);
-            enc->setBuffer(ring_[il].get(), 0, 2);
+            enc->setBuffer(ringb, 0, 2);
             enc->setBuffer(cbuf, 0, 3);
             enc->setBuffer(sel, uint64_t(g0) * top * 4, 4);
             enc->setBytes(&aa, sizeof(aa), 6);
@@ -534,9 +605,11 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             enc->dispatchThreadgroups(MTL::Size(D / 64, n, 1), MTL::Size(128, 1, 1));
         after(enc, "ds_attn_out");
     }
-    const uint32_t ra[4] = {D, T, pos0, W};
-    dispatch(enc, "ds_ring_store", {kvc, ring_[il].get()}, ra, sizeof(ra), MTL::Size(D, std::min(T, W), 1),
-             MTL::Size(256, 1, 1));
+    if (!block) {
+        const uint32_t ra[4] = {D, T, pos0, W};
+        dispatch(enc, "ds_ring_store", {kvc, ringb}, ra, sizeof(ra), MTL::Size(D, std::min(T, W), 1),
+                 MTL::Size(256, 1, 1));
+    }
 
     rope(enc, o, 0, comp, D, H, pos0, T, 1, true);
     round(enc, o, 0, o, 0, T * HD, kFp8);
@@ -563,7 +636,12 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
 const std::vector<float>& Engine::step(int32_t token)
 {
     const int32_t t[1] = {token};
+    const auto t0 = Clock::now();
     run(t, false);
+    ++spec_stats_.steps;
+    spec_stats_.step_ms += ms_since(t0);
+    spec_stats_.step_misses += last_step_.misses;
+    spec_stats_.step_read_ms += last_step_.ensure_ms;
     return logits_;
 }
 
@@ -710,6 +788,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     dispatch(enc, "hc_init", {xg, R}, &ha, sizeof(ha), MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
     MTL::Buffer* prev = pc0;
     int cur = 0;
+    MTL::Buffer* taps = drafter_ ? scratch("ds_taps", uint64_t(G) * 3 * E * 4) : nullptr;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const Layer& L = *layers_[il];
         cur_layer_ = il;
@@ -717,6 +796,12 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             enc->endEncoding();
             enc = encoder(cb, il, 0);
         }
+        if (drafter_)
+            for (uint32_t j = 0; j < Drafter::kTargets.size(); ++j)
+                if (Drafter::kTargets[j] == il) {
+                    const uint32_t ta[4] = {E, 3 * E, j, 0};
+                    dispatch(enc, "ds_tap", {R, taps}, ta, sizeof(ta), MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
+                }
         if (L.engram >= 0) {
             proj(enc, L.engram_kv, eg, uint64_t(L.engram) * G * eg_cols * eg_dim * 4, ekv, 0, G);
             const EngramArgs ea{E, cfg_.rms_eps};
@@ -770,8 +855,15 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         prev = pcs[cur];
         cur ^= 1;
     }
+    // The drafter's window rows of these positions (the last ring-length of them).
+    if (drafter_) {
+        const uint32_t r0 = G > cfg_.sliding_window ? G - cfg_.sliding_window : 0;
+        seed_drafter(enc, taps, uint64_t(r0) * 3 * E * 4, G - r0, pos_ + r0);
+    }
     // Logits of the last position, or of every one (in chunks) for the sink.
     cur_layer_ = cfg_.n_layer;
+    if (all_logits)
+        logits_all_.resize(uint64_t(G) * cfg_.n_vocab);
     if (timing()) {
         enc->endEncoding();
         enc = encoder(cb, cur_layer_, -1);
@@ -796,9 +888,12 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         finish(cb);
         drain();
         const auto* lgp = static_cast<const float*>(lg->contents());
-        if (all_logits && logits_sink_)
-            for (uint32_t i = 0; i < n; ++i)
-                logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
+        if (all_logits) {
+            std::memcpy(logits_all_.data() + uint64_t(l0) * cfg_.n_vocab, lgp, uint64_t(n) * cfg_.n_vocab * 4);
+            if (logits_sink_)
+                for (uint32_t i = 0; i < n; ++i)
+                    logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
+        }
         if (l0 + n == G)
             std::memcpy(logits_.data(), lgp + uint64_t(n - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
         cb = ctx_.queue()->commandBuffer();
@@ -823,6 +918,348 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     last_step_.read_bytes = after_stats.read_bytes - before.read_bytes;
     if (timing())
         resolve_layer_times(cpu0, gpu0);
+}
+
+// dspark.json: [name, dtype, offset, bytes, shape (outermost first)] per tensor of dspark.bin.
+struct DsparkIndex {
+    std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t, std::vector<uint64_t>>> tensors;
+};
+
+void Engine::load_drafter(const std::string& dir)
+{
+    namespace fs = std::filesystem;
+    const fs::path index = fs::path(dir) / "dspark.json", bin = fs::path(dir) / "dspark.bin";
+    std::string text;
+    {
+        std::ifstream in(index, std::ios::binary);
+        if (!in)
+            throw std::runtime_error(std::format("cannot open {}", index.string()));
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    DsparkIndex idx;
+    if (auto ec = glz::read<glz::opts{.error_on_unknown_keys = false}>(idx, text))
+        throw std::runtime_error(std::format("{}: {}", index.string(), glz::format_error(ec, text)));
+    struct Entry {
+        gguf::Type type;
+        uint64_t off, bytes;
+        std::vector<uint64_t> dims; // innermost first
+    };
+    std::map<std::string, Entry> t;
+    for (const auto& [name, dtype, off, bytes, shape] : idx.tensors) {
+        gguf::Type type;
+        if (dtype == "F32")
+            type = gguf::Type::F32;
+        else if (dtype == "BF16")
+            type = gguf::Type::BF16;
+        else if (dtype == "Q8_0")
+            type = gguf::Type::Q8_0;
+        else if (dtype == "MXFP4")
+            type = gguf::Type::MXFP4;
+        else
+            throw std::runtime_error(std::format("{}: {} has type {}", index.string(), name, dtype));
+        t[name] = {type, off, bytes, {shape.rbegin(), shape.rend()}};
+    }
+    auto d = std::make_unique<Drafter>();
+    d->fd = ::open(bin.c_str(), O_RDONLY);
+    if (d->fd < 0)
+        throw std::runtime_error(std::format("cannot open {}", bin.string()));
+    auto entry = [&](const std::string& name) -> const Entry& {
+        const auto it = t.find(name);
+        if (it == t.end())
+            throw std::runtime_error(std::format("{}: no tensor {}", index.string(), name));
+        return it->second;
+    };
+    auto get = [&](const std::string& name) {
+        const Entry& e = entry(name);
+        return upload_raw(d->fd, e.off, e.bytes, e.type, e.dims, name);
+    };
+    for (uint32_t b = 0; b < Drafter::kBlocks; ++b) {
+        Layer& L = d->blocks[b];
+        const std::string p = std::format("mtp.{}.", b);
+        L.attn_norm = get(p + "attn_norm.weight");
+        L.ffn_norm = get(p + "ffn_norm.weight");
+        L.hc_attn_fn = get(p + "hc_attn_fn");
+        L.hc_attn_base = get(p + "hc_attn_base");
+        L.hc_attn_scale = get(p + "hc_attn_scale");
+        L.hc_ffn_fn = get(p + "hc_ffn_fn");
+        L.hc_ffn_base = get(p + "hc_ffn_base");
+        L.hc_ffn_scale = get(p + "hc_ffn_scale");
+        L.q_a = get(p + "attn.wq_a.weight");
+        L.q_a_norm = get(p + "attn.q_norm.weight");
+        L.q_b = get(p + "attn.wq_b.weight");
+        L.kv = get(p + "attn.wkv.weight");
+        L.kv_norm = get(p + "attn.kv_norm.weight");
+        L.out_a = get(p + "attn.wo_a.weight");
+        L.out_a.dims = {L.out_a.dims[0], cfg_.o_lora_rank, cfg_.o_groups};
+        L.out_b = get(p + "attn.wo_b.weight");
+        L.sinks = get(p + "attn.attn_sink");
+        L.moe.router = get(p + "ffn.gate.weight");
+        L.moe.bias = get(p + "ffn.gate.bias");
+        L.moe.sh_gate = get(p + "ffn.shared_experts.w1.weight");
+        L.moe.sh_up = get(p + "ffn.shared_experts.w3.weight");
+        L.moe.sh_down = get(p + "ffn.shared_experts.w2.weight");
+        L.moe.clamp_exp = cfg_.swiglu_clamp_exp[0];
+        L.moe.clamp_sh = cfg_.swiglu_clamp_shexp[0];
+        if (L.moe.router.dims[1] != Drafter::kExperts)
+            throw std::runtime_error(std::format("{}: {} experts, the drafter has {}", index.string(),
+                                                 L.moe.router.dims[1], Drafter::kExperts));
+        const char* parts[3] = {"w1", "w3", "w2"}; // gate, up, down
+        for (int q = 0; q < 3; ++q) {
+            const Entry& e0 = entry(std::format("{}ffn.experts.0.{}.weight", p, parts[q]));
+            d->part_bytes[q] = e0.bytes;
+            DevTensor ex = reserve(e0.bytes * Drafter::kExperts, e0.type, {e0.dims[0], e0.dims[1], Drafter::kExperts});
+            for (uint32_t e = 0; e < Drafter::kExperts; ++e) {
+                const Entry& ee = entry(std::format("{}ffn.experts.{}.{}.weight", p, e, parts[q]));
+                if (ee.bytes != e0.bytes || ee.type != e0.type)
+                    throw std::runtime_error(std::format("{}: experts of {} differ in size", index.string(), p));
+                gguf::read_exact(d->fd, static_cast<char*>(ex.buf->contents()) + ex.off + uint64_t(e) * e0.bytes,
+                                 e0.bytes, ee.off);
+            }
+            d->experts[b][q] = std::move(ex);
+        }
+        d->rings[b] = mtl::Ref<MTL::Buffer>(ctx_.device()->newBuffer(uint64_t(cfg_.sliding_window) * cfg_.head_dim * 4,
+                                                                     MTL::ResourceStorageModeShared));
+        std::memset(d->rings[b]->contents(), 0, d->rings[b]->length());
+    }
+    d->main_proj = get("mtp.0.main_proj.weight");
+    d->main_norm = get("mtp.0.main_norm.weight");
+    d->norm = get("mtp.2.norm.weight");
+    d->markov_embed = get("mtp.2.markov_head.embed.weight");
+    d->markov_head = get("mtp.2.markov_head.head.weight");
+    d->conf_w = get("mtp.2.confidence_head.proj.weight");
+    if (d->main_proj.dims[0] != 3 * uint64_t(cfg_.n_embd) || d->markov_embed.dims[0] != Drafter::kRank ||
+        d->markov_embed.dims[1] != cfg_.n_vocab)
+        throw std::runtime_error(index.string() + ": not this model's drafter");
+    drafter_ = std::move(d);
+}
+
+void Engine::seed_drafter(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* taps, uint64_t taps_off, uint32_t T,
+                          uint32_t pos0)
+{
+    const uint32_t E = cfg_.n_embd, D = cfg_.head_dim, W = cfg_.sliding_window;
+    MTL::Buffer* mx = scratch("dr_mx", uint64_t(T) * E * 4);
+    MTL::Buffer* mxn = scratch("dr_mxn", uint64_t(T) * E * 4);
+    MTL::Buffer* kv = scratch("dr_kv", uint64_t(T) * D * 4);
+    MTL::Buffer* kvn = scratch("dr_kvn", uint64_t(T) * D * 4);
+    proj(enc, drafter_->main_proj, taps, taps_off, mx, 0, T);
+    norm(enc, mx, &drafter_->main_norm, mxn, T, E, E, cfg_.rms_eps);
+    for (uint32_t b = 0; b < Drafter::kBlocks; ++b) {
+        const Layer& L = drafter_->blocks[b];
+        proj(enc, L.kv, mxn, 0, kv, 0, T);
+        norm(enc, kv, &L.kv_norm, kvn, T, D, D, cfg_.rms_eps);
+        rope(enc, kvn, 0, false, D, 1, pos0, T);
+        round(enc, kvn, 0, kvn, 0, T * D, kFp8);
+        const uint32_t ra[4] = {D, T, pos0, W};
+        dispatch(enc, "ds_ring_store", {kvn, drafter_->rings[b].get()}, ra, sizeof(ra), MTL::Size(D, std::min(T, W), 1),
+                 MTL::Size(256, 1, 1));
+    }
+}
+
+void Engine::draft_moe(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t b, MTL::Buffer* xn,
+                       MTL::Buffer* ffo, uint32_t T)
+{
+    const uint32_t E = cfg_.n_embd, nff = cfg_.n_ff_exp, NE = Drafter::kExperts, k = Drafter::kUsed;
+    MTL::Buffer* rlog = scratch("dr_rlog", uint64_t(T) * NE * 4);
+    MTL::Buffer* sel = scratch("dr_sel", uint64_t(T) * 16 * 4);
+    MTL::Buffer* ew = scratch("dr_ew", uint64_t(T) * 16 * 4);
+    MTL::Buffer* biased = scratch("dr_biased", uint64_t(T) * NE * 4);
+    MTL::Buffer* unused = scratch("dr_unused", 64);
+    MTL::Buffer* sho = scratch("dr_sho", uint64_t(T) * E * 4);
+    proj(enc, L.moe.router, xn, 0, rlog, 0, T);
+    const RouteArgs ra{NE, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score)};
+    enc->setComputePipelineState(pso("moe_route"));
+    enc->setBuffer(rlog, 0, 0);
+    enc->setBuffer(L.moe.bias.buf, L.moe.bias.off, 1);
+    enc->setBuffer(sel, 0, 2);
+    enc->setBuffer(ew, 0, 3);
+    enc->setBuffer(biased, 0, 4);
+    enc->setBytes(&ra, sizeof(ra), 5);
+    for (int i = 6; i < 10; ++i)
+        enc->setBuffer(unused, 0, i);
+    enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(32, 1, 1));
+    after(enc, "moe_route");
+    ffn_dense(enc, L.moe.sh_gate, L.moe.sh_up, L.moe.sh_down, xn, sho, L.moe.clamp_sh, T);
+    MTL::Buffer* g = scratch("dr_g", uint64_t(k) * nff * 4);
+    MTL::Buffer* u = scratch("dr_u", uint64_t(k) * nff * 4);
+    MTL::Buffer* m = scratch("dr_m", uint64_t(k) * nff * 4);
+    MTL::Buffer* y = scratch("dr_y", uint64_t(k) * E * 4);
+    const auto& ex = drafter_->experts[b];
+    const SwigluArgs sa{k * nff, L.moe.clamp_exp > 1e-6f ? L.moe.clamp_exp : 0.0f};
+    const CombineArgs ca{E, k};
+    for (uint32_t t = 0; t < T; ++t) {
+        for (int q = 0; q < 3; ++q) {
+            mtl::Gemv::Args a;
+            a.type = ex[q].type;
+            a.k = uint32_t(ex[q].dims[0]);
+            a.n = uint32_t(ex[q].dims[1]);
+            a.t = 1;
+            a.batch = k;
+            a.x_shared = q < 2;
+            MTL::Buffer* in = q < 2 ? xn : m;
+            const uint64_t in_off = q < 2 ? uint64_t(t) * E * 4 : 0;
+            MTL::Buffer* out = q == 0 ? g : q == 1 ? u : y;
+            gemv_->encode_indexed(enc, a, ex[q].buf, ex[q].off, drafter_->part_bytes[q], sel, uint64_t(t) * 64, in,
+                                  in_off, out, 0);
+            after(enc, "draft expert");
+            if (q == 1)
+                dispatch(enc, "swiglu", {g, u, m}, &sa, sizeof(sa), MTL::Size(k * nff, 1, 1), MTL::Size(256, 1, 1));
+        }
+        enc->setComputePipelineState(pso("moe_combine"));
+        enc->setBuffer(y, 0, 0);
+        enc->setBuffer(ew, uint64_t(t) * 64, 1);
+        enc->setBuffer(sho, uint64_t(t) * E * 4, 2);
+        enc->setBuffer(ffo, uint64_t(t) * E * 4, 3);
+        enc->setBytes(&ca, sizeof(ca), 4);
+        enc->dispatchThreads(MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "moe_combine");
+    }
+}
+
+std::vector<int32_t> Engine::draft(int32_t next)
+{
+    draft_conf_.clear();
+    if (!drafter_ || next < 0 || uint32_t(next) >= cfg_.n_vocab || pos_ == 0)
+        return {};
+    const auto t_draft = Clock::now();
+    const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, V = cfg_.n_vocab, T = Drafter::kRows, P = pos_;
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    MTL::Buffer* x = scratch("dr_x", uint64_t(T) * E * 4);
+    MTL::Buffer* xn = scratch("dr_xn", uint64_t(T) * E * 4);
+    MTL::Buffer* att = scratch("dr_att", uint64_t(T) * E * 4);
+    MTL::Buffer* ffo = scratch("dr_ffo", uint64_t(T) * E * 4);
+    MTL::Buffer* R = scratch("dr_R", uint64_t(T) * hd * 4);
+    MTL::Buffer* R2 = scratch("dr_R2", uint64_t(T) * hd * 4);
+    MTL::Buffer* pcs[2] = {scratch("dr_pcA", uint64_t(T) * 24 * 4), scratch("dr_pcB", uint64_t(T) * 24 * 4)};
+    MTL::Buffer* pc0 = scratch("dr_pc0", uint64_t(T) * 24 * 4);
+    MTL::Buffer* lg = scratch("dr_logits", uint64_t(T) * V * 4);
+    MTL::Buffer* scores = scratch("dr_scores", uint64_t(V) * 4);
+    MTL::Buffer* drafts = scratch("dr_drafts", 64);
+    MTL::Buffer* conf = scratch("dr_conf", 64);
+    {
+        auto* p0 = static_cast<float*>(pc0->contents());
+        std::fill_n(p0, uint64_t(T) * 24, 0.0f);
+        for (uint32_t t = 0; t < T; ++t)
+            p0[t * 24] = 1.0f;
+        const gguf::Tensor& te = *token_embd_.tensor;
+        const uint64_t rb = gguf::traits(te.type).block_bytes * (te.dims[0] / gguf::traits(te.type).block_elems);
+        std::vector<std::byte> row(rb);
+        for (uint32_t i = 0; i < T; ++i) {
+            const int32_t id = i == 0 ? next : Drafter::kNoise;
+            gguf::read_exact(token_embd_.file->fd(), row.data(), rb, te.offset + uint64_t(id) * rb);
+            quant::dequant_row(te.type, row.data(), static_cast<float*>(x->contents()) + uint64_t(i) * E, E);
+        }
+    }
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    cur_layer_ = cfg_.n_layer;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
+    const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
+    dispatch(enc, "hc_init", {x, R}, &ha, sizeof(ha), MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    MTL::Buffer* prev = pc0;
+    int cur = 0;
+    for (uint32_t b = 0; b < Drafter::kBlocks; ++b) {
+        const Layer& L = drafter_->blocks[b];
+        hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, 0, 0);
+        norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
+        attention(enc, L, 0, xn, att, T, P, 0, drafter_->rings[b].get(), true);
+        hc_post(enc, att, R, R2, pcs[cur], T);
+        std::swap(R, R2);
+        prev = pcs[cur];
+        cur ^= 1;
+        hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, x, pcs[cur], prev, T, 0, 0);
+        norm(enc, x, &L.ffn_norm, xn, T, E, E, cfg_.rms_eps);
+        draft_moe(enc, L, b, xn, ffo, T);
+        hc_post(enc, ffo, R, R2, pcs[cur], T);
+        std::swap(R, R2);
+        prev = pcs[cur];
+        cur ^= 1;
+    }
+    // The drafts: the trunk's head on the collapsed rows, each plus the Markov bias of the draft before it.
+    dispatch(enc, "hc_collapse", {R, prev, x}, &ha, sizeof(ha), MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    norm(enc, x, &drafter_->norm, xn, T, E, E, cfg_.rms_eps);
+    proj(enc, output_, xn, 0, lg, 0, T);
+    const uint32_t dim = E;
+    for (uint32_t i = 0; i < T; ++i) {
+        const MarkovArgs ma{V, Drafter::kRank, i, next};
+        enc->setComputePipelineState(pso("ds_markov"));
+        enc->setBuffer(lg, uint64_t(i) * V * 4, 0);
+        enc->setBuffer(drafter_->markov_head.buf, drafter_->markov_head.off, 1);
+        enc->setBuffer(drafter_->markov_embed.buf, drafter_->markov_embed.off, 2);
+        enc->setBuffer(drafts, 0, 3);
+        enc->setBuffer(scores, 0, 4);
+        enc->setBytes(&ma, sizeof(ma), 5);
+        enc->dispatchThreads(MTL::Size(uint64_t(V + 7) / 8 * 32, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "ds_markov");
+        enc->setComputePipelineState(pso("ds_draft_pick"));
+        enc->setBuffer(scores, 0, 0);
+        enc->setBuffer(drafts, 0, 1);
+        enc->setBuffer(conf, 0, 2);
+        enc->setBuffer(x, 0, 3);
+        enc->setBuffer(drafter_->markov_embed.buf, drafter_->markov_embed.off, 4);
+        enc->setBuffer(drafter_->conf_w.buf, drafter_->conf_w.off, 5);
+        enc->setBytes(&ma, sizeof(ma), 6);
+        enc->setBytes(&dim, sizeof(dim), 7);
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+        after(enc, "ds_draft_pick");
+    }
+    enc->endEncoding();
+    finish(cb);
+    const auto* dp = static_cast<const int32_t*>(drafts->contents());
+    const auto* cp = static_cast<const float*>(conf->contents());
+    std::vector<int32_t> out;
+    float cum = 1.0f;
+    for (uint32_t i = 0; i < T; ++i) {
+        draft_conf_.push_back(cp[i]);
+        cum *= cp[i];
+        if (out.size() == i && i < opts_.max_drafts && cp[i] >= opts_.draft_conf && cum >= opts_.draft_cum)
+            out.push_back(dp[i]);
+    }
+    pool->release();
+    ++spec_stats_.drafts;
+    spec_stats_.draft_ms += ms_since(t_draft);
+    return out;
+}
+
+const std::vector<float>& Engine::verify(std::span<const int32_t> tokens)
+{
+    if (tokens.empty() || tokens.size() > kHistTokens)
+        throw std::runtime_error("verify: 1 to 8 tokens");
+    verify_pos0_ = pos_;
+    verify_tokens_.assign(tokens.begin(), tokens.end());
+    verify_history_ = engram_history_;
+    verifying_ = true;
+    struct Reset {
+        bool& v;
+        ~Reset() { v = false; }
+    } reset{verifying_};
+    const auto t0 = Clock::now();
+    run(tokens, true);
+    ++spec_stats_.verifies;
+    spec_stats_.verified_tokens += tokens.size();
+    spec_stats_.verify_ms += ms_since(t0);
+    spec_stats_.verify_misses += last_step_.misses;
+    spec_stats_.verify_read_ms += last_step_.read_ms + last_step_.ensure_ms;
+    return logits_all_;
+}
+
+void Engine::keep(uint32_t n)
+{
+    const uint32_t T = uint32_t(verify_tokens_.size());
+    if (n == 0 || n > T || pos_ != verify_pos0_ + T)
+        throw std::runtime_error("keep: not after a verify of at least that many tokens");
+    if (n == T)
+        return;
+    pos_ = verify_pos0_ + n;
+    engram_history_ = engram_->advance(verify_history_, std::span<const int32_t>(verify_tokens_).first(n));
+    // A ratio-2 compressor whose pair is open (the next position odd) holds the first token's (k, g): the state the
+    // verify left after token n - 1.
+    if (pos_ % 2 == 1)
+        for (size_t s = 0; s < kv_sources_.size(); ++s)
+            if (cfg_.compress_ratios[kv_sources_[s]] == 2)
+                std::memcpy(comp_state_[s]->contents(),
+                            static_cast<const char*>(comp_hist_[s]->contents()) + uint64_t(n - 1) * 2 * cfg_.head_dim * 4,
+                            uint64_t(2) * cfg_.head_dim * 4);
+    verify_tokens_.resize(n);
 }
 
 } // namespace mako::dsv41

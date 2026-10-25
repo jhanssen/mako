@@ -27,6 +27,11 @@ struct Options {
     std::string expert_counts;     // routing profile; empty: the model's default one when it exists
     core::Telemetry telemetry = core::Telemetry::off;
     double simulate_ram_gb = 0;
+    // The DSpark drafter (a directory with dspark.json and dspark.bin); empty: none. Drafts are offered while each
+    // one's confidence is at least draft_conf and the product of theirs at least draft_cum, at most max_drafts.
+    std::string dspark;
+    float draft_conf = 0.5f, draft_cum = 0.5f;
+    uint32_t max_drafts = 4;
 };
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from
@@ -68,16 +73,41 @@ public:
     static constexpr std::array<std::string_view, 2> kAblationSites{"attn_out", "shexp_out"};
     void set_ablation(std::optional<mtl::Ablation> ablation);
 
+    // DSpark: three small blocks fed the trunk's streams entering its last layers, proposing the tokens after the
+    // next one, each with a confidence.
+    bool has_drafter() const override { return drafter_ != nullptr; }
+    std::vector<int32_t> draft(int32_t next) override;
+    const std::vector<float>& verify(std::span<const int32_t> tokens) override;
+    void keep(uint32_t n) override;
+    // The last draft()'s confidences (as many as it offered, then the ones it cut).
+    const std::vector<float>& draft_confidences() const { return draft_conf_; }
+    // Totals since load: draft() and verify() calls and their wall times, tokens verified.
+    struct SpecStats {
+        uint64_t drafts = 0, verifies = 0, verified_tokens = 0, steps = 0, verify_misses = 0, step_misses = 0;
+        double draft_ms = 0, verify_ms = 0, step_ms = 0, verify_read_ms = 0, step_read_ms = 0;
+    };
+    const SpecStats& spec_stats() const { return spec_stats_; }
+
 private:
     struct Layer;
+    struct Drafter;
 
     // G tokens at positions pos_..: every layer (attention in chunks of prefill_chunk), then the logits of the last
     // (of all, to the sink, when all_logits).
     void run(std::span<const int32_t> tokens, bool all_logits);
     // Attention of T tokens at positions pos0.. (rows of xn into rows of att); g0: their first row in the group's
     // selection rows.
+    // `ring`: the window's ring (null: layer il's); `block`: the tokens are a draft block (all see each other and the
+    // ring's positions before pos0; their rows do not go into the ring).
     void attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
-                   uint32_t T, uint32_t pos0, uint32_t g0);
+                   uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring = nullptr, bool block = false);
+    void load_drafter(const std::string& dir);
+    // The drafter's MoE of block b on T rows of xn into ffo (its experts all resident).
+    void draft_moe(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t b, MTL::Buffer* xn, MTL::Buffer* ffo,
+                   uint32_t T);
+    // The drafter's window rows for T positions from pos0 from the trunk's taps (rows of 3 * n_embd).
+    void seed_drafter(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* taps, uint64_t taps_off, uint32_t T,
+                      uint32_t pos0);
     // T tokens: x = sum_h pre[h] R[h] with the previous sublayer's pre (pc_prev rows); the new mixes of R go to pc
     // rows. R, pc and pc_prev at byte offsets r_off / pc_off (the same rows of each).
     void hc_lagged(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
@@ -108,6 +138,16 @@ private:
     std::vector<int32_t> kv_sources_;
     uint32_t pos_ = 0;
     std::vector<float> logits_;
+    std::vector<float> logits_all_; // verify(): a row per token
+    std::unique_ptr<Drafter> drafter_;
+    std::vector<float> draft_conf_;
+    // The last verify(): its first position and tokens, the Engram history before it; the ratio-2 compressors'
+    // state after each of its tokens (comp_hist_, per KV source).
+    uint32_t verify_pos0_ = 0;
+    std::vector<int32_t> verify_tokens_, verify_history_;
+    std::vector<mtl::Ref<MTL::Buffer>> comp_hist_;
+    bool verifying_ = false;
+    SpecStats spec_stats_;
     LogitsSink logits_sink_;
     core::StepStats last_prefill_;
     std::optional<mtl::Ablation> ablation_;

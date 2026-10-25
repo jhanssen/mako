@@ -75,7 +75,9 @@ Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads o
 
 - Prefill reads (~6 s a group, now overlapped with the GPU work): more resident experts or fewer bytes per expert.
 - Decode misses (15-40 a step).
-- DSpark not built yet. Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
+- DSpark (opt-in, `--dspark DIR`): greedy output identical to plain decoding (verify up to 8 tokens runs the decode
+  path); 19.8 -> 22.5 tok/s on code (93% of drafts kept), 23.5 -> 22.8 on a story (70%), its 8 GB costing the cache
+  ~9%. Draft rounds take ~11 ms (the reference engine's ~2.4). Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
   6 tokens costs 47-62 / 63 / 101 / 155-185 ms with ~12 misses per token at every width (tokens in a step share
   almost no experts; wider steps still pay off because the dense weights are read once and one step's misses are
   read in parallel). The reference engine's DSpark: on code 97% of drafts kept, 4.6 tokens a round (-> ~1.5-1.65x

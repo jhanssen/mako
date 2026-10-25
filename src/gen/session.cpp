@@ -141,6 +141,53 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         return f >= 0 ? f : sampler.sample(logits);
     };
     int32_t token = choose(lp.data());
+    if (p.speculative && e_.has_drafter()) {
+        // Each round: drafts after `token`, then token and the drafts in one verify; drafts are kept up to the first
+        // the sampler rejects (it then gives the token in its place), and after the last kept the trunk's next.
+        while (p.max_tokens > 0 && emit(token)) {
+            std::vector<int32_t> drafts = e_.draft(token);
+            const uint32_t room = std::min<uint32_t>(e_.max_context() - e_.position(),
+                                                     p.max_tokens - uint32_t(res.tokens.size()) + 1);
+            if (drafts.size() + 1 > room)
+                drafts.resize(room > 0 ? room - 1 : 0);
+            if (drafts.empty()) {
+                const std::vector<float>& l = e_.step(token);
+                ctx_.push_back(token);
+                token = choose(l.data());
+                continue;
+            }
+            std::vector<int32_t> run{token};
+            run.insert(run.end(), drafts.begin(), drafts.end());
+            const std::vector<float>& rows = e_.verify(run);
+            res.drafts += uint32_t(drafts.size());
+            uint32_t kept = 0;
+            int32_t next = -1;
+            bool more = true;
+            for (; kept < drafts.size(); ++kept) {
+                bool accepted = false;
+                const int32_t f = p.forced ? p.forced() : -1;
+                const int32_t t = f >= 0 ? (accepted = f == drafts[kept], f)
+                                         : sampler.verify(rows.data() + uint64_t(kept) * nv, drafts[kept], accepted);
+                if (!accepted) {
+                    next = t;
+                    break;
+                }
+                ++res.accepted;
+                if (!emit(drafts[kept])) {
+                    more = false;
+                    ++kept;
+                    break;
+                }
+            }
+            e_.keep(kept + 1);
+            ctx_.insert(ctx_.end(), run.begin(), run.begin() + kept + 1);
+            if (!more)
+                break;
+            token = next >= 0 ? next : choose(rows.data() + uint64_t(kept) * nv);
+        }
+        res.decode_ms = ms_since(t_decode);
+        return res;
+    }
     int32_t draft = spec ? e_.mtp_draft(token) : -1;
     mtp_next_ = spec ? token : -1;
     while (p.max_tokens > 0 && emit(token)) {

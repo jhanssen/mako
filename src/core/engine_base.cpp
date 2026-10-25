@@ -432,10 +432,11 @@ EngineBase::DevTensor EngineBase::upload(const std::string& name)
     if (!ref)
         throw std::runtime_error("missing tensor " + name);
     const gguf::Tensor& t = *ref.tensor;
-    const bool bf16 = t.type == gguf::Type::BF16;
-    if (t.type != gguf::Type::F32 && !bf16 && !mtl::Gemv::supports(t.type))
-        throw std::runtime_error(std::format("{}: unsupported type {}", name, gguf::traits(t.type).name));
-    const uint64_t bytes = bf16 ? t.bytes * 2 : t.bytes;
+    return upload_raw(ref.file->fd(), t.offset, t.bytes, t.type, t.dims, name);
+}
+
+EngineBase::DevTensor EngineBase::reserve(uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims)
+{
     if (weight_chunks_.empty() || chunk_used_ + bytes > weight_chunks_.back()->length()) {
         const uint64_t size = std::max(kChunkBytes, (bytes + kAlign - 1) / kAlign * kAlign);
         weight_chunks_.emplace_back(ctx_.device()->newBuffer(size, MTL::ResourceStorageModeShared));
@@ -446,20 +447,30 @@ EngineBase::DevTensor EngineBase::upload(const std::string& name)
     DevTensor d;
     d.buf = weight_chunks_.back().get();
     d.off = chunk_used_;
-    d.type = bf16 ? gguf::Type::F32 : t.type;
-    d.dims = t.dims;
+    d.type = type;
+    d.dims = std::move(dims);
+    chunk_used_ += (bytes + kAlign - 1) / kAlign * kAlign;
+    dense_bytes_ += bytes;
+    return d;
+}
+
+EngineBase::DevTensor EngineBase::upload_raw(int fd, uint64_t offset, uint64_t bytes, gguf::Type type,
+                                             std::vector<uint64_t> dims, const std::string& what)
+{
+    const bool bf16 = type == gguf::Type::BF16;
+    if (type != gguf::Type::F32 && !bf16 && !mtl::Gemv::supports(type))
+        throw std::runtime_error(std::format("{}: unsupported type {}", what, gguf::traits(type).name));
+    DevTensor d = reserve(bf16 ? bytes * 2 : bytes, bf16 ? gguf::Type::F32 : type, std::move(dims));
     char* dst = static_cast<char*>(d.buf->contents()) + d.off;
     if (bf16) {
-        std::vector<uint16_t> raw(t.bytes / 2);
-        gguf::read_exact(ref.file->fd(), raw.data(), t.bytes, t.offset);
+        std::vector<uint16_t> raw(bytes / 2);
+        gguf::read_exact(fd, raw.data(), bytes, offset);
         auto* f = reinterpret_cast<uint32_t*>(dst);
         for (size_t i = 0; i < raw.size(); ++i)
             f[i] = uint32_t(raw[i]) << 16;
     } else {
-        gguf::read_exact(ref.file->fd(), dst, t.bytes, t.offset);
+        gguf::read_exact(fd, dst, bytes, offset);
     }
-    chunk_used_ += (bytes + kAlign - 1) / kAlign * kAlign;
-    dense_bytes_ += bytes;
     return d;
 }
 
@@ -538,7 +549,7 @@ void EngineBase::proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL:
 {
     const uint32_t k = uint32_t(w.dims[0]), n = uint32_t(w.dims[1]);
     // A few tokens (decode, speculative verification) stay on the GEMV, which reads each weight once for them.
-    if (T > kMaxDecodeTokens && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type)) {
+    if (T >= gemm_min_tokens_ && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type)) {
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, halves(enc, x, x_off, T, k, 0), 0, y, y_off, ldy);
         if (tel_ == Telemetry::kernels)
             after(enc, std::format("gemm {} {}x{}", gguf::traits(w.type).name, k, n));

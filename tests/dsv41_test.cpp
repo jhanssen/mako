@@ -247,6 +247,44 @@ int main(int argc, char** argv)
         check(off.logits == plain.logits, "switched off: the same logits, bit for bit");
     }
 
+    // Speculative verification: rows of a verify() against the same tokens step by step, and keep()'s rollback
+    // (continuing after it as if the rejected tokens had never run), with the next position odd and even (a
+    // ratio-2 compressor's pair open or closed).
+    {
+        engine.set_ablation(std::nullopt);
+        const uint32_t at = 10; // verify ids[at .. at + width) after a prefill of the ones before
+        // The reference: the same prefill, then step by step.
+        Run steps;
+        steps.logits.resize(ids.size());
+        engine.reset();
+        engine.prefill(std::span<const int32_t>(ids).first(at));
+        for (size_t i = at; i < ids.size(); ++i)
+            steps.logits[i] = engine.step(ids[i]);
+        for (const uint32_t width : {2u, 4u, 5u}) {
+            for (const uint32_t keep : {1u, 2u}) {
+                engine.reset();
+                engine.prefill(std::span<const int32_t>(ids).first(at));
+                std::vector<int32_t> run_ids(ids.begin() + at, ids.begin() + at + width);
+                for (uint32_t i = keep; i < width; ++i)
+                    run_ids[i] = 9 + int32_t(i); // rejected drafts
+                const auto rows = engine.verify(run_ids);
+                double kv = 0;
+                for (uint32_t i = 0; i < keep; ++i)
+                    kv += kl(steps.logits[at + i], std::vector<float>(rows.begin() + uint64_t(i) * V,
+                                                                      rows.begin() + uint64_t(i + 1) * V));
+                engine.keep(keep);
+                double kc = 0;
+                for (size_t i = at + keep; i < ids.size(); ++i)
+                    kc += kl(steps.logits[i], engine.step(ids[i]));
+                kc /= double(ids.size() - at - keep);
+                check(engine.position() == ids.size() && kv / keep < 0.02 && kc < 0.02,
+                      std::format("verify of {} keeping {} (next position {}): rows vs steps KL {:.1e}, continuing "
+                                  "after the rollback KL {:.1e}",
+                                  width, keep, at + keep, kv / keep, kc));
+            }
+        }
+    }
+
     if (!abl_path.empty() && std::filesystem::exists(abl_path)) {
         auto prefill_vs_decode = [&](std::optional<mako::mtl::Ablation> a) {
             const Run dec = run(std::move(a));
