@@ -168,8 +168,13 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
             ctx.messages.push_back({.role = "system", .content = {json::quoted(s)}});
     }
     for (const auto& m : b.messages) {
-        if (m.role != "user" && m.role != "assistant")
+        if (m.role != "user" && m.role != "assistant" && m.role != "system")
             throw BadRequest(std::format("unsupported role '{}'", m.role));
+        if (m.role == "system") { // mid-conversation instructions; the template renders them in place
+            if (std::string t = text_of(m.content.str, "system message"); !t.empty())
+                ctx.messages.push_back({.role = "system", .content = {json::quoted(t)}});
+            continue;
+        }
         const std::string_view raw = trim(m.content.str);
         if (!raw.empty() && raw.front() == '"') {
             ctx.messages.push_back({.role = m.role, .content = {std::string(raw)}});

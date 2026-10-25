@@ -1,6 +1,6 @@
 // OpenAI-compatible HTTP server for a model.
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--no-spec]
-//              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn]
+//              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR]
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes per-layer directions
 // (raw float32, layers x k x n_embd) from the residual streams (Engine::set_ablation).
@@ -26,7 +26,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn]");
+                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -72,6 +72,8 @@ int main(int argc, char** argv)
             ablate_scale = std::stof(v);
         else if (a == "--max-waiting")
             so.max_waiting = uint32_t(std::stoul(v));
+        else if (a == "--dump-requests")
+            so.dump_dir = v;
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
@@ -120,9 +122,20 @@ int main(int argc, char** argv)
         }
         std::println(stderr, "ablating the directions in {} (scale {})", ablate, ablate_scale);
     }
-    std::println(stderr, "loaded in {:.1f} s; context {} tokens; temperature {}, top_p {}",
+    uint64_t slots = 0, experts = 0;
+    for (uint32_t l = 0; l < cfg->n_layer; ++l)
+        if (const uint32_t n = engine.arena().slots(l)) {
+            slots += n;
+            experts += cfg->n_expert;
+        }
+    const double resident = experts ? 100.0 * double(slots) / double(experts) : 100.0;
+    std::println(stderr, "loaded in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
+                         "temperature {}, top_p {}",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), opts.max_ctx,
-                 so.sampling.temperature, so.sampling.top_p);
+                 engine.arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
+    if (resident < 50)
+        std::println(stderr, "warning: little memory was free for the expert cache (a process that just exited may "
+                             "still be returning its memory); decoding will read experts from the SSD often");
     {
         mako::server::Server server(engine, *tok, *tmpl, so);
         std::jthread stopper([&] {

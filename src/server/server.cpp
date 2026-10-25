@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <format>
 #include <mutex>
 #include <print>
@@ -107,6 +108,13 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
     };
     ChatRequest cr;
     std::vector<int32_t> prompt;
+    if (!opts.dump_dir.empty()) {
+        static std::atomic<uint64_t> dumped = 0;
+        if (std::FILE* f = std::fopen(std::format("{}/request-{}.json", opts.dump_dir, ++dumped).c_str(), "w")) {
+            std::fwrite(req.body.data(), 1, req.body.size(), f);
+            std::fclose(f);
+        }
+    }
     try {
         cr = parse();
         const auto rendered = tmpl.render(cr.context);

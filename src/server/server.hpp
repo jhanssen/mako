@@ -18,6 +18,7 @@ struct ServerOptions {
     gen::SamplingParams sampling; // defaults for fields a request leaves out
     bool speculative = true;
     uint32_t max_waiting = 4; // requests waiting behind the one generating; more get HTTP 503
+    std::string dump_dir;     // non-empty: each generation request's body is written there (client debugging)
 };
 
 // OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health.

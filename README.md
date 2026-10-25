@@ -56,7 +56,9 @@ An OpenAI-compatible server at `http://127.0.0.1:8080/v1`: `POST /v1/chat/comple
 calls, `reasoning_content`), `GET /v1/models`, `GET /health`. It also serves the Anthropic Messages API:
 `POST /v1/messages` (text, thinking, tool_use and tool_result blocks, streaming events, `tool_choice` auto/any/tool/none;
 thinking blocks only when `thinking` is enabled, its budget picking the template's low, high or maximum effort) and
-`POST /v1/messages/count_tokens`. Image and document blocks and server tools are rejected. Prompts are rendered with the GGUF's chat template;
+`POST /v1/messages/count_tokens`. Image and document blocks and server tools are rejected. Claude Code works against
+it (`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, any `ANTHROPIC_API_KEY`); its first request is a ~11K-token prompt.
+`--dump-requests DIR` writes each request body there, for debugging a client. Prompts are rendered with the GGUF's chat template;
 sampling defaults come from its `general.sampling.*` metadata. Requests run one at a time on one session, so a
 conversation's next turn reuses the context its previous turn left; up to `--max-waiting` (default 4) wait behind
 the one generating, more get HTTP 503 with `Retry-After`, and a waiting request whose client went away is dropped. `developer` messages are treated as `system`;

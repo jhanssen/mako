@@ -280,7 +280,7 @@ int main(int argc, char** argv)
         check(any.tool_required && any.tool_name == "bash" && !any.show_reasoning, "anthropic: tool_choice tool");
         for (const char* bad : {R"({"messages":[{"role":"user","content":"x"}]})",
                                 R"({"max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{}}]}]})",
-                                R"({"max_tokens":5,"messages":[{"role":"system","content":"x"}]})",
+                                R"({"max_tokens":5,"messages":[{"role":"robot","content":"x"}]})",
                                 R"({"max_tokens":5,"messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"any"}})"}) {
             bool threw = false;
             try {
