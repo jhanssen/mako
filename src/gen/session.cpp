@@ -26,6 +26,9 @@ void Session::clear()
 // Back to the best state that holds at most ctx_[0, keep): the current one, a checkpoint, or the start.
 void Session::rewind(size_t keep)
 {
+    // The model moved outside this session (another user, or a new session over a used model): nothing is known.
+    if (e_.position() != ctx_.size())
+        clear();
     if (keep >= ctx_.size())
         return;
     Saved* best = nullptr;

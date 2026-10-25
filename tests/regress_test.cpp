@@ -47,8 +47,9 @@ const fs::path kExpected = kData / "regress_expected.txt";
 // Tolerances, from the spread measured when they were set (see each use).
 // Prefill vs decode on the short prompt: KL between their distributions and the largest difference among decode's
 // top-20 logits (a maximum over the whole vocabulary measures f16 noise in the far tail instead). Measured when
-// set: KL 1.3e-4, top-20 difference 0.052, the same at every chunk size.
-constexpr double kPrefillKl = 2e-4;
+// set: KL 1.3e-4, top-20 difference 0.052, the same at every chunk size; 3.1e-4 / 0.047 since decode's IQ3_XXS GEMV
+// rounds differently (decode against the reference unchanged: KL 0.0114, top-1 94.5%).
+constexpr double kPrefillKl = 4.5e-4;
 constexpr double kPrefillTopDiff = 0.06;
 constexpr int kTopK = 64;                // reference logits stored per position
 

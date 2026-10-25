@@ -142,8 +142,10 @@ sessions), and long sessions are unmeasured.
 mako's own IQ2_XXS decode GEMV (grid table as half in threadgroup memory, signs by negation, the per-format kernel's
 summation order): bit-identical, 361 -> 405 GB/s, resident experts 7.8 -> 7.35 ms a step (+1.5% tok/s). The same for
 IQ3_XXS (385 -> 440 GB/s) differs from the per-format kernel at rounding level (1.4e-7 relative: the compiler fuses the
-original's arithmetic differently, and reproducing its expression form did not match it); GLM-5.3's prefill and
-session checks then fail, so it is not used. More rows per simdgroup (8, 16) is slower for both: the kernels are bound
+original's arithmetic differently, and reproducing its expression form did not match it). Accuracy is unchanged
+(DeepSeek 1300 positions vs the reference: top-1 98.2% both, KL 0.00557 -> 0.00572; GLM-5.3 decode vs the reference
+KL 0.0114, top-1 94.5%), so it is used; the GLM prefill-vs-decode limit was re-baselined (1.2e-4 -> 3.1e-4), and the
+session check's failure was a Session bug (a new session over a used engine did not reset it). More rows per simdgroup (8, 16) is slower for both: the kernels are bound
 by per-weight work, not by re-reading the activations.
 
 Short GEMV benchmarks at low GPU clocks read ~2x slow (a first measurement blamed the Q4_K kernel; warmed up it
