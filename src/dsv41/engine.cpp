@@ -87,6 +87,7 @@ struct EngramDecodeArgs {
 
 constexpr uint32_t kFp8 = 0, kFp4E4m3 = 1, kFp4Pow2 = 2; // ds_round kinds
 constexpr uint32_t kHistTokens = 8; // verify() runs at most this many tokens (the compressors keep a state per token)
+constexpr uint32_t kCommitLayers = 4; // decode: layers per command buffer
 constexpr uint32_t kAttnGroup = 64; // query tokens per attention dispatch (bounds its key copies and scores)
 
 // RoPE frequencies for n_rot dims: base^(-2i/n_rot), with YaRN's ramp toward freq / factor when orig_ctx > 0.
@@ -896,6 +897,18 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         std::swap(R, R2);
         prev = pcs[cur];
         cur ^= 1;
+        // Decode: the layers encoded so far go to the GPU while the rest are encoded, and layers whose routing is
+        // back are served in between (the GPU waits at each MoE layer until then).
+        if (decode && !timing() && (il + 1) % kCommitLayers == 0 && il + 1 < cfg_.n_layer) {
+            enc->endEncoding();
+            cb->commit();
+            committed.push_back(cb->retain());
+            cb = ctx_.queue()->commandBuffer();
+            cur_cb_ = cb;
+            enc = encoder(cb, cur_layer_, -1);
+        }
+        if (decode && !committed.empty())
+            serve_moe(committed.back(), false);
     }
     // The drafter's window rows of these positions (the last ring-length of them).
     if (drafter_) {
@@ -936,14 +949,14 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
                 for (uint32_t i = 0; i < n; ++i)
                     logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
         }
-        if (l0 + n == G)
+        if (l0 + n == G) {
             std::memcpy(logits_.data(), lgp + uint64_t(n - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
+            break;
+        }
         cb = ctx_.queue()->commandBuffer();
         cur_cb_ = cb;
         enc = encoder(cb, cur_layer_, -1);
     }
-    enc->endEncoding();
-    finish(cb);
     pos_ += G;
     pool->release();
 

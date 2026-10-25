@@ -173,7 +173,8 @@ protected:
     void moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,
                     MTL::Buffer* xn, MTL::Buffer* ffo, uint32_t T,
                     const std::function<void(MTL::ComputeCommandEncoder*&, MTL::Buffer* sho)>& between = {});
-    void serve_moe(MTL::CommandBuffer* cb);
+    // block false: only the layers whose routing has already been signaled, stopping at the first that has not.
+    void serve_moe(MTL::CommandBuffer* cb, bool block = true);
     // G tokens' routed experts of arena row il (rows of xn_g) added into ffo, which holds their shared expert's
     // output. Command buffers it commits go to `committed`: they must complete before the row's slots are used again.
     void moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,

@@ -764,7 +764,7 @@ void EngineBase::ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& ga
 
 // Serves the MoE layers of a committed command buffer in order: waits until a layer's router has run, makes its
 // selected experts resident and writes their slots, then lets the GPU continue.
-void EngineBase::serve_moe(MTL::CommandBuffer* cb)
+void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
 {
     const uint32_t k = dims_.n_expert_used;
     const uint64_t rows = kMaxDecodeTokens * 16 * 4;
@@ -775,7 +775,11 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb)
     auto* miss_rank = static_cast<int32_t*>(scratch("mrank", rows)->contents());
     const uint32_t arena_rows = uint32_t(arena_->usage().size());
     auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(arena_rows) * kMaxDecodeTokens * 36)->contents());
+    size_t served = 0;
     for (const auto [il, v, T] : pending_moe_) {
+        if (!block && routed_->signaledValue() < v)
+            break;
+        ++served;
         const auto t_wait = Clock::now();
         for (uint32_t spins = 0; routed_->signaledValue() < v; ++spins)
             if (spins % 4096 == 4095 && cb->status() == MTL::CommandBufferStatusError)
@@ -837,7 +841,7 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb)
                 ind[d * 3 + 2] = k;
         ready_->setSignaledValue(v);
     }
-    pending_moe_.clear();
+    pending_moe_.erase(pending_moe_.begin(), pending_moe_.begin() + ptrdiff_t(served));
 }
 
 void EngineBase::finish(MTL::CommandBuffer* cb)

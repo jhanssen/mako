@@ -168,6 +168,10 @@ resident, so misses are experts not used for a while; only the router predicts t
 layer (~0.7 ms) before it is needed, competing with that layer's own misses for the SSD: estimated 2-3 ms a step on
 the story. Not built yet.
 
+Decode steps committed every 4 layers, with layers whose routing is back served between encodes (`serve_moe` without
+blocking), and no empty command buffer after the logits: the GPU starts while the CPU still encodes. 41.4 -> 41.0 ms a
+step (+1%, two A/B pairs); wall time is now ~0.5 ms over GPU time.
+
 Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
 projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
 GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against
