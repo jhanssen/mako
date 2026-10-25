@@ -1,7 +1,10 @@
 // DeepSeek-V4.1 kernels: partial RoPE, the FP8 / FP4 activation roundings, the compressor, the sparse attention
 // with its sink, the indexer and Engram. Activations are fp32.
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // Nearest E4M3 value (ties to even), saturating at 448; a must be >= 0.
 static float e4m3_mag(float a)
@@ -160,62 +163,83 @@ static Keys keys_of(constant AttnArgs& a, uint t)
     return k;
 }
 
-static device const float* window_row(constant AttnArgs& a, device const float* chunk, device const float* ringb,
-                                      uint pos)
+// Where key j of token t lives: kind 0 the chunk's rows, 1 the ring, 2 the compressed rows (half), 3 none (zeros);
+// row its row there.
+static uint2 key_row(constant AttnArgs& a, Keys kk, uint t, uint j, device const int* sel)
 {
-    return pos >= a.pos0 ? chunk + uint64_t(pos - a.pos0) * a.dim : ringb + uint64_t(pos % a.ring) * a.dim;
+    if (j < kk.nw) {
+        const uint pos = kk.first + j;
+        return pos >= a.pos0 ? uint2(0, pos - a.pos0) : uint2(1, pos % a.ring);
+    }
+    if (j < kk.nw + kk.nc) {
+        const uint c = j - kk.nw;
+        return uint2(2, kk.identity ? c : uint(sel[uint64_t(t) * a.top + c]));
+    }
+    return uint2(3, 0);
 }
 
-// scores[t][h][j] = scale * q_t,h . key_j(t). Threadgroups of 256 threads take 8 of token t's keys (staged in
-// threadgroup memory); each simdgroup takes heads h = sg, sg + 8, ... Grid (ceil(stride / 8), tokens). dim <= 512.
-kernel void ds_attn_scores(device const float* q [[buffer(0)]], device const float* chunk [[buffer(1)]],
+static float4 key4(uint2 kr, uint d4, uint dim, device const float* chunk, device const float* ringb,
+                   device const half* comp)
+{
+    switch (kr.x) {
+    case 0: return reinterpret_cast<device const float4*>(chunk + uint64_t(kr.y) * dim)[d4];
+    case 1: return reinterpret_cast<device const float4*>(ringb + uint64_t(kr.y) * dim)[d4];
+    case 2: return float4(reinterpret_cast<device const half4*>(comp + uint64_t(kr.y) * dim)[d4]);
+    default: return float4(0.0f);
+    }
+}
+
+// scores[t][h][j] = q_t,h . key_j(t) (the scale goes in the softmax): 64 heads x 32 keys a threadgroup of 4
+// simdgroups through matmul2d, the keys staged as half in threadgroup memory 256 dims at a time, half q, float
+// accumulation. Grid (stride / 32, tokens); heads 64, dim a multiple of 256.
+kernel void ds_attn_scores(device const half* q [[buffer(0)]], device const float* chunk [[buffer(1)]],
                            device const float* ringb [[buffer(2)]], device const half* comp [[buffer(3)]],
                            device const int* sel [[buffer(4)]], device float* scores [[buffer(5)]],
                            constant AttnArgs& a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
-                           uint2 tid2 [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]])
+                           ushort tid [[thread_index_in_threadgroup]])
 {
-    const uint tid = tid2.x;
-    threadgroup float ks[8][512];
-    const uint t = a.t0 + tg.y, j0 = tg.x * 8;
+    constexpr int GN = 32, GK = 256;
+    threadgroup half ws[GN * GK];
+    threadgroup uint2 rows[GN];
+    const uint t = a.t0 + tg.y, j0 = tg.x * GN;
     const Keys kk = keys_of(a, t);
-    const uint n = kk.nw + kk.nc;
-    if (j0 >= n)
+    if (j0 >= kk.nw + kk.nc)
         return;
-    for (uint i = tid; i < 8 * a.dim; i += 256) {
-        const uint r = i / a.dim, d = i % a.dim, j = j0 + r;
-        float v = 0.0f;
-        if (j < kk.nw) {
-            v = window_row(a, chunk, ringb, kk.first + j)[d];
-        } else if (j < n) {
-            const uint c = j - kk.nw;
-            const uint row = kk.identity ? c : uint(sel[uint64_t(t) * a.top + c]);
-            v = float(comp[uint64_t(row) * a.dim + d]);
-        }
-        ks[r][d] = v;
-    }
+    if (tid < GN)
+        rows[tid] = key_row(a, kk, t, j0 + tid, sel);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    device float* srow = scores + uint64_t(tg.y) * a.heads * a.stride;
-    for (uint h = sg; h < a.heads; h += 8) {
-        float acc[8] = {};
-        device const float* qh = q + (uint64_t(t) * a.heads + h) * a.dim;
-        for (uint d = lane; d < a.dim; d += 32) {
-            const float qv = qh[d];
-            for (uint r = 0; r < 8; ++r)
-                acc[r] += qv * ks[r][d];
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + uint64_t(t) * a.heads * a.dim,
+                                                                dextents<int32_t, 2>(a.dim, a.heads));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(GK, GN));
+    constexpr auto desc = matmul2d_descriptor(64, GN, GK, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto mq = tq.slice(0, 0);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mq), decltype(tw), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    for (uint d = 0; d < a.dim; d += GK) {
+        for (uint i = tid; i < GN * GK / 4; i += 128) {
+            const uint r = i / (GK / 4), c4 = i % (GK / 4);
+            reinterpret_cast<threadgroup half4*>(ws)[i] = half4(key4(rows[r], d / 4 + c4, a.dim, chunk, ringb, comp));
         }
-        for (uint r = 0; r < 8; ++r) {
-            const float s = simd_sum(acc[r]);
-            if (lane == 0 && j0 + r < n)
-                srow[uint64_t(h) * a.stride + j0 + r] = s * a.scale;
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto qd = tq.slice(int(d), 0);
+        op.run(qd, tw, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> ts(scores + uint64_t(tg.y) * a.heads * a.stride,
+                                                                 dextents<int32_t, 2>(a.stride, a.heads));
+    acc.store(ts.slice(int(j0), 0));
 }
 
-// Per token and head: p = exp(s - m) / (sum exp(s - m) + exp(sink - m)), m = max(max s, sink), in place. Threadgroups
+// Per token and head, s scaled first: p = exp(s - m) / (sum exp(s - m) + exp(sink - m)), m = max(max s, sink), as
+// half into ph (zeros past the token's keys, up to stride). Threadgroups
 // of 256 threads; grid (heads, tokens).
 kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const float* sink [[buffer(1)]],
-                            constant AttnArgs& a [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
+                            constant AttnArgs& a [[buffer(2)]], device half* ph [[buffer(3)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
                             uint2 tid2 [[thread_position_in_threadgroup]])
 {
     const uint tid = tid2.x;
@@ -225,8 +249,10 @@ kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const flo
     const uint n = kk.nw + kk.nc;
     device float* s = scores + (uint64_t(tg.y) * a.heads + h) * a.stride;
     float m = -INFINITY;
-    for (uint j = tid; j < n; j += 256)
+    for (uint j = tid; j < n; j += 256) {
+        s[j] *= a.scale;
         m = max(m, s[j]);
+    }
     m = simd_max(m);
     if (tid % 32 == 0)
         red[tid / 32] = m;
@@ -249,39 +275,57 @@ kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const flo
     for (uint i = 0; i < 8; ++i)
         total += red[i];
     const float inv = 1.0f / total;
-    for (uint j = tid; j < n; j += 256)
-        s[j] *= inv;
+    device half* pr = ph + (uint64_t(tg.y) * a.heads + h) * a.stride;
+    for (uint j = tid; j < a.stride; j += 256)
+        pr[j] = j < n ? half(s[j] * inv) : 0.0h;
 }
 
-// o[t][h][d] = sum_j p[t][h][j] key_j(t)[d]. Threadgroups of 256 threads own 64 dims of a token: thread (d % 64,
-// head group of 16); grid (dim / 64, tokens).
-kernel void ds_attn_out(device const float* p [[buffer(0)]], device const float* chunk [[buffer(1)]],
+// o[t][h][d] = sum_j p[t][h][j] key_j(t)[d]: 64 heads x 64 dims a threadgroup of 4 simdgroups through matmul2d,
+// probabilities (half, from the softmax) and keys staged 64 keys at a time in threadgroup memory, float
+// accumulation. Grid (dim / 64, tokens).
+kernel void ds_attn_out(device const half* p [[buffer(0)]], device const float* chunk [[buffer(1)]],
                         device const float* ringb [[buffer(2)]], device const half* comp [[buffer(3)]],
                         device const int* sel [[buffer(4)]], device float* o [[buffer(5)]],
                         constant AttnArgs& a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
-                        uint2 tid2 [[thread_position_in_threadgroup]])
+                        ushort tid [[thread_index_in_threadgroup]])
 {
-    const uint tid = tid2.x;
-    const uint t = a.t0 + tg.y, d = tg.x * 64 + tid % 64, h0 = (tid / 64) * 16;
+    constexpr int TK = 64;
+    threadgroup half ps[64 * TK], ks[TK * 64];
+    threadgroup uint2 rows[TK];
+    const uint t = a.t0 + tg.y, d0 = tg.x * 64;
     const Keys kk = keys_of(a, t);
     const uint n = kk.nw + kk.nc;
-    device const float* prow = p + uint64_t(tg.y) * a.heads * a.stride;
-    float acc[16] = {};
-    for (uint j = 0; j < n; ++j) {
-        float k;
-        if (j < kk.nw) {
-            k = window_row(a, chunk, ringb, kk.first + j)[d];
-        } else {
-            const uint c = j - kk.nw;
-            const uint row = kk.identity ? c : uint(sel[uint64_t(t) * a.top + c]);
-            k = float(comp[uint64_t(row) * a.dim + d]);
+    device const half* prow = p + uint64_t(tg.y) * a.heads * a.stride;
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(ps, dextents<int32_t, 2>(TK, 64));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tk(ks, dextents<int32_t, 2>(64, TK));
+    constexpr auto desc = matmul2d_descriptor(64, 64, TK, false, false, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto acc = op.get_destination_cooperative_tensor<decltype(tp), decltype(tk), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    for (uint j0 = 0; j0 < n; j0 += TK) {
+        if (tid < TK)
+            rows[tid] = key_row(a, kk, t, j0 + tid, sel);
+        // p tile: heads x keys j0 .. (zeros past n come from the softmax, up to stride)
+        for (uint i = tid; i < 64 * TK / 4; i += 128) {
+            const uint h = i / (TK / 4), c4 = i % (TK / 4);
+            reinterpret_cast<threadgroup half4*>(ps)[i] =
+                reinterpret_cast<device const half4*>(prow + uint64_t(h) * a.stride + j0)[c4];
         }
-        for (uint i = 0; i < 16; ++i)
-            acc[i] += prow[uint64_t(h0 + i) * a.stride + j] * k;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < TK * 64 / 4; i += 128) {
+            const uint r = i / 16, c4 = i % 16;
+            reinterpret_cast<threadgroup half4*>(ks)[i] = half4(key4(rows[r], d0 / 4 + c4, a.dim, chunk, ringb, comp));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(tp, tk, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint i = 0; i < 16; ++i)
-        if (h0 + i < a.heads)
-            o[(uint64_t(t) * a.heads + h0 + i) * a.dim + d] = acc[i];
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(o + uint64_t(t) * a.heads * a.dim,
+                                                                 dextents<int32_t, 2>(a.dim, a.heads));
+    acc.store(to.slice(int(d0), 0));
 }
 
 // The last min(tokens, ring) of the chunk's rows into the ring (row pos % ring). Grid (dim, rows).

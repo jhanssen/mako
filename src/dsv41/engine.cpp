@@ -58,7 +58,7 @@ struct EngramDecodeArgs {
 };
 
 constexpr uint32_t kFp8 = 0, kFp4E4m3 = 1, kFp4Pow2 = 2; // ds_round kinds
-constexpr uint32_t kAttnGroup = 32;                      // query tokens per attention dispatch (bounds the scores)
+constexpr uint32_t kAttnGroup = 64; // query tokens per attention dispatch (bounds its key copies and scores)
 
 // RoPE frequencies for n_rot dims: base^(-2i/n_rot), with YaRN's ramp toward freq / factor when orig_ctx > 0.
 std::vector<float> rope_freqs(uint32_t n_rot, float base, uint32_t orig_ctx, float factor, float beta_fast,
@@ -101,7 +101,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     : EngineBase(model, ctx, opts.telemetry), cfg_(cfg), opts_(opts)
 {
     const auto t_load = Clock::now();
-    if (cfg_.head_dim != 512 || cfg_.n_rot != 64 || cfg_.hc != 4 || cfg_.n_head * cfg_.head_dim != cfg_.o_groups * 4096 ||
+    if (cfg_.head_dim != 512 || cfg_.n_head != 64 || cfg_.n_rot != 64 || cfg_.hc != 4 || cfg_.n_head * cfg_.head_dim != cfg_.o_groups * 4096 ||
         cfg_.indexer_dim != 128 || cfg_.n_expert_used > 16)
         throw std::runtime_error("unsupported DeepSeek-V4.1 geometry");
     if (cfg_.gating != 4)
@@ -430,7 +430,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
                 enc->setBuffer(blk_ids, 0, 1);
                 enc->setBuffer(keep, uint64_t(g0 + t0) * blk_stride, 2);
                 enc->setBytes(&ta, sizeof(ta), 3);
-                enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
+                for (int r = repeats("ds_topk"); r > 0; --r)
+                    enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
                 after(enc, "ds_topk");
             } else if (cand >= 0 && cand < int(il) && (stride + bs - 1) / bs > kb) {
                 enc->setComputePipelineState(pso("ds_block_mask"));
@@ -446,19 +447,25 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             enc->setBuffer(sel, uint64_t(g0 + t0) * top * 4, 1);
             enc->setBuffer(keep, 0, 2);
             enc->setBytes(&ta, sizeof(ta), 3);
-            enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
+            for (int r = repeats("ds_topk"); r > 0; --r)
+                enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
             after(enc, "ds_topk");
         }
     }
 
     MTL::Buffer* o = scratch("ds_o", uint64_t(T) * HD * 4);
-    const uint32_t stride = W + top;
-    MTL::Buffer* sc = scratch("ds_sc", uint64_t(std::min(T, kAttnGroup)) * H * stride * 4);
+    const uint32_t stride = (W + top + 63) / 64 * 64; // whole tiles of 64 keys for the matmuls
+    const uint32_t ng = std::min(T, kAttnGroup);
+    MTL::Buffer* qh = scratch("ds_qh", uint64_t(T) * HD * 2);
+    MTL::Buffer* sc = scratch("ds_sc", uint64_t(ng) * H * stride * 4);
+    MTL::Buffer* ph = scratch("ds_ph", uint64_t(ng) * H * stride * 2);
     MTL::Buffer* cbuf = comp ? ckv_[L.owner].get() : ring_[il].get();
+    gemm_->to_half(enc, q, 0, T, HD, 0, qh, 0);
+    after(enc, "to_half");
     for (uint32_t t0 = 0; t0 < T; t0 += kAttnGroup) {
         const uint32_t n = std::min(kAttnGroup, T - t0);
         const AttnArgs aa{D, H, stride, W, pos0, t0, ratio, top, 1.0f / std::sqrt(float(D))};
-        auto bind = [&](const char* fn) {
+        auto keys = [&](const char* fn) {
             enc->setComputePipelineState(pso(fn));
             enc->setBuffer(kvc, 0, 1);
             enc->setBuffer(ring_[il].get(), 0, 2);
@@ -466,21 +473,25 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             enc->setBuffer(sel, uint64_t(g0) * top * 4, 4);
             enc->setBytes(&aa, sizeof(aa), 6);
         };
-        bind("ds_attn_scores");
-        enc->setBuffer(q, 0, 0);
+        keys("ds_attn_scores");
+        enc->setBuffer(qh, 0, 0);
         enc->setBuffer(sc, 0, 5);
-        enc->dispatchThreadgroups(MTL::Size((stride + 7) / 8, n, 1), MTL::Size(256, 1, 1));
+        for (int r = repeats("ds_attn_scores"); r > 0; --r)
+            enc->dispatchThreadgroups(MTL::Size(stride / 32, n, 1), MTL::Size(128, 1, 1));
         after(enc, "ds_attn_scores");
         enc->setComputePipelineState(pso("ds_attn_softmax"));
         enc->setBuffer(sc, 0, 0);
         enc->setBuffer(L.sinks.buf, L.sinks.off, 1);
         enc->setBytes(&aa, sizeof(aa), 2);
-        enc->dispatchThreadgroups(MTL::Size(H, n, 1), MTL::Size(256, 1, 1));
+        enc->setBuffer(ph, 0, 3);
+        for (int r = repeats("ds_attn_softmax"); r > 0; --r)
+            enc->dispatchThreadgroups(MTL::Size(H, n, 1), MTL::Size(256, 1, 1));
         after(enc, "ds_attn_softmax");
-        bind("ds_attn_out");
-        enc->setBuffer(sc, 0, 0);
+        keys("ds_attn_out");
+        enc->setBuffer(ph, 0, 0);
         enc->setBuffer(o, 0, 5);
-        enc->dispatchThreadgroups(MTL::Size(D / 64, n, 1), MTL::Size(256, 1, 1));
+        for (int r = repeats("ds_attn_out"); r > 0; --r)
+            enc->dispatchThreadgroups(MTL::Size(D / 64, n, 1), MTL::Size(128, 1, 1));
         after(enc, "ds_attn_out");
     }
     const uint32_t ra[4] = {D, T, pos0, W};
@@ -531,14 +542,27 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
         core::Telemetry saved;
         ~Level() { tel = saved; }
     } level{tel_, tel_};
-    if (tel_ >= core::Telemetry::layers)
+    if (tel_ == core::Telemetry::kernels)
         tel_ = core::Telemetry::summary;
+    if (timing()) {
+        total.layers.assign(cfg_.n_layer, core::LayerTimes{});
+        for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
+            total.layers[l].layer = l;
+            total.layers[l].mla = true;
+        }
+    }
     const ScratchLoan loan(*this, prefill_scratch(std::min<uint32_t>(opts_.prefill_chunk, uint32_t(tokens.size())),
                                                   std::min<uint32_t>(opts_.prefill_group, uint32_t(tokens.size()))));
     for (size_t g0 = 0; g0 < tokens.size(); g0 += opts_.prefill_group) {
         const size_t n = std::min<size_t>(opts_.prefill_group, tokens.size() - g0);
         run(tokens.subspan(g0, n), bool(logits_sink_));
         total.ensure_ms += last_step_.ensure_ms;
+        for (size_t l = 0; l < total.layers.size() && l < last_step_.layers.size(); ++l) {
+            total.layers[l].attn_ms += last_step_.layers[l].attn_ms;
+            total.layers[l].ffn_ms += last_step_.layers[l].ffn_ms;
+            total.layers[l].hit_ms += last_step_.layers[l].hit_ms;
+            total.layers[l].miss_ms += last_step_.layers[l].miss_ms;
+        }
         if (cancelled && g0 + n < tokens.size() && cancelled())
             break;
     }

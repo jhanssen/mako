@@ -2,7 +2,7 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [-n N]
+//          [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [-n N]
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
 #include "dsv41/config.hpp"
@@ -66,6 +66,8 @@ int main(int argc, char** argv)
             opts.prefill_chunk = uint32_t(std::stoul(v));
         else if (a == "--group")
             opts.prefill_group = uint32_t(std::stoul(v));
+        else if (a == "--telemetry")
+            opts.telemetry = v == "layers" ? mako::core::Telemetry::layers : mako::core::Telemetry::summary;
         else if (a == "--top-k")
             opts.indexer_top_k = uint32_t(std::stoul(v));
         else if (a == "--ablate")
@@ -140,6 +142,16 @@ int main(int argc, char** argv)
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
         engine.set_logits_sink({});
         std::println("prefill: {} tokens in {:.0f} ms ({:.1f} tok/s)", ids.size(), ms, ids.size() / ms * 1e3);
+        const auto& st = engine.last_prefill();
+        std::println("  GPU {:.0f} ms, making experts resident {:.0f} ms (reads {:.0f} ms, {} misses, {:.1f} GB)", st.gpu_ms,
+                     st.ensure_ms, st.read_ms, st.misses, st.read_bytes / 1e9);
+        double at = 0, ff = 0, hit = 0, miss = 0;
+        for (const auto& l : st.layers)
+            at += l.attn_ms, ff += l.ffn_ms, hit += l.hit_ms, miss += l.miss_ms;
+        if (!st.layers.empty())
+            std::println("  per section (GPU): attention {:.0f} ms, FFN to routing {:.0f}, resident experts {:.0f}, "
+                         "misses and the rest {:.0f}",
+                         at, ff, hit, miss);
     } else {
         for (size_t t = 0; t < ids.size(); ++t) {
             const auto s0 = std::chrono::steady_clock::now();
