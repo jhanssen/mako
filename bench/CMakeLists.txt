@@ -16,3 +16,6 @@ add_executable(lend_bench lend_bench.cpp)
 target_link_libraries(lend_bench PRIVATE mako_mtl)
 
 add_executable(mem_watchdog mem_watchdog.cpp)
+
+add_executable(mm_types_bench mm_types_bench.cpp)
+target_link_libraries(mm_types_bench PRIVATE mako_mtl)

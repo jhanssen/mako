@@ -75,3 +75,26 @@ Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads o
 - Prefill reads (~6 s a group, now overlapped with the GPU work): more resident experts or fewer bytes per expert.
 - Decode misses (15-40 a step).
 - DSpark (5 drafts verified in one 6-token step) not built yet.
+
+## Apple10 (M5) versus Apple9 (M3/M4)
+
+No code path checks the GPU family; the Apple10 hardware is reached through the same Metal 4 calls that run on Apple9.
+What Apple10 adds that matters here is the per-core matrix units behind `matmul2d` (MetalPerformancePrimitives). Mako
+uses `matmul2d` for every prefill GEMM (dense and expert) and DeepSeek-V4.1's attention, so those already run on
+them on M5; decode is GEMV-bound by memory bandwidth, which no Apple10 feature changes.
+
+`bench/mm_types_bench` (M5 Max, 4096^3, every operand pair `matmul2d` accepts):
+
+| Operands | Throughput |
+| --- | ---: |
+| half x half -> float (mako's), relaxed precision, half -> half, bfloat | 63-64 TFLOP/s |
+| half x int8 / int4 / int2 / fp8 / fp4 -> float | 63-65 (the compact operand is widened to half) |
+| fp8 x fp8 -> float | 65 |
+| fp4 x fp4 -> float | 57 |
+| int8 x int8 -> int32 | 121 TOP/s |
+| int8 x int4 / int2 -> int32 | 93 / 83 |
+
+Only int8 x int8 is faster than half (2x). Using it for expert GEMMs means int8 activations (quantized per token) and
+the weights' per-32 block scales applied outside the multiply (matmul2d has no scale operand), so a K step of 32 and
+a scaled accumulation per step: not built; the expert GEMMs run at 38-44 TFLOP/s of the 63, so dequantization, not
+the multiply, is part of the cost. fp8 / fp4 types need Metal 4.1 and bring no speed.
