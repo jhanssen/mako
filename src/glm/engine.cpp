@@ -145,6 +145,7 @@ struct Engine::Layer {
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : model_(model), cfg_(cfg), opts_(opts), ctx_(ctx)
 {
+    tel_ = opts_.telemetry;
     const auto t_load = Clock::now();
     if (const char* r = std::getenv("MAKO_REPEAT")) {
         const std::string_view spec(r);
@@ -439,9 +440,9 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
 
 MTL::ComputeCommandEncoder* Engine::encoder(MTL::CommandBuffer* cb, uint32_t layer, int section, MTL::DispatchType type)
 {
-    if (samples_.empty() || (opts_.telemetry == Telemetry::layers && section < 0))
+    if (!timing() || (tel_ == Telemetry::layers && section < 0))
         return cb->computeCommandEncoder(type);
-    if (opts_.telemetry == Telemetry::kernels)
+    if (tel_ == Telemetry::kernels)
         section = -1;
     MTL::ComputePassDescriptor* d = MTL::ComputePassDescriptor::computePassDescriptor();
     d->setDispatchType(type);
@@ -458,7 +459,7 @@ MTL::ComputeCommandEncoder* Engine::encoder(MTL::CommandBuffer* cb, uint32_t lay
 
 void Engine::after(MTL::ComputeCommandEncoder*& enc, std::string_view kernel)
 {
-    if (opts_.telemetry != Telemetry::kernels || timed_.empty())
+    if (tel_ != Telemetry::kernels || timed_.empty())
         return;
     timed_.back().kernel = kernel;
     timed_.back().layer = cur_layer_;
@@ -483,7 +484,7 @@ void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
         for (NS::UInteger i = 0; i < n; ++i)
             ts[first + i] = r[i].timestamp;
     }
-    if (opts_.telemetry == Telemetry::layers) {
+    if (tel_ == Telemetry::layers) {
         last_step_.layers.assign(cfg_.n_layer, LayerTimes{});
         for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
             last_step_.layers[l].layer = l;
@@ -695,11 +696,11 @@ void Engine::gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buf
     a.n = uint32_t(w.dims[1]);
     a.t = t;
     a.batch = batch;
-    const bool labelled = opts_.telemetry == Telemetry::kernels || repeat_n_ > 1;
+    const bool labelled = tel_ == Telemetry::kernels || repeat_n_ > 1;
     const std::string label = labelled ? std::format("gemv {} {}x{}", gguf::traits(a.type).name, a.k, a.n) : "";
     for (int r = repeats(label); r > 0; --r)
         gemv_->encode(enc, a, w.buf, w.off, x, x_off, y, y_off);
-    if (opts_.telemetry == Telemetry::kernels)
+    if (tel_ == Telemetry::kernels)
         after(enc, label);
 }
 
@@ -712,7 +713,7 @@ void Engine::proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buf
     // A few tokens (decode, speculative verification) stay on the GEMV, which reads each weight once for them.
     if (T > kMaxDecodeTokens && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type)) {
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, halves(enc, x, x_off, T, k, 0), 0, y, y_off, ldy);
-        if (opts_.telemetry == Telemetry::kernels)
+        if (tel_ == Telemetry::kernels)
             after(enc, std::format("gemm {} {}x{}", gguf::traits(w.type).name, k, n));
         return;
     }
@@ -1479,7 +1480,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     if (probe_)
         probe_("inp_embd", -1, static_cast<const float*>(x->contents()), E);
     MTL::Timestamp cpu0 = 0, gpu0 = 0;
-    if (!samples_.empty())
+    if (timing())
         ctx_.device()->sampleTimestamps(&cpu0, &gpu0);
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     cur_cb_ = cb;
@@ -1496,7 +1497,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
             submit(cb, enc);
             stream_override_(int(il), static_cast<float*>(scratch("R", rows * hd * 4)->contents()), hd);
         }
-        if (!samples_.empty()) {
+        if (timing()) {
             enc->endEncoding();
             enc = encoder(cb, il, 0);
         }
@@ -1513,7 +1514,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
         else
             mla(enc, L, il, xn, att, T, pos_);
         probe(enc, L.kda ? "kda_out" : "attn_out", int(il), att, E);
-        if (!samples_.empty()) {
+        if (timing()) {
             enc->endEncoding();
             enc = encoder(cb, il, 1);
         }
@@ -1550,7 +1551,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     }
 
     cur_layer_ = cfg_.n_layer;
-    if (!samples_.empty()) {
+    if (timing()) {
         enc->endEncoding();
         enc = encoder(cb, cur_layer_, -1);
     }
@@ -1578,7 +1579,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     last_step_.hits = after.hits - before.hits;
     last_step_.misses = after.misses - before.misses;
     last_step_.read_bytes = after.read_bytes - before.read_bytes;
-    if (!samples_.empty())
+    if (timing())
         resolve_layer_times(cpu0, gpu0);
 }
 
@@ -1819,14 +1820,14 @@ void Engine::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc
                    uint64_t in_off, MTL::Buffer* out, uint64_t out_off, uint64_t ind_at) {
         const ExpertArena::Region& r = arena_->region(il, part);
         const mtl::Gemv::Args a = part_args(part, tokens);
-        const bool labelled = opts_.telemetry == Telemetry::kernels || repeat_n_ > 1;
+        const bool labelled = tel_ == Telemetry::kernels || repeat_n_ > 1;
         const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name, a.k, a.n,
                                                          miss ? "miss" : "hit")
                                            : "";
         for (int rep = repeats(label); rep > 0; --rep)
             gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, ids_off, in, in_off, out, out_off,
                                   miss ? indirect : nullptr, ind_at + uint64_t(part) * 12, {r.tail, r.tail_off, r.split});
-        if (opts_.telemetry == Telemetry::kernels)
+        if (tel_ == Telemetry::kernels)
             after(enc, label);
     };
     auto bufs = [&](const char* tag) {
@@ -1862,7 +1863,7 @@ void Engine::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc
 // resident. Leaves the same caches and state as step() would token by token.
 const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled)
 {
-    if (tokens.size() < 2 || probe_ || stream_override_ || route_override_ || opts_.telemetry == Telemetry::kernels) {
+    if (tokens.size() < 2 || probe_ || stream_override_ || route_override_) {
         for (int32_t t : tokens)
             step(t);
         return logits_;
@@ -1873,6 +1874,14 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
     if (pos_ + tokens.size() > opts_.max_ctx)
         throw std::runtime_error("context full");
     apply_pressure();
+    // Kernel timing is for steps: a prefill's dispatches would overflow the sample buffers.
+    struct Level {
+        Telemetry& tel;
+        Telemetry saved;
+        ~Level() { tel = saved; }
+    } level{tel_, tel_};
+    if (tel_ == Telemetry::kernels)
+        tel_ = Telemetry::summary;
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
     const uint32_t chunk = std::max<uint32_t>(1, opts_.prefill_chunk);
     const auto t_start = Clock::now();
@@ -1880,7 +1889,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
     const double gpu_before = stats_.gpu_exec_ms;
     StepStats total;
     total.pos = pos_;
-    if (!samples_.empty()) {
+    if (timing()) {
         total.layers.assign(cfg_.n_layer, LayerTimes{});
         for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
             total.layers[l].layer = l;
@@ -1959,7 +1968,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
         }
 
         MTL::Timestamp cpu0 = 0, gpu0 = 0;
-        if (!samples_.empty())
+        if (timing())
             ctx_.device()->sampleTimestamps(&cpu0, &gpu0);
         last_step_ = StepStats{};
         MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
@@ -1987,7 +1996,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
             for (uint32_t c0 = 0; c0 < G; c0 += chunk) {
                 const uint32_t T = std::min(chunk, G - c0);
                 const uint64_t r_off = uint64_t(c0) * hd * 4;
-                if (!samples_.empty()) {
+                if (timing()) {
                     enc->endEncoding();
                     enc = encoder(cb, il, 0);
                 }
@@ -2000,7 +2009,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                 hc_post(enc, att, R, R2, pc, T, r_off);
             }
             std::swap(R, R2);
-            if (!samples_.empty()) {
+            if (timing()) {
                 enc->endEncoding();
                 enc = encoder(cb, il, 1);
             }
@@ -2273,7 +2282,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
         enc->endEncoding();
         finish(cb);
         total.ensure_ms += last_step_.ensure_ms;
-        if (!samples_.empty()) {
+        if (timing()) {
             resolve_layer_times(cpu0, gpu0);
             for (uint32_t l = 0; l < cfg_.n_layer; ++l) {
                 total.layers[l].attn_ms += last_step_.layers[l].attn_ms;

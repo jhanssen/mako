@@ -289,6 +289,8 @@ private:
     std::chrono::steady_clock::time_point step_start_;
     LoadStats load_;
     StepStats last_step_, last_prefill_;
+    Telemetry tel_ = Telemetry::off; // the level in effect (prefill runs kernel-level telemetry as summary)
+    bool timing() const { return !samples_.empty() && tel_ >= Telemetry::layers; }
     mtl::Ref<MTL::Buffer> ablate_buf_; // set_ablation()'s directions
     uint32_t ablate_k_ = 0;
     float ablate_scale_ = 1.0f;
