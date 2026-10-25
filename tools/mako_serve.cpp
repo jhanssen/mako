@@ -1,6 +1,6 @@
 // OpenAI-compatible HTTP server for a model.
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--no-spec]
-//              [--ablate FILE] [--ablate-scale S]
+//              [--ablate FILE] [--ablate-scale S] [--max-waiting N]
 // Sampling defaults come from the model's general.sampling.* metadata. --ablate removes per-layer directions
 // (raw float32, layers x k x n_embd) from the residual streams (Engine::set_ablation).
 #include "chat/template.hpp"
@@ -21,7 +21,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S]");
+                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N]");
         return 2;
     }
     mako::server::ServerOptions so;
@@ -54,6 +54,8 @@ int main(int argc, char** argv)
             ablate = v;
         else if (a == "--ablate-scale")
             ablate_scale = std::stof(v);
+        else if (a == "--max-waiting")
+            so.max_waiting = uint32_t(std::stoul(v));
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;

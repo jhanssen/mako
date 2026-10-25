@@ -17,10 +17,11 @@ struct ServerOptions {
     std::string model_id;        // reported by /v1/models and in responses
     gen::SamplingParams sampling; // defaults for fields a request leaves out
     bool speculative = true;
+    uint32_t max_waiting = 4; // requests waiting behind the one generating; more get HTTP 503
 };
 
 // OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health.
-// Generation runs one request at a time.
+// Generation runs one request at a time; a request waits for the one before it, up to max_waiting of them.
 class Server {
 public:
     Server(glm::Engine& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);

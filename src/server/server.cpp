@@ -49,6 +49,7 @@ struct Server::Impl {
     ServerOptions opts;
     glm::Session session;
     std::mutex gen_mutex; // one generation at a time
+    std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
     httplib::Server http;
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
 
@@ -106,6 +107,13 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
     if (prompt.size() >= engine.max_context())
         return fail(400, std::format("the prompt is {} tokens; the context holds {}", prompt.size(),
                                      engine.max_context()));
+    if (in_flight.fetch_add(1) > opts.max_waiting) {
+        --in_flight;
+        res.set_header("Retry-After", "2");
+        return fail(503, std::format("{} requests are already waiting", opts.max_waiting), "server_busy");
+    }
+    // Held until the response is done (the streaming provider keeps a copy).
+    const auto slot = std::shared_ptr<void>(nullptr, [this](void*) { --in_flight; });
     const std::string id = std::format("chatcmpl-{}", ++next_id);
     const int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
@@ -113,10 +121,12 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
     const std::string& model = opts.model_id;
     if (!cr.stream) {
         std::lock_guard lock(gen_mutex);
+        const auto closed = req.is_connection_closed;
+        if (closed())
+            return; // gave up while waiting
         try {
             OutputParser parser(tok, cr.tools, cr.stop);
             bool stopped = false;
-            const auto closed = req.is_connection_closed;
             cr.gen.cancelled = closed;
             const auto r = generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped);
             const char* finish = finish_reason(r, parser, stopped);
@@ -132,14 +142,14 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
     cr.gen.cancelled = req.is_connection_closed;
     auto shared = std::make_shared<ChatRequest>(std::move(cr));
     res.set_chunked_content_provider("text/event-stream", [this, shared, prompt = std::move(prompt), id, created,
-                                                           model](size_t, httplib::DataSink& sink) {
+                                                           model, slot](size_t, httplib::DataSink& sink) {
         const auto send = [&](const std::string& json) {
             const std::string event = "data: " + json + "\n\n";
             return sink.write(event.data(), event.size());
         };
         std::lock_guard lock(gen_mutex);
-        if (!send(chunk(id, created, model, {}, true)))
-            return false;
+        if (shared->gen.cancelled() || !send(chunk(id, created, model, {}, true)))
+            return false; // gave up while waiting
         try {
             OutputParser parser(tok, shared->tools, shared->stop);
             bool stopped = false;

@@ -55,7 +55,8 @@ The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e
 An OpenAI-compatible server at `http://127.0.0.1:8080/v1`: `POST /v1/chat/completions` (streaming or not, tool
 calls, `reasoning_content`), `GET /v1/models`, `GET /health`. Prompts are rendered with the GGUF's chat template;
 sampling defaults come from its `general.sampling.*` metadata. Requests run one at a time on one session, so a
-conversation's next turn reuses the context its previous turn left. `developer` messages are treated as `system`;
+conversation's next turn reuses the context its previous turn left; up to `--max-waiting` (default 4) wait behind
+the one generating, more get HTTP 503 with `Retry-After`, and a waiting request whose client went away is dropped. `developer` messages are treated as `system`;
 `reasoning_effort` medium maps to the template's high (it knows low and high, and reasons at its maximum
 otherwise). Not supported (HTTP 400): `n` > 1, `logprobs`, `tool_choice` other than auto/none, structured
 `response_format`.
