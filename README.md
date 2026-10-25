@@ -58,7 +58,8 @@ sampling defaults come from its `general.sampling.*` metadata. Requests run one 
 conversation's next turn reuses the context its previous turn left; up to `--max-waiting` (default 4) wait behind
 the one generating, more get HTTP 503 with `Retry-After`, and a waiting request whose client went away is dropped. `developer` messages are treated as `system`;
 `reasoning_effort` medium maps to the template's high (it knows low and high, and reasons at its maximum
-otherwise). `chat_template_kwargs` adds template variables (GLM: `clear_thinking` drops the reasoning of earlier turns). Not
+otherwise). SIGINT or SIGTERM stops the server; with `--learn` it then adds the session's routing counts to the model's profile, so
+the experts that start resident follow how it was used. `chat_template_kwargs` adds template variables (GLM: `clear_thinking` drops the reasoning of earlier turns). Not
 supported (HTTP 400): `n` > 1, `logprobs`, `tool_choice` other than auto/none, structured
 `response_format`.
 

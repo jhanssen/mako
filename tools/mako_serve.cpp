@@ -1,7 +1,8 @@
 // OpenAI-compatible HTTP server for a model.
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--no-spec]
-//              [--ablate FILE] [--ablate-scale S] [--max-waiting N]
-// Sampling defaults come from the model's general.sampling.* metadata. --ablate removes per-layer directions
+//              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn]
+// Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
+// session's routing counts are then added to the model's profile (which experts start resident). --ablate removes per-layer directions
 // (raw float32, layers x k x n_embd) from the residual streams (Engine::set_ablation).
 #include "chat/template.hpp"
 #include "glm/config.hpp"
@@ -11,19 +12,30 @@
 #include "server/server.hpp"
 #include "text/tokenizer.hpp"
 
+#include <csignal>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <print>
 #include <string>
+#include <thread>
+
+#include <pthread.h>
 
 int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N]");
+                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn]");
         return 2;
     }
+    // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
+    bool learn = false;
     mako::server::ServerOptions so;
     mako::glm::Options opts;
     opts.max_ctx = 131072;
@@ -33,6 +45,10 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         if (a == "--no-spec") {
             so.speculative = false;
+            continue;
+        }
+        if (a == "--learn") {
+            learn = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -107,11 +123,24 @@ int main(int argc, char** argv)
     std::println(stderr, "loaded in {:.1f} s; context {} tokens; temperature {}, top_p {}",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), opts.max_ctx,
                  so.sampling.temperature, so.sampling.top_p);
-    mako::server::Server server(engine, *tok, *tmpl, so);
-    std::println(stderr, "serving {} on http://{}:{}/v1", so.model_id, so.host, so.port);
-    if (!server.run()) {
-        std::println(stderr, "could not listen on {}:{}", so.host, so.port);
-        return 1;
+    {
+        mako::server::Server server(engine, *tok, *tmpl, so);
+        std::jthread stopper([&] {
+            int sig = 0;
+            sigwait(&stop_signals, &sig);
+            server.stop();
+        });
+        std::println(stderr, "serving {} on http://{}:{}/v1", so.model_id, so.host, so.port);
+        const bool listened = server.run();
+        if (!listened)
+            std::println(stderr, "could not listen on {}:{}", so.host, so.port);
+        ::kill(::getpid(), SIGTERM); // wakes the stopper if the server ended on its own
+        if (!listened)
+            return 1;
+    } // the server's threads are done before the profile is written
+    if (learn) {
+        engine.save_profile(engine.default_profile(), true);
+        std::println(stderr, "routing counts added to {}", engine.default_profile().string());
     }
     return 0;
 }
