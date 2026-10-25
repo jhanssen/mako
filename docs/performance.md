@@ -18,6 +18,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | Speculative decoding with the next-token block (two-token verify, rollback of the recurrent state) | 15-25% faster than plain decode at 83-100% acceptance; break-even ~35-45% |
 | Router before the shared expert in decode (the CPU starts on misses earlier) | -0.5 ms/token |
 | Busy-spin on the routing event instead of a blocking wait | blocking was +1 ms/token; no throttling seen |
+| 128- and 256-token GEMM tiles for IQ weights where they pad no more than 64-token ones (each weight dequantized once per tile; the dequantization does not overlap the multiply and cost ~21%) | `bench/gemm_bench` (288 experts, GLM shapes): 114 tokens each 39.5 -> 33.0 ms a layer, 1024 tokens 312 -> 248 ms (48 -> 60 TFLOP/s of the 63 half x half reaches); GLM prefill +7-8% (547 -> 592, 546 -> 586 tok/s in A/B pairs), experts section -19%; logits unchanged |
 | KDA scan with each thread's 32 state columns in registers (was threadgroup memory, read and written twice per token: ~2.2 TB/s of traffic) | scan ~1.05 s -> ~0.3 s on 4096 tokens; prefill +6-8% (562 -> 609, 464 -> 493 tok/s in A/B pairs); logits unchanged against the reference |
 
 Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
@@ -108,5 +109,6 @@ them on M5; decode is GEMV-bound by memory bandwidth, which no Apple10 feature c
 
 Only int8 x int8 is faster than half (2x). Using it for expert GEMMs means int8 activations (quantized per token) and
 the weights' per-32 block scales applied outside the multiply (matmul2d has no scale operand), so a K step of 32 and
-a scaled accumulation per step: not built; the expert GEMMs run at 38-44 TFLOP/s of the 63, so dequantization, not
-the multiply, is part of the cost. fp8 / fp4 types need Metal 4.1 and bring no speed.
+a scaled accumulation per step: not built. With 128/256-token tiles the expert GEMMs run at 50-60 TFLOP/s of the 63
+(the rest is tile padding at ~114 tokens an expert), so int8 could at best double the multiply's rate while adding
+activation quantization and per-block rescaling. fp8 / fp4 types need Metal 4.1 and bring no speed.
