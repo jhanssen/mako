@@ -183,6 +183,10 @@ One layer ahead the reads often had not finished (0.4-1.5 s of waits over 200 st
 code prompt only 21-31% of reads ahead are used: without the gate -2.7%, with it -0.3% (21.18 -> 21.11). Off by
 default.
 
+With cache-aware routing (story, 200 tokens; the penalty changes the text, so misses are not strictly comparable):
+penalty 0.05: 27.07 tok/s, with read-ahead 27.66; penalty 0.1: 27.63, with read-ahead 29.14 (3.0 misses a step,
+against 24.61 and 10.7 with neither).
+
 Decode steps committed every 4 layers, with layers whose routing is back served between encodes (`serve_moe` without
 blocking), and no empty command buffer after the logits: the GPU starts while the CPU still encodes. 41.4 -> 41.0 ms a
 step (+1%, two A/B pairs); wall time is now ~0.5 ms over GPU time.
