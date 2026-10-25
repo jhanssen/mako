@@ -22,6 +22,7 @@ struct Options {
     uint32_t prefill_chunk = 256;  // tokens prefill() runs through each layer's attention together
     uint32_t prefill_group = 8192; // tokens whose routed experts run together, each loaded once per layer
     uint32_t checkpoints = 4;      // checkpoints (checkpoint()) the memory budget reserves room for
+    double stage_gb = -1;       // prefill staging ring limit (0: off; < 0: automatic, EngineBase::set_staging_limit)
     double arena_gb = -1;          // expert arena size; < 0: from the memory budget
     std::string expert_counts;     // routing profile; empty: the model's default one when it exists
     core::Telemetry telemetry = core::Telemetry::off;

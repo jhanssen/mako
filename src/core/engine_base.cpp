@@ -78,31 +78,40 @@ EngineBase::EngineBase(const gguf::ModelFiles& model, mtl::Context& ctx, Telemet
         stage_bytes_ = uint64_t(std::max(0.0, std::atof(g)) * double(1ull << 30));
 }
 
-bool EngineBase::staging_wanted() const
+void EngineBase::set_staging_limit(double gb)
 {
-    if (stage_bytes_ == 0)
-        return false;
-    if (!arena_ || std::getenv("MAKO_STAGE_GB"))
-        return true;
-    // Worth it where most experts are missing (measured: DeepSeek-V4.1 at 42% resident +20-25%; GLM-5.3 at 87%
-    // -11%, the ring's borrowed memory costing more resident experts than the overlap saves).
-    uint64_t slots = 0, experts = 0;
+    if (gb >= 0)
+        stage_bytes_ = uint64_t(gb * double(1ull << 30));
+}
+
+uint64_t EngineBase::staging_bytes() const
+{
+    if (stage_bytes_ == 0 || !arena_)
+        return stage_bytes_;
+    // Measured: GLM-5.3 (~38 missing experts a layer) with a 3 GB ring -11% prefill (the borrowed memory evicts
+    // resident experts), with 0.6 GB the same prefill and ~17% fewer decode misses after the prompt.
+    const auto* table = static_cast<const int32_t*>(arena_->slot_table()->contents());
     const uint32_t n_rows = std::min<uint32_t>(uint32_t(arena_->usage().size()), dims_.n_layer);
-    for (uint32_t l = 0; l < n_rows; ++l)
-        if (arena_->part(l, 0).bytes) {
-            slots += arena_->slots(l);
-            experts += dims_.n_expert;
-        }
-    return !experts || double(slots) <= 0.7 * double(experts);
+    uint64_t most = 0;
+    for (uint32_t l = 0; l < n_rows; ++l) {
+        uint64_t per = 0, missing = 0;
+        for (int p = 0; p < 3; ++p)
+            per += arena_->part(l, p).bytes;
+        for (uint32_t e = 0; e < dims_.n_expert; ++e)
+            missing += table[uint64_t(l) * dims_.n_expert + e] < 0;
+        most = std::max(most, missing * per);
+    }
+    return std::min(stage_bytes_, 2 * most);
 }
 
 void EngineBase::begin_staging(uint32_t tokens)
 {
     stager_.reset();
-    if (tokens < kStageMinTokens || !staging_wanted())
+    const uint64_t bytes = staging_bytes();
+    if (tokens < kStageMinTokens || bytes == 0)
         return;
     const uint32_t n_rows = std::min<uint32_t>(uint32_t(arena_->usage().size()), dims_.n_layer);
-    auto st = std::make_unique<Stager>(ctx_.device(), *arena_, stage_bytes_);
+    auto st = std::make_unique<Stager>(ctx_.device(), *arena_, bytes);
     if (!st->ok())
         return;
     const auto* table = static_cast<const int32_t*>(arena_->slot_table()->contents());

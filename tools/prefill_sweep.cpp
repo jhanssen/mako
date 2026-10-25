@@ -1,6 +1,6 @@
 // Prefill time of reads of several sizes on top of a base context, as an agent turn reading a tool result.
 //   prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] [--steps N] [--prefill-group N]
-//                 [--decode N] [--turns N] [--prompt-file F] [--temp T] [--no-spec]
+//                 [--stage-gb N]                 [--decode N] [--turns N] [--prompt-file F] [--temp T] [--no-spec]
 // The text is this repository's sources, tokenized. Each size runs `repeats` times (default 2), each from a checkpoint
 // of the base context; the experts left resident by the runs before stay. --layers adds per-layer GPU timestamps
 // (GPU time by section; extra encoder boundaries slow it somewhat). --steps N also times sizes up to N as decode
@@ -189,6 +189,8 @@ int main(int argc, char** argv)
             temp = std::stof(v);
         else if (a == "--prefill-group")
             opts.prefill_group = uint32_t(std::stoul(v));
+        else if (a == "--stage-gb")
+            opts.stage_gb = std::stod(v);
         else if (a == "--sizes") {
             sizes.clear();
             std::stringstream ss(v);

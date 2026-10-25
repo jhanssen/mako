@@ -163,14 +163,18 @@ protected:
     static constexpr uint32_t kBatchRows = 8192; // prefill expert rows (token, expert pairs) run and combined together
     // Staged prefill: for a group of at least kStageMinTokens (which routes to nearly every expert of every layer),
     // the arena's missing experts of every layer are read ahead into a ring (Stager) while the GPU works, and the
-    // layer's MoE runs them from there instead of making them resident. end_staging() once the group's GPU work is
-    // done. staging_bytes(): the ring's size, for scratch estimates (MAKO_STAGE_GB, 0 off).
+    // layer's MoE runs them from there instead of making them resident (so a prompt leaves the arena as the steps
+    // shaped it). end_staging() once the group's GPU work is done. staging_bytes(): the ring's size, also for scratch
+    // estimates.
     static constexpr uint32_t kStageMinTokens = 512;
     void begin_staging(uint32_t tokens);
     void end_staging();
-    uint64_t staging_bytes() const { return staging_wanted() ? stage_bytes_ : 0; }
-    // Whether prefill stages (before the arena exists: whether it may).
-    bool staging_wanted() const;
+    // Two layers' worth of the arena's missing experts, at most MAKO_STAGE_GB (3 GB); before the arena exists, that
+    // most.
+    uint64_t staging_bytes() const;
+    // The ring's limit in GB (0: no staging; < 0: MAKO_STAGE_GB, else 3). Call in the derived constructor before
+    // init_runtime().
+    void set_staging_limit(double gb);
     // For a prefill: scratch beyond 256 MB takes the memory of lendable arena slots meanwhile; at the end the scratch
     // buffers allocated since go and the slots are read again (unless memory pressure holds them).
     class ScratchLoan {

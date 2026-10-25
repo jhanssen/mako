@@ -27,6 +27,7 @@ using core::Telemetry;
 struct Options {
     uint32_t max_ctx = 4096;
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
+    double stage_gb = -1;       // prefill staging ring limit (0: off; < 0: automatic, EngineBase::set_staging_limit)
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
     uint32_t prefill_chunk = 512; // tokens prefill() runs through each layer's attention together
     uint32_t prefill_group = 4096; // tokens whose routed experts run together, each loaded once per layer

@@ -1,6 +1,6 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
-//            [--force DIR] [--force-route DIR] [--arena-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
+//            [--force DIR] [--force-route DIR] [--arena-gb N] [--stage-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
 //            [--stats summary|steps|layers|kernels] [--stats-out FILE] [--prefill-chunk N] [--prefill-group N] [--logits-out DIR]
 //            [--spec] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--seed N] [--ablate FILE] [--ablate-scale S]
 // The arena places experts by the model's routing profile (written by mako_calibrate) unless --expert-counts names
@@ -159,6 +159,8 @@ int main(int argc, char** argv)
             opts.simulate_ram_gb = std::stod(v);
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(v);
+        else if (a == "--stage-gb")
+            opts.stage_gb = std::stod(v);
         else if (a == "--ablate")
             ablate = v;
         else if (a == "--ablate-scale")

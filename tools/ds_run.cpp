@@ -2,7 +2,7 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
+//          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
 //          [--save-profile F|default] [-n N]
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
@@ -60,6 +60,8 @@ int main(int argc, char** argv)
             out = v;
         else if (a == "--arena-gb")
             opts.arena_gb = std::stod(v);
+        else if (a == "--stage-gb")
+            opts.stage_gb = std::stod(v);
         else if (a == "--max-ctx")
             opts.max_ctx = uint32_t(std::stoul(v));
         else if (a == "--prefill")

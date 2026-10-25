@@ -39,8 +39,7 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 
 ### Open
 
-- Decode misses rise after a long prompt (~34 vs ~16 a step for ~75 steps). Part of it is prefill's misses
-  evicting decode's resident set (keeping them out cut the rise ~20%); a fix without staging's cost is untried.
+- Decode misses still rise after a long prompt, less since staging (GLM: ~27 vs ~15 a step for the first 40 steps).
 - Expert GEMMs at few rows per expert in short prefills (512 tokens: experts ~714 ms GPU against a ~150 ms
   weight-read bound).
 
@@ -65,7 +64,8 @@ Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads o
 | Idea | Result |
 | --- | --- |
 | Attention on fp32 simdgroup matrices | slower than the scalar kernel: ablation showed the multiply-accumulates themselves bound it (~0.9 TFLOP/s; they do not reach the matrix units) |
-| Staged prefill reads for GLM-5.3 (87% of experts resident) | prefill -11% (429 -> 382 tok/s at 4K): little to read, and the ring's borrowed memory evicts resident experts. Staging is on only below 70% residency. It did cut decode misses in the 40 steps after the prompt from 32.6 to 26.2 a step (prefill misses no longer evict decode's resident set) |
+| Staged prefill reads for GLM-5.3 with a 3 GB ring | prefill -11% (429 -> 382 tok/s at 4K): the ring's borrowed memory evicts resident experts. Sized to two layers' missing experts instead (~0.55 GB): prefill unchanged, decode after a 4K prompt ~4.5% faster (first 40 steps 32.1 -> 26.6 misses a step: prefill no longer evicts the experts steps use). Landed that way |
+| Marking slots filled by prefill misses as preferred victims (no staging) | no change (38.6 vs 38.7 misses a step after the prompt): in a group nearly every resident is in use, so each miss still evicts one of decode's experts before any marked slot frees up |
 | One 1024-thread threadgroup per token for the attention output (no repeated reads of probabilities and keys) | no change: redundant reads were not the cost |
 | Per-row key descriptors with vector loads | no change for the output kernel (helped the score kernel slightly) |
 | More query tokens per attention dispatch (32 -> 256) | no change: occupancy was not the cost |

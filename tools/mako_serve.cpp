@@ -1,11 +1,12 @@
 // OpenAI- and Anthropic-compatible HTTP server for a model (GLM-5.3 or DeepSeek-V4.1).
-//   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--no-spec]
+//   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--stage-gb N] [--no-spec]
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
 // per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
 // DeepSeek-V4.1 attn_out and shexp_out); --ablate-scale multiplies their strength. --engram: the GGUF with
-// DeepSeek-V4.1's Engram tables (default: found beside the model, Engram::find_tables).
+// DeepSeek-V4.1's Engram tables (default: found beside the model, Engram::find_tables). --stage-gb limits the ring
+// that prompts' missing experts are read ahead into (0: off; default: two layers' worth, at most 3 GB).
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
@@ -33,7 +34,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
+                             "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE]");
         return 2;
     }
@@ -46,7 +47,7 @@ int main(int argc, char** argv)
     bool learn = false;
     mako::server::ServerOptions so;
     uint32_t max_ctx = 131072;
-    double arena_gb = -1;
+    double arena_gb = -1, stage_gb = -1;
     std::string ablate, engram;
     float ablate_scale = 1.0f;
     for (int i = 2; i < argc; ++i) {
@@ -74,6 +75,8 @@ int main(int argc, char** argv)
             so.model_id = v;
         else if (a == "--arena-gb")
             arena_gb = std::stod(v);
+        else if (a == "--stage-gb")
+            stage_gb = std::stod(v);
         else if (a == "--engram")
             engram = v;
         else if (a == "--ablate")
@@ -148,6 +151,7 @@ int main(int argc, char** argv)
             mako::dsv41::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
+            opts.stage_gb = stage_gb;
             ds_engine = std::make_unique<mako::dsv41::Engine>(*model, *cfg, opts, ctx);
             model_if = ds_engine.get();
             base = ds_engine.get();
@@ -165,6 +169,7 @@ int main(int argc, char** argv)
             mako::glm::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
+            opts.stage_gb = stage_gb;
             opts.mtp = so.speculative;
             glm_engine = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
             model_if = glm_engine.get();

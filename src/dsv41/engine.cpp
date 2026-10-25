@@ -225,6 +225,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     logits_.resize(cfg_.n_vocab);
 
     load_.dense_ms = ms_since(t_load);
+    set_staging_limit(opts_.stage_gb);
     ArenaInit init;
     for (const auto& L : layers_)
         init.parts.push_back(L->experts);
