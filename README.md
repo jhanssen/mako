@@ -53,7 +53,10 @@ The model is a GLM-5.3-Flash GGUF using the standard `glm5-next` tensor names, e
 ```
 
 An OpenAI-compatible server at `http://127.0.0.1:8080/v1`: `POST /v1/chat/completions` (streaming or not, tool
-calls, `reasoning_content`), `GET /v1/models`, `GET /health`. Prompts are rendered with the GGUF's chat template;
+calls, `reasoning_content`), `GET /v1/models`, `GET /health`. It also serves the Anthropic Messages API:
+`POST /v1/messages` (text, thinking, tool_use and tool_result blocks, streaming events, `tool_choice` auto/any/tool/none;
+thinking blocks only when `thinking` is enabled, its budget picking the template's low, high or maximum effort) and
+`POST /v1/messages/count_tokens`. Image and document blocks and server tools are rejected. Prompts are rendered with the GGUF's chat template;
 sampling defaults come from its `general.sampling.*` metadata. Requests run one at a time on one session, so a
 conversation's next turn reuses the context its previous turn left; up to `--max-waiting` (default 4) wait behind
 the one generating, more get HTTP 503 with `Retry-After`, and a waiting request whose client went away is dropped. `developer` messages are treated as `system`;

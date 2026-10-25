@@ -4,6 +4,7 @@
 //   server_test <model.gguf>
 #include "chat/template.hpp"
 #include "gguf/gguf.hpp"
+#include "server/anthropic.hpp"
 #include "server/openai.hpp"
 #include "text/tokenizer.hpp"
 
@@ -248,6 +249,82 @@ int main(int argc, char** argv)
                   std::format("{}: bash arguments {}", which, p->calls[1].arguments));
             check(!p->calls[0].id.empty() && p->calls[0].id != p->calls[1].id, std::format("{}: call ids", which));
         }
+    }
+
+    // Anthropic Messages: blocks translate to the template's turns the same way.
+    {
+        const std::string body = R"({"model":"m","max_tokens":100,"system":[{"type":"text","text":"Be terse."}],
+          "tools":[{"name":"bash","description":"Run","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],
+          "messages":[{"role":"user","content":"List files"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"I should call ls.","signature":"x"},
+              {"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls -l","n":1.0}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a.txt"}]},
+              {"type":"text","text":"and now?"}]}],
+          "thinking":{"type":"enabled","budget_tokens":2000},"stop_sequences":["END"],"stream":true})";
+        const auto r = mako::server::parse_messages_request(body, defaults);
+        const auto text = tmpl.render(r.context).text;
+        check(r.show_reasoning && r.stream && r.gen.max_tokens == 100 && r.stop == std::vector<std::string>{"END"},
+              "anthropic: thinking, stream, max_tokens, stop_sequences");
+        check(text.contains("<|system|>Reasoning Effort: Low"), "anthropic: thinking budget 2000 renders as Low");
+        check(text.contains("<|system|>Be terse.<|user|>List files"), "anthropic: system blocks");
+        check(text.contains("<think>I should call ls.</think>"), "anthropic: thinking block becomes reasoning");
+        check(text.contains("<tool_call>bash<arg_key>command</arg_key><arg_value>ls -l</arg_value><arg_key>n</arg_key>"
+                            "<arg_value>1.0</arg_value></tool_call>"),
+              "anthropic: tool_use input renders as sent");
+        check(text.contains("<|observation|><tool_response>a.txt</tool_response><|user|>and now?"),
+              "anthropic: tool_result then the user's text");
+        check(text.contains("\"name\": \"bash\"") && text.contains("\"description\": \"Run\""), "anthropic: tools");
+        const auto any = mako::server::parse_messages_request(
+            R"({"max_tokens":5,"messages":[{"role":"user","content":"x"}],"tools":[{"name":"bash"}],"tool_choice":{"type":"tool","name":"bash"}})",
+            defaults);
+        check(any.tool_required && any.tool_name == "bash" && !any.show_reasoning, "anthropic: tool_choice tool");
+        for (const char* bad : {R"({"messages":[{"role":"user","content":"x"}]})",
+                                R"({"max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{}}]}]})",
+                                R"({"max_tokens":5,"messages":[{"role":"system","content":"x"}]})",
+                                R"({"max_tokens":5,"messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"any"}})"}) {
+            bool threw = false;
+            try {
+                mako::server::parse_messages_request(bad, defaults);
+            } catch (const mako::server::BadRequest&) {
+                threw = true;
+            }
+            check(threw, std::format("anthropic rejected: {}", bad));
+        }
+        check(mako::server::parse_messages_request(R"({"messages":[{"role":"user","content":"x"}]})", defaults, true)
+                  .gen.max_tokens == 0,
+              "anthropic count_tokens needs no max_tokens");
+
+        // The stream: blocks open and close in order, deltas add up to the whole message.
+        mako::server::OutputParser p(*tok, r.tools, {});
+        auto proto = mako::server::anthropic_protocol("msg_1", "m", true);
+        std::string events = proto->begin(10);
+        mako::server::Delta d;
+        for (int32_t t : tok->encode("Thinking it over.</think>Here.<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value></tool_call><|observation|>", true)) {
+            mako::server::Delta x;
+            p.push(t, x);
+            events += proto->delta(x);
+        }
+        p.finish(d);
+        events += proto->delta(d);
+        mako::glm::GenerateResult gr;
+        gr.finish = mako::glm::Finish::stop_token;
+        gr.prompt_tokens = 10;
+        events += proto->end(mako::server::End::tool_calls, p, gr);
+        std::vector<std::string> names;
+        for (size_t at = 0; (at = events.find("event: ", at)) != std::string::npos; at += 7)
+            names.push_back(events.substr(at + 7, events.find('\n', at) - at - 7));
+        auto count = [&](const char* n) { return std::ranges::count(names, std::string(n)); };
+        check(!names.empty() && names.front() == "message_start" && names.back() == "message_stop" &&
+                  count("content_block_start") == 3 && count("content_block_stop") == 3 && count("message_delta") == 1,
+              std::format("anthropic stream events ({} starts, {} stops)", count("content_block_start"), count("content_block_stop")));
+        check(events.contains(R"("type":"thinking")") && events.contains(R"("type":"text")") &&
+                  events.contains(R"("type":"tool_use")") && events.contains(R"("stop_reason":"tool_use")"),
+              "anthropic stream: thinking, text and tool_use blocks, stop_reason tool_use");
+        const auto whole = proto->whole(mako::server::End::tool_calls, p, gr);
+        glz::generic g;
+        check(!glz::read_json(g, whole) && g["content"].get_array().size() == 3 &&
+                  g["content"][2]["input"]["command"].get_string() == "pwd" && g["stop_reason"].get_string() == "tool_use",
+              std::format("anthropic message body: {}", whole));
     }
 
     // Stop strings end the answer, also when split across tokens, and are not part of it.

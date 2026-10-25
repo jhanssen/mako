@@ -27,6 +27,7 @@ struct ChatRequest {
     glm::GenerateParams gen;       // max_tokens 0: up to the context size
     std::vector<std::string> stop; // stop strings (in the answer, not the reasoning)
     bool stream = false, include_usage = false;
+    bool show_reasoning = true; // reasoning goes to the client
     bool tool_required = false; // tool_choice "required" or a named function
     std::string tool_name;      // a named function's
 };
@@ -70,6 +71,8 @@ public:
     const std::string& reasoning() const { return reasoning_; }
     const std::string& content() const { return content_; }
     const std::vector<ToolCall>& calls() const { return calls_; }
+    // The stop string that ended the answer (empty if none did).
+    const std::string& stop_matched() const { return stop_matched_; }
 
 private:
     enum class Mode { reasoning, content, name, key, between, value, done };
@@ -89,7 +92,7 @@ private:
     bool content_started_ = false;
     std::string key_;
     bool call_open_ = false, first_arg_ = true;
-    std::string reasoning_, content_;
+    std::string reasoning_, content_, stop_matched_;
     std::vector<ToolCall> calls_;
     const text::Tokenizer& tok_;
     bool require_ = false, named_has_args_ = false;

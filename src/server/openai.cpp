@@ -1,6 +1,7 @@
 #include "server/openai.hpp"
 
-#include <glaze/glaze.hpp>
+#include "server/json.hpp"
+#include "server/protocol.hpp"
 
 #include <algorithm>
 #include <format>
@@ -126,37 +127,19 @@ namespace {
 
 using namespace wire;
 
+using json::is_object_text;
+using json::is_space;
+using json::trim;
+
 template <class T>
 std::string to_json(const T& v)
 {
-    std::string s;
-    (void)glz::write_json(v, s);
-    return s;
+    return json::write(v);
 }
 
 std::string json_string(std::string_view s)
 {
-    return to_json(s);
-}
-
-bool is_space(char c)
-{
-    return c == ' ' || c == '\n' || c == '\t' || c == '\r';
-}
-
-std::string_view trim(std::string_view s)
-{
-    while (!s.empty() && is_space(s.front()))
-        s.remove_prefix(1);
-    while (!s.empty() && is_space(s.back()))
-        s.remove_suffix(1);
-    return s;
-}
-
-bool is_object_text(std::string_view s)
-{
-    s = trim(s);
-    return !s.empty() && s.front() == '{' && !glz::validate_json(s);
+    return json::quoted(s);
 }
 
 // Tool call arguments as the template iterates them: an object (OpenAI sends its JSON text as a string).
@@ -503,7 +486,10 @@ void OutputParser::emit_content(Delta& out, bool final)
     }
     size_t cut = std::string::npos;
     for (const auto& s : stop_)
-        cut = std::min(cut, pending_.find(s));
+        if (const size_t at = pending_.find(s); at < cut) {
+            cut = at;
+            stop_matched_ = s;
+        }
     if (cut != std::string::npos) {
         pending_.resize(cut);
         final = true;
@@ -633,6 +619,71 @@ std::string completion(const std::string& id, int64_t created, const std::string
 std::string error_body(const std::string& message, const char* type)
 {
     return to_json(ErrorBody{{.message = message, .type = type}});
+}
+
+End end_of(const glm::GenerateResult& r, const OutputParser& p, bool stopped)
+{
+    switch (r.finish) {
+    case glm::Finish::stop_token:
+        return p.calls().empty() ? End::stop : End::tool_calls;
+    case glm::Finish::max_tokens:
+    case glm::Finish::context_full:
+        return End::length;
+    case glm::Finish::cancelled:
+        return stopped ? End::stop_sequence : End::cancelled;
+    }
+    return End::stop;
+}
+
+namespace {
+
+const char* finish_reason(End e)
+{
+    switch (e) {
+    case End::tool_calls: return "tool_calls";
+    case End::length: return "length";
+    case End::cancelled: return "cancelled";
+    default: return "stop";
+    }
+}
+
+class OpenAIProtocol : public Protocol {
+public:
+    OpenAIProtocol(std::string id, int64_t created, std::string model, bool include_usage)
+        : id_(std::move(id)), created_(created), model_(std::move(model)), include_usage_(include_usage)
+    {
+    }
+    std::string begin(uint32_t) override { return event(chunk(id_, created_, model_, {}, true)); }
+    std::string delta(const Delta& d) override { return event(chunk(id_, created_, model_, d)); }
+    std::string end(End e, const OutputParser&, const glm::GenerateResult& r) override
+    {
+        std::string s = event(chunk(id_, created_, model_, {}, false, finish_reason(e)));
+        if (include_usage_)
+            s += event(usage_chunk(id_, created_, model_, r));
+        return s + "data: [DONE]\n\n";
+    }
+    std::string stream_error(const std::string& message) override
+    {
+        return event(error_body(message, "server_error")) + "data: [DONE]\n\n";
+    }
+    std::string whole(End e, const OutputParser& p, const glm::GenerateResult& r) override
+    {
+        return completion(id_, created_, model_, p, finish_reason(e), r);
+    }
+
+private:
+    static std::string event(const std::string& json) { return "data: " + json + "\n\n"; }
+    std::string id_;
+    int64_t created_;
+    std::string model_;
+    bool include_usage_;
+};
+
+} // namespace
+
+std::unique_ptr<Protocol> openai_protocol(std::string id, int64_t created, std::string model, bool include_usage)
+{
+    return std::make_unique<OpenAIProtocol>(std::move(id), created, std::move(model), include_usage);
 }
 
 std::string models_body(const std::string& model)

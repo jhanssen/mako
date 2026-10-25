@@ -1,6 +1,8 @@
 #include "server/server.hpp"
 
+#include "server/anthropic.hpp"
 #include "server/openai.hpp"
+#include "server/protocol.hpp"
 
 #include <httplib.h>
 
@@ -14,18 +16,16 @@ namespace mako::server {
 
 namespace {
 
-const char* finish_reason(const glm::GenerateResult& r, const OutputParser& p, bool stopped)
+const char* end_name(End e)
 {
-    switch (r.finish) {
-    case glm::Finish::stop_token:
-        return p.calls().empty() ? "stop" : "tool_calls";
-    case glm::Finish::max_tokens:
-    case glm::Finish::context_full:
-        return "length";
-    case glm::Finish::cancelled:
-        return stopped ? "stop" : "cancelled";
+    switch (e) {
+    case End::stop: return "stop";
+    case End::tool_calls: return "tool calls";
+    case End::length: return "length";
+    case End::stop_sequence: return "stop sequence";
+    case End::cancelled: return "cancelled";
     }
-    return "stop";
+    return "?";
 }
 
 void log_result(const std::string& id, const glm::GenerateResult& r, const char* finish)
@@ -58,7 +58,12 @@ struct Server::Impl {
     {
     }
 
-    void chat(const httplib::Request& req, httplib::Response& res);
+    using ErrorBody = std::function<std::string(const std::string&, const char*)>;
+    using MakeProtocol = std::function<std::unique_ptr<Protocol>(const ChatRequest&, const std::string& id)>;
+    // A generation request in any protocol: parse makes the request, make its response encoder.
+    void serve(const httplib::Request& req, httplib::Response& res, const std::function<ChatRequest()>& parse,
+               const ErrorBody& error, const char* id_prefix, const MakeProtocol& make);
+    void count_tokens(const httplib::Request& req, httplib::Response& res);
     // Runs the request on the session; on_delta gets each increment (false: the client went away).
     glm::GenerateResult generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                                  const std::function<bool(const Delta&)>& on_delta, bool& stopped);
@@ -93,16 +98,17 @@ glm::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
     return r;
 }
 
-void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
+void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, const std::function<ChatRequest()>& parse,
+                         const ErrorBody& error, const char* id_prefix, const MakeProtocol& make)
 {
     const auto fail = [&](int status, const std::string& msg, const char* type = "invalid_request_error") {
         res.status = status;
-        res.set_content(error_body(msg, type), "application/json");
+        res.set_content(error(msg, type), "application/json");
     };
     ChatRequest cr;
     std::vector<int32_t> prompt;
     try {
-        cr = parse_chat_request(req.body, opts.sampling);
+        cr = parse();
         const auto rendered = tmpl.render(cr.context);
         prompt = tok.encode(rendered.text, rendered.input);
     } catch (const std::exception& e) {
@@ -118,11 +124,8 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
     }
     // Held until the response is done (the streaming provider keeps a copy).
     const auto slot = std::shared_ptr<void>(nullptr, [this](void*) { --in_flight; });
-    const std::string id = std::format("chatcmpl-{}", ++next_id);
-    const int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-    const std::string& model = opts.model_id;
+    const std::string id = std::format("{}{}", id_prefix, ++next_id);
+    std::shared_ptr<Protocol> proto = make(cr, id);
     if (!cr.stream) {
         std::lock_guard lock(gen_mutex);
         const auto closed = req.is_connection_closed;
@@ -133,9 +136,9 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
             bool stopped = false;
             cr.gen.cancelled = closed;
             const auto r = generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped);
-            const char* finish = finish_reason(r, parser, stopped);
-            log_result(id, r, finish);
-            res.set_content(completion(id, created, model, parser, finish, r), "application/json");
+            const End e = end_of(r, parser, stopped);
+            log_result(id, r, end_name(e));
+            res.set_content(proto->whole(e, parser, r), "application/json");
         } catch (const std::exception& e) {
             fail(500, e.what(), "server_error");
         }
@@ -145,45 +148,79 @@ void Server::Impl::chat(const httplib::Request& req, httplib::Response& res)
     // The provider runs after this handler returns; the check only holds the socket.
     cr.gen.cancelled = req.is_connection_closed;
     auto shared = std::make_shared<ChatRequest>(std::move(cr));
-    res.set_chunked_content_provider("text/event-stream", [this, shared, prompt = std::move(prompt), id, created,
-                                                           model, slot](size_t, httplib::DataSink& sink) {
-        const auto send = [&](const std::string& json) {
-            const std::string event = "data: " + json + "\n\n";
-            return sink.write(event.data(), event.size());
-        };
+    res.set_chunked_content_provider("text/event-stream", [this, shared, proto, prompt = std::move(prompt), id,
+                                                           slot](size_t, httplib::DataSink& sink) {
+        const auto write = [&](const std::string& s) { return s.empty() || sink.write(s.data(), s.size()); };
         std::lock_guard lock(gen_mutex);
-        if (shared->gen.cancelled() || !send(chunk(id, created, model, {}, true)))
+        if (shared->gen.cancelled() || !write(proto->begin(uint32_t(prompt.size()))))
             return false; // gave up while waiting
         try {
             OutputParser parser(tok, shared->tools, shared->stop);
             bool stopped = false;
-            const auto r = generate(prompt, *shared, parser,
-                                    [&](const Delta& d) { return send(chunk(id, created, model, d)); }, stopped);
-            const char* finish = finish_reason(r, parser, stopped);
-            log_result(id, r, finish);
-            if (std::string_view(finish) == "cancelled")
+            const auto r = generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); },
+                                    stopped);
+            const End e = end_of(r, parser, stopped);
+            log_result(id, r, end_name(e));
+            if (e == End::cancelled)
                 return false;
-            send(chunk(id, created, model, {}, false, finish));
-            if (shared->include_usage)
-                send(usage_chunk(id, created, model, r));
+            write(proto->end(e, parser, r));
         } catch (const std::exception& e) {
             std::println(stderr, "{}: {}", id, e.what());
-            send(error_body(e.what(), "server_error"));
+            write(proto->stream_error(e.what()));
         }
-        const std::string done = "data: [DONE]\n\n";
-        sink.write(done.data(), done.size());
         sink.done();
         return true;
     });
+}
+
+void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& res)
+{
+    try {
+        const auto cr = parse_messages_request(req.body, opts.sampling, true);
+        const auto rendered = tmpl.render(cr.context);
+        res.set_content(count_tokens_body(uint32_t(tok.encode(rendered.text, rendered.input).size())),
+                        "application/json");
+    } catch (const std::exception& e) {
+        res.status = 400;
+        res.set_content(anthropic_error(e.what(), "invalid_request_error"), "application/json");
+    }
 }
 
 Server::Server(glm::Engine& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts)
     : impl_(std::make_unique<Impl>(engine, tok, tmpl, std::move(opts)))
 {
     auto& h = impl_->http;
-    const auto chat = [this](const httplib::Request& req, httplib::Response& res) { impl_->chat(req, res); };
+    const auto chat = [this](const httplib::Request& req, httplib::Response& res) {
+        auto& im = *impl_;
+        const int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+        im.serve(
+            req, res, [&] { return parse_chat_request(req.body, im.opts.sampling); },
+            [](const std::string& m, const char* t) { return error_body(m, t); }, "chatcmpl-",
+            [&](const ChatRequest& cr, const std::string& id) {
+                return openai_protocol(id, created, im.opts.model_id, cr.include_usage);
+            });
+    };
     h.Post("/v1/chat/completions", chat);
     h.Post("/chat/completions", chat);
+    const auto messages = [this](const httplib::Request& req, httplib::Response& res) {
+        auto& im = *impl_;
+        im.serve(
+            req, res, [&] { return parse_messages_request(req.body, im.opts.sampling); },
+            [](const std::string& m, const char* t) {
+                const std::string_view type(t);
+                return anthropic_error(m, type == "server_busy" ? "overloaded_error"
+                                          : type == "server_error" ? "api_error"
+                                                                   : t);
+            },
+            "msg_", [&](const ChatRequest& cr, const std::string& id) {
+                return anthropic_protocol(id, im.opts.model_id, cr.show_reasoning);
+            });
+    };
+    h.Post("/v1/messages", messages);
+    h.Post("/v1/messages/count_tokens",
+           [this](const httplib::Request& req, httplib::Response& res) { impl_->count_tokens(req, res); });
     const auto models = [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(models_body(impl_->opts.model_id), "application/json");
     };
