@@ -2,6 +2,8 @@
 //   io_bench create <file> <GiB>
 //   io_bench read <file> [threads] [block_KiB] [seconds]
 //   io_bench sweep <file> [seconds]
+//   io_bench batch <file> [reps]   time to read one span of 7 or 14 MB (a decode step's missing experts) as parallel
+//                                  chunks from persistent threads, across thread counts and chunk sizes
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -9,6 +11,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <numeric>
+#include <mutex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -138,6 +143,87 @@ void print_row(int threads, size_t block, const Result& r)
 
 } // namespace
 
+// Persistent threads that each take chunks of a span until none are left; run() returns when the span is read.
+class Pool {
+public:
+    explicit Pool(int n)
+    {
+        for (int i = 0; i < n; ++i)
+            threads_.emplace_back([this](std::stop_token st) { work(st); });
+    }
+    ~Pool()
+    {
+        for (auto& t : threads_)
+            t.request_stop();
+        cv_.notify_all();
+    }
+    void run(int fd, char* dst, uint64_t off, uint64_t bytes, uint64_t chunk)
+    {
+        std::unique_lock lock(m_);
+        fd_ = fd, dst_ = dst, off_ = off, bytes_ = bytes, chunk_ = chunk;
+        n_ = (bytes + chunk - 1) / chunk, next_ = 0, done_ = 0;
+        ++gen_;
+        cv_.notify_all();
+        done_cv_.wait(lock, [&] { return done_ == n_; });
+    }
+
+private:
+    void work(std::stop_token st)
+    {
+        uint64_t seen = 0;
+        std::unique_lock lock(m_);
+        while (!st.stop_requested()) {
+            cv_.wait(lock, [&] { return st.stop_requested() || (gen_ != seen && next_ < n_); });
+            if (st.stop_requested())
+                return;
+            while (next_ < n_) {
+                const uint64_t i = next_++;
+                lock.unlock();
+                const uint64_t o = i * chunk_, b = std::min(chunk_, bytes_ - o);
+                if (::pread(fd_, dst_ + o, b, off_t(off_ + o)) != ssize_t(b))
+                    std::abort();
+                lock.lock();
+                if (++done_ == n_)
+                    done_cv_.notify_one();
+            }
+            seen = gen_;
+        }
+    }
+    std::mutex m_;
+    std::condition_variable cv_, done_cv_;
+    std::vector<std::jthread> threads_;
+    int fd_ = -1;
+    char* dst_ = nullptr;
+    uint64_t off_ = 0, bytes_ = 0, chunk_ = 0, n_ = 0, next_ = 0, done_ = 0, gen_ = 0;
+};
+
+int run_batch(const char* path, int reps)
+{
+    const int fd = open_nocache(path, O_RDONLY);
+    const uint64_t size = uint64_t(::lseek(fd, 0, SEEK_END));
+    char* dst = static_cast<char*>(map_anon(16 << 20));
+    std::memset(dst, 0, 16 << 20);
+    std::mt19937_64 rng(1);
+    std::println("| MB | threads | chunk KiB | median ms | mean ms | GB/s at median |\n|---|---|---|---|---|---|");
+    for (uint64_t mb : {7, 14})
+        for (int threads : {4, 8, 12, 16, 24})
+            for (uint64_t kib : {256, 512, 1024}) {
+                Pool pool(threads);
+                std::vector<double> ms;
+                for (int r = 0; r < reps; ++r) {
+                    const uint64_t off = (rng() % ((size - (16 << 20)) >> 16)) << 16;
+                    const auto t0 = Clock::now();
+                    pool.run(fd, dst, off, mb << 20, kib << 10);
+                    ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
+                std::ranges::sort(ms);
+                const double med = ms[ms.size() / 2], mean = std::accumulate(ms.begin(), ms.end(), 0.0) / ms.size();
+                std::println("| {} | {} | {} | {:.3f} | {:.3f} | {:.1f} |", mb, threads, kib, med, mean,
+                             (mb << 20) / med / 1e6);
+            }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) {
@@ -155,6 +241,8 @@ int main(int argc, char** argv)
         print_row(threads, block, run_read(path, threads, block, secs));
         return 0;
     }
+    if (cmd == "batch")
+        return run_batch(path, argc > 3 ? std::stoi(argv[3]) : 200);
     if (cmd == "sweep") {
         double secs = argc > 3 ? std::stod(argv[3]) : 3.0;
         for (size_t kib : {128, 512, 1024, 2048, 4096, 8192})
