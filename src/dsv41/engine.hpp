@@ -87,7 +87,11 @@ public:
     struct SpecStats {
         uint64_t drafts = 0, verifies = 0, verified_tokens = 0, steps = 0, verify_misses = 0, step_misses = 0;
         double draft_ms = 0, verify_ms = 0, step_ms = 0, verify_read_ms = 0, step_read_ms = 0;
-        double step_gpu_ms = 0, step_wait_ms = 0, step_encode_ms = 0;
+        double step_gpu_ms = 0, step_wait_ms = 0, step_encode_ms = 0, step_prep_ms = 0, step_wall_ms = 0;
+        // Layer telemetry: GPU time by section (attention; FFN to routing; shared and resident experts; misses and
+        // the rest) and by named part.
+        double step_attn_ms = 0, step_ffn_ms = 0, step_hit_ms = 0, step_miss_ms = 0;
+        std::vector<core::KernelTime> parts;
     };
     const SpecStats& spec_stats() const { return spec_stats_; }
 

@@ -2,7 +2,7 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
+//          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [-n N]
 // --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one and
@@ -55,6 +55,7 @@ int main(int argc, char** argv)
     int gen = 0;
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0;
+    bool part_timing = false;
     bool spec = true;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
@@ -78,8 +79,12 @@ int main(int argc, char** argv)
             opts.prefill_chunk = uint32_t(std::stoul(v));
         else if (a == "--group")
             opts.prefill_group = uint32_t(std::stoul(v));
-        else if (a == "--telemetry")
-            opts.telemetry = v == "layers" ? mako::core::Telemetry::layers : mako::core::Telemetry::summary;
+        else if (a == "--telemetry") {
+            opts.telemetry = v == "summary" ? mako::core::Telemetry::summary
+                             : v == "kernels" ? mako::core::Telemetry::kernels
+                                              : mako::core::Telemetry::layers;
+            part_timing = v == "parts";
+        }
         else if (a == "--save-profile")
             save_profile = v;
         else if (a == "--profile")
@@ -137,6 +142,7 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     const auto t0 = std::chrono::steady_clock::now();
     mako::dsv41::Engine engine(*m, *cfg, opts, ctx);
+    engine.set_part_timing(part_timing);
     std::println(stderr, "loaded in {:.1f} s: arena {:.1f} GB, {}-{} slots a layer, profile {}",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), engine.arena().bytes() / 1e9,
                  engine.load_stats().slots_min, engine.load_stats().slots_max,
@@ -221,9 +227,23 @@ int main(int argc, char** argv)
                      ss.verifies ? double(ss.verify_misses) / ss.verifies : 0.0,
                      ss.verifies ? ss.verify_read_ms / ss.verifies : 0.0, ss.steps, ss.steps ? ss.step_ms / ss.steps : 0.0,
                      ss.steps ? double(ss.step_misses) / ss.steps : 0.0, ss.steps ? ss.step_read_ms / ss.steps : 0.0);
-        if (ss.steps)
-            std::println("per step: GPU {:.1f} ms, CPU waiting for routing {:.1f} ms, encoding {:.1f} ms",
-                         ss.step_gpu_ms / ss.steps, ss.step_wait_ms / ss.steps, ss.step_encode_ms / ss.steps);
+        if (ss.steps) {
+            const double n = double(ss.steps);
+            std::println("per step: wall {:.1f} ms = inputs read {:.1f} + encoding {:.1f} + ...; GPU {:.1f} ms; CPU waiting "
+                         "for routing {:.1f} ms; making experts resident {:.1f} ms ({:.1f} misses)",
+                         ss.step_wall_ms / n, ss.step_prep_ms / n, ss.step_encode_ms / n, ss.step_gpu_ms / n,
+                         ss.step_wait_ms / n, ss.step_read_ms / n, double(ss.step_misses) / n);
+            const double sec = ss.step_attn_ms + ss.step_ffn_ms + ss.step_hit_ms + ss.step_miss_ms;
+            if (sec > 0 && ss.parts.empty()) // with parts, empty section encoders' timestamps overlap the parts'
+                std::println("GPU sections per step: attention {:.2f}, FFN to routing {:.2f}, shared + resident experts "
+                             "{:.2f}, misses + rest {:.2f} = {:.2f} ms busy; GPU time not in a section {:.2f} ms",
+                             ss.step_attn_ms / n, ss.step_ffn_ms / n, ss.step_hit_ms / n, ss.step_miss_ms / n, sec / n,
+                             (ss.step_gpu_ms - sec) / n);
+            auto parts = ss.parts;
+            std::ranges::sort(parts, std::greater{}, &mako::core::KernelTime::ms);
+            for (const auto& k : parts)
+                std::println("    {:36} {:6.2f} ms per step  ({:.0f} a step)", k.kernel, k.ms / n, k.count / n);
+        }
         return 0;
     }
     if (split > 0 && width > 0) {

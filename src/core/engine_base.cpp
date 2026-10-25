@@ -925,6 +925,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
             ind[t * 9 + part * 3 + 1] = uint32_t(g.height);
         }
 
+    part(enc, "moe router");
     gemv(enc, mw.router, xn, 0, rlog, 0, 1, T);
     const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 1, uint32_t(routing_.score)};
     enc->setComputePipelineState(pso("moe_route"));
@@ -946,6 +947,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     cb->encodeSignalEvent(routed_.get(), v);
     pending_moe_.push_back({il, v, T});
     enc = encoder(cb, tl, il < dims_.n_layer ? 2 : -1);
+    part(enc, "moe shared expert");
     // The CPU starts on the misses as soon as the route is known; the shared expert runs meanwhile.
     ffn_dense(enc, mw.sh_gate, mw.sh_up, mw.sh_down, xn, sho, mw.clamp_sh, T);
     if (between)
@@ -974,6 +976,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
                                            scratch(std::string("ed") + tag, uint64_t(T) * k * E * 4)};
     };
     const auto h = bufs("h");
+    part(enc, "moe resident experts");
     run(0, T, false, hit_ids, 0, xn, 0, h[0], 0, 0);
     run(1, T, false, hit_ids, 0, xn, 0, h[1], 0, 0);
     dispatch(enc, "swiglu", {h[0], h[1], h[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1), MTL::Size(256, 1, 1));
@@ -981,6 +984,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     enc->endEncoding();
     cb->encodeWait(ready_.get(), v);
     enc = encoder(cb, tl, il < dims_.n_layer ? 3 : -1);
+    part(enc, "moe miss experts");
     const auto m = bufs("m");
     const uint64_t rows = uint64_t(k) * nff * 4;
     for (uint32_t t = 0; t < T; ++t) {
@@ -991,6 +995,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     for (uint32_t t = 0; t < T; ++t)
         run(2, 1, true, miss_ids, t * 64, m[2], t * rows, m[3], uint64_t(t) * k * E * 4, ind_off + t * 36);
     const CombineArgs ca{E, k};
+    part(enc, "moe combine");
     dispatch(enc, "moe_combine_split", {h[3], m[3], miss_rank, ew, sho, ffo}, &ca, sizeof(ca), MTL::Size(E, T, 1),
              MTL::Size(256, 1, 1));
 }

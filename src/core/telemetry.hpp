@@ -53,6 +53,7 @@ struct StepStats {
     uint32_t pos = 0;
     int32_t token = 0;
     double wall_ms = 0, encode_ms = 0, gpu_ms = 0;
+    double prep_ms = 0;       // CPU work before encoding (inputs read from files)
     double route_wait_ms = 0; // CPU waiting for the GPU's routing results
     double ensure_ms = 0;     // CPU making selected experts resident, misses read included
     double read_ms = 0;

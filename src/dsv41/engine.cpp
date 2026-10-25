@@ -456,6 +456,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     MTL::Buffer* kv = scratch("ds_kv", uint64_t(T) * D * 4);
     MTL::Buffer* kvn = scratch("ds_kvn", uint64_t(T) * D * 4);
     MTL::Buffer* kvc = scratch("ds_kvc", uint64_t(T) * D * 4);
+    part(enc, "attn q kv");
     proj(enc, L.q_a, xn, 0, qr, 0, T);
     norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
     proj(enc, L.q_b, qrn, 0, q, 0, T);
@@ -469,6 +470,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
 
     // A KV source's compressor: a new compressed row (and index key) per completed group of `ratio` tokens.
     if (L.kv_src) {
+        part(enc, "attn compressor");
         const uint32_t src = uint32_t(L.owner);
         MTL::Buffer* lat = scratch("ds_lat", uint64_t(T) * D * 4);
         MTL::Buffer* latn = scratch("ds_latn", uint64_t(T) * D * 4);
@@ -511,6 +513,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     const uint32_t blk_stride = opts_.max_ctx / bs + 2;
     MTL::Buffer* keep = scratch("ds_keep", uint64_t(opts_.prefill_group) * blk_stride);
     if (L.idx_src && comp && (pos0 + T) / ratio > top) {
+        part(enc, "attn indexer");
         // first token with more than `top` rows
         const uint32_t t_s = (top + 1) * ratio > pos0 + 1 ? (top + 1) * ratio - 1 - pos0 : 0;
         MTL::Buffer* iq = scratch("ds_iq", uint64_t(T) * Hi * Di * 4);
@@ -572,6 +575,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     MTL::Buffer* sc = scratch("ds_sc", uint64_t(ng) * H * stride * 4);
     MTL::Buffer* ph = scratch("ds_ph", uint64_t(ng) * H * stride * 2);
     MTL::Buffer* cbuf = comp ? ckv_[L.owner].get() : ringb;
+    part(enc, "attn core");
     gemm_->to_half(enc, q, 0, T, HD, 0, qh, 0);
     after(enc, "to_half");
     for (uint32_t t0 = 0; t0 < T; t0 += kAttnGroup) {
@@ -612,6 +616,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
                  MTL::Size(256, 1, 1));
     }
 
+    part(enc, "attn output");
     rope(enc, o, 0, comp, D, H, pos0, T, 1, true);
     round(enc, o, 0, o, 0, T * HD, kFp8);
     // Grouped output projection: group g's heads (rows g * gw of each token) through its o_lora_rank rows.
@@ -646,6 +651,22 @@ const std::vector<float>& Engine::step(int32_t token)
     spec_stats_.step_gpu_ms += last_step_.gpu_ms;
     spec_stats_.step_wait_ms += last_step_.route_wait_ms;
     spec_stats_.step_encode_ms += last_step_.encode_ms;
+    spec_stats_.step_prep_ms += last_step_.prep_ms;
+    spec_stats_.step_wall_ms += last_step_.wall_ms;
+    for (const auto& l : last_step_.layers) {
+        spec_stats_.step_attn_ms += l.attn_ms;
+        spec_stats_.step_ffn_ms += l.ffn_ms;
+        spec_stats_.step_hit_ms += l.hit_ms;
+        spec_stats_.step_miss_ms += l.miss_ms;
+    }
+    for (const auto* list : {&last_step_.parts, &last_step_.kernels})
+    for (const core::KernelTime& k : *list) {
+        auto it = std::ranges::find(spec_stats_.parts, k.kernel, &core::KernelTime::kernel);
+        if (it == spec_stats_.parts.end())
+            it = spec_stats_.parts.insert(it, core::KernelTime{k.kernel, 0, 0});
+        it->ms += k.ms;
+        it->count += k.count;
+    }
     return logits_;
 }
 
@@ -767,6 +788,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         }
     }
 
+    const double prep_ms = ms_since(step_start_);
     if (!decode)
         begin_staging(G);
     struct StagingEnd {
@@ -814,6 +836,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
                     dispatch(enc, "ds_tap", {R, taps}, ta, sizeof(ta), MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
                 }
         if (L.engram >= 0) {
+            part(enc, "engram");
             proj(enc, L.engram_kv, eg, uint64_t(L.engram) * G * eg_cols * eg_dim * 4, ekv, 0, G);
             const EngramArgs ea{E, cfg_.rms_eps};
             enc->setComputePipelineState(pso("ds_engram_gate"));
@@ -827,9 +850,11 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         for (uint32_t c0 = 0; c0 < G; c0 += chunk) {
             const uint32_t T = std::min(chunk, G - c0);
             const uint64_t r_off = uint64_t(c0) * hd * 4, pc_off = uint64_t(c0) * 24 * 4;
+            part(enc, "attn hc and norm");
             hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, r_off, pc_off);
             norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
             attention(enc, L, il, xn, att, T, pos_ + c0, c0);
+            part(enc, "attn hc post");
             ablate(enc, il, ablate_attn_, att, 0, T);
             if (G == 1)
                 probe(enc, "attn_out", int(il), att, E);
@@ -843,6 +868,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             enc = encoder(cb, il, 1);
         }
 
+        part(enc, "ffn hc and norm");
         hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, G, 0, 0);
         norm(enc, xg, &L.ffn_norm, xn_g, G, E, E, cfg_.rms_eps);
         if (decode) {
@@ -859,6 +885,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             ablate(enc, il, ablate_shexp_, ffo, 0, G);
             moe_prefill(cb, enc, L.moe, il, xn_g, ffo, G, committed);
         }
+        part(enc, "ffn hc post");
         if (G == 1)
             probe(enc, "ffn_out", int(il), ffo, E);
         hc_post(enc, ffo, R, R2, pcs[cur], G);
@@ -921,6 +948,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     stats_.step_ms += ms_since(step_start_);
     const ExpertArena::Stats& after_stats = arena_->stats();
     last_step_.wall_ms = ms_since(step_start_);
+    last_step_.prep_ms = prep_ms;
     last_step_.encode_ms = stats_.encode_ms - stats_before.encode_ms;
     last_step_.gpu_ms = stats_.gpu_exec_ms - stats_before.gpu_exec_ms;
     last_step_.read_ms = after_stats.read_ms - before.read_ms;
