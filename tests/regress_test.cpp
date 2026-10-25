@@ -6,8 +6,9 @@
 //   session      generation through Session: greedy and speculative tokens, prefix reuse from the current state
 //                and from a checkpoint (the same logits as a fresh prefill), a repeated prompt, a read cancelled
 //                between groups and resumed, drafts after a restore
-//   ablate       per-layer direction removal: the streams after an ablated layer have no component along its
-//                directions, prefill and decode agree, all-zero directions and switching it off change nothing
+//   ablate       per-layer direction removal (sites ffn_out and stream): the streams after an ablated layer have
+//                no component along its directions, prefill and decode agree, all-zero directions and switching it
+//                off change nothing
 //   long         a prompt past the dense-attention window (sparse selection, lent arena slots) against the
 //                reference, then decode
 //   regress_test <model.gguf> [case ...] [--update]
@@ -632,9 +633,19 @@ int main(int argc, char** argv)
                     v[i] /= float(std::sqrt(n));
             }
 
-        engine.set_ablation(std::vector<float>(uint64_t(NL) * E, 0.0f));
+        // The engine's file layout: [layer][site][k][n_embd], the same directions at both sites.
+        auto ablation = [&](const std::vector<float>& per_layer, uint32_t kk) {
+            const std::vector<std::string> names{"ffn_out", "stream"};
+            std::vector<float> v(uint64_t(NL) * names.size() * kk * E);
+            for (uint32_t l = 0; l < NL; ++l)
+                for (size_t s = 0; s < names.size(); ++s)
+                    std::copy_n(per_layer.data() + uint64_t(l) * kk * E, uint64_t(kk) * E,
+                                v.data() + (uint64_t(l) * names.size() + s) * kk * E);
+            return mako::mtl::Ablation::from_vectors(ctx, E, NL, names, kk, v, mako::glm::Engine::kAblationSites);
+        };
+        engine.set_ablation(ablation(std::vector<float>(uint64_t(NL) * E, 0.0f), 1));
         const bool zero_same = whole() == base && split() == base_split;
-        engine.set_ablation(dirs);
+        engine.set_ablation(ablation(dirs, k));
         const auto abl = whole(), abl_split = split();
 
         // The streams after layer l: probed while the last token runs as a step.
@@ -661,7 +672,7 @@ int main(int argc, char** argv)
                     }
                     (l == 0 ? worst_off : worst_on) = std::max(l == 0 ? worst_off : worst_on, std::abs(dot) / std::sqrt(n));
                 }
-        engine.set_ablation({});
+        engine.set_ablation(std::nullopt);
         const bool off_same = whole() == base;
 
         check(zero_same, "all-zero directions: the same logits, bit for bit");

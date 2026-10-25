@@ -39,11 +39,6 @@ struct NormArgs {
     float eps;
     uint32_t ystride;
 };
-struct AblateArgs {
-    uint32_t n_embd, k;
-    float scale;
-};
-
 struct HcArgs {
     uint32_t n_embd, iters;
     float eps;
@@ -749,56 +744,18 @@ MTL::Buffer* Engine::halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uin
     return h;
 }
 
-void Engine::set_ablation(std::vector<float> dirs, float scale)
+void Engine::set_ablation(std::optional<mtl::Ablation> ablation)
 {
-    const uint64_t per_dir = uint64_t(cfg_.n_layer) * cfg_.n_embd;
-    if (dirs.empty()) {
-        ablate_k_ = 0;
-        ablate_buf_ = {};
-        ablate_layer_.clear();
-        return;
-    }
-    if (dirs.size() % per_dir)
-        throw std::invalid_argument(std::format("ablation directions: {} floats are not {} layers x k x {}",
-                                                dirs.size(), cfg_.n_layer, cfg_.n_embd));
-    const uint32_t k = uint32_t(dirs.size() / per_dir);
-    ablate_layer_.assign(cfg_.n_layer, 0);
-    for (uint32_t l = 0; l < cfg_.n_layer; ++l)
-        ablate_layer_[l] = std::ranges::any_of(std::span(dirs).subspan(uint64_t(l) * k * cfg_.n_embd,
-                                                                       uint64_t(k) * cfg_.n_embd),
-                                               [](float x) { return x != 0.0f; });
-    ablate_buf_ = mtl::Ref<MTL::Buffer>(
-        ctx_.device()->newBuffer(dirs.data(), dirs.size() * 4, MTL::ResourceStorageModeShared));
-    ablate_k_ = k;
-    ablate_scale_ = scale;
+    ablation_ = std::move(ablation);
+    ablate_ffn_ = ablation_ ? ablation_->site("ffn_out") : -1;
+    ablate_stream_ = ablation_ ? ablation_->site("stream") : -1;
 }
 
-std::vector<float> Engine::read_directions(const std::string& path)
+void Engine::ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* x, uint32_t rows)
 {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in)
-        throw std::runtime_error(std::format("cannot open {}", path));
-    const auto bytes = uint64_t(in.tellg());
-    if (bytes == 0 || bytes % 4)
-        throw std::runtime_error(std::format("{} is not float32 values ({} bytes)", path, bytes));
-    std::vector<float> v(bytes / 4);
-    in.seekg(0);
-    if (!in.read(reinterpret_cast<char*>(v.data()), std::streamsize(bytes)))
-        throw std::runtime_error(std::format("reading {} failed", path));
-    return v;
-}
-
-void Engine::ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, MTL::Buffer* x, uint32_t rows)
-{
-    if (!ablate_k_ || il >= ablate_layer_.size() || !ablate_layer_[il])
+    if (!ablation_ || !ablation_->active(il, site))
         return;
-    const AblateArgs a{cfg_.n_embd, ablate_k_, ablate_scale_};
-    enc->setComputePipelineState(pso("ablate_rows"));
-    enc->setBuffer(x, 0, 0);
-    enc->setBuffer(ablate_buf_.get(), uint64_t(il) * ablate_k_ * cfg_.n_embd * 4, 1);
-    enc->setBytes(&a, sizeof(a), 2);
-    for (int r = repeats(last_pso_); r > 0; --r)
-        enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+    ablation_->apply(enc, pso("ablate_rows"), il, site, x, 0, rows);
     after(enc, "ablate_rows");
 }
 
@@ -1544,8 +1501,8 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
             moe_decode(cb, enc, L, il, xn, ffo, T);
         }
         probe(enc, "ffn_out", int(il), ffo, E);
-        ablate(enc, il, ffo, T);
-        ablate(enc, il, scratch("R", rows * hd * 4), T * cfg_.hc);
+        ablate(enc, il, ablate_ffn_, ffo, T);
+        ablate(enc, il, ablate_stream_, scratch("R", rows * hd * 4), T * cfg_.hc);
         if (fused && il + 1 < cfg_.n_layer) {
             const Layer& N = *layers_[il + 1];
             hc_step(enc, ffo, scratch("R", rows * hd * 4), scratch("R2", rows * hd * 4), N.hc_attn_fn, N.hc_attn_scale,
@@ -2231,8 +2188,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                 for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
                     enc->dispatchThreads(MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
             }
-            ablate(enc, il, ffo, G);
-            ablate(enc, il, R, G * cfg_.hc);
+            ablate(enc, il, ablate_ffn_, ffo, G);
+            ablate(enc, il, ablate_stream_, R, G * cfg_.hc);
             hc_post(enc, ffo, R, R2, pc_g, G);
             std::swap(R, R2);
         }

@@ -5,6 +5,7 @@
 #include "glm/profile.hpp"
 #include "glm/telemetry.hpp"
 #include "gguf/model_files.hpp"
+#include "mtl/ablation.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemm.hpp"
 #include "mtl/gemv.hpp"
@@ -17,6 +18,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -90,14 +92,12 @@ public:
     // The logits after the last step's (or prefill's) last token.
     const std::vector<float>& logits() const { return logits_; }
     uint32_t max_context() const { return opts_.max_ctx; }
-    // Abliteration: before layer l's FFN output is mixed into the residual streams, it and the streams lose their
-    // components along layer l's directions (x -= scale (x . v) v), in prefill and decode; the next-token block is
-    // left alone. dirs: n_layer * k * n_embd floats, each layer's k directions orthonormal or all zero (the layer
-    // is left alone); k follows from the size. Empty: off. Throws std::invalid_argument on a size that does not fit.
-    void set_ablation(std::vector<float> dirs, float scale = 1.0f);
-    bool ablating() const { return ablate_k_ > 0; }
-    // A raw float32 file of directions for set_ablation(). Throws std::runtime_error.
-    static std::vector<float> read_directions(const std::string& path);
+    // Abliteration sites: before layer l's FFN output is mixed into the residual streams, it (ffn_out) and the
+    // streams (stream) lose their components along the layer's directions, in prefill and decode; the next-token
+    // block is left alone. A file may hold either or both.
+    static constexpr std::array<std::string_view, 2> kAblationSites{"ffn_out", "stream"};
+    void set_ablation(std::optional<mtl::Ablation> ablation);
+    bool ablating() const { return ablation_.has_value(); }
     uint32_t checkpoint_slots() const { return opts_.checkpoints; }
     // Size of one checkpoint().
     uint64_t checkpoint_bytes() const;
@@ -291,11 +291,9 @@ private:
     StepStats last_step_, last_prefill_;
     Telemetry tel_ = Telemetry::off; // the level in effect (prefill runs kernel-level telemetry as summary)
     bool timing() const { return !samples_.empty() && tel_ >= Telemetry::layers; }
-    mtl::Ref<MTL::Buffer> ablate_buf_; // set_ablation()'s directions
-    uint32_t ablate_k_ = 0;
-    float ablate_scale_ = 1.0f;
-    std::vector<char> ablate_layer_; // the layer has non-zero directions
-    void ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, MTL::Buffer* x, uint32_t rows);
+    std::optional<mtl::Ablation> ablation_;
+    int ablate_ffn_ = -1, ablate_stream_ = -1; // the sites' indices in ablation_
+    void ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* x, uint32_t rows);
     // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
     struct Timed {
         uint32_t layer;

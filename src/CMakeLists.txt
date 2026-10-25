@@ -1,4 +1,4 @@
-add_library(mako_mtl STATIC mtl/metal_impl.cpp mtl/context.cpp mtl/gemv.cpp mtl/gemm.cpp mtl/embedded.cpp)
+add_library(mako_mtl STATIC mtl/ablation.cpp mtl/metal_impl.cpp mtl/context.cpp mtl/gemv.cpp mtl/gemm.cpp mtl/embedded.cpp)
 target_include_directories(mako_mtl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_mtl PUBLIC metal_cpp mako_gguf)
 

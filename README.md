@@ -68,10 +68,12 @@ the experts that start resident follow how it was used. `chat_template_kwargs` a
 `required` or a named function forces the answer to start with a call (of that function). Not supported (HTTP 400):
 `n` > 1, `logprobs`, structured `response_format`.
 
-`--ablate FILE` (also on `mako_run`) removes per-layer directions from the residual streams (abliteration): before
-layer l's FFN output is mixed into the hyper-connection streams, it and the streams lose their components along
-layer l's directions. The file is raw float32, layers x k x n_embd, each layer's k directions orthonormal or all
-zero; `--ablate-scale` sets the strength (default 1). The next-token block is left alone.
+`--ablate FILE` (also on `mako_run`) removes per-layer directions (abliteration) from chosen rows of the computation.
+The file names its sites (`MAKOABL1`: n_embd, n_layer, site names, then float32 vectors [layer][site][k][n_embd]; see
+`src/mtl/ablation.hpp`); each row loses x -= scale (x . v) v per direction, the vectors' norms carrying the strength and
+`--ablate-scale` multiplying it. GLM-5.3's sites: `ffn_out` (a layer's FFN output) and `stream` (the hyper-connection
+streams), both before the FFN output is mixed in; the next-token block is left alone. `tools/make_ablation.py` turns
+raw float32 directions [layer][k][n_embd] into a file (`--sites ffn_out,stream` for GLM-5.3).
 
 For pi, a provider in `~/.pi/agent/models.json` with `"api": "openai-completions"`, `"baseUrl":
 "http://127.0.0.1:8080/v1"`, `"reasoning": true` and `"compat": {"supportsMidConvoSystemMessages": true}` (system

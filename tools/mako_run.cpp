@@ -13,7 +13,8 @@
 // logits against <DIR>/logits.<pos>.f32. --dump writes the probes and logits in the same layout.
 // --force feeds each layer the reference's l_out of the layer before (teacher forcing), so --ref then
 // measures each layer's own error; --force-route also takes the reference's expert selection and weights.
-// --ablate removes per-layer directions (raw float32) from the residual streams (Engine::set_ablation).
+// --ablate removes per-layer directions (an ablation file, mtl::Ablation; sites ffn_out and stream) from the
+// FFN output and residual streams (Engine::set_ablation); --ablate-scale multiplies their strength.
 // --spec or a sampling option generates through a Session (speculatively with --spec; sampled with --temp > 0).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -226,8 +227,11 @@ int main(int argc, char** argv)
     auto t0 = std::chrono::steady_clock::now();
     opts.mtp = mtp_stats || spec;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
-    if (!ablate.empty())
-        engine.set_ablation(mako::glm::Engine::read_directions(ablate), ablate_scale);
+    if (!ablate.empty()) {
+        auto a = mako::mtl::Ablation::load(ablate, ctx, cfg->n_embd, cfg->n_layer, mako::glm::Engine::kAblationSites);
+        a.set_scale(ablate_scale);
+        engine.set_ablation(std::move(a));
+    }
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (!stats_out.empty() && opts.telemetry == mako::glm::Telemetry::off)
         opts.telemetry = mako::glm::Telemetry::summary;

@@ -3,7 +3,8 @@
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR]
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes per-layer directions
-// (raw float32, layers x k x n_embd) from the residual streams (Engine::set_ablation).
+// (an ablation file, mtl::Ablation; sites ffn_out and stream) from the FFN output and residual streams; --ablate-scale
+// multiplies their strength.
 #include "chat/template.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -115,7 +116,9 @@ int main(int argc, char** argv)
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     if (!ablate.empty()) {
         try {
-            engine.set_ablation(mako::glm::Engine::read_directions(ablate), ablate_scale);
+            auto a = mako::mtl::Ablation::load(ablate, ctx, cfg->n_embd, cfg->n_layer, mako::glm::Engine::kAblationSites);
+            a.set_scale(ablate_scale);
+            engine.set_ablation(std::move(a));
         } catch (const std::exception& e) {
             std::println(stderr, "--ablate: {}", e.what());
             return 1;
