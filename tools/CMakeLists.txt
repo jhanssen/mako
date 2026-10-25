@@ -31,3 +31,6 @@ target_compile_definitions(prefill_sweep PRIVATE MAKO_SOURCE_DIR="${PROJECT_SOUR
 
 add_executable(render_template render_template.cpp)
 target_link_libraries(render_template PRIVATE mako_chat mako_gguf)
+
+add_executable(engram_rows engram_rows.cpp)
+target_link_libraries(engram_rows PRIVATE mako_dsv41)

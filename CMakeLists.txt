@@ -40,5 +40,6 @@ add_subdirectory(tools)
 # Model-backed tests (ctest) need the first shard of the GGUF; without it they report as skipped.
 set(MAKO_MODEL "$ENV{MAKO_MODEL}" CACHE FILEPATH "First GGUF shard for the tests")
 set(MAKO_DS41_MODEL "$ENV{MAKO_DS41_MODEL}" CACHE FILEPATH "First DeepSeek-V4.1 GGUF shard for its tests")
+set(MAKO_DS41_ENGRAM "$ENV{MAKO_DS41_ENGRAM}" CACHE FILEPATH "The GGUF holding DeepSeek-V4.1's Engram tables")
 enable_testing()
 add_subdirectory(tests)

@@ -37,7 +37,7 @@ target_link_libraries(mako_chat PRIVATE jinja_engine)
 add_library(mako_server STATIC server/anthropic.cpp server/openai.cpp server/server.cpp)
 target_link_libraries(mako_server PUBLIC mako_glm mako_text mako_chat PRIVATE glaze_headers httplib_headers)
 
-add_library(mako_dsv41 STATIC dsv41/config.cpp)
+add_library(mako_dsv41 STATIC dsv41/config.cpp dsv41/engram.cpp)
 target_include_directories(mako_dsv41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_dsv41 PUBLIC mako_gguf)
 
