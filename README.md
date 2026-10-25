@@ -93,6 +93,7 @@ only the tests that need no GPU work.
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<model-00001-of-0000N.gguf>   # or MAKO_MODEL in the environment at configure
 ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | sampler | server | e2e
+# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> (at configure) adds the DeepSeek tokenizer test
 ```
 
 Every test but `sampler` needs the model and reports as skipped without it. The `e2e` tests (about a minute) check
