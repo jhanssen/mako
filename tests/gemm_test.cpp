@@ -70,13 +70,14 @@ int main(int argc, char** argv)
             for (size_t i = 0; i < rows.size(); ++i)
                 mako::quant::dequant_row(t->type, data.data() + rows[i] * rb, deq[i].data(), k);
 
-        for (uint32_t tokens : {1u, 37u, 64u, 200u}) {
+        for (uint32_t tokens : {1u, 2u, 5u, 8u, 13u, 16u, 37u, 64u, 200u}) {
             auto x = buffer(uint64_t(k) * tokens * 4), xh = buffer(uint64_t(k) * tokens * 2);
             auto y = buffer(uint64_t(n) * tokens * 4);
             auto* xf = static_cast<float*>(x->contents());
             for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
                 xf[i] = nd(rng);
             auto yref = buffer(uint64_t(n) * tokens * 4);
+            gemm.set_few_tokens(tokens <= 2 ? 2 : 0); // up to 2 tokens the few-token kernel, where it has one
             auto* cb = ctx.queue()->commandBuffer();
             auto* enc = cb->computeCommandEncoder();
             gemm.to_half(enc, x.get(), 0, tokens, k, 0, xh.get(), 0);
@@ -111,28 +112,48 @@ int main(int argc, char** argv)
                          rel, cpu_ref ? "CPU" : "GEMV", ok ? "ok" : "FAIL");
         }
 
-        // Speed at 28 (an expert's share of a chunk), 64 and 512 tokens (random activations: the matrix units' power, and so clocks, depend on the data).
-        for (const uint32_t tokens : {28u, 64u, 512u}) {
-        auto xh = buffer(uint64_t(k) * tokens * 2), y = buffer(uint64_t(n) * tokens * 4);
-        for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
-            static_cast<__fp16*>(xh->contents())[i] = __fp16(nd(rng));
-        // Sustained: the GPU clocks down between short, spaced-out dispatches, so time 20 back to back after a
-        // warm-up of about half a second.
-        double best = 1e9;
-        for (int rep = 0; rep < 8; ++rep) {
-            auto* cb = ctx.queue()->commandBuffer();
-            auto* enc = cb->computeCommandEncoder();
-            const int n_disp = rep < 3 ? 200 : 20;
-            for (int d = 0; d < n_disp; ++d)
-                gemm.encode(enc, t->type, k, n, tokens, w.get(), 0, xh.get(), 0, y.get(), 0);
-            enc->endEncoding();
-            cb->commit();
-            cb->waitUntilCompleted();
-            if (rep >= 3)
-                best = std::min(best, (cb->GPUEndTime() - cb->GPUStartTime()) / n_disp);
-        }
-        std::println("{:28} t={:3}: {:8.1f} us, {:6.2f} TFLOP/s", name, tokens, best * 1e6,
-                     2.0 * k * n * tokens / best / 1e12);
+        // Speed (random activations: the matrix units' power, and so clocks, depend on the data). The matrix is
+        // repeated 64 times and the dispatches, concurrent, cycle through the copies, so its weights come from
+        // memory, not cache, as a batch of experts' do in prefill. Formats with a few-token kernel are also timed
+        // without it.
+        constexpr uint32_t copies = 64;
+        auto wc = buffer(data.size() * copies);
+        for (uint32_t c = 0; c < copies; ++c)
+            std::memcpy(static_cast<char*>(wc->contents()) + c * data.size(), data.data(), data.size());
+        const bool few = t->type == mako::gguf::Type::IQ2_XXS || t->type == mako::gguf::Type::IQ2_S ||
+                         t->type == mako::gguf::Type::IQ3_XXS;
+        for (const uint32_t tokens : {1u, 2u, 4u, 8u, 12u, 16u, 20u, 24u, 28u, 64u, 512u}) {
+            auto xh = buffer(uint64_t(k) * tokens * 2), y = buffer(uint64_t(n) * tokens * 4);
+            for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
+                static_cast<__fp16*>(xh->contents())[i] = __fp16(nd(rng));
+            auto time = [&](uint32_t few_tokens) {
+                gemm.set_few_tokens(few_tokens);
+                // Sustained: the GPU clocks down between short, spaced-out dispatches, so time back to back after a
+                // warm-up of about half a second.
+                double best = 1e9;
+                for (int rep = 0; rep < 8; ++rep) {
+                    auto* cb = ctx.queue()->commandBuffer();
+                    // Concurrent, as prefill runs a batch of experts.
+                    auto* enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+                    const int n_disp = rep < 3 ? 200 : 64;
+                    for (int d = 0; d < n_disp; ++d)
+                        gemm.encode(enc, t->type, k, n, tokens, wc.get(), uint64_t(d % copies) * data.size(), xh.get(),
+                                    0, y.get(), 0);
+                    enc->endEncoding();
+                    cb->commit();
+                    cb->waitUntilCompleted();
+                    if (rep >= 3)
+                        best = std::min(best, (cb->GPUEndTime() - cb->GPUStartTime()) / n_disp);
+                }
+                return best;
+            };
+            const double tiled = time(0), fast = few ? time(1u << 30) : 0;
+            gemm.set_few_tokens(0);
+            std::println("{:28} t={:3}: tiled {:7.1f} us ({:4.0f} GB/s){}", name, tokens, tiled * 1e6,
+                         data.size() / tiled / 1e9,
+                         few && tokens <= 64 ? std::format(", few-token {:7.1f} us ({:4.0f} GB/s)", fast * 1e6,
+                                                           data.size() / fast / 1e9)
+                                             : "");
         }
     }
     return failures ? 1 : 0;
