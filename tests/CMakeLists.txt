@@ -65,3 +65,7 @@ set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds4
 add_executable(quant_test quant_test.cpp)
 target_link_libraries(quant_test PRIVATE mako_mtl mako_gguf)
 add_test(NAME quant COMMAND quant_test)
+
+add_executable(presets_test presets_test.cpp)
+target_link_libraries(presets_test PRIVATE mako_app)
+add_test(NAME presets COMMAND presets_test ${CMAKE_CURRENT_BINARY_DIR})

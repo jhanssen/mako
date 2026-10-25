@@ -1,0 +1,35 @@
+{
+  "glm": {
+    "description": "GLM-5.3-Flash, defaults",
+    "model": "~/models/glm-5.3-flash/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf"
+  },
+  "ds": {
+    "description": "DeepSeek-V4.1-Flash-1017, defaults (Engram tables found beside the model)",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf"
+  },
+  "ds-dspark": {
+    "description": "DeepSeek with the DSpark drafter (helps on code, its 8 GB come out of the expert cache)",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "--dspark": "~/models/ds-4.1-flash-1017/dspark"
+  },
+  "ds-route-0.05": {
+    "description": "DeepSeek, cache-aware routing: misses 13.4 -> 8.6 a token, KL 0.0056 -> 0.0067",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "--miss-penalty": 0.05
+  },
+  "ds-route-0.1": {
+    "description": "DeepSeek, cache-aware routing: misses 6.6 a token, KL 0.0088",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "--miss-penalty": 0.1
+  },
+  "ds-route-0.2": {
+    "description": "DeepSeek, cache-aware routing: misses 4.4 a token, KL 0.0100",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "--miss-penalty": 0.2
+  },
+  "ds-q6": {
+    "description": "DeepSeek, dense weights re-quantized to Q6_K at load: KL 0.0076",
+    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "--dense-quant": "q6_k"
+  }
+}

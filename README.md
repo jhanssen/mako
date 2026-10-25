@@ -96,6 +96,23 @@ The file names its sites (`MAKOABL1`: n_embd, n_layer, site names, then float32 
 streams), both before the FFN output is mixed in; the next-token block is left alone. `tools/make_ablation.py` turns
 raw float32 directions [layer][k][n_embd] into a file (`--sites ffn_out,stream` for GLM-5.3).
 
+### Presets
+
+`--preset NAME` (on `mako_serve`, `mako_run`, `ds_run`, `prefill_sweep`) applies a named set of options from
+`~/Library/Application Support/mako/presets.json` (`--presets FILE` for another). Each `"--flag"` entry becomes that
+option (`true`: the flag alone, `false`: left out), inserted where `--preset` stands, so options after it override
+it and presets stack; `"model"` (a path or a list) is used when the command line names none; `~/` is the home
+directory. `docs/presets.example.json` has presets for both models and the DeepSeek trade-offs below.
+
+```sh
+./build/tools/mako_serve --preset ds-route-0.1 --port 8091
+```
+
+DeepSeek-V4.1 speed/accuracy options (measured in `docs/performance.md`): `--miss-penalty F` lowers the routing
+score of experts not in memory, so fewer are read from the SSD (0.05-0.2: 9-20% faster steps, KL against the
+reference +20-80%; the output then depends on what is cached), and `--dense-quant q4_k|q5_k|q6_k` re-quantizes the
+dense Q8_0 weights at load.
+
 For pi, a provider in `~/.pi/agent/models.json` with `"api": "openai-completions"`, `"baseUrl":
 "http://127.0.0.1:8080/v1"`, `"reasoning": true` and `"compat": {"supportsMidConvoSystemMessages": true}` (system
 prompt changes then append instead of rewriting the start of the prompt, which would re-read the whole context).

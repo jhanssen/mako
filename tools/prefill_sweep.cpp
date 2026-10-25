@@ -9,12 +9,14 @@
 // (greedy and speculative unless --temp / --no-spec) and summarizes its steps. --prompt-file takes the text from F
 // (all of it, up to --base tokens) instead of the sources. --turns N simulates an agent: an answer of 150 tokens after the
 // base context, then N turns that each read 1000 new tokens and answer 150 (misses per step in each answer's halves).
+#include "app/presets.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gen/session.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -147,6 +149,16 @@ int run_turns(mako::glm::Engine& engine, const std::vector<int32_t>& ids, uint32
 
 int main(int argc, char** argv)
 {
+    mako::app::Args expanded = [&] {
+        try {
+            return mako::app::Args(argc, argv);
+        } catch (const std::exception& e) {
+            std::println(stderr, "{}", e.what());
+            std::exit(2);
+        }
+    }();
+    argc = expanded.argc();
+    argv = expanded.argv();
     if (argc < 2) {
         std::println(stderr, "usage: prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] "
                              "[--steps N] [--prefill-group N] [--parts]");

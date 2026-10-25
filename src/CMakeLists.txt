@@ -42,6 +42,10 @@ add_library(mako_dsv41 STATIC dsv41/config.cpp dsv41/engine.cpp dsv41/engram.cpp
 target_include_directories(mako_dsv41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_dsv41 PUBLIC mako_core mako_mtl mako_gguf PRIVATE glaze_headers)
 
+add_library(mako_app STATIC app/presets.cpp)
+target_include_directories(mako_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_app PRIVATE glaze_headers)
+
 add_library(mako_gen STATIC gen/sampler.cpp gen/session.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

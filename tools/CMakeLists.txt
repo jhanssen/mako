@@ -5,7 +5,7 @@ add_executable(tokenize tokenize.cpp)
 target_link_libraries(tokenize PRIVATE mako_text)
 
 add_executable(mako_run mako_run.cpp)
-target_link_libraries(mako_run PRIVATE mako_glm mako_text)
+target_link_libraries(mako_run PRIVATE mako_glm mako_text mako_app)
 
 add_executable(mako_calibrate mako_calibrate.cpp)
 target_link_libraries(mako_calibrate PRIVATE mako_glm mako_dsv41 mako_text)
@@ -23,10 +23,10 @@ if(MAKO_REF_SRC AND MAKO_REF_BUILD)
 endif()
 
 add_executable(mako_serve mako_serve.cpp)
-target_link_libraries(mako_serve PRIVATE mako_server mako_dsv41)
+target_link_libraries(mako_serve PRIVATE mako_server mako_dsv41 mako_app)
 
 add_executable(prefill_sweep prefill_sweep.cpp)
-target_link_libraries(prefill_sweep PRIVATE mako_glm mako_text)
+target_link_libraries(prefill_sweep PRIVATE mako_glm mako_text mako_app)
 target_compile_definitions(prefill_sweep PRIVATE MAKO_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 add_executable(render_template render_template.cpp)
@@ -36,4 +36,4 @@ add_executable(engram_rows engram_rows.cpp)
 target_link_libraries(engram_rows PRIVATE mako_dsv41)
 
 add_executable(ds_run ds_run.cpp)
-target_link_libraries(ds_run PRIVATE mako_dsv41 mako_gen)
+target_link_libraries(ds_run PRIVATE mako_dsv41 mako_gen mako_app)

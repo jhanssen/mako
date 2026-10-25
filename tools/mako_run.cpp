@@ -16,12 +16,14 @@
 // --ablate removes per-layer directions (an ablation file, mtl::Ablation; sites ffn_out and stream) from the
 // FFN output and residual streams (Engine::set_ablation); --ablate-scale multiplies their strength.
 // --spec or a sampling option generates through a Session (speculatively with --spec; sampled with --temp > 0).
+#include "app/presets.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gen/session.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -104,6 +106,16 @@ void dump(const std::filesystem::path& file, const float* data, size_t n)
 
 int main(int argc, char** argv)
 {
+    mako::app::Args expanded = [&] {
+        try {
+            return mako::app::Args(argc, argv);
+        } catch (const std::exception& e) {
+            std::println(stderr, "{}", e.what());
+            std::exit(2);
+        }
+    }();
+    argc = expanded.argc();
+    argv = expanded.argv();
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     if (argc < 3) {
         std::println(stderr, "usage: mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K]");

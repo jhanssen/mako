@@ -11,10 +11,12 @@
 // drafts were all right would) and reports the time and expert misses per step and per token.
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
+#include "app/presets.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
 #include "gen/session.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -44,6 +46,16 @@ std::vector<float> log_softmax(const float* x, size_t n)
 
 int main(int argc, char** argv)
 {
+    mako::app::Args expanded = [&] {
+        try {
+            return mako::app::Args(argc, argv);
+        } catch (const std::exception& e) {
+            std::println(stderr, "{}", e.what());
+            std::exit(2);
+        }
+    }();
+    argc = expanded.argc();
+    argv = expanded.argv();
     if (argc < 4) {
         std::println(stderr, "usage: ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref F] [--logits-out F] "
                              "[--arena-gb N] [--max-ctx N] [--ablate F] [-n N]");

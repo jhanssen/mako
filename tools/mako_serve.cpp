@@ -12,6 +12,7 @@
 // cache (measured: +13% on code, -3% on prose). DeepSeek-V4.1 trade-offs (accuracy for speed, docs/performance.md):
 // --miss-penalty lowers the routing score of experts not in memory (fewer SSD reads; output then depends on what is
 // cached); --dense-quant re-quantizes the dense Q8_0 weights at load.
+#include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
@@ -22,6 +23,7 @@
 #include "server/server.hpp"
 #include "text/tokenizer.hpp"
 
+#include <cstdlib>
 #include <csignal>
 #include <chrono>
 #include <cstdio>
@@ -38,6 +40,16 @@
 
 int main(int argc, char** argv)
 {
+    mako::app::Args expanded = [&] {
+        try {
+            return mako::app::Args(argc, argv);
+        } catch (const std::exception& e) {
+            std::println(stderr, "{}", e.what());
+            std::exit(2);
+        }
+    }();
+    argc = expanded.argc();
+    argv = expanded.argv();
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
