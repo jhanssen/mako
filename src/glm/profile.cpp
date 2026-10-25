@@ -52,8 +52,11 @@ Counts load_profile(const std::filesystem::path& path, uint32_t n_layer, uint32_
         uint32_t layer;
         if (!(ls >> layer))
             continue;
-        if (layer >= n_layer)
+        // Rows past n_layer (a profile saved with the next-token block, loaded without it) are kept for the caller.
+        if (layer >= 4096)
             throw std::runtime_error(std::format("{}: layer {} out of range", path.string(), layer));
+        if (layer >= counts.size())
+            counts.resize(layer + 1);
         counts[layer].clear();
         for (uint64_t c; ls >> c;)
             counts[layer].push_back(c);

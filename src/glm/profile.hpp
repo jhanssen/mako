@@ -19,6 +19,7 @@ std::string routing_key(const gguf::ModelFiles& model, const Config& cfg);
 // ~/Library/Application Support/mako/profiles/<key>.counts
 std::filesystem::path default_profile_path(const std::string& key);
 
+// At least n_layer rows (empty where the file has none); rows past it in the file are kept too.
 Counts load_profile(const std::filesystem::path& path, uint32_t n_layer, uint32_t n_expert);
 // Writes through a temporary file and a rename, creating the directory.
 void save_profile(const std::filesystem::path& path, const Counts& counts);

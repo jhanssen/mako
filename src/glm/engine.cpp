@@ -199,7 +199,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         idx_pooled_.emplace_back(ctx_.device()->newBuffer(
             uint64_t(opts_.max_ctx / cfg_.indexer_kpool + 1) * cfg_.indexer_dim * 4, MTL::ResourceStorageModeShared));
     };
-    auto load_moe = [&](Layer& L, const std::string& p) {
+    // Trunk experts also run in prefill (the GEMM); the next-token block's only in steps (the GEMV).
+    auto load_moe = [&](Layer& L, const std::string& p, bool prefill) {
         L.router = upload(p + "ffn_gate_inp.weight");
         L.sh_gate = upload(p + "ffn_gate_shexp.weight");
         L.sh_up = upload(p + "ffn_up_shexp.weight");
@@ -207,8 +208,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         L.router_bias = upload(p + "exp_probs_b.bias");
         if (L.router_bias.type != gguf::Type::F32 || L.router_bias.dims[0] != cfg_.n_expert)
             throw std::runtime_error(p + "exp_probs_b.bias is not F32 [n_expert]");
-        L.experts = {expert(p + "ffn_gate_exps.weight"), expert(p + "ffn_up_exps.weight"),
-                     expert(p + "ffn_down_exps.weight")};
+        L.experts = {expert(p + "ffn_gate_exps.weight", prefill), expert(p + "ffn_up_exps.weight", prefill),
+                     expert(p + "ffn_down_exps.weight", prefill)};
     };
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         auto L = std::make_unique<Layer>();
@@ -260,7 +261,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             L->ffn_up = upload(p + "ffn_up.weight");
             L->ffn_down = upload(p + "ffn_down.weight");
         } else {
-            load_moe(*L, p);
+            load_moe(*L, p, true);
         }
         layers_.push_back(std::move(L));
     }
@@ -273,7 +274,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         L->ffn_norm = upload(p + "ffn_norm.weight");
         L->wo = upload(p + "attn_output.weight");
         load_mla(*L, p);
-        load_moe(*L, p);
+        load_moe(*L, p, false);
         L->eh_proj = upload(p + "nextn.eh_proj.weight");
         L->enorm = upload(p + "nextn.enorm.weight");
         L->hnorm = upload(p + "nextn.hnorm.weight");
@@ -340,6 +341,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     Counts counts;
     if (!loaded_profile_.empty()) {
         counts = load_profile(loaded_profile_, uint32_t(layers_.size()), cfg_.n_expert);
+        counts.resize(layers_.size()); // a row for a next-token block this engine did not load
         // A profile without the next-token block's counts gives each of its experts the trunk's mean count, so
         // the block competes for slots like a typical layer (its live counts then decide which experts stay).
         if (layers_.size() > cfg_.n_layer && counts[cfg_.n_layer].empty()) {
@@ -591,6 +593,7 @@ void Engine::save_profile(const std::filesystem::path& path, bool merge) const
     const uint32_t nl = uint32_t(layers_.size()); // the next-token block included
     Counts counts = merge && std::filesystem::exists(path) ? load_profile(path, nl, cfg_.n_expert) : Counts(nl);
     const auto& usage = arena_->usage();
+    counts.resize(std::max<size_t>(counts.size(), nl)); // rows of layers this engine did not load stay
     for (uint32_t l = 0; l < nl; ++l) {
         if (!arena_->slots(l))
             continue;
@@ -640,7 +643,7 @@ Engine::DevTensor Engine::upload(const std::string& name)
     return d;
 }
 
-ExpertArena::Part Engine::expert(const std::string& name)
+ExpertArena::Part Engine::expert(const std::string& name, bool prefill)
 {
     auto ref = model_.find(name);
     if (!ref)
@@ -650,6 +653,10 @@ ExpertArena::Part Engine::expert(const std::string& name)
         throw std::runtime_error(name + ": expected [k, n, n_expert]");
     if (!mtl::Gemv::supports(t.type))
         throw std::runtime_error(std::format("{}: unsupported type {}", name, gguf::traits(t.type).name));
+    if (prefill && !mtl::Gemm::supports(t.type))
+        throw std::runtime_error(std::format("{}: type {} has no prefill GEMM (experts: IQ2_XXS, IQ2_S, IQ3_XXS, Q6_K, "
+                                             "Q8_0, F16, F32)",
+                                             name, gguf::traits(t.type).name));
     auto [it, fresh] = nocache_fds_.try_emplace(ref.file->path(), -1);
     if (fresh) {
         it->second = ::open(ref.file->path().c_str(), O_RDONLY);

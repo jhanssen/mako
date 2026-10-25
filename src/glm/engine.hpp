@@ -167,7 +167,7 @@ private:
     int32_t mtp_run(std::span<const int32_t> next, uint32_t row0);
     DevTensor upload(const std::string& name);
     DevTensor upload_optional(const std::string& name);
-    ExpertArena::Part expert(const std::string& name);
+    ExpertArena::Part expert(const std::string& name, bool prefill);
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
     MTL::ComputePipelineState* pso(const std::string& fn);
 
