@@ -1,5 +1,7 @@
 #include "glm/engine.hpp"
 
+#include "gguf/read_pool.hpp"
+
 #include "mtl/embedded.hpp"
 #include "quant/dequant.hpp"
 
@@ -103,19 +105,6 @@ struct SoftmaxArgs {
 struct PvArgs {
     uint32_t heads, dim, n_kv, keys_per_split;
 };
-
-void read_exact(int fd, void* dst, uint64_t bytes, uint64_t offset)
-{
-    auto* p = static_cast<char*>(dst);
-    while (bytes) {
-        const ssize_t n = ::pread(fd, p, bytes, static_cast<off_t>(offset));
-        if (n <= 0)
-            throw std::runtime_error(std::format("pread at {}: {}", offset, n < 0 ? std::strerror(errno) : "EOF"));
-        p += n;
-        bytes -= static_cast<uint64_t>(n);
-        offset += static_cast<uint64_t>(n);
-    }
-}
 
 } // namespace
 
@@ -632,7 +621,7 @@ Engine::DevTensor Engine::upload(const std::string& name)
     d.off = chunk_used_;
     d.type = t.type;
     d.dims = t.dims;
-    read_exact(ref.file->fd(), static_cast<char*>(d.buf->contents()) + d.off, t.bytes, t.offset);
+    gguf::read_exact(ref.file->fd(), static_cast<char*>(d.buf->contents()) + d.off, t.bytes, t.offset);
     chunk_used_ += (t.bytes + kAlign - 1) / kAlign * kAlign;
     dense_bytes_ += t.bytes;
     return d;
@@ -1436,7 +1425,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
         const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
         std::vector<std::byte> row(rb);
         for (uint32_t i = 0; i < T; ++i) {
-            read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[i]) * rb);
+            gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[i]) * rb);
             quant::dequant_row(t.type, row.data(), static_cast<float*>(x->contents()) + uint64_t(i) * E, E);
         }
     }
@@ -1681,7 +1670,7 @@ int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)
         const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
         std::vector<std::byte> row(rb);
         for (uint32_t i = 0; i < T; ++i) {
-            read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(next[i]) * rb);
+            gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(next[i]) * rb);
             quant::dequant_row(t.type, row.data(), static_cast<float*>(e->contents()) + uint64_t(i) * E, E);
         }
     }
@@ -1917,14 +1906,14 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
             const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
             std::vector<std::byte> row(rb);
             for (uint32_t i = 0; i < G; ++i) {
-                read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i]) * rb);
+                gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i]) * rb);
                 quant::dequant_row(t.type, row.data(), static_cast<float*>(xg_in->contents()) + uint64_t(i) * E, E);
             }
             // The next-token block's inputs: each position's following prompt token (written before any of the
             // group's GPU work, which reads them).
             if (has_mtp())
                 for (uint32_t i = 0; i < G && g0 + i + 1 < tokens.size(); ++i) {
-                    read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i + 1]) * rb);
+                    gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i + 1]) * rb);
                     quant::dequant_row(t.type, row.data(),
                                        static_cast<float*>(scratch("mf_e", uint64_t(group) * E * 4)->contents()) +
                                            uint64_t(i) * E,

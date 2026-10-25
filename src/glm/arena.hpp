@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gguf/gguf.hpp"
+#include "gguf/read_pool.hpp"
 #include "mtl/context.hpp"
 
 #include <array>
@@ -118,7 +119,6 @@ public:
     const std::vector<std::vector<uint64_t>>& usage() const { return usage_; }
 
 private:
-    class Readers;
     void read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads); // (expert, slot)
 
     std::vector<LayerParts> layers_;
@@ -146,7 +146,7 @@ private:
     std::vector<std::vector<char>> pinned_;         // [layer][slot]
     uint64_t clock_ = 0;
     Stats stats_;
-    std::unique_ptr<Readers> readers_;
+    std::unique_ptr<gguf::ReadPool> readers_;
 };
 
 } // namespace mako::glm
