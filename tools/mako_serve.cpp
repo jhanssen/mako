@@ -1,7 +1,7 @@
 // OpenAI- and Anthropic-compatible HTTP server for a model (GLM-5.3 or DeepSeek-V4.1).
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--stage-gb N] [--no-spec]
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
-//              [--dspark DIR]
+//              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k]
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
 // per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
@@ -9,7 +9,9 @@
 // DeepSeek-V4.1's Engram tables (default: found beside the model, Engram::find_tables). --stage-gb limits the ring
 // that prompts' missing experts are read ahead into (0: off; default: two layers' worth, at most 3 GB). --dspark:
 // DeepSeek-V4.1's drafter (dspark.json and dspark.bin) for speculative decoding; its 8 GB come out of the expert
-// cache (measured: +13% on code, -3% on prose).
+// cache (measured: +13% on code, -3% on prose). DeepSeek-V4.1 trade-offs (accuracy for speed, docs/performance.md):
+// --miss-penalty lowers the routing score of experts not in memory (fewer SSD reads; output then depends on what is
+// cached); --dense-quant re-quantizes the dense Q8_0 weights at load.
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
@@ -26,6 +28,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <print>
 #include <string>
@@ -38,7 +41,8 @@ int main(int argc, char** argv)
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
-                             "[--dump-requests DIR] [--engram FILE] [--dspark DIR]");
+                             "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
+                             "[--dense-quant q4_k|q5_k|q6_k]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -52,7 +56,8 @@ int main(int argc, char** argv)
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1;
     std::string ablate, engram, dspark;
-    float ablate_scale = 1.0f;
+    float ablate_scale = 1.0f, miss_penalty = 0.0f;
+    std::optional<mako::gguf::Type> dense_quant;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--no-spec") {
@@ -84,6 +89,21 @@ int main(int argc, char** argv)
             engram = v;
         else if (a == "--dspark")
             dspark = v;
+        else if (a == "--miss-penalty")
+            miss_penalty = std::stof(v);
+        else if (a == "--dense-quant") {
+            const std::string q = v;
+            if (q == "q4_k")
+                dense_quant = mako::gguf::Type::Q4_K;
+            else if (q == "q5_k")
+                dense_quant = mako::gguf::Type::Q5_K;
+            else if (q == "q6_k")
+                dense_quant = mako::gguf::Type::Q6_K;
+            else {
+                std::println(stderr, "--dense-quant takes q4_k, q5_k or q6_k");
+                return 2;
+            }
+        }
         else if (a == "--ablate")
             ablate = v;
         else if (a == "--ablate-scale")
@@ -159,6 +179,8 @@ int main(int argc, char** argv)
             opts.stage_gb = stage_gb;
             if (so.speculative)
                 opts.dspark = dspark;
+            opts.miss_penalty = miss_penalty;
+            opts.dense_quant = dense_quant;
             ds_engine = std::make_unique<mako::dsv41::Engine>(*model, *cfg, opts, ctx);
             model_if = ds_engine.get();
             base = ds_engine.get();

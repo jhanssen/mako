@@ -34,6 +34,7 @@ struct Options {
     uint32_t max_drafts = 4;
     // Dense Q8_0 matrices re-quantized at load to this type (Q4_K, Q5_K or Q6_K); unset: as stored.
     std::optional<gguf::Type> dense_quant;
+    float miss_penalty = 0.0f; // core::Routing::miss_penalty
 };
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from

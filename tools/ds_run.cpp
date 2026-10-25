@@ -4,7 +4,7 @@
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
-//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [-n N]
+//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [-n N]
 // --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one and
 // --spec is not 0), with the tokens, speed and drafts kept.
 // --split S --width W: prefills the first S ids, then runs the rest W at a time (as a speculative verify step whose
@@ -56,6 +56,7 @@ int main(int argc, char** argv)
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0;
     bool part_timing = false;
+    uint64_t step_misses = 0;
     bool spec = true;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
@@ -89,6 +90,8 @@ int main(int argc, char** argv)
             save_profile = v;
         else if (a == "--profile")
             opts.expert_counts = v;
+        else if (a == "--miss-penalty")
+            opts.miss_penalty = std::stof(v);
         else if (a == "--dense-quant") {
             if (v == "q4_k")
                 opts.dense_quant = mako::gguf::Type::Q4_K;
@@ -285,12 +288,13 @@ int main(int argc, char** argv)
         for (size_t t = 0; t < ids.size(); ++t) {
             const auto s0 = std::chrono::steady_clock::now();
             const auto& lg = engine.step(ids[t]);
+            step_misses += engine.last_step().misses;
             check(t, lg.data(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
         }
     }
     if (compared)
-        std::println("{} positions: top-1 agreement {:.1f}%, KL mean {:.5f}", compared, 100.0 * agree / compared,
-                     kl_sum / compared);
+        std::println("{} positions: top-1 agreement {:.1f}%, KL mean {:.5f}, {:.2f} expert misses a step", compared,
+                     100.0 * agree / compared, kl_sum / compared, double(step_misses) / double(ids.size()));
     int32_t next = int32_t(std::max_element(engine.logits().begin(), engine.logits().end()) - engine.logits().begin());
     std::vector<int32_t> gen_ids;
     const auto g0 = std::chrono::steady_clock::now();

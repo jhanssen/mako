@@ -124,6 +124,21 @@ Dense re-quantization at load (`ds_run --dense-quant`, 1300 positions against th
 | Q5_K | 96.8% | 0.00964 | 43.5 ms |
 | Q4_K | 96.9% | 0.01609 | 38.6 ms |
 
+Cache-aware routing (`--miss-penalty F`: subtracted from a non-resident expert's selection score, its weight
+unchanged), 1300 positions against the reference:
+
+| Penalty | Misses/step | Top-1 | KL mean | Median step |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 13.4 | 98.2% | 0.00557 | 44.4 ms |
+| 0.02 | 10.9 | 98.5% | 0.00648 | 41.3 ms |
+| 0.05 | 8.6 | 98.2% | 0.00670 | 40.2 ms |
+| 0.1 | 6.6 | 98.0% | 0.00881 | 37.9 ms |
+| 0.2 | 4.4 | 97.5% | 0.00999 | 35.4 ms |
+| 0.5 | 2.1 | 96.5% | 0.01852 | 33.4 ms |
+
+It beats dense re-quantization per unit of KL; output then depends on what is cached (not reproducible across
+sessions), and long sessions are unmeasured.
+
 Short GEMV benchmarks at low GPU clocks read ~2x slow (a first measurement blamed the Q4_K kernel; warmed up it
 runs at 464-542 GB/s).
 

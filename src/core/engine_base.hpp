@@ -39,6 +39,9 @@ struct Routing {
     Score score = Score::sigmoid;
     bool norm = false; // weights normalized over the selected experts
     float scale = 1.0f;
+    // Decode: subtracted from a non-resident expert's selection score (its weight unchanged), trading routing
+    // fidelity for fewer expert reads; 0: off.
+    float miss_penalty = 0.0f;
 };
 
 // The GPU runtime models share: resident dense weights, scratch buffers, kernel dispatch with telemetry and probes,

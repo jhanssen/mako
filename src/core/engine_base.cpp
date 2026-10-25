@@ -57,6 +57,7 @@ struct RouteArgs {
     uint32_t n_expert, n_used, norm;
     float scale;
     uint32_t lookup, score;
+    float miss_penalty;
 };
 
 } // namespace
@@ -927,7 +928,8 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
 
     part(enc, "moe router");
     gemv(enc, mw.router, xn, 0, rlog, 0, 1, T);
-    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 1, uint32_t(routing_.score)};
+    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 1, uint32_t(routing_.score),
+                       routing_.miss_penalty};
     enc->setComputePipelineState(pso("moe_route"));
     enc->setBuffer(rlog, 0, 0);
     enc->setBuffer(mw.bias.buf, mw.bias.off, 1);
@@ -1015,7 +1017,7 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     MTL::Buffer* ew = scratch("p_ew", uint64_t(G) * 16 * 4);
     proj(enc, mw.router, xn_g, 0, rlog, 0, G);
     // Routing only; the CPU assigns slots after this sync.
-    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score)};
+    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score), 0.0f};
     MTL::Buffer* unused = scratch("p_unused", 64);
     enc->setComputePipelineState(pso("moe_route"));
     enc->setBuffer(rlog, 0, 0);

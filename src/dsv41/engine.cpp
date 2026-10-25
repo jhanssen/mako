@@ -54,6 +54,7 @@ struct RouteArgs {
     uint32_t n_expert, n_used, norm;
     float scale;
     uint32_t lookup, score;
+    float miss_penalty;
 };
 struct SwigluArgs {
     uint32_t n;
@@ -154,7 +155,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         throw std::runtime_error(std::format("expert gating function {} (only sqrt(softplus), 4)", cfg_.gating));
     dims_ = {cfg_.n_embd, cfg_.n_layer, cfg_.hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
              cfg_.n_expert, cfg_.n_expert_used, cfg_.n_ff_exp};
-    routing_ = {core::Routing::Score::sqrt_softplus, cfg_.expert_weights_norm, cfg_.expert_weights_scale};
+    routing_ = {core::Routing::Score::sqrt_softplus, cfg_.expert_weights_norm, cfg_.expert_weights_scale,
+                opts_.miss_penalty};
     // A verify of up to kMaxDecodeTokens tokens on the GEMVs and decode's MoE: each row as a step would compute it.
     gemm_min_tokens_ = kMaxDecodeTokens + 1;
     if (opts_.indexer_top_k)
@@ -1105,7 +1107,7 @@ void Engine::draft_moe(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     MTL::Buffer* unused = scratch("dr_unused", 64);
     MTL::Buffer* sho = scratch("dr_sho", uint64_t(T) * E * 4);
     proj(enc, L.moe.router, xn, 0, rlog, 0, T);
-    const RouteArgs ra{NE, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score)};
+    const RouteArgs ra{NE, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score), 0.0f};
     enc->setComputePipelineState(pso("moe_route"));
     enc->setBuffer(rlog, 0, 0);
     enc->setBuffer(L.moe.bias.buf, L.moe.bias.off, 1);
