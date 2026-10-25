@@ -2,8 +2,8 @@
 
 #include "chat/template.hpp"
 #include "gen/sampler.hpp"
-#include "glm/engine.hpp"
-#include "glm/session.hpp"
+#include "gen/model.hpp"
+#include "gen/session.hpp"
 #include "text/tokenizer.hpp"
 
 #include <memory>
@@ -25,7 +25,7 @@ struct ServerOptions {
 // Generation runs one request at a time; a request waits for the one before it, up to max_waiting of them.
 class Server {
 public:
-    Server(glm::Engine& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);
+    Server(gen::Model& model, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);
     ~Server();
 
     // Serves until stop(); false if the address could not be bound.

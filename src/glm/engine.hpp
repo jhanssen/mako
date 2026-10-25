@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/engine_base.hpp"
+#include "gen/model.hpp"
 #include "glm/config.hpp"
 #include "mtl/ablation.hpp"
 
@@ -41,67 +42,64 @@ struct Options {
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones
 // a token selects but the arena lacks are read from the model files after each MoE layer's router runs.
-class Engine : public core::EngineBase {
+class Engine : public core::EngineBase, public gen::Model {
 public:
     Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx);
     ~Engine();
 
     // Runs one token at the next position and returns its logits.
-    const std::vector<float>& step(int32_t token);
+    const std::vector<float>& step(int32_t token) override;
     // Two consecutive tokens in one step (speculative verification): their logits, a row each.
-    const std::vector<float>& step2(int32_t a, int32_t b);
+    const std::vector<float>& step2(int32_t a, int32_t b) override;
     // Undoes the second token of the last step2(): its position becomes the next one again.
-    void rollback();
+    void rollback() override;
     // The next-token block's guess for the token after `next`, where `next` follows the token of the last step():
     // from that step's final hidden state and `next`'s embedding. Also fills the block's own attention cache at the
     // last step's position, so it must run after every step for later drafts to see the whole context. -1 without
     // the block.
-    int32_t mtp_draft(int32_t next);
+    int32_t mtp_draft(int32_t next) override;
     // The same over the positions of the last step's first next.size() tokens (rows of its hidden state), each
     // followed by next[i]; the guess comes from the last.
-    int32_t mtp_draft(std::span<const int32_t> next);
+    int32_t mtp_draft(std::span<const int32_t> next) override;
     // Tells the next-token block that the token after position() - 1 is `next`: refills its attention cache there
     // (the last draft may have assumed another token). No-op without the block or at position 0.
-    void mtp_seed(int32_t next);
+    void mtp_seed(int32_t next) override;
     // The logits behind the last draft (valid until the next one).
     std::span<const float> mtp_logits();
-    bool has_mtp() const { return layers_.size() > cfg_.n_layer; }
+    bool has_mtp() const override { return layers_.size() > cfg_.n_layer; }
 
     // The recurrent state at a position, to continue from it later (prefix reuse). The attention caches are
     // positional and not part of it: restore() is valid while the tokens before cp.pos are the same as when the
     // checkpoint was taken.
-    struct Checkpoint {
-        uint32_t pos = 0;
-        std::vector<std::byte> state; // the KDA layers' scan and convolution states
-        std::vector<float> hidden;    // position pos - 1's final hidden state (the next-token block's input)
-        uint64_t bytes() const { return state.size() + hidden.size() * 4; }
-    };
-    Checkpoint checkpoint();
-    void restore(const Checkpoint& cp);
+    // state: the KDA layers' scan and convolution states; hidden: position pos - 1's final hidden state (the
+    // next-token block's input).
+    Checkpoint checkpoint() override;
+    void restore(const Checkpoint& cp) override;
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     // `cancelled` is polled between groups of tokens (Options::prefill_group): true stops there, with the tokens so
     // far in the context (position() tells how many) and the logits after the last of them.
-    const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {});
+    const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {}) override;
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
     using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
 
-    uint32_t position() const { return pos_; }
+    uint32_t position() const override { return pos_; }
     // The logits after the last step's (or prefill's) last token.
     const std::vector<float>& logits() const { return logits_; }
-    uint32_t max_context() const { return opts_.max_ctx; }
+    uint32_t max_context() const override { return opts_.max_ctx; }
+    uint32_t n_vocab() const override { return cfg_.n_vocab; }
     // Abliteration sites: before layer l's FFN output is mixed into the residual streams, it (ffn_out) and the
     // streams (stream) lose their components along the layer's directions, in prefill and decode; the next-token
     // block is left alone. A file may hold either or both.
     static constexpr std::array<std::string_view, 2> kAblationSites{"ffn_out", "stream"};
     void set_ablation(std::optional<mtl::Ablation> ablation);
     bool ablating() const { return ablation_.has_value(); }
-    uint32_t checkpoint_slots() const { return opts_.checkpoints; }
+    uint32_t checkpoint_slots() const override { return opts_.checkpoints; }
     // Size of one checkpoint().
     uint64_t checkpoint_bytes() const;
     const Config& config() const { return cfg_; }
     // Back to position 0 with empty recurrent state (the expert arena keeps its contents).
-    void reset();
+    void reset() override;
     // At most the chunk size the engine was built with, which sized the arena's lendable slots.
     void set_prefill_chunk(uint32_t chunk);
     // At most the group size the engine was built with.

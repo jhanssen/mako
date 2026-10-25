@@ -1,11 +1,14 @@
-// OpenAI-compatible HTTP server for a model.
+// OpenAI- and Anthropic-compatible HTTP server for a model (GLM-5.3 or DeepSeek-V4.1).
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--no-spec]
-//              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR]
+//              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
-// session's routing counts are then added to the model's profile (which experts start resident). --ablate removes per-layer directions
-// (an ablation file, mtl::Ablation; sites ffn_out and stream) from the FFN output and residual streams; --ablate-scale
-// multiplies their strength.
+// session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
+// per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
+// DeepSeek-V4.1 attn_out and shexp_out); --ablate-scale multiplies their strength. --engram: the GGUF with
+// DeepSeek-V4.1's Engram tables (default: found beside the model, Engram::find_tables).
 #include "chat/template.hpp"
+#include "dsv41/config.hpp"
+#include "dsv41/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gguf/model_files.hpp"
@@ -17,6 +20,9 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
+#include <memory>
+#include <span>
 #include <print>
 #include <string>
 #include <thread>
@@ -27,7 +33,8 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR]");
+                             "[--arena-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
+                             "[--dump-requests DIR] [--engram FILE]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -38,9 +45,9 @@ int main(int argc, char** argv)
     pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
     bool learn = false;
     mako::server::ServerOptions so;
-    mako::glm::Options opts;
-    opts.max_ctx = 131072;
-    std::string ablate;
+    uint32_t max_ctx = 131072;
+    double arena_gb = -1;
+    std::string ablate, engram;
     float ablate_scale = 1.0f;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -62,11 +69,13 @@ int main(int argc, char** argv)
         else if (a == "--port")
             so.port = std::stoi(v);
         else if (a == "--ctx")
-            opts.max_ctx = uint32_t(std::stoul(v));
+            max_ctx = uint32_t(std::stoul(v));
         else if (a == "--model-id")
             so.model_id = v;
         else if (a == "--arena-gb")
-            opts.arena_gb = std::stod(v);
+            arena_gb = std::stod(v);
+        else if (a == "--engram")
+            engram = v;
         else if (a == "--ablate")
             ablate = v;
         else if (a == "--ablate-scale")
@@ -85,12 +94,21 @@ int main(int argc, char** argv)
         std::println(stderr, "{}", model.error());
         return 1;
     }
-    const auto& meta = model->meta();
+    const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
+    if (deepseek) {
+        if (engram.empty())
+            engram = mako::dsv41::Engram::find_tables(argv[1]);
+        if (!engram.empty())
+            if (auto r = model->add(engram); !r) {
+                std::println(stderr, "{}", r.error());
+                return 1;
+            }
+    }
+    const auto& meta = model->meta(); // (after add(), which may move the files)
     auto tok = mako::text::Tokenizer::load(meta);
-    auto cfg = mako::glm::Config::load(*model);
     const auto source = meta.get_string("tokenizer.chat_template");
-    if (!tok || !cfg || !source) {
-        std::println(stderr, "{}", !tok ? tok.error() : !cfg ? cfg.error() : "the model has no chat template");
+    if (!tok || !source) {
+        std::println(stderr, "{}", !tok ? tok.error() : "the model has no chat template");
         return 1;
     }
     std::optional<mako::chat::Template> tmpl;
@@ -112,35 +130,76 @@ int main(int argc, char** argv)
 
     mako::mtl::Context ctx;
     const auto t0 = std::chrono::steady_clock::now();
-    opts.mtp = so.speculative;
-    mako::glm::Engine engine(*model, *cfg, opts, ctx);
-    if (!ablate.empty()) {
-        try {
-            auto a = mako::mtl::Ablation::load(ablate, ctx, cfg->n_embd, cfg->n_layer, mako::glm::Engine::kAblationSites);
-            a.set_scale(ablate_scale);
-            engine.set_ablation(std::move(a));
-        } catch (const std::exception& e) {
-            std::println(stderr, "--ablate: {}", e.what());
-            return 1;
+    std::unique_ptr<mako::glm::Engine> glm_engine;
+    std::unique_ptr<mako::dsv41::Engine> ds_engine;
+    mako::gen::Model* model_if = nullptr;
+    mako::core::EngineBase* base = nullptr;
+    double expected_resident = 50; // below this share of the experts, the cache is smaller than this Mac allows
+    try {
+        uint32_t n_embd = 0, n_layer = 0;
+        std::span<const std::string_view> sites;
+        std::function<void(mako::mtl::Ablation)> set_ablation;
+        if (deepseek) {
+            auto cfg = mako::dsv41::Config::load(*model);
+            if (!cfg) {
+                std::println(stderr, "{}", cfg.error());
+                return 1;
+            }
+            mako::dsv41::Options opts;
+            opts.max_ctx = max_ctx;
+            opts.arena_gb = arena_gb;
+            ds_engine = std::make_unique<mako::dsv41::Engine>(*model, *cfg, opts, ctx);
+            model_if = ds_engine.get();
+            base = ds_engine.get();
+            n_embd = cfg->n_embd, n_layer = cfg->n_layer;
+            sites = mako::dsv41::Engine::kAblationSites;
+            set_ablation = [&](mako::mtl::Ablation a) { ds_engine->set_ablation(std::move(a)); };
+            expected_resident = 25;
+            so.speculative = false; // no drafter yet
+        } else {
+            auto cfg = mako::glm::Config::load(*model);
+            if (!cfg) {
+                std::println(stderr, "{}", cfg.error());
+                return 1;
+            }
+            mako::glm::Options opts;
+            opts.max_ctx = max_ctx;
+            opts.arena_gb = arena_gb;
+            opts.mtp = so.speculative;
+            glm_engine = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
+            model_if = glm_engine.get();
+            base = glm_engine.get();
+            n_embd = cfg->n_embd, n_layer = cfg->n_layer;
+            sites = mako::glm::Engine::kAblationSites;
+            set_ablation = [&](mako::mtl::Ablation a) { glm_engine->set_ablation(std::move(a)); };
         }
-        std::println(stderr, "ablating the directions in {} (scale {})", ablate, ablate_scale);
+        if (!ablate.empty()) {
+            auto a = mako::mtl::Ablation::load(ablate, ctx, n_embd, n_layer, sites);
+            a.set_scale(ablate_scale);
+            set_ablation(std::move(a));
+            std::println(stderr, "ablating the directions in {} (scale {})", ablate, ablate_scale);
+        }
+    } catch (const std::exception& e) {
+        std::println(stderr, "{}", e.what());
+        return 1;
     }
     uint64_t slots = 0, experts = 0;
-    for (uint32_t l = 0; l < cfg->n_layer; ++l)
-        if (const uint32_t n = engine.arena().slots(l)) {
+    const auto& usage = base->arena().usage();
+    for (uint32_t l = 0; l < usage.size(); ++l)
+        if (const uint32_t n = base->arena().slots(l)) {
             slots += n;
-            experts += cfg->n_expert;
+            experts += usage[l].size();
         }
     const double resident = experts ? 100.0 * double(slots) / double(experts) : 100.0;
     std::println(stderr, "loaded in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
                          "temperature {}, top_p {}",
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), opts.max_ctx,
-                 engine.arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
-    if (resident < 50)
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), max_ctx,
+                 base->arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
+    if (resident < expected_resident)
         std::println(stderr, "warning: little memory was free for the expert cache (a process that just exited may "
                              "still be returning its memory); decoding will read experts from the SSD often");
     {
-        mako::server::Server server(engine, *tok, *tmpl, so);
+        mako::server::Server server(*model_if, *tok, *tmpl, so);
         std::jthread stopper([&] {
             int sig = 0;
             sigwait(&stop_signals, &sig);
@@ -155,8 +214,8 @@ int main(int argc, char** argv)
             return 1;
     } // the server's threads are done before the profile is written
     if (learn) {
-        engine.save_profile(engine.default_profile(), true);
-        std::println(stderr, "routing counts added to {}", engine.default_profile().string());
+        base->save_profile(base->default_profile(), true);
+        std::println(stderr, "routing counts added to {}", base->default_profile().string());
     }
     return 0;
 }

@@ -1,17 +1,17 @@
 #pragma once
 
+#include "gen/model.hpp"
 #include "gen/sampler.hpp"
-#include "glm/engine.hpp"
 
 #include <cstdint>
 #include <functional>
 #include <span>
 #include <vector>
 
-namespace mako::glm {
+namespace mako::gen {
 
 struct GenerateParams {
-    gen::SamplingParams sampling;
+    SamplingParams sampling;
     uint64_t seed = 0;
     uint32_t max_tokens = 256;
     std::vector<int32_t> stop_tokens; // generation ends after one of these (it is part of the output)
@@ -41,8 +41,8 @@ struct GenerateResult {
 class Session {
 public:
     // max_checkpoints beyond the engine's checkpoint_slots() use memory its budget did not reserve.
-    explicit Session(Engine& engine) : Session(engine, engine.checkpoint_slots()) {}
-    Session(Engine& engine, size_t max_checkpoints) : e_(engine), max_checkpoints_(max_checkpoints) {}
+    explicit Session(Model& model) : Session(model, model.checkpoint_slots()) {}
+    Session(Model& model, size_t max_checkpoints) : e_(model), max_checkpoints_(max_checkpoints) {}
 
     // on_token gets each generated token once decided; returning false stops (Finish::cancelled).
     GenerateResult generate(std::span<const int32_t> prompt, const GenerateParams& p,
@@ -54,7 +54,7 @@ public:
 
 private:
     struct Saved {
-        Engine::Checkpoint cp;
+        Model::Checkpoint cp;
         uint64_t used = 0;
     };
     GenerateResult run(std::span<const int32_t> prompt, const GenerateParams& p,
@@ -62,7 +62,7 @@ private:
     void rewind(size_t keep);
     void save_checkpoint();
 
-    Engine& e_;
+    Model& e_;
     size_t max_checkpoints_;
     std::vector<int32_t> ctx_;
     std::vector<Saved> saved_;
@@ -70,4 +70,4 @@ private:
     int32_t mtp_next_ = -1; // the token the next-token block's cache assumes after ctx_.back(); -1: none
 };
 
-} // namespace mako::glm
+} // namespace mako::gen

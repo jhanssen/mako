@@ -1,10 +1,10 @@
-#include "glm/session.hpp"
+#include "gen/session.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
 
-namespace mako::glm {
+namespace mako::gen {
 
 namespace {
 
@@ -110,8 +110,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     res.prefill_ms = ms_since(t_prefill);
 
     const auto t_decode = std::chrono::steady_clock::now();
-    const uint32_t nv = e_.config().n_vocab;
-    gen::Sampler sampler(p.sampling, nv, p.seed);
+    const uint32_t nv = e_.n_vocab();
+    Sampler sampler(p.sampling, nv, p.seed);
     const bool spec = p.speculative && e_.has_mtp();
     // Takes a decided token; false when generation ends with it.
     auto emit = [&](int32_t t) {
@@ -184,4 +184,4 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     return res;
 }
 
-} // namespace mako::glm
+} // namespace mako::gen

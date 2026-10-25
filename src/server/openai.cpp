@@ -318,8 +318,18 @@ struct OutputParser::Tools {
     glz::generic defs;
 };
 
-OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop)
-    : tools_(std::make_unique<Tools>()), stop_(std::move(stop)), stream_(tok, false), tok_(tok)
+namespace {
+
+constexpr std::string_view kDsmlCalls = "<｜DSML｜ calls>", kDsmlCallsEnd = "</｜DSML｜ calls>",
+                           kDsmlInvoke = "<｜DSML｜ invoke name=\"", kDsmlInvokeEnd = "</｜DSML｜ invoke>",
+                           kDsmlParam = "<｜DSML｜ parameter name=\"", kDsmlParamEnd = "</｜DSML｜ parameter>";
+
+} // namespace
+
+OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop,
+                           bool reasoning_first)
+    : tools_(std::make_unique<Tools>()), stop_(std::move(stop)), stream_(tok, false),
+      mode_(reasoning_first ? Mode::reasoning : Mode::content), tok_(tok)
 {
     if (glz::read_json(tools_->defs, tools) || !tools_->defs.is_array())
         tools_->defs = glz::generic::array_t{};
@@ -330,6 +340,7 @@ OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, s
     key_end_ = tok.find("</arg_key>");
     value_begin_ = tok.find("<arg_value>");
     value_end_ = tok.find("</arg_value>");
+    dsml_form_ = tok.find("｜DSML｜") >= 0 && call_begin_ < 0;
 }
 
 OutputParser::~OutputParser() = default;
@@ -337,6 +348,9 @@ OutputParser::~OutputParser() = default;
 void OutputParser::require_call(const std::string& name)
 {
     require_ = true;
+    if (dsml_form_)
+        forced_ = tok_.encode(std::string(kDsmlCalls) + "\n" + std::string(kDsmlInvoke) + (name.empty() ? "" : name + "\">"),
+                              true);
     name_tokens_ = name.empty() ? std::vector<int32_t>{} : tok_.encode(name, false);
     named_has_args_ = false;
     for (const auto& t : tools_->defs.get_array()) {
@@ -353,6 +367,10 @@ int32_t OutputParser::forced() const
 {
     if (!require_)
         return -1;
+    if (dsml_form_)
+        return mode_ != Mode::reasoning && forced_seen_ < forced_.size() && (forced_seen_ > 0 || !content_started_)
+                   ? forced_[forced_seen_]
+                   : -1;
     if (mode_ == Mode::content && calls_.empty() && !content_started_ && pending_.empty())
         return call_begin_;
     if (mode_ == Mode::name && calls_.size() == 1 && !name_tokens_.empty()) {
@@ -371,9 +389,13 @@ bool OutputParser::push(int32_t token, Delta& out)
     const auto marker = [&](int32_t id, std::initializer_list<Mode> modes) {
         return token == id && std::ranges::find(modes, mode_) != modes.end();
     };
+    if (dsml_form_ && forced_seen_ < forced_.size() && mode_ != Mode::reasoning && token == forced_[forced_seen_])
+        ++forced_seen_;
     if (marker(think_end_, {Mode::reasoning})) {
         flush_text(out);
         mode_ = Mode::content;
+    } else if (dsml_form_) {
+        text(stream_.push(token), out);
     } else if (marker(call_begin_, {Mode::content})) {
         flush_text(out);
         if (mode_ == Mode::done)
@@ -433,6 +455,11 @@ void OutputParser::finish(Delta& out)
     case Mode::name: // cut off before the call had a name
         calls_.pop_back();
         break;
+    case Mode::dsml:
+        parse_dsml(out);
+        if (call_open_)
+            close_call(out);
+        break;
     case Mode::key:
     case Mode::between:
     case Mode::value: { // cut off inside the arguments: close what was complete
@@ -458,7 +485,23 @@ void OutputParser::text(const std::string& s, Delta& out)
         break;
     case Mode::content:
         pending_ += s;
+        if (dsml_form_) {
+            if (const size_t at = pending_.find(kDsmlCalls); at != std::string::npos) {
+                dsml_ = pending_.substr(at + kDsmlCalls.size());
+                pending_.resize(at);
+                emit_content(out, true);
+                if (mode_ == Mode::done)
+                    break;
+                mode_ = Mode::dsml;
+                parse_dsml(out);
+                break;
+            }
+        }
         emit_content(out, false);
+        break;
+    case Mode::dsml:
+        dsml_ += s;
+        parse_dsml(out);
         break;
     case Mode::name:
     case Mode::key:
@@ -499,19 +542,106 @@ void OutputParser::emit_content(Delta& out, bool final)
     size_t keep = 0;
     while (keep < pending_.size() && is_space(pending_[pending_.size() - 1 - keep]))
         ++keep;
-    if (!final)
+    if (!final) {
         for (const auto& s : stop_)
             for (size_t k = std::min(s.size() - 1, pending_.size()); k > keep; --k)
                 if (pending_.ends_with(std::string_view(s).substr(0, k))) {
                     keep = k;
                     break;
                 }
+        if (dsml_form_)
+            for (size_t k = std::min(kDsmlCalls.size() - 1, pending_.size()); k > keep; --k)
+                if (pending_.ends_with(kDsmlCalls.substr(0, k))) {
+                    keep = k;
+                    break;
+                }
+        // and the whitespace before what is held back
+        while (keep < pending_.size() && is_space(pending_[pending_.size() - 1 - keep]))
+            ++keep;
+    }
     const std::string emit = pending_.substr(0, pending_.size() - keep);
     pending_.erase(0, emit.size());
     if (final)
         pending_.clear();
     content_ += emit;
     out.content += emit;
+}
+
+void OutputParser::close_call(Delta& out)
+{
+    const std::string frag = first_arg_ ? "{}" : "}";
+    calls_.back().arguments += frag;
+    out.calls.push_back({calls_.size() - 1, "", "", frag});
+    call_open_ = false;
+}
+
+void OutputParser::parse_dsml(Delta& out)
+{
+    for (;;) {
+        const size_t start = dsml_.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) {
+            dsml_.clear();
+            return;
+        }
+        const std::string_view rest = std::string_view(dsml_).substr(start);
+        size_t used = 0;
+        if (rest.starts_with(kDsmlInvoke)) {
+            const size_t q = rest.find("\">", kDsmlInvoke.size());
+            if (q == std::string_view::npos)
+                return;
+            if (call_open_)
+                close_call(out);
+            calls_.push_back({});
+            buf_ = std::string(rest.substr(kDsmlInvoke.size(), q - kDsmlInvoke.size()));
+            first_arg_ = true;
+            open_call(out);
+            used = q + 2;
+        } else if (rest.starts_with(kDsmlParam)) {
+            const size_t q = rest.find('"', kDsmlParam.size());
+            const size_t open_end = q == std::string_view::npos ? q : rest.find('>', q);
+            const size_t close = open_end == std::string_view::npos ? open_end : rest.find(kDsmlParamEnd, open_end);
+            if (close == std::string_view::npos)
+                return;
+            const std::string key(rest.substr(kDsmlParam.size(), q - kDsmlParam.size()));
+            const std::string_view attrs = rest.substr(q + 1, open_end - q - 1);
+            const std::string value(rest.substr(open_end + 1, close - open_end - 1));
+            const bool is_string = attrs.find("string=\"false\"") == std::string_view::npos;
+            const bool raw = !is_string && !value.empty() && !glz::validate_json(value);
+            if (call_open_) {
+                const std::string frag = (first_arg_ ? "{" : ", ") + json_string(key) + ": " +
+                                         (raw ? value : json_string(value));
+                first_arg_ = false;
+                calls_.back().arguments += frag;
+                out.calls.push_back({calls_.size() - 1, "", "", frag});
+            }
+            used = close + kDsmlParamEnd.size();
+        } else if (rest.starts_with(kDsmlInvokeEnd)) {
+            if (call_open_)
+                close_call(out);
+            used = kDsmlInvokeEnd.size();
+        } else if (rest.starts_with(kDsmlCallsEnd)) {
+            if (call_open_)
+                close_call(out);
+            dsml_.erase(0, start + kDsmlCallsEnd.size());
+            mode_ = Mode::content;
+            content_started_ = false;
+            if (!dsml_.empty()) {
+                const std::string tail = std::move(dsml_);
+                dsml_.clear();
+                text(tail, out);
+            }
+            return;
+        } else {
+            // An element still arriving, or text the block does not allow (left until more makes sense of it).
+            const std::string_view all[] = {kDsmlInvoke, kDsmlParam, kDsmlInvokeEnd, kDsmlCallsEnd};
+            for (const auto m : all)
+                if (m.starts_with(rest.substr(0, std::min(rest.size(), m.size()))))
+                    return;
+            const size_t lt = rest.find('<', 1);
+            used = lt == std::string_view::npos ? rest.size() : lt;
+        }
+        dsml_.erase(0, start + used);
+    }
 }
 
 void OutputParser::open_call(Delta& out)
@@ -577,7 +707,7 @@ std::string chunk(const std::string& id, int64_t created, const std::string& mod
 
 namespace {
 
-Usage usage_of(const glm::GenerateResult& r)
+Usage usage_of(const gen::GenerateResult& r)
 {
     const auto n = uint32_t(r.tokens.size());
     return {.prompt_tokens = r.prompt_tokens,
@@ -588,13 +718,13 @@ Usage usage_of(const glm::GenerateResult& r)
 
 } // namespace
 
-std::string usage_chunk(const std::string& id, int64_t created, const std::string& model, const glm::GenerateResult& r)
+std::string usage_chunk(const std::string& id, int64_t created, const std::string& model, const gen::GenerateResult& r)
 {
     return to_json(Chunk{.id = id, .created = created, .model = model, .usage = usage_of(r)});
 }
 
 std::string completion(const std::string& id, int64_t created, const std::string& model, const OutputParser& p,
-                       const char* finish_reason, const glm::GenerateResult& r)
+                       const char* finish_reason, const gen::GenerateResult& r)
 {
     MessageOut msg;
     if (!p.content().empty() || p.calls().empty())
@@ -621,15 +751,15 @@ std::string error_body(const std::string& message, const char* type)
     return to_json(ErrorBody{{.message = message, .type = type}});
 }
 
-End end_of(const glm::GenerateResult& r, const OutputParser& p, bool stopped)
+End end_of(const gen::GenerateResult& r, const OutputParser& p, bool stopped)
 {
     switch (r.finish) {
-    case glm::Finish::stop_token:
+    case gen::Finish::stop_token:
         return p.calls().empty() ? End::stop : End::tool_calls;
-    case glm::Finish::max_tokens:
-    case glm::Finish::context_full:
+    case gen::Finish::max_tokens:
+    case gen::Finish::context_full:
         return End::length;
-    case glm::Finish::cancelled:
+    case gen::Finish::cancelled:
         return stopped ? End::stop_sequence : End::cancelled;
     }
     return End::stop;
@@ -655,7 +785,7 @@ public:
     }
     std::string begin(uint32_t) override { return event(chunk(id_, created_, model_, {}, true)); }
     std::string delta(const Delta& d) override { return event(chunk(id_, created_, model_, d)); }
-    std::string end(End e, const OutputParser&, const glm::GenerateResult& r) override
+    std::string end(End e, const OutputParser&, const gen::GenerateResult& r) override
     {
         std::string s = event(chunk(id_, created_, model_, {}, false, finish_reason(e)));
         if (include_usage_)
@@ -666,7 +796,7 @@ public:
     {
         return event(error_body(message, "server_error")) + "data: [DONE]\n\n";
     }
-    std::string whole(End e, const OutputParser& p, const glm::GenerateResult& r) override
+    std::string whole(End e, const OutputParser& p, const gen::GenerateResult& r) override
     {
         return completion(id_, created_, model_, p, finish_reason(e), r);
     }

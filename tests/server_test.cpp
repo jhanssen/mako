@@ -54,9 +54,9 @@ struct Parsed {
 // Feeds the tokens of `text` (as generated after the prompt's <think>), returning the parser's results and the
 // concatenation of the streamed increments.
 std::pair<Parsed, Parsed> parse(const mako::text::Tokenizer& tok, const std::string& text, const char* tools,
-                                std::vector<std::string> stop = {})
+                                std::vector<std::string> stop = {}, bool reasoning_first = true)
 {
-    mako::server::OutputParser p(tok, tools, std::move(stop));
+    mako::server::OutputParser p(tok, tools, std::move(stop), reasoning_first);
     Parsed streamed;
     const auto add = [&](const mako::server::Delta& d) {
         streamed.reasoning += d.reasoning;
@@ -85,6 +85,73 @@ std::pair<Parsed, Parsed> parse(const mako::text::Tokenizer& tok, const std::str
     return {Parsed{p.reasoning(), p.content(), p.calls(), streamed.stopped}, streamed};
 }
 
+// DeepSeek-V4.1's markup: reasoning only when the prompt opened it, DSML tool calls.
+int deepseek(const mako::text::Tokenizer& tok, const mako::chat::Template& tmpl)
+{
+    {
+        const auto [p, s] = parse(tok, "Weighing it.</think>The answer is 4.", kTools);
+        check(p.reasoning == "Weighing it." && p.content == "The answer is 4." && p.calls.empty(), "reasoning, answer");
+        check(s.reasoning == p.reasoning && s.content == p.content, "streamed reasoning and answer");
+    }
+    {
+        const auto [p, s] = parse(tok, "Just the answer.", kTools, {}, false);
+        check(p.reasoning.empty() && p.content == "Just the answer.", "no reasoning when the prompt did not open it");
+    }
+    const std::string call =
+        "Let me look.</think>Reading it.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n<｜DSML｜ parameter "
+        "name=\"path\" string=\"true\">/tmp/a \"b\".txt</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" "
+        "string=\"false\">10</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ "
+        "parameter name=\"env\" string=\"false\">{\"A\": 1}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    {
+        const auto [p, s] = parse(tok, call, kTools);
+        check(p.content == "Reading it." && p.calls.size() == 2, std::format("DSML calls ({} calls, content '{}')",
+                                                                             p.calls.size(), p.content));
+        if (p.calls.size() == 2) {
+            check(p.calls[0].name == "read" && p.calls[0].arguments == R"({"path": "/tmp/a \"b\".txt", "limit": 10})",
+                  "first call's arguments: " + p.calls[0].arguments);
+            check(p.calls[1].name == "bash" && p.calls[1].arguments == R"({"env": {"A": 1}})",
+                  "second call's arguments: " + p.calls[1].arguments);
+        }
+        check(s.content == p.content && s.calls.size() == p.calls.size() &&
+                  (s.calls.empty() || (s.calls[0].arguments == p.calls[0].arguments && s.calls[0].name == "read")),
+              "streamed calls match");
+    }
+    {
+        // A call cut off inside its parameters closes what was complete.
+        const auto [p, s] = parse(tok, call.substr(0, call.find("</｜DSML｜ invoke>")), kTools);
+        check(p.calls.size() == 1 && p.calls[0].arguments == R"({"path": "/tmp/a \"b\".txt", "limit": 10})",
+              "cut-off call closed");
+    }
+    {
+        mako::server::OutputParser p(tok, kTools, {}, false);
+        p.require_call("read");
+        const auto want = tok.encode("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">", true);
+        std::vector<int32_t> got;
+        for (int32_t f; (f = p.forced()) >= 0;) {
+            got.push_back(f);
+            mako::server::Delta d;
+            p.push(f, d);
+        }
+        check(got == want, std::format("required call forces its opening ({} of {} tokens)", got.size(), want.size()));
+    }
+    // The template's generation prompt and DSML for earlier calls.
+    const std::string body = R"({"model":"m","tools":[{"type":"function","function":{"name":"read","parameters":{"type":
+        "object","properties":{"path":{"type":"string"}}}}}],"messages":[{"role":"user","content":"Read a"},
+        {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read",
+        "arguments":"{\"path\":\"a\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"hello"}]})";
+    try {
+        const auto r = mako::server::parse_chat_request(body, {});
+        const std::string text = tmpl.render(r.context).text;
+        check(text.contains("<｜DSML｜ invoke name=\"read\">") && text.contains("<tool_result>hello</tool_result>"),
+              "earlier call and its result render");
+        check(text.ends_with("<｜Assistant｜><think>") || text.ends_with("<｜Assistant｜></think>"), "generation prompt");
+    } catch (const std::exception& e) {
+        check(false, std::format("translation threw: {}", e.what()));
+    }
+    std::println("{} failures", failures);
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -109,6 +176,8 @@ int main(int argc, char** argv)
         return 1;
     }
     const mako::chat::Template tmpl{std::string(*source)};
+    if (f->get_string("general.architecture").value_or("") == "deepseek41")
+        return deepseek(*tok, tmpl);
     const mako::gen::SamplingParams defaults{.temperature = 0.6f, .top_p = 0.9f};
 
     // Translation: developer becomes system, argument strings become objects, missing content becomes empty,
@@ -306,8 +375,8 @@ int main(int argc, char** argv)
         }
         p.finish(d);
         events += proto->delta(d);
-        mako::glm::GenerateResult gr;
-        gr.finish = mako::glm::Finish::stop_token;
+        mako::gen::GenerateResult gr;
+        gr.finish = mako::gen::Finish::stop_token;
         gr.prompt_tokens = 10;
         events += proto->end(mako::server::End::tool_calls, p, gr);
         std::vector<std::string> names;

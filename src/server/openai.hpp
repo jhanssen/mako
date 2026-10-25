@@ -1,7 +1,7 @@
 #pragma once
 
 #include "gen/sampler.hpp"
-#include "glm/session.hpp"
+#include "gen/session.hpp"
 #include "text/stream.hpp"
 #include "text/tokenizer.hpp"
 
@@ -24,12 +24,13 @@ struct BadRequest : std::runtime_error {
 struct ChatRequest {
     std::string context;           // the template's variables, JSON
     std::string tools;             // the request's tool definitions, JSON ("[]" without)
-    glm::GenerateParams gen;       // max_tokens 0: up to the context size
+    gen::GenerateParams gen;       // max_tokens 0: up to the context size
     std::vector<std::string> stop; // stop strings (in the answer, not the reasoning)
     bool stream = false, include_usage = false;
     bool show_reasoning = true; // reasoning goes to the client
     bool tool_required = false; // tool_choice "required" or a named function
     std::string tool_name;      // a named function's
+    bool reasoning_first = true; // the rendered prompt opened the reasoning (ends in <think>)
 };
 
 // Throws BadRequest. `sampling` holds the model's defaults for the fields the request leaves out.
@@ -50,13 +51,17 @@ struct Delta {
     bool empty() const { return reasoning.empty() && content.empty() && calls.empty(); }
 };
 
-// Splits generated tokens into reasoning, answer and tool calls, following the template's markup: the prompt ends in
-// <think>, reasoning runs to </think>, then the answer with <tool_call>name<arg_key>k</arg_key><arg_value>v
-// </arg_value>...</tool_call> blocks. Argument values are JSON unless the tool's schema types them as strings.
+// Splits generated tokens into reasoning, answer and tool calls, following the template's markup: when the prompt
+// ends in <think>, reasoning runs to </think>; then the answer with tool calls, in one of two forms (by the
+// vocabulary): <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call> blocks (special tokens;
+// values are JSON unless the tool's schema types them as strings), or DSML text blocks, <｜DSML｜ calls> of
+// <｜DSML｜ invoke name="..."> with <｜DSML｜ parameter name="k" string="true|false">v</｜DSML｜ parameter> each
+// (string="true": v is text, else JSON).
 class OutputParser {
 public:
-    // tools: the request's tool definitions (JSON).
-    OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop);
+    // tools: the request's tool definitions (JSON); reasoning_first: the prompt opened the reasoning.
+    OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop,
+                 bool reasoning_first = true);
     ~OutputParser();
 
     // The answer must start with a call (of `name`, when given; its tokens are forced, then the arguments' start).
@@ -75,11 +80,14 @@ public:
     const std::string& stop_matched() const { return stop_matched_; }
 
 private:
-    enum class Mode { reasoning, content, name, key, between, value, done };
+    enum class Mode { reasoning, content, name, key, between, value, dsml, done };
     void text(const std::string& s, Delta& out);
     void flush_text(Delta& out);
     void emit_content(Delta& out, bool final);
     void open_call(Delta& out);
+    // DSML: complete elements at the start of dsml_ become calls and arguments; false while one is incomplete.
+    void parse_dsml(Delta& out);
+    void close_call(Delta& out);
     bool string_typed(const std::string& tool, const std::string& key) const;
 
     struct Tools;
@@ -99,15 +107,19 @@ private:
     std::vector<int32_t> name_tokens_; // a required call's name
     size_t name_seen_ = 0;             // tokens of the first call's name so far
     int32_t think_end_, call_begin_, call_end_, key_begin_, key_end_, value_begin_, value_end_;
+    bool dsml_form_ = false;       // tool calls as DSML text
+    std::string dsml_;             // DSML text not yet parsed
+    std::vector<int32_t> forced_;  // DSML: a required call's opening tokens
+    size_t forced_seen_ = 0;
 };
 
 // Chat Completions response bodies (JSON). A chunk with `role` opens the stream; one with `usage` closes it.
 std::string chunk(const std::string& id, int64_t created, const std::string& model, const Delta& d, bool role = false,
                   const char* finish_reason = nullptr);
 std::string usage_chunk(const std::string& id, int64_t created, const std::string& model,
-                        const glm::GenerateResult& r);
+                        const gen::GenerateResult& r);
 std::string completion(const std::string& id, int64_t created, const std::string& model, const OutputParser& p,
-                       const char* finish_reason, const glm::GenerateResult& r);
+                       const char* finish_reason, const gen::GenerateResult& r);
 std::string error_body(const std::string& message, const char* type = "invalid_request_error");
 std::string models_body(const std::string& model);
 

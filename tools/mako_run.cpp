@@ -18,7 +18,7 @@
 // --spec or a sampling option generates through a Session (speculatively with --spec; sampled with --temp > 0).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
-#include "glm/session.hpp"
+#include "gen/session.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
@@ -114,7 +114,7 @@ int main(int argc, char** argv)
     bool mtp_stats = false, spec = false, use_session = false;
     bool learn = false;
     mako::glm::Options opts;
-    mako::glm::GenerateParams gp;
+    mako::gen::GenerateParams gp;
     std::string ablate;
     float ablate_scale = 1.0f;
     gp.sampling.temperature = 0;
@@ -379,7 +379,7 @@ int main(int argc, char** argv)
     std::string gen;
     std::vector<int32_t> gen_ids;
     if (use_session) {
-        mako::glm::Session session(engine);
+        mako::gen::Session session(engine);
         gp.max_tokens = uint32_t(n_gen);
         gp.speculative = spec;
         uint32_t recorded = uint32_t(ids.size());

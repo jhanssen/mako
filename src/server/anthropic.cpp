@@ -335,7 +335,7 @@ public:
         return s;
     }
 
-    std::string end(End e, const OutputParser& p, const glm::GenerateResult& r) override
+    std::string end(End e, const OutputParser& p, const gen::GenerateResult& r) override
     {
         std::string s = close();
         s += event("message_delta",
@@ -350,7 +350,7 @@ public:
         return event("error", anthropic_error(message, "api_error"));
     }
 
-    std::string whole(End e, const OutputParser& p, const glm::GenerateResult& r) override
+    std::string whole(End e, const OutputParser& p, const gen::GenerateResult& r) override
     {
         MessageOut m{.id = id_, .model = model_};
         if (show_reasoning_ && !p.reasoning().empty())

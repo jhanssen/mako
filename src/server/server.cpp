@@ -29,7 +29,7 @@ const char* end_name(End e)
     return "?";
 }
 
-void log_result(const std::string& id, const glm::GenerateResult& r, const char* finish)
+void log_result(const std::string& id, const gen::GenerateResult& r, const char* finish)
 {
     const auto rate = [](size_t n, double ms) { return ms > 0 ? n / ms * 1e3 : 0.0; };
     const size_t read = r.prompt_tokens - r.reused_tokens, n = r.tokens.size();
@@ -44,17 +44,17 @@ void log_result(const std::string& id, const glm::GenerateResult& r, const char*
 } // namespace
 
 struct Server::Impl {
-    glm::Engine& engine;
+    gen::Model& engine;
     const text::Tokenizer& tok;
     const chat::Template& tmpl;
     ServerOptions opts;
-    glm::Session session;
+    gen::Session session;
     std::mutex gen_mutex; // one generation at a time
     std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
     httplib::Server http;
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
 
-    Impl(glm::Engine& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
+    Impl(gen::Model& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
         : engine(e), tok(t), tmpl(tm), opts(std::move(o)), session(e)
     {
     }
@@ -66,11 +66,11 @@ struct Server::Impl {
                const ErrorBody& error, const char* id_prefix, const MakeProtocol& make);
     void count_tokens(const httplib::Request& req, httplib::Response& res);
     // Runs the request on the session; on_delta gets each increment (false: the client went away).
-    glm::GenerateResult generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
+    gen::GenerateResult generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                                  const std::function<bool(const Delta&)>& on_delta, bool& stopped);
 };
 
-glm::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
+gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                                            const std::function<bool(const Delta&)>& on_delta, bool& stopped)
 {
     cr.gen.stop_tokens = {tok.eos(), tok.eot(), tok.find("<|observation|>")};
@@ -119,6 +119,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
         cr = parse();
         const auto rendered = tmpl.render(cr.context);
         prompt = tok.encode(rendered.text, rendered.input);
+        cr.reasoning_first = !prompt.empty() && prompt.back() == tok.find("<think>");
     } catch (const std::exception& e) {
         return fail(400, e.what());
     }
@@ -140,7 +141,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
         if (closed())
             return; // gave up while waiting
         try {
-            OutputParser parser(tok, cr.tools, cr.stop);
+            OutputParser parser(tok, cr.tools, cr.stop, cr.reasoning_first);
             bool stopped = false;
             cr.gen.cancelled = closed;
             const auto r = generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped);
@@ -163,7 +164,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
         if (shared->gen.cancelled() || !write(proto->begin(uint32_t(prompt.size()))))
             return false; // gave up while waiting
         try {
-            OutputParser parser(tok, shared->tools, shared->stop);
+            OutputParser parser(tok, shared->tools, shared->stop, shared->reasoning_first);
             bool stopped = false;
             const auto r = generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); },
                                     stopped);
@@ -194,7 +195,7 @@ void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& 
     }
 }
 
-Server::Server(glm::Engine& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts)
+Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts)
     : impl_(std::make_unique<Impl>(engine, tok, tmpl, std::move(opts)))
 {
     auto& h = impl_->http;

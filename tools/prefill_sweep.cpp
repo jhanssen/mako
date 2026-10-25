@@ -10,7 +10,7 @@
 // base context, then N turns that each read 1000 new tokens and answer 150 (misses per step in each answer's halves).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
-#include "glm/session.hpp"
+#include "gen/session.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
@@ -53,8 +53,8 @@ double ms_since(std::chrono::steady_clock::time_point t)
 // steps (drafting, sampling) is the rest of the decode's wall time.
 int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint32_t n, float temp, bool spec)
 {
-    mako::glm::Session session(engine);
-    mako::glm::GenerateParams gp;
+    mako::gen::Session session(engine);
+    mako::gen::GenerateParams gp;
     gp.sampling.temperature = temp;
     gp.sampling.top_p = 0.95f;
     gp.seed = 1;
@@ -108,8 +108,8 @@ int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint3
 int run_turns(mako::glm::Engine& engine, const std::vector<int32_t>& ids, uint32_t base, uint32_t turns, uint32_t read,
               uint32_t gen)
 {
-    mako::glm::Session session(engine);
-    mako::glm::GenerateParams gp;
+    mako::gen::Session session(engine);
+    mako::gen::GenerateParams gp;
     gp.sampling.temperature = 0;
     gp.max_tokens = gen;
     std::vector<int32_t> ctx(ids.begin(), ids.begin() + base);

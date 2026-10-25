@@ -230,7 +230,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         init.parts.push_back(L->experts);
     for (uint32_t il = 0; il < cfg_.n_layer; ++il)
         init.moe_layers.push_back(il);
-    init.context_bytes = context_bytes;
+    init.context_bytes = context_bytes + uint64_t(opts_.checkpoints) * checkpoint_bytes();
     init.lendable = double(prefill_scratch(opts_.prefill_chunk, opts_.prefill_group));
     init.arena_gb = opts_.arena_gb;
     init.simulate_ram_gb = opts_.simulate_ram_gb;
@@ -264,6 +264,44 @@ void Engine::reset()
     engram_history_.assign(engram_->history(), -1);
     for (auto& b : comp_state_)
         std::memset(b->contents(), 0, b->length());
+}
+
+uint64_t Engine::checkpoint_bytes() const
+{
+    uint64_t n = engram_history_.size() * 4;
+    for (const auto* v : {&ring_, &comp_state_})
+        for (const auto& b : *v)
+            n += b->length();
+    return n;
+}
+
+Engine::Checkpoint Engine::checkpoint()
+{
+    Checkpoint cp;
+    cp.pos = pos_;
+    cp.state.reserve(checkpoint_bytes());
+    for (const auto* v : {&ring_, &comp_state_})
+        for (const auto& b : *v) {
+            const auto* p = static_cast<const std::byte*>(b->contents());
+            cp.state.insert(cp.state.end(), p, p + b->length());
+        }
+    const auto* h = reinterpret_cast<const std::byte*>(engram_history_.data());
+    cp.state.insert(cp.state.end(), h, h + engram_history_.size() * 4);
+    return cp;
+}
+
+void Engine::restore(const Checkpoint& cp)
+{
+    if (cp.pos > opts_.max_ctx || cp.state.size() != checkpoint_bytes())
+        throw std::runtime_error("checkpoint from another engine");
+    size_t off = 0;
+    for (const auto* v : {&ring_, &comp_state_})
+        for (const auto& b : *v) {
+            std::memcpy(b->contents(), cp.state.data() + off, b->length());
+            off += b->length();
+        }
+    std::memcpy(engram_history_.data(), cp.state.data() + off, engram_history_.size() * 4);
+    pos_ = cp.pos;
 }
 
 void Engine::set_ablation(std::optional<mtl::Ablation> ablation)

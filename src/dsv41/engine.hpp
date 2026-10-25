@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/engine_base.hpp"
+#include "gen/model.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "mtl/ablation.hpp"
@@ -20,6 +21,7 @@ struct Options {
     uint32_t indexer_top_k = 0;    // nonzero: override the model's (for testing the sparse selection)
     uint32_t prefill_chunk = 256;  // tokens prefill() runs through each layer's attention together
     uint32_t prefill_group = 8192; // tokens whose routed experts run together, each loaded once per layer
+    uint32_t checkpoints = 4;      // checkpoints (checkpoint()) the memory budget reserves room for
     double arena_gb = -1;          // expert arena size; < 0: from the memory budget
     std::string expert_counts;     // routing profile; empty: the model's default one when it exists
     core::Telemetry telemetry = core::Telemetry::off;
@@ -28,28 +30,36 @@ struct Options {
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from
 // their tables. Decode and prefill run the same layer code over one or many tokens.
-class Engine : public core::EngineBase {
+class Engine : public core::EngineBase, public gen::Model {
 public:
     // `model` holds the Engram tables too (ModelFiles::add).
     Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx);
     ~Engine();
 
     // Runs one token at the next position and returns its logits.
-    const std::vector<float>& step(int32_t token);
+    const std::vector<float>& step(int32_t token) override;
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     // `cancelled` is polled between groups of tokens (Options::prefill_group): true stops there, with the tokens so
     // far in the context (position() tells how many).
-    const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {});
+    const std::vector<float>& prefill(std::span<const int32_t> tokens,
+                                      const std::function<bool()>& cancelled = {}) override;
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
     using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
 
-    uint32_t position() const { return pos_; }
+    uint32_t position() const override { return pos_; }
     const std::vector<float>& logits() const { return logits_; }
-    uint32_t max_context() const { return opts_.max_ctx; }
+    uint32_t max_context() const override { return opts_.max_ctx; }
+    uint32_t n_vocab() const override { return cfg_.n_vocab; }
     const Config& config() const { return cfg_; }
     // Back to position 0 (the expert arena keeps its contents).
-    void reset();
+    void reset() override;
+    // state: every layer's window rows, the compressors' pending halves and the Engram history (the compressed rows
+    // and index keys are positional).
+    Checkpoint checkpoint() override;
+    void restore(const Checkpoint& cp) override;
+    uint32_t checkpoint_slots() const override { return opts_.checkpoints; }
+    uint64_t checkpoint_bytes() const;
     const core::StepStats& last_prefill() const { return last_prefill_; }
 
     // Abliteration sites: a layer's attention output (attn_out, after the output projection) and its shared

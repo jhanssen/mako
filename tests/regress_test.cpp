@@ -18,7 +18,7 @@
 // Exit 77: the model is missing (skipped).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
-#include "glm/session.hpp"
+#include "gen/session.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "text/tokenizer.hpp"
@@ -432,7 +432,7 @@ int main(int argc, char** argv)
             engine.reset();
             return engine.prefill(p);
         };
-        mako::glm::GenerateParams greedy_p;
+        mako::gen::GenerateParams greedy_p;
         greedy_p.sampling.temperature = 0;
         greedy_p.max_tokens = 24;
         greedy_p.speculative = false;
@@ -447,9 +447,9 @@ int main(int argc, char** argv)
         // Greedy without drafts: the plain decode loop's tokens.
         engine.reset();
         const auto want = greedy(engine, as_session(prompt), 24);
-        mako::glm::Session session(engine);
+        mako::gen::Session session(engine);
         auto r = session.generate(prompt, greedy_p);
-        check(r.tokens == want && r.finish == mako::glm::Finish::max_tokens, "greedy session tokens match the decode loop");
+        check(r.tokens == want && r.finish == mako::gen::Finish::max_tokens, "greedy session tokens match the decode loop");
 
         // Speculative greedy: each token is the argmax of the logits before it (teacher-forced over prompt + output),
         // except at near-ties, where the two-token step's rounding may choose the other.
@@ -536,7 +536,7 @@ int main(int argc, char** argv)
             engine.prefill(std::span(corpus).first(kept));
             const double kl_resumed = kl_to(as_session(std::span(corpus).subspan(kept)), l_resumed);
             engine.set_prefill_group(opts.prefill_group);
-            check(rx.finish == mako::glm::Finish::cancelled && rx.tokens.empty() && polls == 1 &&
+            check(rx.finish == mako::gen::Finish::cancelled && rx.tokens.empty() && polls == 1 &&
                       kept == 1024 && ry.reused_tokens == kept && kl_resumed == 0,
                   std::format("cancelled read keeps {} of {} tokens ({} polls), resumed with {} reused, KL {:.2e}", kept,
                               corpus.size(), polls, ry.reused_tokens, kl_resumed));
