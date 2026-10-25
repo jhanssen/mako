@@ -13,6 +13,9 @@ target_link_libraries(server_test PRIVATE mako_server glaze_headers)
 add_executable(template_cases_test template_cases_test.cpp)
 target_link_libraries(template_cases_test PRIVATE mako_chat mako_gguf)
 
+add_executable(dsv41_test dsv41_test.cpp)
+target_link_libraries(dsv41_test PRIVATE mako_dsv41)
+
 add_executable(engram_test engram_test.cpp)
 target_link_libraries(engram_test PRIVATE mako_dsv41)
 
@@ -34,6 +37,9 @@ add_test(NAME tokenizer COMMAND tokenizer_test "${MAKO_MODEL}" ${CMAKE_CURRENT_S
 add_test(NAME tokenizer_ds41 COMMAND tokenizer_test "${MAKO_DS41_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_tokenizer_cases.bin
                                      ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_tokenizer_expected.txt)
 add_test(NAME template_ds41 COMMAND template_cases_test "${MAKO_DS41_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_template)
+# DeepSeek-V4.1 engine checks (ablation sites and invariants; MAKO_DS41_ABLATION adds a real file's prefill check).
+add_test(NAME dsv41 COMMAND dsv41_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_ENGRAM}" ${MAKO_DS41_ABLATION})
+set_tests_properties(dsv41 PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
 # Engram hashing and row decoding (expected rows from the reference hasher, values decoded independently).
 add_test(NAME engram_ds41 COMMAND engram_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_ENGRAM}"
                                   ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_engram_expected.txt)

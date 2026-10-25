@@ -553,6 +553,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             after(enc, "out_a gemm");
         }
     }
+    if (T == 1)
+        probe(enc, "attn_low", int(il), low, uint64_t(G) * R);
     proj(enc, L.out_b, low, 0, att, 0, T);
 }
 
@@ -724,9 +726,9 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, r_off, pc_off);
             norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
             attention(enc, L, il, xn, att, T, pos_ + c0, c0);
+            ablate(enc, il, ablate_attn_, att, 0, T);
             if (G == 1)
                 probe(enc, "attn_out", int(il), att, E);
-            ablate(enc, il, ablate_attn_, att, 0, T);
             hc_post(enc, att, R, R2, pcs[cur], T, r_off, 0, pc_off);
         }
         std::swap(R, R2);
@@ -741,6 +743,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         norm(enc, xg, &L.ffn_norm, xn_g, G, E, E, cfg_.rms_eps);
         if (decode) {
             moe_decode(cb, enc, L.moe, il, xn_g, ffo, G, [&](MTL::ComputeCommandEncoder*& e, MTL::Buffer* sho) {
+                if (G == 1)
+                    probe(e, "shexp_out", int(il), sho, E);
                 ablate(e, il, ablate_shexp_, sho, 0, G);
             });
         } else {
