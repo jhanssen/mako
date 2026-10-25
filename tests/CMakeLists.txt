@@ -69,3 +69,7 @@ add_test(NAME quant COMMAND quant_test)
 add_executable(presets_test presets_test.cpp)
 target_link_libraries(presets_test PRIVATE mako_app)
 add_test(NAME presets COMMAND presets_test ${CMAKE_CURRENT_BINARY_DIR})
+
+add_executable(gemv_own_test gemv_own_test.cpp)
+target_link_libraries(gemv_own_test PRIVATE mako_mtl)
+add_test(NAME gemv_own COMMAND gemv_own_test)
