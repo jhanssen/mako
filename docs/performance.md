@@ -96,6 +96,37 @@ Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads o
   read in parallel). The reference engine's DSpark: on code 97% of drafts kept, 4.6 tokens a round (-> ~1.5-1.65x
   here); on a story 1.34 tokens a round, drafts offered in 113 of 299 rounds (-> ~0-8% here, before its 8 GB).
 
+### Where a decode step goes (2026-10-25, short story prompt, Q8_0 dense, 94.4 GB expert cache)
+
+`ds_run --gen 200 --spec 0 --telemetry layers|parts|kernels`. A step is ~41 ms, GPU-bound (inputs and encoding <1 ms):
+
+| | ms/step | Note |
+| --- | ---: | --- |
+| GPU waiting for missing experts | 12.2 | ~10.7 misses of ~10 MB; one 7-14 MB read peaks at 10.5-11.9 GB/s on this SSD (`io_bench batch`), so ~0.9-1.1 ms each |
+| Resident experts (IQ2_XXS / IQ3_XXS indexed GEMV) | 7.8 | the IQ kernels run at 360-385 GB/s (Q8_0 at 566-580 on the same shapes): ~4.6 ms at bandwidth |
+| Attention output (out_a, out_b) | 6.1 | 3.2 GB of Q8_0, near bandwidth |
+| Attention q/kv projections | 4.8 | 2.2 GB of Q8_0 |
+| Shared expert | 3.6 | 1.5 GB of Q8_0 |
+| Router + routing | 2.1 | the F32 router GEMV is ~0.6; the route kernel and the event signal the rest |
+| hc and norm (attention and FFN) | 1.9 | small kernels |
+| Attention core | 1.8 | |
+| Miss experts, Engram, compressor, combine, hc post | 2.4 | |
+
+Weights read per token: ~8.5 GB dense + ~2.5 GB routed experts = ~11 GB, ~19.6 ms at 560 GB/s; GPU compute is
+~28-30 ms. A step issues ~1800 dispatches; a tiny dependent dispatch costs ~2 us, so ~3.6 ms is launch overhead.
+
+Dense re-quantization at load (`ds_run --dense-quant`, 1300 positions against the reference):
+
+| Dense | Top-1 | KL mean | Median step |
+| --- | ---: | ---: | ---: |
+| Q8_0 (stored) | 98.2% | 0.00557 | 46.0 ms |
+| Q6_K | 97.5% | 0.00755 | 40.9 ms |
+| Q5_K | 96.8% | 0.00964 | 43.5 ms |
+| Q4_K | 96.9% | 0.01609 | 38.6 ms |
+
+Short GEMV benchmarks at low GPU clocks read ~2x slow (a first measurement blamed the Q4_K kernel; warmed up it
+runs at 464-542 GB/s).
+
 ## Apple10 (M5) versus Apple9 (M3/M4)
 
 No code path checks the GPU family; the Apple10 hardware is reached through the same Metal 4 calls that run on Apple9.
