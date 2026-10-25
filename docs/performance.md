@@ -45,6 +45,9 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 | KDA scan with 8 threads per row (16 rows a threadgroup) | KDA section +9% against 4 threads per row; it also moved the second token of a two-token step by KL 4e-6 against single steps (cause not found) |
 | GEMM instead of the GEMV for small-output projections at >= 256 tokens (router, KDA gates) | prefill +3.5%, but KL against the reference 0.00719 -> 0.00845 |
 | The same for the KDA gate projections only (f_a, g_a, beta), with and without a second GEMM on the activations' rounding error (hi + lo halves) | KL 0.00719 -> 0.00784 / 0.00755 (sparse-attention check), top-1 below its limit: activation precision is not the cause (half-rounded weights, inferred); the most it could gain was 75-177 ms of KDA (1-2%) |
+| Sparse attention output in 64-column tiles (8 simdgroups on a 64x64 matmul2d tile) | pathologically slow: the end-to-end prefill tests took ~15 min instead of ~15 s |
+| Sparse attention without the sum pass when there is one split (output written in place) | no change (5.5% vs 5.3% of prefill GPU time) |
+| Sparse-attention groups of up to 128 tokens (was 32) | no change (sparse attention and selection 744 vs 748 ms): the kernels, not the group size, bound it |
 | Per-kernel telemetry to find slow kernels | timestamps around each dispatch inflate small kernels several-fold (one "slow" shared-expert GEMV was 93 us measured, 13 us real); repeat-in-place costs (`MAKO_REPEAT`) replaced it |
 
 ### Open

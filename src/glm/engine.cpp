@@ -701,6 +701,7 @@ void Engine::attend_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache,
     MTL::Buffer* partial = scratch("sp_part", uint64_t(splits) * rows * R * 4);
     MTL::Buffer* qh = halves(enc, q, q_off, rows, R, 0);
     const GatherArgs ga{H, R, L, splits, tokens};
+    part(enc, "mla sparse scores");
     enc->setComputePipelineState(pso("attn_gather_scores"));
     enc->setBuffer(qh, 0, 0);
     enc->setBuffer(cache, 0, 1);
@@ -711,6 +712,7 @@ void Engine::attend_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache,
     for (int rep_ = repeats("attn_gather_scores"); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size((L + 31) / 32, 1, tokens), MTL::Size(128, 1, 1));
     after(enc, "attn_gather_scores");
+    part(enc, "mla sparse softmax");
     const ListSoftmaxArgs sa{L, 1.0f / std::sqrt(float(cfg_.head_k)), H};
     enc->setComputePipelineState(pso("attn_softmax_list"));
     enc->setBuffer(scores, 0, 0);
@@ -719,6 +721,7 @@ void Engine::attend_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache,
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "attn_softmax_list");
+    part(enc, "mla sparse output");
     enc->setComputePipelineState(pso("attn_gather_pv"));
     enc->setBuffer(scores, 0, 0);
     enc->setBuffer(cache, 0, 1);
