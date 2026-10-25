@@ -198,7 +198,9 @@ void Engram::read_raw(std::span<const int64_t> rows, uint8_t* out, gguf::ReadPoo
 {
     const size_t per_pos = size_t(layers()) * cols_;
     const size_t n = rows.size();
-    constexpr size_t kChunk = 32;
+    // A decode step's ~48 rows go one per task so every reader thread issues one at a time (32 per task left two
+    // threads reading 2.3 ms of rows per token); a prefill's thousands still batch.
+    const size_t kChunk = std::max<size_t>(1, n / 256);
     pool.run((n + kChunk - 1) / kChunk, [&](size_t chunk) {
         for (size_t i = chunk * kChunk; i < std::min(n, (chunk + 1) * kChunk); ++i) {
             uint8_t* dst = out + i * row_bytes_;

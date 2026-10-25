@@ -248,7 +248,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     if (!eg)
         throw std::runtime_error(eg.error());
     engram_.emplace(std::move(*eg));
-    engram_pool_ = std::make_unique<gguf::ReadPool>(8);
+    engram_pool_ = std::make_unique<gguf::ReadPool>(16);
     engram_history_.assign(engram_->history(), -1);
 
     const uint32_t D = cfg_.head_dim, W = cfg_.sliding_window;
