@@ -22,3 +22,6 @@ target_link_libraries(mm_types_bench PRIVATE mako_mtl)
 
 add_executable(gemm_bench gemm_bench.cpp)
 target_link_libraries(gemm_bench PRIVATE mako_mtl)
+
+add_executable(gemv_bench gemv_bench.cpp)
+target_link_libraries(gemv_bench PRIVATE mako_mtl mako_gguf)
