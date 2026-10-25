@@ -110,7 +110,13 @@ public:
     // Never evicts a selected or pinned expert, so the GPU may read those meanwhile; no other slot of the layer may
     // be in use. With `pin` the selected slots stay pinned until unpin(). Returns false, changing nothing, when the
     // misses do not fit in the unpinned slots.
-    bool ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin = false);
+    // `count`: the call is one token's selection, for usage and scores (prefill passes false and reports its
+    // routing with note_prefill).
+    bool ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin = false, bool count = true);
+    // A prefill group's routing of a layer: users[e] tokens selected expert e. Usage counts them all; the eviction
+    // scores take them as at most 256 decode tokens' worth (scaled down, and decayed as many calls), so one long
+    // prompt does not wipe out what the profile and earlier steps taught.
+    void note_prefill(uint32_t layer, std::span<const uint32_t> users);
     void unpin(uint32_t layer);
     void unpin(uint32_t layer, std::span<const int32_t> slots);
 
@@ -123,7 +129,7 @@ private:
 
     std::vector<LayerParts> layers_;
     std::vector<std::array<Region, 3>> regions_;
-    uint32_t n_expert_ = 0;
+    uint32_t n_expert_ = 0, n_used_ = 0;
     std::vector<uint32_t> slots_;              // per layer
     std::vector<std::vector<int32_t>> order_;  // per layer, experts in prefill order
     std::vector<std::vector<uint64_t>> usage_;

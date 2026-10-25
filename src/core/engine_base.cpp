@@ -913,6 +913,12 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         if (!users[e].empty() && table[e] >= 0)
             order.push_back(e);
     const size_t n_resident = order.size();
+    {
+        std::vector<uint32_t> counts(dims_.n_expert);
+        for (uint32_t e = 0; e < dims_.n_expert; ++e)
+            counts[e] = uint32_t(users[e].size());
+        arena_->note_prefill(il, counts);
+    }
     for (int e = 0; e < int(dims_.n_expert); ++e)
         if (!users[e].empty() && table[e] < 0)
             order.push_back(e);
@@ -1032,7 +1038,7 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
             commit(b0, i);
             b0 = i;
         }
-        arena_->ensure(il, std::span<const int>(&order[i], 1), &slot[order[i]], true);
+        arena_->ensure(il, std::span<const int>(&order[i], 1), &slot[order[i]], true, false);
     }
     commit(b0, n_resident);
     // Misses are read a few at a time (their chunks in flight together) and each batch goes to the GPU
@@ -1043,7 +1049,7 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         size_t j = i + 1;
         while (j < order.size() && j - i < kMissesPerRead && rows_of(i, j + 1) <= kBatchRows)
             ++j;
-        while (!arena_->ensure(il, std::span<const int>(&order[i], j - i), got.data(), true)) {
+        while (!arena_->ensure(il, std::span<const int>(&order[i], j - i), got.data(), true, false)) {
             // Not enough unpinned slots: free the oldest batch's, or read fewer.
             if (!inflight.empty())
                 retire();

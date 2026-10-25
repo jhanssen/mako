@@ -16,6 +16,10 @@ namespace mako::dsv41 {
 // MXFP8 on disk (blocks of an E8M0 scale and 32 E4M3 codes).
 class Engram {
 public:
+    // The GGUF holding a model's Engram tables when they are not in the model's own files: a .gguf with them in
+    // <model dir>/Engram or <model dir>/../Engram. Empty when none is found.
+    static std::string find_tables(const std::string& first_shard);
+
     // Finds the tables in `m` (one tensor holding every layer's table in turn, or one per layer).
     static std::expected<Engram, std::string> open(const Config& cfg, const gguf::ModelFiles& m);
 

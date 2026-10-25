@@ -19,7 +19,7 @@ struct Options {
     uint32_t max_ctx = 8192;
     uint32_t indexer_top_k = 0;    // nonzero: override the model's (for testing the sparse selection)
     uint32_t prefill_chunk = 256;  // tokens prefill() runs through each layer's attention together
-    uint32_t prefill_group = 2048; // tokens whose routed experts run together, each loaded once per layer
+    uint32_t prefill_group = 8192; // tokens whose routed experts run together, each loaded once per layer
     double arena_gb = -1;          // expert arena size; < 0: from the memory budget
     std::string expert_counts;     // routing profile; empty: the model's default one when it exists
     core::Telemetry telemetry = core::Telemetry::off;

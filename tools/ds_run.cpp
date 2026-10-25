@@ -2,7 +2,8 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [-n N]
+//          [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
+//          [--save-profile F|default] [-n N]
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
 #include "dsv41/config.hpp"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <print>
 #include <sstream>
@@ -42,7 +44,7 @@ int main(int argc, char** argv)
         return 2;
     }
     std::vector<int32_t> ids;
-    std::string ref, out, ablate;
+    std::string ref, out, ablate, save_profile;
     mako::dsv41::Options opts;
     int gen = 0;
     bool use_prefill = false;
@@ -68,6 +70,10 @@ int main(int argc, char** argv)
             opts.prefill_group = uint32_t(std::stoul(v));
         else if (a == "--telemetry")
             opts.telemetry = v == "layers" ? mako::core::Telemetry::layers : mako::core::Telemetry::summary;
+        else if (a == "--save-profile")
+            save_profile = v;
+        else if (a == "--profile")
+            opts.expert_counts = v;
         else if (a == "--top-k")
             opts.indexer_top_k = uint32_t(std::stoul(v));
         else if (a == "--ablate")
@@ -96,8 +102,10 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     const auto t0 = std::chrono::steady_clock::now();
     mako::dsv41::Engine engine(*m, *cfg, opts, ctx);
-    std::println(stderr, "loaded in {:.1f} s: arena {:.1f} GB", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-                 engine.arena().bytes() / 1e9);
+    std::println(stderr, "loaded in {:.1f} s: arena {:.1f} GB, {}-{} slots a layer, profile {}",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), engine.arena().bytes() / 1e9,
+                 engine.load_stats().slots_min, engine.load_stats().slots_max,
+                 engine.loaded_profile().empty() ? "none" : engine.loaded_profile().string());
     if (!ablate.empty()) {
         auto a = mako::mtl::Ablation::load(ablate, ctx, cfg->n_embd, cfg->n_layer, mako::dsv41::Engine::kAblationSites);
         engine.set_ablation(std::move(a));
@@ -179,6 +187,11 @@ int main(int argc, char** argv)
         std::println("per step: wall {:.1f} ms, GPU {:.1f}, CPU waiting for routing {:.1f}, making experts resident {:.1f} "
                      "(reads {:.1f}, {:.1f} misses)",
                      wall / gen, gpu / gen, wait / gen, ensure / gen, read / gen, double(misses) / gen);
+    if (!save_profile.empty()) {
+        const auto path = save_profile == "default" ? engine.default_profile() : std::filesystem::path(save_profile);
+        engine.save_profile(path, true);
+        std::println(stderr, "routing counts added to {}", path.string());
+    }
     if (gen > 0) {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count();
         std::print("generated:");

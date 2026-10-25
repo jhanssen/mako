@@ -125,7 +125,7 @@ double arena_budget(const MemInfo& m)
 ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<LayerParts> layers, uint32_t n_expert,
                          uint32_t n_used, double budget_bytes, const std::vector<std::vector<uint64_t>>& counts,
                          double lendable_bytes)
-    : layers_(std::move(layers)), regions_(layers_.size()), n_expert_(n_expert), dev_(dev),
+    : layers_(std::move(layers)), regions_(layers_.size()), n_expert_(n_expert), n_used_(n_used), dev_(dev),
       readers_(std::make_unique<gguf::ReadPool>(kReaders))
 {
     const size_t nl = layers_.size();
@@ -321,6 +321,24 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
         stats_.read_bytes += loads.size() * p.bytes;
 }
 
+void ExpertArena::note_prefill(uint32_t layer, std::span<const uint32_t> users)
+{
+    uint64_t tokens = 0;
+    for (uint32_t u : users)
+        tokens += u;
+    tokens /= std::max<uint64_t>(1, n_used_);
+    if (!tokens)
+        return;
+    const double calls = double(std::min<uint64_t>(tokens, 256));
+    const double decay = std::exp2(-calls / 256), scale = calls / double(tokens);
+    for (double& c : score_[layer])
+        c *= decay;
+    for (size_t e = 0; e < users.size() && e < usage_[layer].size(); ++e) {
+        usage_[layer][e] += users[e];
+        score_[layer][e] += scale * double(users[e]);
+    }
+}
+
 void ExpertArena::unpin(uint32_t layer) { std::ranges::fill(pinned_[layer], 0); }
 
 void ExpertArena::unpin(uint32_t layer, std::span<const int32_t> slots)
@@ -351,7 +369,7 @@ void ExpertArena::prefill()
     stats_.read_bytes = 0;
 }
 
-bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin)
+bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin, bool count)
 {
     auto* table = static_cast<int32_t*>(table_buf_->contents()) + uint64_t(layer) * n_expert_;
     auto& owner = slot_expert_[layer];
@@ -370,13 +388,15 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     if (size_t(std::ranges::count(taken, 0)) < misses)
         return false;
     ++clock_;
-    // Each use adds 1; scores halve every 256 calls, so usage long past counts for little.
-    static const double decay = std::exp2(-1.0 / 256);
-    for (double& c : score_[layer])
-        c *= decay;
-    for (int e : experts) {
-        ++usage_[layer][e];
-        score_[layer][e] += 1.0;
+    if (count) {
+        // Each use adds 1; scores halve every 256 calls, so usage long past counts for little.
+        static const double decay = std::exp2(-1.0 / 256);
+        for (double& c : score_[layer])
+            c *= decay;
+        for (int e : experts) {
+            ++usage_[layer][e];
+            score_[layer][e] += 1.0;
+        }
     }
     std::vector<size_t> missed;
     for (size_t i = 0; i < experts.size(); ++i) {

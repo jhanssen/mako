@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <filesystem>
 #include <format>
 
 namespace mako::dsv41 {
@@ -34,6 +35,28 @@ const Lut& lut()
 }
 
 } // namespace
+
+std::string Engram::find_tables(const std::string& first_shard)
+{
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(first_shard).parent_path();
+    for (const fs::path& d : {dir / "Engram", dir.parent_path() / "Engram"}) {
+        std::error_code ec;
+        if (!fs::is_directory(d, ec))
+            continue;
+        std::vector<fs::path> files;
+        for (const auto& e : fs::directory_iterator(d, ec))
+            if (e.path().extension() == ".gguf")
+                files.push_back(e.path());
+        std::ranges::sort(files);
+        for (const auto& f : files) {
+            auto g = gguf::File::open(f.string());
+            if (g && (g->tensor("per_layer_token_embd.weight") || g->tensor("blk.1.engram_embd.weight")))
+                return f.string();
+        }
+    }
+    return {};
+}
 
 std::expected<Engram, std::string> Engram::open(const Config& cfg, const gguf::ModelFiles& m)
 {
