@@ -788,6 +788,13 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb)
             std::array<float, 16> self{};
             std::copy_n(sel, k, self.begin());
             probe_("moe_sel", int(il), self.data(), k);
+            // Which experts are resident before this layer's misses are read (1 / 0 per expert).
+            const auto* table = static_cast<const int32_t*>(arena_->slot_table()->contents()) +
+                                uint64_t(il) * dims_.n_expert;
+            std::vector<float> resident(dims_.n_expert);
+            for (uint32_t e = 0; e < dims_.n_expert; ++e)
+                resident[e] = table[e] >= 0 ? 1.0f : 0.0f;
+            probe_("moe_resident", int(il), resident.data(), resident.size());
         }
         // An override changes the selection after the GPU looked it up: then every expert goes to the miss pass.
         const bool overridden = bool(route_override_);

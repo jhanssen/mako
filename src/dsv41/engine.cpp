@@ -873,6 +873,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         part(enc, "ffn hc and norm");
         hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, G, 0, 0);
         norm(enc, xg, &L.ffn_norm, xn_g, G, E, E, cfg_.rms_eps);
+        if (G == 1)
+            probe(enc, "ffn_in", int(il), xn_g, E);
         if (decode) {
             moe_decode(cb, enc, L.moe, il, xn_g, ffo, G, [&](MTL::ComputeCommandEncoder*& e, MTL::Buffer* sho) {
                 if (G == 1)

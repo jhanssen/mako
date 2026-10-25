@@ -5,6 +5,9 @@
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [-n N]
+// --route-study N: N greedy tokens without drafts, then how well each expert-miss predictor would have done: layer
+// l+1's router on layer l's FFN input (one and two layers ahead), the previous token's experts, and the experts the
+// same input token used earlier (misses caught, and reads of experts neither resident nor selected wasted).
 // --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one and
 // --spec is not 0), with the tokens, speed and drafts kept.
 // --split S --width W: prefills the first S ids, then runs the rest W at a time (as a speculative verify step whose
@@ -18,6 +21,8 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <cstring>
+#include <map>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -66,7 +71,7 @@ int main(int argc, char** argv)
     mako::dsv41::Options opts;
     int gen = 0;
     bool use_prefill = false;
-    uint32_t split = 0, width = 0, session_n = 0;
+    uint32_t split = 0, width = 0, session_n = 0, study_n = 0;
     bool part_timing = false;
     uint64_t step_misses = 0;
     bool spec = true;
@@ -119,6 +124,8 @@ int main(int argc, char** argv)
             opts.dspark = v;
         else if (a == "--gen")
             session_n = uint32_t(std::stoul(v));
+        else if (a == "--route-study")
+            study_n = uint32_t(std::stoul(v));
         else if (a == "--spec")
             spec = v != "0";
         else if (a == "--max-drafts")
@@ -219,6 +226,138 @@ int main(int argc, char** argv)
             engine.reset();
             engine.prefill(ids);
         }
+        return 0;
+    }
+    if (study_n > 0) {
+        const uint32_t NL = cfg->n_layer, NE = cfg->n_expert, K = cfg->n_expert_used, E = cfg->n_embd;
+        struct LayerRec {
+            std::vector<float> x;      // FFN input
+            std::vector<int> sel;      // selected experts
+            std::vector<char> resident; // before this layer's misses were read
+        };
+        std::vector<std::vector<LayerRec>> steps; // [step][layer]
+        engine.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
+            if (layer < 0 || uint32_t(layer) >= NL)
+                return;
+            if (name == "moe_sel") {
+                if (layer == 0)
+                    steps.emplace_back(NL);
+                steps.back()[layer].sel.assign(data, data + n);
+            } else if (name == "moe_resident") {
+                steps.back()[layer].resident.assign(n, 0);
+                for (size_t e = 0; e < n; ++e)
+                    steps.back()[layer].resident[e] = data[e] > 0.5f;
+            } else if (name == "ffn_in" && !steps.empty()) {
+                steps.back()[layer].x.assign(data, data + n);
+            }
+        });
+        mako::gen::Session session(engine);
+        mako::gen::GenerateParams gp;
+        gp.sampling.temperature = 0;
+        gp.max_tokens = study_n;
+        gp.speculative = false;
+        const auto r = session.generate(ids, gp);
+        engine.set_probe({});
+        std::vector<int32_t> inputs{ids.back()};
+        inputs.insert(inputs.end(), r.tokens.begin(), r.tokens.end());
+        // Router weights and biases, read from the model file.
+        std::vector<std::vector<float>> W(NL), B(NL);
+        for (uint32_t l = 0; l < NL; ++l) {
+            for (auto [name, dst] : {std::pair{std::format("blk.{}.ffn_gate_inp.weight", l), &W[l]},
+                                     std::pair{std::format("blk.{}.exp_probs_b.bias", l), &B[l]}}) {
+                const auto ref = m->find(name);
+                if (!ref || ref.tensor->type != mako::gguf::Type::F32)
+                    throw std::runtime_error("need F32 " + name);
+                const auto d = ref.file->data(*ref.tensor);
+                dst->resize(d.size() / 4);
+                std::memcpy(dst->data(), d.data(), d.size());
+            }
+        }
+        auto predict = [&](uint32_t l, const std::vector<float>& x, uint32_t topk) {
+            std::vector<std::pair<float, int>> sc(NE);
+            for (uint32_t e = 0; e < NE; ++e) {
+                const float* w = W[l].data() + uint64_t(e) * E;
+                double dot = 0;
+                for (uint32_t i = 0; i < E; ++i)
+                    dot += double(w[i]) * x[i];
+                const double sp = dot > 20 ? dot : std::log1p(std::exp(dot));
+                sc[e] = {float(std::sqrt(sp) + B[l][e]), int(e)};
+            }
+            std::partial_sort(sc.begin(), sc.begin() + topk, sc.end(), std::greater{});
+            std::vector<int> out;
+            for (uint32_t i = 0; i < topk; ++i)
+                out.push_back(sc[i].second);
+            return out;
+        };
+        struct Score {
+            double caught = 0, wasted = 0;
+        };
+        std::map<std::string, Score> scores;
+        double misses = 0;
+        uint64_t counted = 0;
+        std::map<std::pair<int32_t, uint32_t>, std::map<int, int>> by_token; // (input token, layer) -> expert counts
+        for (size_t s = 0; s < steps.size(); ++s) {
+            for (uint32_t l = 0; l < NL; ++l) {
+                const LayerRec& rec = steps[s][l];
+                if (rec.sel.size() != K || rec.resident.size() != NE)
+                    continue;
+                auto is_sel = [&](int e) { return std::ranges::find(rec.sel, e) != rec.sel.end(); };
+                std::vector<int> miss;
+                for (int e : rec.sel)
+                    if (!rec.resident[e])
+                        miss.push_back(e);
+                auto score = [&](const std::string& name, const std::vector<int>& pred) {
+                    Score& sc = scores[name];
+                    for (int e : pred) {
+                        if (std::ranges::find(miss, e) != miss.end())
+                            sc.caught += 1;
+                        else if (!rec.resident[e] && !is_sel(e))
+                            sc.wasted += 1;
+                    }
+                };
+                std::vector<int> a1, a2;
+                if (l >= 1 && steps[s][l - 1].x.size() == E) {
+                    a1 = predict(l, steps[s][l - 1].x, 8);
+                    for (uint32_t k : {2u, 3u, 4u, 6u, 8u})
+                        score(std::format("router 1 layer ahead, top {}", k), {a1.begin(), a1.begin() + k});
+                }
+                if (l >= 2 && steps[s][l - 2].x.size() == E) {
+                    a2 = predict(l, steps[s][l - 2].x, 8);
+                    for (uint32_t k : {2u, 4u, 6u})
+                        score(std::format("router 2 layers ahead, top {}", k), {a2.begin(), a2.begin() + k});
+                }
+                if (!a1.empty() && !a2.empty()) {
+                    std::vector<int> both;
+                    for (int e : a2)
+                        if (std::ranges::find(a1, e) != a1.end())
+                            both.push_back(e);
+                    score("2-ahead top 8 also in 1-ahead top 8", both);
+                }
+                if (s >= 1 && steps[s - 1][l].sel.size() == K)
+                    score("previous token's experts", steps[s - 1][l].sel);
+                const int32_t tok = s < inputs.size() ? inputs[s] : -1;
+                auto& hist = by_token[{tok, l}];
+                if (!hist.empty()) {
+                    std::vector<std::pair<int, int>> v;
+                    for (auto [e, c] : hist)
+                        v.push_back({c, e});
+                    std::ranges::sort(v, std::greater{});
+                    std::vector<int> pred;
+                    for (size_t i = 0; i < v.size() && i < 8; ++i)
+                        pred.push_back(v[i].second);
+                    score("same input token earlier, up to 8", pred);
+                }
+                for (int e : rec.sel)
+                    ++hist[e];
+                misses += double(miss.size());
+                ++counted;
+            }
+        }
+        const double n_steps = double(steps.size());
+        std::println("{} steps, {:.1f} misses a step (layers with records: {})", steps.size(), misses / n_steps, counted);
+        for (const auto& [name, sc] : scores)
+            std::println("  {:38} catches {:5.1f}% of misses ({:.2f} a step), wastes {:.2f} reads a step", name,
+                         misses > 0 ? 100.0 * sc.caught / misses : 0.0, sc.caught / n_steps, sc.wasted / n_steps);
         return 0;
     }
     if (session_n > 0) {

@@ -153,6 +153,21 @@ Decode at long context (code text, 100 greedy tokens after the prompt): 16K toke
 of the difference is misses (17-18 a step against ~11). Leaving prefill out of the eviction scores made decode after a
 16K prompt worse (19.8 vs 15.4 misses a step, 18.6 vs 20.7 tok/s), as it did on GLM.
 
+Miss prediction (`ds_run --route-study N`, story prompt, 300 steps, 9.4 misses a step; a predicted expert neither
+resident nor selected counts as a wasted read):
+
+| Predictor | Misses caught | Wasted reads a step |
+| --- | ---: | ---: |
+| previous token's experts / same input token earlier | 0-1% | ~0-1 |
+| router 1 layer ahead (layer l's router on layer l-1's FFN input), top 2 / 4 / 6 / 8 | 15 / 34 / 53 / 63% | 0.9 / 3.4 / 9.9 / 21 |
+| router 2 layers ahead, top 2 / 4 / 6 | 14 / 30 / 44% | 1.1 / 5.0 / 13 |
+| 2-ahead top 8 that is also in 1-ahead top 8 | 47% | 7.4 |
+
+After a 16K code prompt (15.4 misses a step) 1-ahead top 6 catches 39% (21 wasted). Recently used experts are
+resident, so misses are experts not used for a while; only the router predicts them. A prediction is ready about one
+layer (~0.7 ms) before it is needed, competing with that layer's own misses for the SSD: estimated 2-3 ms a step on
+the story. Not built yet.
+
 Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
 projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
 GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against
