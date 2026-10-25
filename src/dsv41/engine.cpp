@@ -683,6 +683,13 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
             total.layers[l].hit_ms += last_step_.layers[l].hit_ms;
             total.layers[l].miss_ms += last_step_.layers[l].miss_ms;
         }
+        for (const core::KernelTime& k : last_step_.parts) {
+            auto it = std::ranges::find(total.parts, k.kernel, &core::KernelTime::kernel);
+            if (it == total.parts.end())
+                it = total.parts.insert(it, core::KernelTime{k.kernel, 0, 0});
+            it->ms += k.ms;
+            it->count += k.count;
+        }
         if (cancelled && g0 + n < tokens.size() && cancelled())
             break;
     }

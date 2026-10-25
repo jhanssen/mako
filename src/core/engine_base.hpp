@@ -82,6 +82,8 @@ public:
     const ExpertArena& arena() const { return *arena_; }
     const LoadStats& load_stats() const { return load_; }
     const StepStats& last_step() const { return last_step_; }
+    // Prefill at the layers level: also time named parts of each layer (StepStats::parts); adds encoders.
+    void set_part_timing(bool on);
     // Bytes of all scratch buffers allocated so far.
     uint64_t scratch_bytes() const
     {
@@ -214,6 +216,9 @@ protected:
     void deliver_probes();
     void apply_pressure();
     bool timing() const { return !samples_.empty() && tel_ >= Telemetry::layers; }
+    // At the layers level with part timing on: the dispatches from here to the next part() (or the end of the
+    // section's encoder) are timed as `name`, within the current section.
+    void part(MTL::ComputeCommandEncoder*& enc, std::string_view name);
     // MAKO_REPEAT=<label substring>:<n> encodes matching GEMVs, norms and helper dispatches n times, so the extra
     // step time measures their cost in place (they all recompute their output from their inputs).
     int repeats(std::string_view label) const
@@ -268,6 +273,8 @@ protected:
     StepStats last_step_;
     Telemetry tel_ = Telemetry::off; // the level in effect (prefill runs kernel-level telemetry as summary)
     // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
+    bool part_timing_ = false;
+    void add_samples(uint64_t want); // timestamp sample buffers for at least `want` samples
     struct Timed {
         uint32_t layer;
         int section; // 0 attention, 1 FFN (to routing), 2 resident experts, 3 misses and the rest; -1 one kernel

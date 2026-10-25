@@ -364,11 +364,13 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         throw std::runtime_error("the KDA scan kernel needs head_dim 128");
     MTL::Buffer* qkv = scratch("qkv", uint64_t(T) * 3 * inner * 4);
     MTL::Buffer* qkvc = scratch("qkvc", uint64_t(T) * 3 * inner * 4);
+    part(enc, "kda q k v");
     proj(enc, L.wq, xn, 0, qkv, 0, T, 3 * inner);
     proj(enc, L.wk, xn, 0, qkv, uint64_t(inner) * 4, T, 3 * inner);
     proj(enc, L.wv, xn, 0, qkv, uint64_t(inner) * 8, T, 3 * inner);
     // With snap_ (a speculative step), the state after the first snap_ tokens also goes to the alternate buffers.
     const uint32_t snap = snap_ && T > snap_ ? snap_ : 0;
+    part(enc, "kda conv");
     const ConvArgs ca{inner, cfg_.conv_kernel, T, snap};
     enc->setComputePipelineState(pso("kda_conv"));
     enc->setBuffer(qkv, 0, 0);
@@ -392,6 +394,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* braw = scratch("braw", uint64_t(T) * H * 4);
     MTL::Buffer* g = scratch("g", uint64_t(T) * inner * 4);
     MTL::Buffer* beta = scratch("beta", uint64_t(T) * H * 4);
+    part(enc, "kda gates");
     proj(enc, L.f_a, xn, 0, fa, 0, T);
     proj(enc, L.f_b, fa, 0, graw, 0, T);
     proj(enc, L.beta, xn, 0, braw, 0, T);
@@ -408,6 +411,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         enc->dispatchThreads(MTL::Size(inner, T, 1), MTL::Size(256, 1, 1));
     after(enc, "kda_gate");
 
+    part(enc, "kda l2 norm");
     const L2Args la{D, 1e-6f, 3 * inner};
     enc->setComputePipelineState(pso("l2_norm"));
     enc->setBuffer(qkvc, 0, 0);
@@ -417,6 +421,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     after(enc, "l2_norm");
 
     MTL::Buffer* o = scratch("o", uint64_t(T) * inner * 4);
+    part(enc, "kda scan");
     const ScanArgs sa{D, T, 3 * inner, inner, H, snap};
     enc->setComputePipelineState(pso("kda_scan"));
     enc->setBuffer(qkvc, 0, 0);
@@ -440,6 +445,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* gab = scratch("ga", uint64_t(T) * D * 4);
     MTL::Buffer* g2 = scratch("g2", uint64_t(T) * inner * 4);
     MTL::Buffer* gated = scratch("gated", uint64_t(T) * inner * 4);
+    part(enc, "kda output gate");
     proj(enc, L.g_a, xn, 0, gab, 0, T);
     proj(enc, L.g_b, gab, 0, g2, 0, T);
     if (probes)
@@ -456,6 +462,7 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     after(enc, "rms_norm_gate");
     if (probes)
         probe(enc, "attn_output", int(il), gated, inner);
+    part(enc, "kda output");
     proj(enc, L.wo, gated, 0, att, 0, T);
 }
 
@@ -516,6 +523,7 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* lat = scratch("lat", T * lrow * 4);
     MTL::Buffer* vout = scratch("vout", T * vrow * 4);
 
+    part(enc, "mla q kv");
     proj(enc, L.q_a, xn, 0, qr, 0, T);
     norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
     proj(enc, L.q_b, qrn, 0, q, 0, T);
@@ -547,8 +555,11 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
                           uint64_t(h) * yw * 4, H * yw, H * xw);
         after(enc, "per_head_gemm");
     };
+    part(enc, "mla k_b v_b");
     per_head(L.k_b, q, cfg_.head_k, qabs, R);
+    part(enc, "mla indexer project");
     indexer_project(enc, L, il, xn, qrn, T, pos0);
+    part(enc, "mla dense attention");
     const uint32_t kp = cfg_.indexer_kpool, n_top = cfg_.indexer_top_k / kp;
     // Query tokens per attention group: up to 16, fewer when the scores would pass 4M floats.
     const uint32_t group = std::clamp<uint32_t>((4u << 20) / (H * (pos0 + T)), 1, 16);
@@ -564,12 +575,16 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     const uint32_t sgroup = sparse_group();
     while (t < T) {
         const uint32_t g = std::min(sgroup, T - t);
+        part(enc, "mla indexer select");
         if (!indexer_select(enc, il, t, pos0 + t, g))
             throw std::logic_error("sparse attention group inside the dense window");
+        part(enc, "mla sparse attention");
         attend_sparse(enc, kv_cache_[il].get(), qabs, t * lrow * 4, lat, t * lrow * 4, g);
         t += g;
     }
+    part(enc, "mla k_b v_b");
     per_head(L.v_b, lat, R, vout, cfg_.head_v);
+    part(enc, "mla output");
     proj(enc, L.wo, vout, 0, att, 0, T);
 }
 
@@ -1208,12 +1223,14 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                     enc->endEncoding();
                     enc = encoder(cb, il, 0);
                 }
+                part(enc, "hc and norm");
                 hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pc, T, r_off);
                 norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
                 if (L.kda)
                     kda(enc, L, il, xn, att, T);
                 else
                     mla(enc, L, il, xn, att, T, pos_ + uint32_t(g0) + c0);
+                part(enc, "hc and norm");
                 hc_post(enc, att, R, R2, pc, T, r_off);
             }
             std::swap(R, R2);
@@ -1299,6 +1316,13 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                 total.layers[l].ffn_ms += last_step_.layers[l].ffn_ms;
                 total.layers[l].hit_ms += last_step_.layers[l].hit_ms;
                 total.layers[l].miss_ms += last_step_.layers[l].miss_ms;
+            }
+            for (const core::KernelTime& k : last_step_.parts) {
+                auto it = std::ranges::find(total.parts, k.kernel, &core::KernelTime::kernel);
+                if (it == total.parts.end())
+                    it = total.parts.insert(it, core::KernelTime{k.kernel, 0, 0});
+                it->ms += k.ms;
+                it->count += k.count;
             }
         }
         pool->release();

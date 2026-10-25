@@ -58,6 +58,7 @@ struct StepStats {
     double read_ms = 0;
     uint64_t hits = 0, misses = 0, read_bytes = 0;
     std::vector<LayerTimes> layers;
+    std::vector<KernelTime> parts; // layers level with part timing on: GPU time by named part of the layers
     std::vector<KernelTime> kernels;
 };
 

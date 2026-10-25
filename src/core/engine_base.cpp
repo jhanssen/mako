@@ -258,25 +258,8 @@ void EngineBase::init_runtime(ArenaInit init)
         if (!ctx_.info().counters_stage || !ctx_.info().timestamp_set)
             throw std::runtime_error("this GPU has no timestamps at encoder boundaries; per-layer telemetry is "
                                      "unavailable");
-        NS::Array* sets = ctx_.device()->counterSets();
-        MTL::CounterSet* ts = nullptr;
-        for (NS::UInteger i = 0; i < sets->count(); ++i)
-            if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
-                ts = sets->object<MTL::CounterSet>(i);
         // Layers: a prefill group's MoE layers commit their misses a few experts at a time, each in a timed encoder.
-        const uint64_t want = tel_ == Telemetry::kernels ? uint64_t(dims_.n_layer) * 240 + 64
-                                                         : uint64_t(dims_.n_layer) * 256 + 64;
-        mtl::Ref<MTL::CounterSampleBufferDescriptor> d(MTL::CounterSampleBufferDescriptor::alloc()->init());
-        d->setCounterSet(ts);
-        d->setSampleCount(kSamplesPerBuffer);
-        d->setStorageMode(MTL::StorageModeShared);
-        for (uint64_t n = 0; n < want; n += kSamplesPerBuffer) {
-            NS::Error* err = nullptr;
-            samples_.emplace_back(ctx_.device()->newCounterSampleBuffer(d.get(), &err));
-            if (!samples_.back())
-                throw std::runtime_error(std::format("newCounterSampleBuffer: {}",
-                                                     err ? err->localizedDescription()->utf8String() : "?"));
-        }
+        add_samples(tel_ == Telemetry::kernels ? uint64_t(dims_.n_layer) * 240 + 64 : uint64_t(dims_.n_layer) * 256 + 64);
     }
     pressure_queue_ = dispatch_queue_create("mako.memory-pressure", DISPATCH_QUEUE_SERIAL);
     pressure_src_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
@@ -326,6 +309,43 @@ void EngineBase::after(MTL::ComputeCommandEncoder*& enc, std::string_view kernel
     enc = encoder(cur_cb_, cur_layer_, -1);
 }
 
+void EngineBase::add_samples(uint64_t want)
+{
+    NS::Array* sets = ctx_.device()->counterSets();
+    MTL::CounterSet* ts = nullptr;
+    for (NS::UInteger i = 0; i < sets->count(); ++i)
+        if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
+            ts = sets->object<MTL::CounterSet>(i);
+    mtl::Ref<MTL::CounterSampleBufferDescriptor> d(MTL::CounterSampleBufferDescriptor::alloc()->init());
+    d->setCounterSet(ts);
+    d->setSampleCount(kSamplesPerBuffer);
+    d->setStorageMode(MTL::StorageModeShared);
+    for (uint64_t n = samples_.size() * kSamplesPerBuffer; n < want; n += kSamplesPerBuffer) {
+        NS::Error* err = nullptr;
+        samples_.emplace_back(ctx_.device()->newCounterSampleBuffer(d.get(), &err));
+        if (!samples_.back())
+            throw std::runtime_error(std::format("newCounterSampleBuffer: {}",
+                                                 err ? err->localizedDescription()->utf8String() : "?"));
+    }
+}
+
+void EngineBase::set_part_timing(bool on)
+{
+    part_timing_ = on && tel_ == Telemetry::layers;
+    if (part_timing_) // two parts per sparse-attention group, a few per layer otherwise
+        add_samples(uint64_t(dims_.n_layer) * 256 + 64 + 32768);
+}
+
+void EngineBase::part(MTL::ComputeCommandEncoder*& enc, std::string_view name)
+{
+    if (!part_timing_ || tel_ != Telemetry::layers || timed_.empty() || timed_.back().section < 0)
+        return;
+    const Timed cur = timed_.back();
+    enc->endEncoding();
+    enc = encoder(cur_cb_, cur.layer, cur.section);
+    timed_.back().kernel = name;
+}
+
 // Turns the step's encoder timestamps into per-layer section times. GPU ticks are converted with the CPU clock
 // over the step, from timestamp pairs taken at its start and end.
 void EngineBase::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
@@ -343,6 +363,7 @@ void EngineBase::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
         for (NS::UInteger i = 0; i < n; ++i)
             ts[first + i] = r[i].timestamp;
     }
+    last_step_.parts.clear();
     if (tel_ == Telemetry::layers) {
         last_step_.layers.assign(dims_.n_layer, LayerTimes{});
         for (uint32_t l = 0; l < dims_.n_layer; ++l) {
@@ -364,6 +385,13 @@ void EngineBase::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
             it->ms += ms;
             ++it->count;
             continue;
+        }
+        if (!t.kernel.empty()) {
+            auto it = std::ranges::find(last_step_.parts, t.kernel, &KernelTime::kernel);
+            if (it == last_step_.parts.end())
+                it = last_step_.parts.insert(it, KernelTime{t.kernel, 0, 0});
+            it->ms += ms;
+            ++it->count;
         }
         LayerTimes& lt = last_step_.layers[t.layer];
         (t.section == 0 ? lt.attn_ms : t.section == 1 ? lt.ffn_ms : t.section == 2 ? lt.hit_ms : lt.miss_ms) += ms;

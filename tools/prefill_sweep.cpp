@@ -1,9 +1,10 @@
 // Prefill time of reads of several sizes on top of a base context, as an agent turn reading a tool result.
 //   prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] [--steps N] [--prefill-group N]
-//                 [--stage-gb N]                 [--decode N] [--turns N] [--prompt-file F] [--temp T] [--no-spec]
+//                 [--stage-gb N] [--parts] [--decode N] [--turns N] [--prompt-file F] [--temp T] [--no-spec]
 // The text is this repository's sources, tokenized. Each size runs `repeats` times (default 2), each from a checkpoint
 // of the base context; the experts left resident by the runs before stay. --layers adds per-layer GPU timestamps
-// (GPU time by section; extra encoder boundaries slow it somewhat). --steps N also times sizes up to N as decode
+// (GPU time by section; extra encoder boundaries slow it somewhat); --parts also times named parts of the layers
+// (more encoders) and prints them after each run, as shares of the GPU time (comparable across runs that drift). --steps N also times sizes up to N as decode
 // steps, one token at a time. --decode N instead generates N tokens after the base context through a Session
 // (greedy and speculative unless --temp / --no-spec) and summarizes its steps. --prompt-file takes the text from F
 // (all of it, up to --base tokens) instead of the sources. --turns N simulates an agent: an answer of 150 tokens after the
@@ -148,13 +149,13 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::println(stderr, "usage: prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] "
-                             "[--steps N] [--prefill-group N]");
+                             "[--steps N] [--prefill-group N] [--parts]");
         return 2;
     }
     uint32_t base = 15000, repeats = 2, step_max = 0, decode = 0, turns = 0;
     std::string prompt_file;
     float temp = 0.0f;
-    bool spec = true;
+    bool spec = true, parts = false;
     std::vector<uint32_t> sizes{16, 64, 256, 512, 1024, 2048, 4096};
     mako::glm::Options opts;
     opts.telemetry = mako::core::Telemetry::summary;
@@ -162,6 +163,11 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         if (a == "--layers") {
             opts.telemetry = mako::core::Telemetry::layers;
+            continue;
+        }
+        if (a == "--parts") {
+            opts.telemetry = mako::core::Telemetry::layers;
+            parts = true;
             continue;
         }
         if (a == "--no-spec") {
@@ -234,6 +240,7 @@ int main(int argc, char** argv)
     opts.max_ctx = std::max(opts.max_ctx, base + decode + (turns + 1) * (kTurnRead + kTurnGen) + 16);
     mako::mtl::Context ctx;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
+    engine.set_part_timing(parts);
     if (decode)
         return run_decode(engine, std::span(ids).first(base), decode, temp, spec);
     if (turns)
@@ -269,6 +276,12 @@ int main(int argc, char** argv)
             }
             std::println("| {} | {} | {:.0f} | {:.0f} | {:.0f} | {:.0f} | {} | {:.2f} | {:.0f} |{}", n, r + 1, wall,
                          n / wall * 1e3, p.gpu_ms, p.ensure_ms, p.misses, p.read_bytes / 1e9, p.read_ms, sections);
+            if (parts) {
+                auto sorted = p.parts;
+                std::ranges::sort(sorted, std::greater{}, &mako::core::KernelTime::ms);
+                for (const auto& k : sorted)
+                    std::println("    {:24} {:8.1f} ms  {:5.1f}%  ({} encoders)", k.kernel, k.ms, 100 * k.ms / p.gpu_ms, k.count);
+            }
         }
     for (uint32_t n : sizes) {
         if (n > step_max)
