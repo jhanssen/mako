@@ -148,6 +148,27 @@ KL 0.0114, top-1 94.5%), so it is used; the GLM prefill-vs-decode limit was re-b
 session check's failure was a Session bug (a new session over a used engine did not reset it). More rows per simdgroup (8, 16) is slower for both: the kernels are bound
 by per-weight work, not by re-reading the activations.
 
+Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
+projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
+GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against
+the reference rose with every summation split tried (separate kernels 0.00557 / 0.00572; fused with 16 / 32 / 64 parts
+0.00615 / 0.00632 / 0.00678, top-1 98.1-97.7%). Likely the reference computes in the separate order, so this measures
+agreement with it rather than accuracy; not taken for 1.7%. Repeat-in-place costs of the remaining small kernels
+(`MAKO_REPEAT=<kernel>:2`, busy GPU time, base 27.6-27.8 ms a step):
+
+| Kernel (dispatches a step) | Added when doubled |
+| --- | ---: |
+| rms_norm (246) | +0.6 ms |
+| miss-expert GEMVs (120, mostly with no misses) | +0.4 ms |
+| ds_rope (125) | +0.25 ms |
+| moe_route (40) | +0.15-0.2 ms |
+| ds_round (85), swiglu (120) | +0.1 ms each |
+| hc_mix, hc_collapse, hc_expand (80 each), moe_combine_split (40) | ~0 |
+
+Repeats back to back undercount pipeline switches (the fused hc step saved ~0.6 ms where its kernels show ~0.4), so
+fusing everything is worth ~2-3 ms a step (7-10% of busy time), each step likely with a similar shift against the
+reference. Not pursued.
+
 Short GEMV benchmarks at low GPU clocks read ~2x slow (a first measurement blamed the Q4_K kernel; warmed up it
 runs at 464-542 GB/s).
 
