@@ -3,7 +3,9 @@
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
-//          [--save-profile F|default] [-n N]
+//          [--save-profile F|default] [--split S --width W] [-n N]
+// --split S --width W: prefills the first S ids, then runs the rest W at a time (as a speculative verify step whose
+// drafts were all right would) and reports the time and expert misses per step and per token.
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
 #include "dsv41/config.hpp"
@@ -48,6 +50,7 @@ int main(int argc, char** argv)
     mako::dsv41::Options opts;
     int gen = 0;
     bool use_prefill = false;
+    uint32_t split = 0, width = 0;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--ids") {
@@ -76,6 +79,10 @@ int main(int argc, char** argv)
             save_profile = v;
         else if (a == "--profile")
             opts.expert_counts = v;
+        else if (a == "--split")
+            split = uint32_t(std::stoul(v));
+        else if (a == "--width")
+            width = uint32_t(std::stoul(v));
         else if (a == "--top-k")
             opts.indexer_top_k = uint32_t(std::stoul(v));
         else if (a == "--ablate")
@@ -145,6 +152,24 @@ int main(int argc, char** argv)
             std::println("pos {:4} token {:6}: top {:6} ({:.3f})  {:.1f} ms", t, ids[t], top, lg[top], ms);
         }
     };
+    if (split > 0 && width > 0) {
+        engine.prefill(std::span<const int32_t>(ids).first(std::min<size_t>(split, ids.size())));
+        double ms = 0;
+        uint64_t misses = 0, steps = 0, tokens = 0;
+        for (size_t t = split; t + width <= ids.size(); t += width) {
+            const auto s0 = std::chrono::steady_clock::now();
+            const std::span<const int32_t> part(ids.data() + t, width);
+            const auto& st = width == 1 ? (engine.step(part[0]), engine.last_step()) : (engine.prefill(part), engine.last_prefill());
+            ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+            misses += st.misses;
+            ++steps;
+            tokens += width;
+        }
+        std::println("width {}: {} steps, {:.1f} ms a step ({:.1f} ms a token), {:.1f} misses a step ({:.1f} a token)", width,
+                     steps, ms / double(steps), ms / double(tokens), double(misses) / double(steps),
+                     double(misses) / double(tokens));
+        return 0;
+    }
     if (use_prefill) {
         engine.set_logits_sink([&](uint32_t pos, const float* lg) { check(pos, lg, 0); });
         const auto s0 = std::chrono::steady_clock::now();

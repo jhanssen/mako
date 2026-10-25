@@ -75,7 +75,11 @@ Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads o
 
 - Prefill reads (~6 s a group, now overlapped with the GPU work): more resident experts or fewer bytes per expert.
 - Decode misses (15-40 a step).
-- DSpark (5 drafts verified in one 6-token step) not built yet.
+- DSpark not built yet. Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
+  6 tokens costs 47-62 / 63 / 101 / 155-185 ms with ~12 misses per token at every width (tokens in a step share
+  almost no experts; wider steps still pay off because the dense weights are read once and one step's misses are
+  read in parallel). The reference engine's DSpark: on code 97% of drafts kept, 4.6 tokens a round (-> ~1.5-1.65x
+  here); on a story 1.34 tokens a round, drafts offered in 113 of 299 rounds (-> ~0-8% here, before its 8 GB).
 
 ## Apple10 (M5) versus Apple9 (M3/M4)
 
