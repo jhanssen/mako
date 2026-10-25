@@ -171,4 +171,22 @@ void Engram::read(std::span<const int64_t> rows, float* out, gguf::ReadPool& poo
     });
 }
 
+void Engram::read_raw(std::span<const int64_t> rows, uint8_t* out, gguf::ReadPool& pool) const
+{
+    const size_t per_pos = size_t(layers()) * cols_;
+    const size_t n = rows.size();
+    constexpr size_t kChunk = 32;
+    pool.run((n + kChunk - 1) / kChunk, [&](size_t chunk) {
+        for (size_t i = chunk * kChunk; i < std::min(n, (chunk + 1) * kChunk); ++i) {
+            uint8_t* dst = out + i * row_bytes_;
+            if (rows[i] < 0) {
+                std::fill_n(dst, row_bytes_, uint8_t(0));
+                continue;
+            }
+            const auto& tb = tables_[(i % per_pos) / cols_];
+            gguf::read_exact(tb.fd, dst, row_bytes_, tb.offset + uint64_t(rows[i]) * row_bytes_);
+        }
+    });
+}
+
 } // namespace mako::dsv41

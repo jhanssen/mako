@@ -2,7 +2,8 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--max-ctx N] [--ablate FILE] [--top-k N] [-n N]
+//          [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [-n N]
+// --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
@@ -44,6 +45,7 @@ int main(int argc, char** argv)
     std::string ref, out, ablate;
     mako::dsv41::Options opts;
     int gen = 0;
+    bool use_prefill = false;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--ids") {
@@ -58,6 +60,12 @@ int main(int argc, char** argv)
             opts.arena_gb = std::stod(v);
         else if (a == "--max-ctx")
             opts.max_ctx = uint32_t(std::stoul(v));
+        else if (a == "--prefill")
+            use_prefill = v != "0";
+        else if (a == "--chunk")
+            opts.prefill_chunk = uint32_t(std::stoul(v));
+        else if (a == "--group")
+            opts.prefill_group = uint32_t(std::stoul(v));
         else if (a == "--top-k")
             opts.indexer_top_k = uint32_t(std::stoul(v));
         else if (a == "--ablate")
@@ -106,16 +114,13 @@ int main(int argc, char** argv)
         lo.open(out, std::ios::binary);
     double kl_sum = 0;
     int agree = 0, compared = 0;
-    for (size_t t = 0; t < ids.size(); ++t) {
-        const auto s0 = std::chrono::steady_clock::now();
-        const auto& lg = engine.step(ids[t]);
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+    auto check = [&](size_t t, const float* lg, double ms) {
         if (lo)
-            lo.write(reinterpret_cast<const char*>(lg.data()), std::streamsize(V * 4));
-        const size_t top = size_t(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            lo.write(reinterpret_cast<const char*>(lg), std::streamsize(V * 4));
+        const size_t top = size_t(std::max_element(lg, lg + V) - lg);
         if ((t + 1) * V <= want.size()) {
             const float* w = want.data() + t * V;
-            const auto lp = log_softmax(w, V), lq = log_softmax(lg.data(), V);
+            const auto lp = log_softmax(w, V), lq = log_softmax(lg, V);
             double kl = 0;
             for (size_t i = 0; i < V; ++i)
                 kl += std::exp(double(lp[i])) * (double(lp[i]) - double(lq[i]));
@@ -126,6 +131,20 @@ int main(int argc, char** argv)
             std::println("pos {:4} token {:6}: top {:6} (ref {:6}) KL {:.5f}  {:.1f} ms", t, ids[t], top, wtop, kl, ms);
         } else {
             std::println("pos {:4} token {:6}: top {:6} ({:.3f})  {:.1f} ms", t, ids[t], top, lg[top], ms);
+        }
+    };
+    if (use_prefill) {
+        engine.set_logits_sink([&](uint32_t pos, const float* lg) { check(pos, lg, 0); });
+        const auto s0 = std::chrono::steady_clock::now();
+        engine.prefill(ids);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+        engine.set_logits_sink({});
+        std::println("prefill: {} tokens in {:.0f} ms ({:.1f} tok/s)", ids.size(), ms, ids.size() / ms * 1e3);
+    } else {
+        for (size_t t = 0; t < ids.size(); ++t) {
+            const auto s0 = std::chrono::steady_clock::now();
+            const auto& lg = engine.step(ids[t]);
+            check(t, lg.data(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
         }
     }
     if (compared)

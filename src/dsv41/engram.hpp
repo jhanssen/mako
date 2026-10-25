@@ -38,6 +38,9 @@ public:
     // Reads and decodes rows (as hash() gives them, n positions) into out[t][layer][column][dim] floats; rows of -1
     // become zeros. Throws std::runtime_error on a read error.
     void read(std::span<const int64_t> rows, float* out, gguf::ReadPool& pool) const;
+    // The same rows' bytes as stored (row_bytes() each; zeros for -1, which decode to zeros).
+    void read_raw(std::span<const int64_t> rows, uint8_t* out, gguf::ReadPool& pool) const;
+    uint32_t row_bytes() const { return row_bytes_; }
 
 private:
     struct Table {

@@ -325,6 +325,29 @@ void EngineBase::apply_pressure()
     }
 }
 
+EngineBase::ScratchLoan::ScratchLoan(EngineBase& e, uint64_t need) : e_(e)
+{
+    constexpr uint64_t kLendBelow = 256ull << 20;
+    lend_ = need > kLendBelow && e.arena_->lendable_bytes() > 0;
+    if (!lend_)
+        return;
+    for (const auto& [name, b] : e.scratch_)
+        kept_.emplace(name, b.get());
+    e.arena_->lend(need - kLendBelow);
+}
+
+EngineBase::ScratchLoan::~ScratchLoan()
+{
+    if (!lend_)
+        return;
+    std::erase_if(e_.scratch_, [&](const auto& kv) {
+        auto it = kept_.find(kv.first);
+        return it == kept_.end() || it->second != kv.second.get();
+    });
+    if (!e_.pressure_lent_)
+        e_.arena_->reclaim();
+}
+
 void EngineBase::save_profile(const std::filesystem::path& path, bool merge) const
 {
     const auto& usage = arena_->usage();
@@ -548,13 +571,13 @@ void EngineBase::hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, c
 }
 
 void EngineBase::hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out,
-                         MTL::Buffer* pc, uint32_t T, uint64_t r_off)
+                         MTL::Buffer* pc, uint32_t T, uint64_t r_off, uint64_t x_off, uint64_t pc_off)
 {
     const HcArgs ha{dims_.n_embd, dims_.hc_iters, dims_.hc_eps, T};
     enc->setComputePipelineState(pso("hc_expand"));
-    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(x, x_off, 0);
     enc->setBuffer(R, r_off, 1);
-    enc->setBuffer(pc, 0, 2);
+    enc->setBuffer(pc, pc_off, 2);
     enc->setBuffer(out, r_off, 3);
     enc->setBytes(&ha, sizeof(ha), 4);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)

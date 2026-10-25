@@ -139,7 +139,7 @@ protected:
     void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
                 MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, uint32_t T, uint64_t r_off = 0);
     void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* R, MTL::Buffer* out, MTL::Buffer* pc,
-                 uint32_t T, uint64_t r_off = 0);
+                 uint32_t T, uint64_t r_off = 0, uint64_t x_off = 0, uint64_t pc_off = 0);
     // T tokens: hc_post(post_x, R -> R_out, pc) when post_x is set (else R_out is R), then hc_pre of the next block
     // on the new stream (fn, scale, base) into x and pc, in two dispatches.
     void hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
@@ -160,6 +160,20 @@ protected:
     void moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,
                      MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, std::vector<MTL::CommandBuffer*>& committed);
     static constexpr uint32_t kBatchRows = 8192; // prefill expert rows (token, expert pairs) run and combined together
+    // For a prefill: scratch beyond 256 MB takes the memory of lendable arena slots meanwhile; at the end the scratch
+    // buffers allocated since go and the slots are read again (unless memory pressure holds them).
+    class ScratchLoan {
+    public:
+        ScratchLoan(EngineBase& e, uint64_t need);
+        ~ScratchLoan();
+        ScratchLoan(const ScratchLoan&) = delete;
+        ScratchLoan& operator=(const ScratchLoan&) = delete;
+
+    private:
+        EngineBase& e_;
+        bool lend_ = false;
+        std::map<std::string, MTL::Buffer*> kept_;
+    };
     // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
     MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                         uint32_t ld);

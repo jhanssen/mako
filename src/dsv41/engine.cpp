@@ -33,31 +33,32 @@ struct RoundArgs {
     uint32_t n, kind, out_half;
 };
 struct PoolArgs {
-    uint32_t dim, emit;
+    uint32_t dim, tokens, pos0;
 };
-struct GatherArgs {
-    uint32_t dim, n_window, first_pos, ring, n_comp, ids_identity;
-};
-struct ScoreArgs {
-    uint32_t dim, heads, n;
+struct AttnArgs {
+    uint32_t dim, heads, stride, ring, pos0, t0, ratio, top;
     float scale;
 };
 struct IdxArgs {
-    uint32_t dim, heads, n;
+    uint32_t dim, heads, stride, pos0, t0, ratio;
     float w_scale;
 };
 struct BlockArgs {
-    uint32_t n, block;
+    uint32_t stride, blk_stride, pos0, t0, ratio, block, kblocks;
 };
 struct TopkArgs {
-    uint32_t n, k, with_flags;
+    uint32_t stride, k, ids_stride, flags_stride, pos0, t0, ratio, block;
 };
 struct EngramArgs {
     uint32_t dim;
     float eps;
 };
+struct EngramDecodeArgs {
+    uint32_t dim, tokens, layers, cols;
+};
 
 constexpr uint32_t kFp8 = 0, kFp4E4m3 = 1, kFp4Pow2 = 2; // ds_round kinds
+constexpr uint32_t kAttnGroup = 32;                      // query tokens per attention dispatch (bounds the scores)
 
 // RoPE frequencies for n_rot dims: base^(-2i/n_rot), with YaRN's ramp toward freq / factor when orig_ctx > 0.
 std::vector<float> rope_freqs(uint32_t n_rot, float base, uint32_t orig_ctx, float factor, float beta_fast,
@@ -110,6 +111,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     routing_ = {core::Routing::Score::sqrt_softplus, cfg_.expert_weights_norm, cfg_.expert_weights_scale};
     if (opts_.indexer_top_k)
         cfg_.indexer_top_k = opts_.indexer_top_k;
+    opts_.prefill_chunk = std::max(1u, opts_.prefill_chunk);
+    opts_.prefill_group = std::max(opts_.prefill_chunk, opts_.prefill_group);
 
     token_embd_ = model_.find("token_embd.weight");
     if (!token_embd_ || !quant::can_dequant(token_embd_.tensor->type))
@@ -141,6 +144,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
                 L->owner = int(s);
         if (L->ratio && L->owner < 0)
             throw std::runtime_error(std::format("layer {} compresses but has no KV source", il));
+        if (L->ratio && cfg_.compress_ratios[kv_sources_[L->owner]] != L->ratio)
+            throw std::runtime_error(std::format("layer {}: compress ratio differs from its KV source's", il));
         if (L->kv_src && L->ratio != 1 && L->ratio != 2)
             throw std::runtime_error(std::format("layer {}: compress ratio {} unsupported", il, L->ratio));
         L->attn_norm = upload(p + "attn_norm.weight");
@@ -185,9 +190,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         L->moe.sh_down = upload(p + "ffn_down_shexp.weight");
         L->moe.clamp_exp = cfg_.swiglu_clamp_exp[il];
         L->moe.clamp_sh = cfg_.swiglu_clamp_shexp[il];
-        // Prefill (expert GEMMs) is not built yet: decode only needs the GEMV.
-        L->experts = {expert(p + "ffn_gate_exps.weight", false), expert(p + "ffn_up_exps.weight", false),
-                      expert(p + "ffn_down_exps.weight", false)};
+        L->experts = {expert(p + "ffn_gate_exps.weight", true), expert(p + "ffn_up_exps.weight", true),
+                      expert(p + "ffn_down_exps.weight", true)};
         layers_.push_back(std::move(L));
         layer_mla_.push_back(1);
     }
@@ -227,6 +231,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     for (uint32_t il = 0; il < cfg_.n_layer; ++il)
         init.moe_layers.push_back(il);
     init.context_bytes = context_bytes;
+    init.lendable = double(prefill_scratch(opts_.prefill_chunk, opts_.prefill_group));
     init.arena_gb = opts_.arena_gb;
     init.simulate_ram_gb = opts_.simulate_ram_gb;
     init.expert_counts = opts_.expert_counts;
@@ -234,6 +239,24 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
 }
 
 Engine::~Engine() = default;
+
+// Scratch bytes of a prefill: per group token (streams, mixes, FFN rows, Engram rows, routed outputs, selections),
+// per chunk token (the attention's projections and outputs), the attention and indexer score buffers, the expert
+// batch buffers.
+uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
+{
+    const uint64_t E = cfg_.n_embd, hd = uint64_t(cfg_.hc) * E, k = cfg_.n_expert_used, nff = cfg_.n_ff_exp;
+    const uint64_t HD = uint64_t(cfg_.n_head) * cfg_.head_dim, top = cfg_.indexer_top_k;
+    const uint64_t eg = uint64_t(cfg_.engram.layers.size()) * cfg_.engram.columns() * cfg_.engram.head_dim;
+    const uint64_t blocks = opts_.max_ctx / std::max(1u, cfg_.candidate_block_size) + 2;
+    const uint64_t per_group = 3 * hd + 3 * 24 + 4 * E + 5 * E + eg + k * E + 2 * cfg_.n_expert + 64 + top + blocks / 4;
+    const uint64_t per_chunk = 3 * HD + 2 * cfg_.q_lora_rank + 6 * uint64_t(cfg_.head_dim) + 2 * uint64_t(cfg_.o_groups) *
+                               cfg_.o_lora_rank + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) + 3 * nff + HD / 2;
+    const uint64_t scores = uint64_t(kAttnGroup) * cfg_.n_head * (cfg_.sliding_window + top) +
+                            (64ull << 20) / 4; // the indexer's
+    const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (E / 2 + 2 * nff + nff / 2);
+    return (uint64_t(group) * per_group + uint64_t(chunk) * per_chunk + scores + batch) * 4 + (96ull << 20);
+}
 
 void Engine::reset()
 {
@@ -250,24 +273,25 @@ void Engine::set_ablation(std::optional<mtl::Ablation> ablation)
     ablate_shexp_ = ablation_ ? ablation_->site("shexp_out") : -1;
 }
 
-void Engine::ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* x)
+void Engine::ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* x, uint64_t off,
+                    uint32_t rows)
 {
     if (!ablation_ || !ablation_->active(il, site))
         return;
-    ablation_->apply(enc, pso("ablate_rows"), il, site, x, 0, 1);
+    ablation_->apply(enc, pso("ablate_rows"), il, site, x, off, rows);
     after(enc, "ablate_rows");
 }
 
 void Engine::rope(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint64_t x_off, bool compressed, uint32_t head_dim,
-                  uint32_t heads, uint32_t pos, bool inverse)
+                  uint32_t heads, uint32_t pos0, uint32_t T, uint32_t step, bool inverse)
 {
-    const RopeArgs a{head_dim, heads, cfg_.n_rot, heads * head_dim, pos, 1, inverse ? 1u : 0u};
+    const RopeArgs a{head_dim, heads, cfg_.n_rot, heads * head_dim, pos0, step, inverse ? 1u : 0u};
     enc->setComputePipelineState(pso("ds_rope"));
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(compressed ? freq_comp_.get() : freq_window_.get(), 0, 1);
     enc->setBytes(&a, sizeof(a), 2);
     for (int r = repeats("ds_rope"); r > 0; --r)
-        enc->dispatchThreads(MTL::Size(cfg_.n_rot / 2, heads, 1), MTL::Size(32, 1, 1));
+        enc->dispatchThreads(MTL::Size(cfg_.n_rot / 2, heads, T), MTL::Size(32, 1, 1));
     after(enc, "ds_rope");
 }
 
@@ -285,263 +309,446 @@ void Engine::round(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint64_t x_
 }
 
 void Engine::hc_lagged(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale,
-                       const DevTensor& base, MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, MTL::Buffer* pc_prev)
+                       const DevTensor& base, MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, MTL::Buffer* pc_prev,
+                       uint32_t T, uint64_t r_off, uint64_t pc_off)
 {
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E;
-    MTL::Buffer* flat = scratch("flat", uint64_t(hd) * 4);
-    MTL::Buffer* mixes = scratch("mixes", 24 * 4);
-    norm(enc, R, nullptr, flat, 1, hd, 0, cfg_.rms_eps);
-    proj(enc, fn, flat, 0, mixes, 0, 1);
-    const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, 1};
+    MTL::Buffer* flat = scratch("flat", uint64_t(T) * hd * 4);
+    MTL::Buffer* mixes = scratch("mixes", uint64_t(T) * 24 * 4);
+    norm(enc, R, nullptr, flat, T, hd, 0, cfg_.rms_eps, r_off);
+    proj(enc, fn, flat, 0, mixes, 0, T);
+    const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
     enc->setComputePipelineState(pso("hc_mix"));
     enc->setBuffer(mixes, 0, 0);
     enc->setBuffer(scale.buf, scale.off, 1);
     enc->setBuffer(base.buf, base.off, 2);
-    enc->setBuffer(pc, 0, 3);
+    enc->setBuffer(pc, pc_off, 3);
     enc->setBytes(&ha, sizeof(ha), 4);
-    enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+    enc->dispatchThreads(MTL::Size(T, 1, 1), MTL::Size(std::min<uint32_t>(T, 64), 1, 1));
     after(enc, "hc_mix");
-    dispatch(enc, "hc_collapse", {R, pc_prev, x}, &ha, sizeof(ha), MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+    enc->setComputePipelineState(pso("hc_collapse"));
+    enc->setBuffer(R, r_off, 0);
+    enc->setBuffer(pc_prev, pc_off, 1);
+    enc->setBuffer(x, 0, 2);
+    enc->setBytes(&ha, sizeof(ha), 3);
+    enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    after(enc, "hc_collapse");
 }
 
-// One token's attention at position pos_: window rows of this layer plus the compressed rows its KV source keeps
+// T tokens' attention at positions pos0..: each token's window rows plus the compressed rows its KV source keeps
 // (all of them up to indexer_top_k, else the indexer's selection), a sink per head, then the grouped output
 // projection.
-void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att)
+void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
+                       uint32_t T, uint32_t pos0, uint32_t g0)
 {
     const uint32_t H = cfg_.n_head, D = cfg_.head_dim, QR = cfg_.q_lora_rank, W = cfg_.sliding_window;
-    const uint32_t p = pos_, Hi = cfg_.indexer_heads, Di = cfg_.indexer_dim, top = cfg_.indexer_top_k;
-    const bool comp = L.ratio != 0;
-    MTL::Buffer* qr = scratch("ds_qr", QR * 4);
-    MTL::Buffer* qrn = scratch("ds_qrn", QR * 4);
-    MTL::Buffer* q = scratch("ds_q", uint64_t(H) * D * 4);
-    MTL::Buffer* kv = scratch("ds_kv", D * 4);
-    MTL::Buffer* kvn = scratch("ds_kvn", D * 4);
-    proj(enc, L.q_a, xn, 0, qr, 0, 1);
-    norm(enc, qr, &L.q_a_norm, qrn, 1, QR, QR, cfg_.rms_eps);
-    proj(enc, L.q_b, qrn, 0, q, 0, 1);
-    proj(enc, L.kv, xn, 0, kv, 0, 1);
-    norm(enc, kv, &L.kv_norm, kvn, 1, D, D, cfg_.rms_eps);
-    rope(enc, q, 0, comp, D, H, p);
-    rope(enc, kvn, 0, comp, D, 1, p);
-    round(enc, kvn, 0, ring_[il].get(), uint64_t(p % W) * D * 4, D, kFp8);
-    probe(enc, "attn_q", int(il), q, uint64_t(H) * D);
+    const uint32_t Hi = cfg_.indexer_heads, Di = cfg_.indexer_dim, top = cfg_.indexer_top_k, HD = H * D;
+    const uint32_t ratio = uint32_t(L.ratio);
+    const bool comp = ratio != 0;
+    MTL::Buffer* qr = scratch("ds_qr", uint64_t(T) * QR * 4);
+    MTL::Buffer* qrn = scratch("ds_qrn", uint64_t(T) * QR * 4);
+    MTL::Buffer* q = scratch("ds_q", uint64_t(T) * HD * 4);
+    MTL::Buffer* kv = scratch("ds_kv", uint64_t(T) * D * 4);
+    MTL::Buffer* kvn = scratch("ds_kvn", uint64_t(T) * D * 4);
+    MTL::Buffer* kvc = scratch("ds_kvc", uint64_t(T) * D * 4);
+    proj(enc, L.q_a, xn, 0, qr, 0, T);
+    norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+    proj(enc, L.q_b, qrn, 0, q, 0, T);
+    proj(enc, L.kv, xn, 0, kv, 0, T);
+    norm(enc, kv, &L.kv_norm, kvn, T, D, D, cfg_.rms_eps);
+    rope(enc, q, 0, comp, D, H, pos0, T);
+    rope(enc, kvn, 0, comp, D, 1, pos0, T);
+    round(enc, kvn, 0, kvc, 0, T * D, kFp8);
+    if (T == 1)
+        probe(enc, "attn_q", int(il), q, HD);
 
-    // A KV source's compressor: a new compressed row (and index key) once its group of `ratio` tokens is complete.
+    // A KV source's compressor: a new compressed row (and index key) per completed group of `ratio` tokens.
     if (L.kv_src) {
         const uint32_t src = uint32_t(L.owner);
-        MTL::Buffer* lat = scratch("ds_lat", D * 4);
-        MTL::Buffer* latn = scratch("ds_latn", D * 4);
-        bool emit = true;
-        uint32_t row = p, rpos = p;
-        if (L.ratio == 1) {
-            proj(enc, L.comp_kv, xn, 0, lat, 0, 1);
+        MTL::Buffer* lat = scratch("ds_lat", uint64_t(T) * D * 4);
+        MTL::Buffer* latn = scratch("ds_latn", uint64_t(T) * D * 4);
+        // rows [row0, row0 + n_emit): those whose group ends within the tokens
+        const uint32_t row0 = pos0 / ratio, n_emit = (pos0 + T) / ratio - row0;
+        if (ratio == 1) {
+            proj(enc, L.comp_kv, xn, 0, lat, 0, T);
         } else {
-            MTL::Buffer* ck = scratch("ds_ck", D * 4);
-            MTL::Buffer* cg = scratch("ds_cg", D * 4);
-            proj(enc, L.comp_kv, xn, 0, ck, 0, 1);
-            proj(enc, L.comp_gate, xn, 0, cg, 0, 1);
-            emit = p % 2 == 1;
-            row = p / 2;
-            rpos = p - 1;
-            const PoolArgs pa{D, emit ? 1u : 0u};
+            MTL::Buffer* ck = scratch("ds_ck", uint64_t(T) * D * 4);
+            MTL::Buffer* cg = scratch("ds_cg", uint64_t(T) * D * 4);
+            proj(enc, L.comp_kv, xn, 0, ck, 0, T);
+            proj(enc, L.comp_gate, xn, 0, cg, 0, T);
+            const PoolArgs pa{D, T, pos0};
             dispatch(enc, "ds_pool2", {ck, cg, comp_state_[src].get(), lat}, &pa, sizeof(pa), MTL::Size(D, 1, 1),
                      MTL::Size(256, 1, 1));
         }
-        if (emit) {
-            norm(enc, lat, &L.comp_norm, latn, 1, D, D, cfg_.rms_eps);
-            MTL::Buffer* ikr = scratch("ds_ikr", Di * 4);
-            MTL::Buffer* ikn = scratch("ds_ikn", Di * 4);
-            proj(enc, L.idx_k, latn, 0, ikr, 0, 1);
-            norm(enc, ikr, &L.idx_k_norm, ikn, 1, Di, Di, cfg_.rms_eps);
-            rope(enc, ikn, 0, true, Di, 1, rpos);
-            round(enc, ikn, 0, ik_[src].get(), uint64_t(row) * Di * 4, Di, kFp4Pow2);
-            rope(enc, latn, 0, true, D, 1, rpos);
-            round(enc, latn, 0, ckv_[src].get(), uint64_t(row) * D * 2, D, kFp4E4m3, true);
+        if (n_emit) {
+            norm(enc, lat, &L.comp_norm, latn, n_emit, D, D, cfg_.rms_eps);
+            MTL::Buffer* ikr = scratch("ds_ikr", uint64_t(n_emit) * Di * 4);
+            MTL::Buffer* ikn = scratch("ds_ikn", uint64_t(n_emit) * Di * 4);
+            proj(enc, L.idx_k, latn, 0, ikr, 0, n_emit);
+            norm(enc, ikr, &L.idx_k_norm, ikn, n_emit, Di, Di, cfg_.rms_eps);
+            rope(enc, ikn, 0, true, Di, 1, row0 * ratio, n_emit, ratio);
+            round(enc, ikn, 0, ik_[src].get(), uint64_t(row0) * Di * 4, n_emit * Di, kFp4Pow2);
+            rope(enc, latn, 0, true, D, 1, row0 * ratio, n_emit, ratio);
+            round(enc, latn, 0, ckv_[src].get(), uint64_t(row0) * D * 2, n_emit * D, kFp4E4m3, true);
         }
     }
 
-    const uint32_t n_comp = comp ? (p + 1) / uint32_t(L.ratio) : 0;
-    const bool sparse = n_comp > top;
-    MTL::Buffer* sel = scratch("ds_sel", top * 4);
-    if (L.idx_src && sparse) {
-        MTL::Buffer* iq = scratch("ds_iq", uint64_t(Hi) * Di * 4);
-        MTL::Buffer* iw = scratch("ds_iw", Hi * 4);
-        MTL::Buffer* score = scratch("ds_score", uint64_t(opts_.max_ctx) * 4);
-        proj(enc, L.idx_q_b, qrn, 0, iq, 0, 1);
-        rope(enc, iq, 0, true, Di, Hi, p);
-        round(enc, iq, 0, iq, 0, Hi * Di, kFp4Pow2);
-        proj(enc, L.idx_proj, xn, 0, iw, 0, 1);
-        const IdxArgs ia{Di, Hi, n_comp, 1.0f / std::sqrt(float(Di * Hi))};
-        dispatch(enc, "ds_idx_score", {iq, iw, ik_[L.owner].get(), score}, &ia, sizeof(ia),
-                 MTL::Size(uint64_t(n_comp) * 32, 1, 1), MTL::Size(256, 1, 1));
-        // The candidate stage: the source layer keeps its best blocks of rows; later index sources score only
-        // those (all blocks survive while there are at most candidate_top_k_blocks).
-        const uint32_t bs = cfg_.candidate_block_size, nb = (n_comp + bs - 1) / bs;
+    // The indexer (index sources) for the tokens with more visible compressed rows than it keeps.
+    MTL::Buffer* sel = scratch("ds_sel", uint64_t(opts_.prefill_group) * top * 4);
+    const uint32_t bs = cfg_.candidate_block_size, kb = cfg_.candidate_top_k_blocks;
+    const uint32_t blk_stride = opts_.max_ctx / bs + 2;
+    MTL::Buffer* keep = scratch("ds_keep", uint64_t(opts_.prefill_group) * blk_stride);
+    if (L.idx_src && comp && (pos0 + T) / ratio > top) {
+        // first token with more than `top` rows
+        const uint32_t t_s = (top + 1) * ratio > pos0 + 1 ? (top + 1) * ratio - 1 - pos0 : 0;
+        MTL::Buffer* iq = scratch("ds_iq", uint64_t(T) * Hi * Di * 4);
+        MTL::Buffer* iw = scratch("ds_iw", uint64_t(T) * Hi * 4);
+        proj(enc, L.idx_q_b, qrn, 0, iq, 0, T);
+        rope(enc, iq, 0, true, Di, Hi, pos0, T);
+        round(enc, iq, 0, iq, 0, T * Hi * Di, kFp4Pow2);
+        proj(enc, L.idx_proj, xn, 0, iw, 0, T);
+        const uint32_t stride = (pos0 + T) / ratio;
+        const uint32_t S = std::clamp<uint32_t>(uint32_t((64ull << 20) / (uint64_t(stride) * 4)), 1, 64);
+        MTL::Buffer* score = scratch("ds_score", uint64_t(S) * stride * 4);
+        MTL::Buffer* blk = scratch("ds_blk", uint64_t(S) * blk_stride * 4);
+        MTL::Buffer* blk_ids = scratch("ds_blk_ids", uint64_t(S) * kb * 4);
         const int cand = cfg_.candidate_source_layer;
-        MTL::Buffer* keep = scratch("ds_keep", uint64_t(opts_.max_ctx) / bs + 2);
-        const BlockArgs ba{n_comp, bs};
-        if (int(il) == cand && nb > cfg_.candidate_top_k_blocks) {
-            MTL::Buffer* blk = scratch("ds_blk", (uint64_t(opts_.max_ctx) / bs + 2) * 4);
-            MTL::Buffer* blk_ids = scratch("ds_blk_ids", uint64_t(cfg_.candidate_top_k_blocks) * 4);
-            dispatch(enc, "ds_block_max", {score, blk}, &ba, sizeof(ba), MTL::Size(nb, 1, 1), MTL::Size(256, 1, 1));
-            const TopkArgs ta{nb, cfg_.candidate_top_k_blocks, 1};
-            dispatch(enc, "ds_topk", {blk, blk_ids, keep}, &ta, sizeof(ta), MTL::Size(1, 1, 1),
-                     MTL::Size(1024, 1, 1), false);
-        } else if (cand >= 0 && cand < int(il) && nb > cfg_.candidate_top_k_blocks) {
-            dispatch(enc, "ds_block_mask", {score, keep}, &ba, sizeof(ba), MTL::Size(n_comp, 1, 1),
-                     MTL::Size(256, 1, 1));
+        for (uint32_t t0 = t_s; t0 < T; t0 += S) {
+            const uint32_t n = std::min(S, T - t0);
+            const IdxArgs ia{Di, Hi, stride, pos0, t0, ratio, 1.0f / std::sqrt(float(Di * Hi))};
+            dispatch(enc, "ds_idx_score", {iq, iw, ik_[L.owner].get(), score}, &ia, sizeof(ia),
+                     MTL::Size(uint64_t(stride) * 32, n, 1), MTL::Size(256, 1, 1));
+            // The candidate stage: the source layer keeps each token's best blocks of rows; later index sources
+            // score only those (no restriction while there are at most kb blocks).
+            const BlockArgs ba{stride, blk_stride, pos0, t0, ratio, bs, kb};
+            if (int(il) == cand && (stride + bs - 1) / bs > kb) {
+                dispatch(enc, "ds_block_max", {score, blk}, &ba, sizeof(ba), MTL::Size(blk_stride, n, 1),
+                         MTL::Size(256, 1, 1));
+                const TopkArgs ta{blk_stride, kb, kb, blk_stride, pos0, t0, ratio, bs};
+                enc->setComputePipelineState(pso("ds_topk"));
+                enc->setBuffer(blk, 0, 0);
+                enc->setBuffer(blk_ids, 0, 1);
+                enc->setBuffer(keep, uint64_t(g0 + t0) * blk_stride, 2);
+                enc->setBytes(&ta, sizeof(ta), 3);
+                enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
+                after(enc, "ds_topk");
+            } else if (cand >= 0 && cand < int(il) && (stride + bs - 1) / bs > kb) {
+                enc->setComputePipelineState(pso("ds_block_mask"));
+                enc->setBuffer(score, 0, 0);
+                enc->setBuffer(keep, uint64_t(g0 + t0) * blk_stride, 1);
+                enc->setBytes(&ba, sizeof(ba), 2);
+                enc->dispatchThreads(MTL::Size(stride, n, 1), MTL::Size(256, 1, 1));
+                after(enc, "ds_block_mask");
+            }
+            const TopkArgs ta{stride, top, top, 0, pos0, t0, ratio, 1};
+            enc->setComputePipelineState(pso("ds_topk"));
+            enc->setBuffer(score, 0, 0);
+            enc->setBuffer(sel, uint64_t(g0 + t0) * top * 4, 1);
+            enc->setBuffer(keep, 0, 2);
+            enc->setBytes(&ta, sizeof(ta), 3);
+            enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
+            after(enc, "ds_topk");
         }
-        const TopkArgs ta{n_comp, top, 0};
-        dispatch(enc, "ds_topk", {score, sel, keep}, &ta, sizeof(ta), MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1),
-                 false);
     }
 
-    const uint32_t nw = std::min(p + 1, W), nc = std::min(n_comp, top), N = nw + nc;
-    MTL::Buffer* K = scratch("ds_K", uint64_t(W + top) * D * 4);
-    MTL::Buffer* sc = scratch("ds_sc", uint64_t(H) * (W + top) * 4);
-    MTL::Buffer* o = scratch("ds_o", uint64_t(H) * D * 4);
-    const GatherArgs ga{D, nw, p + 1 - nw, W, nc, sparse ? 0u : 1u};
-    dispatch(enc, "ds_gather_keys", {ring_[il].get(), comp ? ckv_[L.owner].get() : ring_[il].get(), sel, K}, &ga,
-             sizeof(ga), MTL::Size(D, N, 1), MTL::Size(256, 1, 1));
-    const ScoreArgs sa{D, H, N, 1.0f / std::sqrt(float(D))};
-    dispatch(enc, "ds_attn_scores", {q, K, sc}, &sa, sizeof(sa), MTL::Size((N + 7) / 8, 1, 1), MTL::Size(256, 1, 1),
-             false);
-    enc->setComputePipelineState(pso("ds_attn_softmax"));
-    enc->setBuffer(sc, 0, 0);
-    enc->setBuffer(L.sinks.buf, L.sinks.off, 1);
-    enc->setBytes(&sa, sizeof(sa), 2);
-    enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(256, 1, 1));
-    after(enc, "ds_attn_softmax");
-    dispatch(enc, "ds_attn_out", {sc, K, o}, &sa, sizeof(sa), MTL::Size(D / 64, 1, 1), MTL::Size(256, 1, 1), false);
-    rope(enc, o, 0, comp, D, H, p, true);
-    round(enc, o, 0, o, 0, H * D, kFp8);
-    MTL::Buffer* low = scratch("ds_low", uint64_t(cfg_.o_groups) * cfg_.o_lora_rank * 4);
-    gemv(enc, L.out_a, o, 0, low, 0, cfg_.o_groups);
-    proj(enc, L.out_b, low, 0, att, 0, 1);
+    MTL::Buffer* o = scratch("ds_o", uint64_t(T) * HD * 4);
+    const uint32_t stride = W + top;
+    MTL::Buffer* sc = scratch("ds_sc", uint64_t(std::min(T, kAttnGroup)) * H * stride * 4);
+    MTL::Buffer* cbuf = comp ? ckv_[L.owner].get() : ring_[il].get();
+    for (uint32_t t0 = 0; t0 < T; t0 += kAttnGroup) {
+        const uint32_t n = std::min(kAttnGroup, T - t0);
+        const AttnArgs aa{D, H, stride, W, pos0, t0, ratio, top, 1.0f / std::sqrt(float(D))};
+        auto bind = [&](const char* fn) {
+            enc->setComputePipelineState(pso(fn));
+            enc->setBuffer(kvc, 0, 1);
+            enc->setBuffer(ring_[il].get(), 0, 2);
+            enc->setBuffer(cbuf, 0, 3);
+            enc->setBuffer(sel, uint64_t(g0) * top * 4, 4);
+            enc->setBytes(&aa, sizeof(aa), 6);
+        };
+        bind("ds_attn_scores");
+        enc->setBuffer(q, 0, 0);
+        enc->setBuffer(sc, 0, 5);
+        enc->dispatchThreadgroups(MTL::Size((stride + 7) / 8, n, 1), MTL::Size(256, 1, 1));
+        after(enc, "ds_attn_scores");
+        enc->setComputePipelineState(pso("ds_attn_softmax"));
+        enc->setBuffer(sc, 0, 0);
+        enc->setBuffer(L.sinks.buf, L.sinks.off, 1);
+        enc->setBytes(&aa, sizeof(aa), 2);
+        enc->dispatchThreadgroups(MTL::Size(H, n, 1), MTL::Size(256, 1, 1));
+        after(enc, "ds_attn_softmax");
+        bind("ds_attn_out");
+        enc->setBuffer(sc, 0, 0);
+        enc->setBuffer(o, 0, 5);
+        enc->dispatchThreadgroups(MTL::Size(D / 64, n, 1), MTL::Size(256, 1, 1));
+        after(enc, "ds_attn_out");
+    }
+    const uint32_t ra[4] = {D, T, pos0, W};
+    dispatch(enc, "ds_ring_store", {kvc, ring_[il].get()}, ra, sizeof(ra), MTL::Size(D, std::min(T, W), 1),
+             MTL::Size(256, 1, 1));
+
+    rope(enc, o, 0, comp, D, H, pos0, T, 1, true);
+    round(enc, o, 0, o, 0, T * HD, kFp8);
+    // Grouped output projection: group g's heads (rows g * gw of each token) through its o_lora_rank rows.
+    const uint32_t G = cfg_.o_groups, R = cfg_.o_lora_rank, gw = HD / G;
+    MTL::Buffer* low = scratch("ds_low", uint64_t(T) * G * R * 4);
+    if (T <= kMaxDecodeTokens) {
+        for (uint32_t t = 0; t < T; ++t)
+            gemv(enc, L.out_a, o, uint64_t(t) * HD * 4, low, uint64_t(t) * G * R * 4, G);
+    } else {
+        const uint64_t mat = mtl::Gemv::row_bytes(L.out_a.type, gw) * R;
+        for (uint32_t g = 0; g < G; ++g) {
+            MTL::Buffer* xh = halves(enc, o, uint64_t(g) * gw * 4, T, gw, HD);
+            gemm_->encode(enc, L.out_a.type, gw, R, T, L.out_a.buf, L.out_a.off + g * mat, xh, 0, low,
+                          uint64_t(g) * R * 4, G * R);
+            after(enc, "out_a gemm");
+        }
+    }
+    proj(enc, L.out_b, low, 0, att, 0, T);
 }
 
 const std::vector<float>& Engine::step(int32_t token)
 {
-    if (token < 0 || uint32_t(token) >= cfg_.n_vocab)
-        throw std::runtime_error("token out of range");
-    if (pos_ >= opts_.max_ctx)
+    const int32_t t[1] = {token};
+    run(t, false);
+    return logits_;
+}
+
+const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled)
+{
+    if (tokens.empty())
+        return logits_;
+    if (tokens.size() == 1 && !logits_sink_)
+        return step(tokens[0]);
+    const auto t_start = Clock::now();
+    const ExpertArena::Stats arena_before = arena_->stats();
+    const double gpu_before = stats_.gpu_exec_ms;
+    core::StepStats total;
+    total.pos = pos_;
+    // Kernel timing is for steps: a prefill's dispatches would overflow the sample buffers.
+    struct Level {
+        core::Telemetry& tel;
+        core::Telemetry saved;
+        ~Level() { tel = saved; }
+    } level{tel_, tel_};
+    if (tel_ >= core::Telemetry::layers)
+        tel_ = core::Telemetry::summary;
+    const ScratchLoan loan(*this, prefill_scratch(std::min<uint32_t>(opts_.prefill_chunk, uint32_t(tokens.size())),
+                                                  std::min<uint32_t>(opts_.prefill_group, uint32_t(tokens.size()))));
+    for (size_t g0 = 0; g0 < tokens.size(); g0 += opts_.prefill_group) {
+        const size_t n = std::min<size_t>(opts_.prefill_group, tokens.size() - g0);
+        run(tokens.subspan(g0, n), bool(logits_sink_));
+        total.ensure_ms += last_step_.ensure_ms;
+        if (cancelled && g0 + n < tokens.size() && cancelled())
+            break;
+    }
+    const ExpertArena::Stats& arena_after = arena_->stats();
+    total.wall_ms = ms_since(t_start);
+    total.gpu_ms = stats_.gpu_exec_ms - gpu_before;
+    total.read_ms = arena_after.read_ms - arena_before.read_ms;
+    total.hits = arena_after.hits - arena_before.hits;
+    total.misses = arena_after.misses - arena_before.misses;
+    total.read_bytes = arena_after.read_bytes - arena_before.read_bytes;
+    last_prefill_ = std::move(total);
+    return logits_;
+}
+
+void Engine::run(std::span<const int32_t> tokens, bool all_logits)
+{
+    const uint32_t G = uint32_t(tokens.size());
+    if (G == 0 || G > opts_.prefill_group)
+        throw std::runtime_error("bad token count");
+    for (int32_t t : tokens)
+        if (t < 0 || uint32_t(t) >= cfg_.n_vocab)
+            throw std::runtime_error("token out of range");
+    if (pos_ + G > opts_.max_ctx)
         throw std::runtime_error("context full");
     apply_pressure();
-    const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E;
+    const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, chunk = std::min(opts_.prefill_chunk, G);
+    const bool decode = G <= kMaxDecodeTokens; // MoE with GPU routing and served misses, no expert GEMMs
     step_start_ = Clock::now();
     encoding_ = true;
     const ExpertArena::Stats before = arena_->stats();
     const Stats stats_before = stats_;
     last_step_ = core::StepStats{};
     last_step_.pos = pos_;
-    last_step_.token = token;
+    last_step_.token = tokens[0];
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
-    // Engram rows of this position (both tables), read before the GPU work that needs them.
-    const uint32_t eg_per = engram_->layers() * engram_->columns();
-    MTL::Buffer* eg = scratch("ds_eg", uint64_t(eg_per) * engram_->dim() * 4);
+    // Engram rows of these positions (both tables), read before the GPU work that needs them.
+    const uint32_t eg_layers = engram_->layers(), eg_cols = engram_->columns(), eg_dim = engram_->dim();
+    const uint64_t eg_rows = uint64_t(G) * eg_layers * eg_cols;
+    MTL::Buffer* eg_raw = scratch("ds_eg_raw", eg_rows * engram_->row_bytes());
+    MTL::Buffer* eg = scratch("ds_eg", eg_rows * eg_dim * 4);
     {
-        std::vector<int64_t> rows(eg_per);
-        const int32_t t[1] = {token};
-        engram_->hash(t, engram_history_, rows);
-        engram_->read(rows, static_cast<float*>(eg->contents()), *engram_pool_);
-        engram_history_ = engram_->advance(engram_history_, t);
+        std::vector<int64_t> rows(eg_rows);
+        engram_->hash(tokens, engram_history_, rows);
+        engram_->read_raw(rows, static_cast<uint8_t*>(eg_raw->contents()), *engram_pool_);
+        engram_history_ = engram_->advance(engram_history_, tokens);
     }
 
-    MTL::Buffer* x = scratch("x", uint64_t(E) * 4);
-    MTL::Buffer* xn = scratch("xn", uint64_t(E) * 4);
-    MTL::Buffer* att = scratch("att", uint64_t(E) * 4);
-    MTL::Buffer* ffo = scratch("ffo", uint64_t(E) * 4);
-    MTL::Buffer* ekv = scratch("ds_ekv", uint64_t(5) * E * 4);
-    scratch("R", uint64_t(hd) * 4);
-    scratch("R2", uint64_t(hd) * 4);
-    MTL::Buffer* pcs[2] = {scratch("pcA", 24 * 4), scratch("pcB", 24 * 4)};
-    MTL::Buffer* pc0 = scratch("pc0", 24 * 4);
+    MTL::Buffer* xg = scratch("ds_xg", uint64_t(G) * E * 4);
+    MTL::Buffer* xn_g = scratch("ds_xng", uint64_t(G) * E * 4);
+    MTL::Buffer* ffo = scratch("ds_ffo", uint64_t(G) * E * 4);
+    MTL::Buffer* x = scratch("ds_x", uint64_t(chunk) * E * 4);
+    MTL::Buffer* xn = scratch("ds_xn", uint64_t(chunk) * E * 4);
+    MTL::Buffer* att = scratch("ds_att", uint64_t(chunk) * E * 4);
+    MTL::Buffer* ekv = scratch("ds_ekv", uint64_t(G) * 5 * E * 4);
+    MTL::Buffer* R = scratch("ds_R", uint64_t(G) * hd * 4);
+    MTL::Buffer* R2 = scratch("ds_R2", uint64_t(G) * hd * 4);
+    MTL::Buffer* pcs[2] = {scratch("ds_pcA", uint64_t(G) * 24 * 4), scratch("ds_pcB", uint64_t(G) * 24 * 4)};
+    MTL::Buffer* pc0 = scratch("ds_pc0", uint64_t(G) * 24 * 4);
     {
         auto* p0 = static_cast<float*>(pc0->contents());
-        std::fill_n(p0, 24, 0.0f);
-        p0[0] = 1.0f; // the first sublayer's input is stream 0
+        std::fill_n(p0, uint64_t(G) * 24, 0.0f);
+        for (uint32_t t = 0; t < G; ++t)
+            p0[t * 24] = 1.0f; // the first sublayer's input is stream 0
         const gguf::Tensor& t = *token_embd_.tensor;
         const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
         std::vector<std::byte> row(rb);
-        gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(token) * rb);
-        quant::dequant_row(t.type, row.data(), static_cast<float*>(x->contents()), E);
+        for (uint32_t i = 0; i < G; ++i) {
+            gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[i]) * rb);
+            quant::dequant_row(t.type, row.data(), static_cast<float*>(xg->contents()) + uint64_t(i) * E, E);
+        }
     }
 
+    MTL::Timestamp cpu0 = 0, gpu0 = 0;
+    if (timing())
+        ctx_.device()->sampleTimestamps(&cpu0, &gpu0);
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     cur_cb_ = cb;
     cur_layer_ = cfg_.n_layer;
     MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
-    const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, 1};
-    dispatch(enc, "hc_init", {x, scratch("R", uint64_t(hd) * 4)}, &ha, sizeof(ha), MTL::Size(E, 1, 1),
+    // Command buffers committed without waiting (the routed experts' batches); drained before the next group.
+    std::vector<MTL::CommandBuffer*> committed;
+    auto drain = [&] {
+        for (MTL::CommandBuffer* c : committed) {
+            c->waitUntilCompleted();
+            if (c->status() != MTL::CommandBufferStatusCompleted)
+                throw std::runtime_error("command buffer failed");
+            stats_.gpu_exec_ms += (c->GPUEndTime() - c->GPUStartTime()) * 1e3;
+            c->release();
+        }
+        committed.clear();
+    };
+    const EngramDecodeArgs eda{eg_dim, G, eg_layers, eg_cols};
+    dispatch(enc, "ds_engram_decode", {eg_raw, eg}, &eda, sizeof(eda), MTL::Size(eg_dim, eg_rows, 1),
              MTL::Size(256, 1, 1));
+    const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, G};
+    dispatch(enc, "hc_init", {xg, R}, &ha, sizeof(ha), MTL::Size(E, G, 1), MTL::Size(256, 1, 1));
     MTL::Buffer* prev = pc0;
     int cur = 0;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const Layer& L = *layers_[il];
         cur_layer_ = il;
-        auto R = [&] { return scratch("R", uint64_t(hd) * 4); };
-        auto R2 = [&] { return scratch("R2", uint64_t(hd) * 4); };
+        if (timing()) {
+            enc->endEncoding();
+            enc = encoder(cb, il, 0);
+        }
         if (L.engram >= 0) {
-            gemv(enc, L.engram_kv, eg, uint64_t(L.engram) * engram_->columns() * engram_->dim() * 4, ekv, 0);
+            proj(enc, L.engram_kv, eg, uint64_t(L.engram) * G * eg_cols * eg_dim * 4, ekv, 0, G);
             const EngramArgs ea{E, cfg_.rms_eps};
             enc->setComputePipelineState(pso("ds_engram_gate"));
-            enc->setBuffer(R(), 0, 0);
+            enc->setBuffer(R, 0, 0);
             enc->setBuffer(ekv, 0, 1);
             enc->setBuffer(L.engram_gate.buf, L.engram_gate.off, 2);
             enc->setBytes(&ea, sizeof(ea), 3);
-            enc->dispatchThreadgroups(MTL::Size(4, 1, 1), MTL::Size(256, 1, 1));
+            enc->dispatchThreadgroups(MTL::Size(4, G, 1), MTL::Size(256, 1, 1));
             after(enc, "ds_engram_gate");
         }
-        hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R(), x, pcs[cur], prev);
-        norm(enc, x, &L.attn_norm, xn, 1, E, E, cfg_.rms_eps);
-        probe(enc, "attn_norm", int(il), xn, E);
-        attention(enc, L, il, xn, att);
-        probe(enc, "attn_out", int(il), att, E);
-        ablate(enc, il, ablate_attn_, att);
-        hc_post(enc, att, R(), R2(), pcs[cur], 1);
-        std::swap(scratch_["R"], scratch_["R2"]);
+        for (uint32_t c0 = 0; c0 < G; c0 += chunk) {
+            const uint32_t T = std::min(chunk, G - c0);
+            const uint64_t r_off = uint64_t(c0) * hd * 4, pc_off = uint64_t(c0) * 24 * 4;
+            hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, r_off, pc_off);
+            norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
+            attention(enc, L, il, xn, att, T, pos_ + c0, c0);
+            if (G == 1)
+                probe(enc, "attn_out", int(il), att, E);
+            ablate(enc, il, ablate_attn_, att, 0, T);
+            hc_post(enc, att, R, R2, pcs[cur], T, r_off, 0, pc_off);
+        }
+        std::swap(R, R2);
         prev = pcs[cur];
         cur ^= 1;
+        if (timing()) {
+            enc->endEncoding();
+            enc = encoder(cb, il, 1);
+        }
 
-        hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R(), x, pcs[cur], prev);
-        norm(enc, x, &L.ffn_norm, xn, 1, E, E, cfg_.rms_eps);
-        probe(enc, "ffn_norm", int(il), xn, E);
-        moe_decode(cb, enc, L.moe, il, xn, ffo, 1, [&](MTL::ComputeCommandEncoder*& e, MTL::Buffer* sho) {
-            ablate(e, il, ablate_shexp_, sho);
-        });
-        probe(enc, "ffn_out", int(il), ffo, E);
-        hc_post(enc, ffo, R(), R2(), pcs[cur], 1);
-        std::swap(scratch_["R"], scratch_["R2"]);
+        hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, G, 0, 0);
+        norm(enc, xg, &L.ffn_norm, xn_g, G, E, E, cfg_.rms_eps);
+        if (decode) {
+            moe_decode(cb, enc, L.moe, il, xn_g, ffo, G, [&](MTL::ComputeCommandEncoder*& e, MTL::Buffer* sho) {
+                ablate(e, il, ablate_shexp_, sho, 0, G);
+            });
+        } else {
+            // The shared expert in chunks (its intermediates are wide), then the routed experts added in.
+            for (uint32_t c0 = 0; c0 < G; c0 += chunk)
+                ffn_dense(enc, L.moe.sh_gate, L.moe.sh_up, L.moe.sh_down, xn_g, ffo, L.moe.clamp_sh,
+                          std::min(chunk, G - c0), uint64_t(c0) * E * 4, uint64_t(c0) * E * 4);
+            ablate(enc, il, ablate_shexp_, ffo, 0, G);
+            moe_prefill(cb, enc, L.moe, il, xn_g, ffo, G, committed);
+        }
+        if (G == 1)
+            probe(enc, "ffn_out", int(il), ffo, E);
+        hc_post(enc, ffo, R, R2, pcs[cur], G);
+        std::swap(R, R2);
         prev = pcs[cur];
         cur ^= 1;
-        probe(enc, "l_out", int(il), R(), hd);
     }
+    // Logits of the last position, or of every one (in chunks) for the sink.
     cur_layer_ = cfg_.n_layer;
-    dispatch(enc, "hc_collapse", {scratch("R", uint64_t(hd) * 4), prev, x}, &ha, sizeof(ha), MTL::Size(E, 1, 1),
-             MTL::Size(256, 1, 1));
-    norm(enc, x, &output_norm_, xn, 1, E, E, cfg_.rms_eps);
-    MTL::Buffer* lg = scratch("logits", uint64_t(cfg_.n_vocab) * 4);
-    gemv(enc, output_, xn, 0, lg, 0);
+    if (timing()) {
+        enc->endEncoding();
+        enc = encoder(cb, cur_layer_, -1);
+    }
+    const uint32_t nl = all_logits ? chunk : 1;
+    MTL::Buffer* xl = scratch("ds_xl", uint64_t(nl) * E * 4);
+    MTL::Buffer* xnl = scratch("ds_xnl", uint64_t(nl) * E * 4);
+    MTL::Buffer* lg = scratch("ds_logits", uint64_t(nl) * cfg_.n_vocab * 4);
+    for (uint32_t l0 = all_logits ? 0 : G - 1; l0 < G; l0 += nl) {
+        const uint32_t n = std::min(nl, G - l0);
+        const HcArgs h1{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, n};
+        enc->setComputePipelineState(pso("hc_collapse"));
+        enc->setBuffer(R, uint64_t(l0) * hd * 4, 0);
+        enc->setBuffer(prev, uint64_t(l0) * 24 * 4, 1);
+        enc->setBuffer(xl, 0, 2);
+        enc->setBytes(&h1, sizeof(h1), 3);
+        enc->dispatchThreads(MTL::Size(E, n, 1), MTL::Size(256, 1, 1));
+        after(enc, "hc_collapse");
+        norm(enc, xl, &output_norm_, xnl, n, E, E, cfg_.rms_eps);
+        proj(enc, output_, xnl, 0, lg, 0, n);
+        enc->endEncoding();
+        finish(cb);
+        drain();
+        const auto* lgp = static_cast<const float*>(lg->contents());
+        if (all_logits && logits_sink_)
+            for (uint32_t i = 0; i < n; ++i)
+                logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
+        if (l0 + n == G)
+            std::memcpy(logits_.data(), lgp + uint64_t(n - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
+        cb = ctx_.queue()->commandBuffer();
+        cur_cb_ = cb;
+        enc = encoder(cb, cur_layer_, -1);
+    }
     enc->endEncoding();
     finish(cb);
-    std::memcpy(logits_.data(), lg->contents(), uint64_t(cfg_.n_vocab) * 4);
-    ++pos_;
+    pos_ += G;
     pool->release();
 
     stats_.expert_read_ms = arena_->stats().read_ms;
     stats_.expert_bytes = arena_->stats().read_bytes;
     stats_.step_ms += ms_since(step_start_);
-    const ExpertArena::Stats& after = arena_->stats();
+    const ExpertArena::Stats& after_stats = arena_->stats();
     last_step_.wall_ms = ms_since(step_start_);
     last_step_.encode_ms = stats_.encode_ms - stats_before.encode_ms;
     last_step_.gpu_ms = stats_.gpu_exec_ms - stats_before.gpu_exec_ms;
-    last_step_.read_ms = after.read_ms - before.read_ms;
-    last_step_.hits = after.hits - before.hits;
-    last_step_.misses = after.misses - before.misses;
-    last_step_.read_bytes = after.read_bytes - before.read_bytes;
-    return logits_;
+    last_step_.read_ms = after_stats.read_ms - before.read_ms;
+    last_step_.hits = after_stats.hits - before.hits;
+    last_step_.misses = after_stats.misses - before.misses;
+    last_step_.read_bytes = after_stats.read_bytes - before.read_bytes;
+    if (timing())
+        resolve_layer_times(cpu0, gpu0);
 }
 
 } // namespace mako::dsv41

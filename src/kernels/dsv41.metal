@@ -99,79 +99,106 @@ kernel void ds_round(device float* x [[buffer(0)]], device void* y [[buffer(1)]]
 
 struct PoolArgs {
     uint dim;
-    uint emit; // 0: stash (k, g) of the group's first token; 1: pool with the stash into y
+    uint tokens;
+    uint pos0; // position of the first token
 };
 
-// Ratio-2 compressor: per channel, softmax over the group's two tokens of the gate, applied to the kv projections.
-// state holds the first token's k then g; k, g the current token's. Grid (dim).
+// Ratio-2 compressor over consecutive tokens: per channel, a group's two tokens (positions 2j, 2j + 1) give row j,
+// the kv projections weighted by the softmax over the two of the gate. state holds the pending first token's k then
+// g (from before pos0, or left for the next call). Rows go to y in order, one per completed group. Grid (dim).
 kernel void ds_pool2(device const float* k [[buffer(0)]], device const float* g [[buffer(1)]],
                      device float* state [[buffer(2)]], device float* y [[buffer(3)]], constant PoolArgs& a [[buffer(4)]],
                      uint c [[thread_position_in_grid]])
 {
     if (c >= a.dim)
         return;
-    if (!a.emit) {
-        state[c] = k[c];
-        state[a.dim + c] = g[c];
-        return;
+    float k0 = state[c], g0 = state[a.dim + c];
+    uint row = 0;
+    for (uint t = 0; t < a.tokens; ++t) {
+        const float kt = k[uint64_t(t) * a.dim + c], gt = g[uint64_t(t) * a.dim + c];
+        if ((a.pos0 + t) % 2 == 0) {
+            k0 = kt;
+            g0 = gt;
+            continue;
+        }
+        const float m = max(g0, gt);
+        const float e0 = exp(g0 - m), e1 = exp(gt - m);
+        y[uint64_t(row++) * a.dim + c] = (k0 * e0 + kt * e1) / (e0 + e1);
     }
-    const float g0 = state[a.dim + c], g1 = g[c];
-    const float m = max(g0, g1);
-    const float e0 = exp(g0 - m), e1 = exp(g1 - m);
-    y[c] = (state[c] * e0 + k[c] * e1) / (e0 + e1);
+    state[c] = k0;
+    state[a.dim + c] = g0;
 }
 
-struct GatherArgs {
-    uint dim;
-    uint n_window;  // window rows first: positions first_pos .. first_pos + n_window - 1, ring row pos % ring
-    uint first_pos, ring;
-    uint n_comp;    // then compressed rows: ids[j] (or j itself when ids_identity)
-    uint ids_identity;
-};
-
-// K = the window's rows of the ring (float) followed by the selected compressed rows (half). Grid (dim, rows).
-kernel void ds_gather_keys(device const float* ringb [[buffer(0)]], device const half* comp [[buffer(1)]],
-                           device const int* ids [[buffer(2)]], device float* K [[buffer(3)]],
-                           constant GatherArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
-{
-    const uint d = gid.x, j = gid.y;
-    if (d >= a.dim || j >= a.n_window + a.n_comp)
-        return;
-    float v;
-    if (j < a.n_window) {
-        v = ringb[uint64_t((a.first_pos + j) % a.ring) * a.dim + d];
-    } else {
-        const uint c = j - a.n_window;
-        const uint row = a.ids_identity ? c : uint(ids[c]);
-        v = float(comp[uint64_t(row) * a.dim + d]);
-    }
-    K[uint64_t(j) * a.dim + d] = v;
-}
-
-struct ScoreArgs {
-    uint dim;   // 512
-    uint heads; // 64
-    uint n;     // keys
+struct AttnArgs {
+    uint dim;     // 512
+    uint heads;   // 64
+    uint stride;  // score row stride (keys per head) of a token
+    uint ring;    // window rows (sliding window)
+    uint pos0;    // position of the chunk's first token (its rows of kv_chunk)
+    uint t0;      // first token (of the chunk) this dispatch covers
+    uint ratio;   // compressed rows: one per `ratio` tokens; 0: none
+    uint top;     // at most this many compressed rows; more visible: the selection's
     float scale;
 };
 
-// scores[h][j] = scale * q_h . K_j. Threadgroups of 256 threads take 8 keys (staged in threadgroup memory); each
-// simdgroup takes heads h = sg, sg + 8, ... Grid (ceil(n / 8)) threadgroups. dim <= 512.
-kernel void ds_attn_scores(device const float* q [[buffer(0)]], device const float* K [[buffer(1)]],
-                           device float* scores [[buffer(2)]], constant ScoreArgs& a [[buffer(3)]],
-                           uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
-                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+// Token t's keys: its window (positions max(0, p - ring + 1) .. p, from the chunk's rows at or after pos0, else the
+// ring), then its compressed rows (all visible ones while at most `top`, else sel's).
+struct Keys {
+    uint p, nw, first, nc;
+    bool identity;
+};
+
+static Keys keys_of(constant AttnArgs& a, uint t)
 {
+    Keys k;
+    k.p = a.pos0 + t;
+    k.nw = min(k.p + 1, a.ring);
+    k.first = k.p + 1 - k.nw;
+    const uint n_comp = a.ratio ? (k.p + 1) / a.ratio : 0;
+    k.nc = min(n_comp, a.top);
+    k.identity = n_comp <= a.top;
+    return k;
+}
+
+static device const float* window_row(constant AttnArgs& a, device const float* chunk, device const float* ringb,
+                                      uint pos)
+{
+    return pos >= a.pos0 ? chunk + uint64_t(pos - a.pos0) * a.dim : ringb + uint64_t(pos % a.ring) * a.dim;
+}
+
+// scores[t][h][j] = scale * q_t,h . key_j(t). Threadgroups of 256 threads take 8 of token t's keys (staged in
+// threadgroup memory); each simdgroup takes heads h = sg, sg + 8, ... Grid (ceil(stride / 8), tokens). dim <= 512.
+kernel void ds_attn_scores(device const float* q [[buffer(0)]], device const float* chunk [[buffer(1)]],
+                           device const float* ringb [[buffer(2)]], device const half* comp [[buffer(3)]],
+                           device const int* sel [[buffer(4)]], device float* scores [[buffer(5)]],
+                           constant AttnArgs& a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                           uint2 tid2 [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]])
+{
+    const uint tid = tid2.x;
     threadgroup float ks[8][512];
-    const uint j0 = tg * 8;
+    const uint t = a.t0 + tg.y, j0 = tg.x * 8;
+    const Keys kk = keys_of(a, t);
+    const uint n = kk.nw + kk.nc;
+    if (j0 >= n)
+        return;
     for (uint i = tid; i < 8 * a.dim; i += 256) {
-        const uint r = i / a.dim, d = i % a.dim;
-        ks[r][d] = j0 + r < a.n ? K[uint64_t(j0 + r) * a.dim + d] : 0.0f;
+        const uint r = i / a.dim, d = i % a.dim, j = j0 + r;
+        float v = 0.0f;
+        if (j < kk.nw) {
+            v = window_row(a, chunk, ringb, kk.first + j)[d];
+        } else if (j < n) {
+            const uint c = j - kk.nw;
+            const uint row = kk.identity ? c : uint(sel[uint64_t(t) * a.top + c]);
+            v = float(comp[uint64_t(row) * a.dim + d]);
+        }
+        ks[r][d] = v;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* srow = scores + uint64_t(tg.y) * a.heads * a.stride;
     for (uint h = sg; h < a.heads; h += 8) {
         float acc[8] = {};
-        device const float* qh = q + uint64_t(h) * a.dim;
+        device const float* qh = q + (uint64_t(t) * a.heads + h) * a.dim;
         for (uint d = lane; d < a.dim; d += 32) {
             const float qv = qh[d];
             for (uint r = 0; r < 8; ++r)
@@ -179,22 +206,26 @@ kernel void ds_attn_scores(device const float* q [[buffer(0)]], device const flo
         }
         for (uint r = 0; r < 8; ++r) {
             const float s = simd_sum(acc[r]);
-            if (lane == 0 && j0 + r < a.n)
-                scores[uint64_t(h) * a.n + j0 + r] = s * a.scale;
+            if (lane == 0 && j0 + r < n)
+                srow[uint64_t(h) * a.stride + j0 + r] = s * a.scale;
         }
     }
 }
 
-// Per head: p = exp(s - m) / (sum exp(s - m) + exp(sink - m)), m = max(max s, sink), in place. One threadgroup of
-// 256 threads per head.
+// Per token and head: p = exp(s - m) / (sum exp(s - m) + exp(sink - m)), m = max(max s, sink), in place. Threadgroups
+// of 256 threads; grid (heads, tokens).
 kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const float* sink [[buffer(1)]],
-                            constant ScoreArgs& a [[buffer(2)]], uint h [[threadgroup_position_in_grid]],
-                            uint tid [[thread_position_in_threadgroup]])
+                            constant AttnArgs& a [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
+                            uint2 tid2 [[thread_position_in_threadgroup]])
 {
+    const uint tid = tid2.x;
     threadgroup float red[8];
-    device float* s = scores + uint64_t(h) * a.n;
+    const uint h = tg.x;
+    const Keys kk = keys_of(a, a.t0 + tg.y);
+    const uint n = kk.nw + kk.nc;
+    device float* s = scores + (uint64_t(tg.y) * a.heads + h) * a.stride;
     float m = -INFINITY;
-    for (uint j = tid; j < a.n; j += 256)
+    for (uint j = tid; j < n; j += 256)
         m = max(m, s[j]);
     m = simd_max(m);
     if (tid % 32 == 0)
@@ -205,7 +236,7 @@ kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const flo
         m = max(m, red[i]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float sum = 0.0f;
-    for (uint j = tid; j < a.n; j += 256) {
+    for (uint j = tid; j < n; j += 256) {
         const float e = exp(s[j] - m);
         s[j] = e;
         sum += e;
@@ -218,87 +249,130 @@ kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const flo
     for (uint i = 0; i < 8; ++i)
         total += red[i];
     const float inv = 1.0f / total;
-    for (uint j = tid; j < a.n; j += 256)
+    for (uint j = tid; j < n; j += 256)
         s[j] *= inv;
 }
 
-// o[h][d] = sum_j p[h][j] K[j][d]. Threadgroups of 256 threads own 64 dims: thread (d % 64, head group of 16);
-// grid (dim / 64) threadgroups.
-kernel void ds_attn_out(device const float* p [[buffer(0)]], device const float* K [[buffer(1)]],
-                        device float* o [[buffer(2)]], constant ScoreArgs& a [[buffer(3)]],
-                        uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+// o[t][h][d] = sum_j p[t][h][j] key_j(t)[d]. Threadgroups of 256 threads own 64 dims of a token: thread (d % 64,
+// head group of 16); grid (dim / 64, tokens).
+kernel void ds_attn_out(device const float* p [[buffer(0)]], device const float* chunk [[buffer(1)]],
+                        device const float* ringb [[buffer(2)]], device const half* comp [[buffer(3)]],
+                        device const int* sel [[buffer(4)]], device float* o [[buffer(5)]],
+                        constant AttnArgs& a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                        uint2 tid2 [[thread_position_in_threadgroup]])
 {
-    const uint d = tg * 64 + tid % 64, h0 = (tid / 64) * 16;
+    const uint tid = tid2.x;
+    const uint t = a.t0 + tg.y, d = tg.x * 64 + tid % 64, h0 = (tid / 64) * 16;
+    const Keys kk = keys_of(a, t);
+    const uint n = kk.nw + kk.nc;
+    device const float* prow = p + uint64_t(tg.y) * a.heads * a.stride;
     float acc[16] = {};
-    for (uint j = 0; j < a.n; ++j) {
-        const float k = K[uint64_t(j) * a.dim + d];
+    for (uint j = 0; j < n; ++j) {
+        float k;
+        if (j < kk.nw) {
+            k = window_row(a, chunk, ringb, kk.first + j)[d];
+        } else {
+            const uint c = j - kk.nw;
+            const uint row = kk.identity ? c : uint(sel[uint64_t(t) * a.top + c]);
+            k = float(comp[uint64_t(row) * a.dim + d]);
+        }
         for (uint i = 0; i < 16; ++i)
-            acc[i] += p[uint64_t(h0 + i) * a.n + j] * k;
+            acc[i] += prow[uint64_t(h0 + i) * a.stride + j] * k;
     }
     for (uint i = 0; i < 16; ++i)
         if (h0 + i < a.heads)
-            o[uint64_t(h0 + i) * a.dim + d] = acc[i];
+            o[(uint64_t(t) * a.heads + h0 + i) * a.dim + d] = acc[i];
+}
+
+// The last min(tokens, ring) of the chunk's rows into the ring (row pos % ring). Grid (dim, rows).
+kernel void ds_ring_store(device const float* chunk [[buffer(0)]], device float* ringb [[buffer(1)]],
+                          constant uint4& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint dim = a.x, tokens = a.y, pos0 = a.z, ring = a.w;
+    const uint first = tokens > ring ? tokens - ring : 0;
+    const uint t = first + gid.y;
+    if (gid.x >= dim || t >= tokens)
+        return;
+    ringb[uint64_t((pos0 + t) % ring) * dim + gid.x] = chunk[uint64_t(t) * dim + gid.x];
 }
 
 struct IdxArgs {
-    uint dim;   // 128
-    uint heads; // 32
-    uint n;     // compressed rows visible
+    uint dim;    // 128
+    uint heads;  // 32
+    uint stride; // score row stride
+    uint pos0, t0, ratio;
     float w_scale;
 };
 
-// score[i] = sum_h relu(q_h . k_i) * w_h * w_scale for i < n. One simdgroup per row: lane l holds dims l*4..l*4+3.
+// score[t][i] = sum_h relu(q_t,h . k_i) * w_t,h * w_scale for the token's visible rows i < (p + 1) / ratio. One
+// simdgroup per row: lane l holds dims l*4..l*4+3. Grid (stride * 32, tokens).
 kernel void ds_idx_score(device const float* q [[buffer(0)]], device const float* w [[buffer(1)]],
                          device const float* keys [[buffer(2)]], device float* score [[buffer(3)]],
-                         constant IdxArgs& a [[buffer(4)]], uint gid [[thread_position_in_grid]],
+                         constant IdxArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]],
                          uint lane [[thread_index_in_simdgroup]])
 {
-    const uint i = gid / 32;
-    if (i >= a.n)
+    const uint i = gid.x / 32, t = a.t0 + gid.y;
+    const uint n = (a.pos0 + t + 1) / a.ratio;
+    if (i >= n)
         return;
     const float4 k = reinterpret_cast<device const float4*>(keys + uint64_t(i) * a.dim)[lane];
+    device const float* qt = q + uint64_t(t) * a.heads * a.dim;
+    device const float* wt = w + uint64_t(t) * a.heads;
     float acc = 0.0f;
     for (uint h = 0; h < a.heads; ++h) {
-        const float4 qh = reinterpret_cast<device const float4*>(q + uint64_t(h) * a.dim)[lane];
+        const float4 qh = reinterpret_cast<device const float4*>(qt + uint64_t(h) * a.dim)[lane];
         const float d = simd_sum(dot(qh, k));
-        acc += max(d, 0.0f) * w[h];
+        acc += max(d, 0.0f) * wt[h];
     }
     if (lane == 0)
-        score[i] = acc * a.w_scale;
+        score[uint64_t(gid.y) * a.stride + i] = acc * a.w_scale;
 }
 
 struct BlockArgs {
-    uint n;     // rows
-    uint block; // rows per block
+    uint stride;       // score row stride
+    uint blk_stride;   // block row stride
+    uint pos0, t0, ratio, block;
+    uint kblocks;      // blocks kept (tokens with at most this many keep them all)
 };
 
-// blk[b] = max of score over the block's rows; the block holding the last row is +inf (always kept). Grid (blocks).
+// blk[t][b] = max of the token's scores over block b's visible rows; the block holding its last row is +inf
+// (always kept). Grid (blk_stride, tokens).
 kernel void ds_block_max(device const float* score [[buffer(0)]], device float* blk [[buffer(1)]],
-                         constant BlockArgs& a [[buffer(2)]], uint b [[thread_position_in_grid]])
+                         constant BlockArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
-    const uint nb = (a.n + a.block - 1) / a.block;
+    const uint b = gid.x, n = (a.pos0 + a.t0 + gid.y + 1) / a.ratio;
+    const uint nb = (n + a.block - 1) / a.block;
     if (b >= nb)
         return;
+    device const float* s = score + uint64_t(gid.y) * a.stride;
     float m = -INFINITY;
-    for (uint i = b * a.block; i < min(a.n, (b + 1) * a.block); ++i)
-        m = max(m, score[i]);
-    blk[b] = b == nb - 1 ? INFINITY : m;
+    for (uint i = b * a.block; i < min(n, (b + 1) * a.block); ++i)
+        m = max(m, s[i]);
+    blk[uint64_t(gid.y) * a.blk_stride + b] = b == nb - 1 ? INFINITY : m;
 }
 
-// score[i] = -inf where the candidate mask (kept blocks, a flag per block) drops row i. Grid (n).
+// score[t][i] = -inf where the token's candidate blocks (a flag per block) drop row i; nothing for a token with at
+// most kblocks blocks. Grid (stride, tokens).
 kernel void ds_block_mask(device float* score [[buffer(0)]], device const uchar* keep [[buffer(1)]],
-                          constant BlockArgs& a [[buffer(2)]], uint i [[thread_position_in_grid]])
+                          constant BlockArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
-    if (i < a.n && !keep[i / a.block])
-        score[i] = -INFINITY;
+    const uint i = gid.x, n = (a.pos0 + a.t0 + gid.y + 1) / a.ratio;
+    if ((n + a.block - 1) / a.block <= a.kblocks)
+        return;
+    if (i < n && !keep[uint64_t(gid.y) * a.blk_stride + i / a.block])
+        score[uint64_t(gid.y) * a.stride + i] = -INFINITY;
 }
 
 struct TopkArgs {
-    uint n, k;
-    uint with_flags;
+    uint stride;      // v row stride
+    uint k;
+    uint ids_stride;  // ids row stride (rows: tokens from t0)
+    uint flags_stride; // 0: no flags
+    uint pos0, t0, ratio;
+    uint block;       // n counts blocks of this many rows (1: rows)
 };
 
-// Order-preserving map of a float to uint (larger float, larger key); -inf and NaN sort lowest.
+// Order-preserving map of a float to uint (larger float, larger key); NaN sorts lowest.
 static uint fkey(float f)
 {
     if (isnan(f))
@@ -307,24 +381,32 @@ static uint fkey(float f)
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// The k largest of v[0..n) (k < n): ids gets their indices in increasing order, flags (with_flags) a 1 per kept
-// index. Values equal to the k-th largest are taken in index order. One threadgroup of 1024 threads: the k-th key
-// by bisection on its bits, then a stable compaction.
-kernel void ds_topk(device const float* v [[buffer(0)]], device int* ids [[buffer(1)]], device uchar* flags [[buffer(2)]],
-                    constant TopkArgs& a [[buffer(3)]], uint tid [[thread_position_in_threadgroup]])
+// For each token (one threadgroup of 1024 threads each; grid (tokens)): the k largest of its n values (n: its
+// visible rows / block, rounded up), their indices in increasing order into its row of ids (and a 1 per kept index
+// into flags). Values equal to the k-th largest are taken in index order. Nothing when n <= k (all are kept).
+kernel void ds_topk(device const float* vall [[buffer(0)]], device int* idsall [[buffer(1)]],
+                    device uchar* flagsall [[buffer(2)]], constant TopkArgs& a [[buffer(3)]],
+                    uint tok [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
 {
     constexpr uint NT = 1024;
     threadgroup uint cnt[32];
     threadgroup uint total;
     threadgroup uint base_out, base_eq;
     threadgroup uint sg_eq[32], sg_keep[32];
+    const uint rows = (a.pos0 + a.t0 + tok + 1) / a.ratio;
+    const uint n = (rows + a.block - 1) / a.block;
+    if (n <= a.k)
+        return;
+    device const float* v = vall + uint64_t(tok) * a.stride;
+    device int* ids = idsall + uint64_t(tok) * a.ids_stride;
+    device uchar* flags = flagsall + uint64_t(tok) * a.flags_stride;
     // Largest t with count(key >= t) >= k.
     uint lo = 0;
     for (int bit = 31; bit >= 0; --bit) {
-        const uint t = lo | (1u << bit);
+        const uint th = lo | (1u << bit);
         uint c = 0;
-        for (uint i = tid; i < a.n; i += NT)
-            c += fkey(v[i]) >= t ? 1u : 0u;
+        for (uint i = tid; i < n; i += NT)
+            c += fkey(v[i]) >= th ? 1u : 0u;
         c = simd_sum(c);
         if (tid % 32 == 0)
             cnt[tid / 32] = c;
@@ -337,13 +419,13 @@ kernel void ds_topk(device const float* v [[buffer(0)]], device int* ids [[buffe
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (total >= a.k)
-            lo = t;
+            lo = th;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const uint kth = lo;
     // Strictly above the k-th key: all kept; equal: the first (k - above) in index order.
     uint c = 0;
-    for (uint i = tid; i < a.n; i += NT)
+    for (uint i = tid; i < n; i += NT)
         c += fkey(v[i]) > kth ? 1u : 0u;
     c = simd_sum(c);
     if (tid % 32 == 0)
@@ -354,19 +436,16 @@ kernel void ds_topk(device const float* v [[buffer(0)]], device int* ids [[buffe
         for (uint i = 0; i < NT / 32; ++i)
             s += cnt[i];
         total = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint equal_quota = a.k - total;
-    // Stable compaction in chunks of NT indices.
-    if (tid == 0) {
         base_out = 0;
         base_eq = 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint c0 = 0; c0 < a.n; c0 += NT) {
+    const uint equal_quota = a.k - total;
+    // Stable compaction in chunks of NT indices.
+    for (uint c0 = 0; c0 < n; c0 += NT) {
         const uint i = c0 + tid;
-        const uint key = i < a.n ? fkey(v[i]) : 0;
-        const bool eq = i < a.n && key == kth;
+        const uint key = i < n ? fkey(v[i]) : 0;
+        const bool eq = i < n && key == kth;
         const uint eq_rank = simd_prefix_exclusive_sum(eq ? 1u : 0u);
         const uint eq_sg = simd_sum(eq ? 1u : 0u);
         if (tid % 32 == 0)
@@ -375,7 +454,7 @@ kernel void ds_topk(device const float* v [[buffer(0)]], device int* ids [[buffe
         uint eq_before = base_eq;
         for (uint s = 0; s < tid / 32; ++s)
             eq_before += sg_eq[s];
-        const bool keep = i < a.n && (key > kth || (eq && eq_before + eq_rank < equal_quota));
+        const bool keep = i < n && (key > kth || (eq && eq_before + eq_rank < equal_quota));
         const uint keep_rank = simd_prefix_exclusive_sum(keep ? 1u : 0u);
         const uint keep_sg = simd_sum(keep ? 1u : 0u);
         if (tid % 32 == 0)
@@ -386,7 +465,7 @@ kernel void ds_topk(device const float* v [[buffer(0)]], device int* ids [[buffe
             keep_before += sg_keep[s];
         if (keep)
             ids[keep_before + keep_rank] = int(i);
-        if (i < a.n && a.with_flags)
+        if (i < n && a.flags_stride)
             flags[i] = keep ? 1 : 0;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
@@ -402,22 +481,47 @@ kernel void ds_topk(device const float* v [[buffer(0)]], device int* ids [[buffe
     }
 }
 
+struct EngramDecodeArgs {
+    uint dim, tokens, layers, cols;
+};
+
+// Engram rows from their MXFP8 bytes (per 32 values an E8M0 scale byte, then 32 E4M3 codes) to float. Raw rows are
+// [token][layer][column]; y rows [layer][token][column] of dim values (each layer's rows contiguous). Grid (dim,
+// rows).
+kernel void ds_engram_decode(device const uchar* raw [[buffer(0)]], device float* y [[buffer(1)]],
+                             constant EngramDecodeArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x, r = gid.y, dim = a.dim;
+    if (i >= dim)
+        return;
+    const uint t = r / (a.layers * a.cols), l = (r / a.cols) % a.layers, c = r % a.cols;
+    const uint out = (l * a.tokens + t) * a.cols + c;
+    device const uchar* blk = raw + uint64_t(r) * (dim / 32 * 33) + (i / 32) * 33;
+    const uchar code = blk[1 + i % 32];
+    const int e = (code >> 3) & 15, m = code & 7;
+    float v = e ? ldexp(float(8 + m), e - 10) : ldexp(float(m), -9);
+    v = (code & 128) ? -v : v;
+    y[uint64_t(out) * dim + i] = ldexp(v, int(blk[0]) - 127);
+}
+
 struct EngramArgs {
     uint dim; // n_embd
     float eps;
 };
 
-// Engram for each of the 4 streams (one threadgroup of 256 threads per stream k): with key_k and the shared value
-// from kv ([4 keys | value] of dim each), d = sum h_k * G_k * key_k * rstd(h_k) * rstd(key_k) / sqrt(dim),
-// h_k += sigmoid(sign(d) sqrt(max(|d|, 1e-6))) * value.
+// Engram for each of a token's 4 streams (one threadgroup of 256 threads per stream k and token; grid (4, tokens)):
+// with key_k and the shared value from kv ([4 keys | value] of dim each per token), d = sum h_k * G_k * key_k *
+// rstd(h_k) * rstd(key_k) / sqrt(dim), h_k += sigmoid(sign(d) sqrt(max(|d|, 1e-6))) * value.
 kernel void ds_engram_gate(device float* R [[buffer(0)]], device const float* kv [[buffer(1)]],
                            device const float* G [[buffer(2)]], constant EngramArgs& a [[buffer(3)]],
-                           uint k [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+                           uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]])
 {
+    const uint tid = tid2.x;
     threadgroup float red[3][8];
-    device float* h = R + uint64_t(k) * a.dim;
-    device const float* key = kv + uint64_t(k) * a.dim;
-    device const float* value = kv + uint64_t(4) * a.dim;
+    const uint k = tg.x;
+    device float* h = R + (uint64_t(tg.y) * 4 + k) * a.dim;
+    device const float* key = kv + (uint64_t(tg.y) * 5 + k) * a.dim;
+    device const float* value = kv + (uint64_t(tg.y) * 5 + 4) * a.dim;
     device const float* g = G + uint64_t(k) * a.dim;
     float hh = 0.0f, kk = 0.0f, hgk = 0.0f;
     for (uint i = tid; i < a.dim; i += 256) {
