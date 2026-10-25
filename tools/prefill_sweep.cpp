@@ -1,11 +1,12 @@
 // Prefill time of reads of several sizes on top of a base context, as an agent turn reading a tool result.
 //   prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] [--steps N] [--prefill-group N]
-//                 [--decode N]
+//                 [--decode N] [--turns N]
 // The text is this repository's sources, tokenized. Each size runs `repeats` times (default 2), each from a checkpoint
 // of the base context; the experts left resident by the runs before stay. --layers adds per-layer GPU timestamps
 // (GPU time by section; extra encoder boundaries slow it somewhat). --steps N also times sizes up to N as decode
 // steps, one token at a time. --decode N instead generates N tokens after the base context through a Session
-// (greedy, speculative) and summarizes its steps.
+// (greedy, speculative) and summarizes its steps. --turns N simulates an agent: an answer of 150 tokens after the
+// base context, then N turns that each read 1000 new tokens and answer 150 (misses per step in each answer's halves).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "glm/session.hpp"
@@ -99,6 +100,43 @@ int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint3
     return 0;
 }
 
+int run_turns(mako::glm::Engine& engine, const std::vector<int32_t>& ids, uint32_t base, uint32_t turns, uint32_t read,
+              uint32_t gen)
+{
+    mako::glm::Session session(engine);
+    mako::glm::GenerateParams gp;
+    gp.sampling.temperature = 0;
+    gp.max_tokens = gen;
+    std::vector<int32_t> ctx(ids.begin(), ids.begin() + base);
+    for (uint32_t turn = 0; turn <= turns; ++turn) {
+        if (turn)
+            ctx.insert(ctx.end(), ids.begin() + base + (turn - 1) * read, ids.begin() + base + turn * read);
+        std::vector<mako::glm::StepStats> steps;
+        uint32_t seen = uint32_t(ctx.size());
+        const auto r = session.generate(ctx, gp, [&](int32_t) {
+            if (engine.position() != seen) {
+                steps.push_back(engine.last_step());
+                seen = engine.position();
+            }
+            return true;
+        });
+        auto half = [&](size_t b, size_t e) {
+            double misses = 0, read_ms = 0, wall = 0;
+            for (size_t i = b; i < e; ++i)
+                misses += double(steps[i].misses), read_ms += steps[i].read_ms, wall += steps[i].wall_ms;
+            const double k = double(std::max<size_t>(e - b, 1));
+            return std::format("{:.1f} misses, reads {:.1f} ms, wall {:.1f} ms", misses / k, read_ms / k, wall / k);
+        };
+        const size_t h = steps.size() / 2;
+        std::println("turn {}: prefill {} new tokens in {:.0f} ms; {} tokens in {:.0f} ms ({:.1f} ms/token); per step, "
+                     "first half: {}; second half: {}",
+                     turn, r.prompt_tokens - r.reused_tokens, r.prefill_ms, r.tokens.size(), r.decode_ms,
+                     r.decode_ms / r.tokens.size(), half(1, h), half(h, steps.size()));
+        ctx.insert(ctx.end(), r.tokens.begin(), r.tokens.end());
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -108,7 +146,7 @@ int main(int argc, char** argv)
                              "[--steps N] [--prefill-group N]");
         return 2;
     }
-    uint32_t base = 15000, repeats = 2, step_max = 0, decode = 0;
+    uint32_t base = 15000, repeats = 2, step_max = 0, decode = 0, turns = 0;
     std::vector<uint32_t> sizes{16, 64, 256, 512, 1024, 2048, 4096};
     mako::glm::Options opts;
     opts.telemetry = mako::glm::Telemetry::summary;
@@ -131,6 +169,8 @@ int main(int argc, char** argv)
             step_max = uint32_t(std::stoul(v));
         else if (a == "--decode")
             decode = uint32_t(std::stoul(v));
+        else if (a == "--turns")
+            turns = uint32_t(std::stoul(v));
         else if (a == "--prefill-group")
             opts.prefill_group = uint32_t(std::stoul(v));
         else if (a == "--sizes") {
@@ -160,12 +200,17 @@ int main(int argc, char** argv)
     while (ids.size() < base + most)
         ids.insert(ids.end(), text.begin(), text.end());
     opts.max_ctx = base + most + 16;
-    opts.mtp = decode > 0;
-    opts.max_ctx = std::max(opts.max_ctx, base + decode + 16);
+    constexpr uint32_t kTurnRead = 1000, kTurnGen = 150;
+    while (ids.size() < base + turns * kTurnRead)
+        ids.insert(ids.end(), text.begin(), text.end());
+    opts.mtp = decode > 0 || turns > 0;
+    opts.max_ctx = std::max(opts.max_ctx, base + decode + (turns + 1) * (kTurnRead + kTurnGen) + 16);
     mako::mtl::Context ctx;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     if (decode)
         return run_decode(engine, std::span(ids).first(base), decode);
+    if (turns)
+        return run_turns(engine, ids, base, turns, kTurnRead, kTurnGen);
 
     auto t = std::chrono::steady_clock::now();
     engine.prefill(std::span(ids).first(base));
