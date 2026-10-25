@@ -1,11 +1,12 @@
 // Prefill time of reads of several sizes on top of a base context, as an agent turn reading a tool result.
 //   prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] [--steps N] [--prefill-group N]
-//                 [--decode N] [--turns N]
+//                 [--decode N] [--turns N] [--prompt-file F] [--temp T] [--no-spec]
 // The text is this repository's sources, tokenized. Each size runs `repeats` times (default 2), each from a checkpoint
 // of the base context; the experts left resident by the runs before stay. --layers adds per-layer GPU timestamps
 // (GPU time by section; extra encoder boundaries slow it somewhat). --steps N also times sizes up to N as decode
 // steps, one token at a time. --decode N instead generates N tokens after the base context through a Session
-// (greedy, speculative) and summarizes its steps. --turns N simulates an agent: an answer of 150 tokens after the
+// (greedy and speculative unless --temp / --no-spec) and summarizes its steps. --prompt-file takes the text from F
+// (all of it, up to --base tokens) instead of the sources. --turns N simulates an agent: an answer of 150 tokens after the
 // base context, then N turns that each read 1000 new tokens and answer 150 (misses per step in each answer's halves).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -50,11 +51,14 @@ double ms_since(std::chrono::steady_clock::time_point t)
 // Generates n tokens after the prompt (greedy, speculative) and summarizes the engine steps: per step its wall,
 // GPU, routing-wait and expert-read times, misses and (with layer telemetry) GPU time by section; the time between
 // steps (drafting, sampling) is the rest of the decode's wall time.
-int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint32_t n)
+int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint32_t n, float temp, bool spec)
 {
     mako::glm::Session session(engine);
     mako::glm::GenerateParams gp;
-    gp.sampling.temperature = 0;
+    gp.sampling.temperature = temp;
+    gp.sampling.top_p = 0.95f;
+    gp.seed = 1;
+    gp.speculative = spec;
     gp.max_tokens = n;
     std::vector<mako::glm::StepStats> steps;
     uint32_t seen = uint32_t(prompt.size());
@@ -65,9 +69,10 @@ int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint3
         }
         return true;
     });
-    std::println("prompt {} tokens in {:.0f} ms; {} tokens in {:.0f} ms ({:.1f} ms/token), {} steps, {} of {} drafts kept",
+    std::println("prompt {} tokens in {:.0f} ms; {} tokens in {:.0f} ms ({:.1f} ms/token), {} steps, {} of {} drafts kept "
+                 "({:.0f}%)",
                  prompt.size(), r.prefill_ms, r.tokens.size(), r.decode_ms, r.decode_ms / r.tokens.size(), steps.size(),
-                 r.accepted, r.drafts);
+                 r.accepted, r.drafts, 100.0 * r.accepted / std::max(1u, r.drafts));
     // The first steps after a long prompt pay for the experts it displaced; both halves are shown.
     auto summary = [&](size_t b, size_t e, const char* what) {
         double wall = 0, gpu = 0, wait = 0, ensure = 0, read = 0, enc = 0, misses = 0;
@@ -147,6 +152,9 @@ int main(int argc, char** argv)
         return 2;
     }
     uint32_t base = 15000, repeats = 2, step_max = 0, decode = 0, turns = 0;
+    std::string prompt_file;
+    float temp = 0.0f;
+    bool spec = true;
     std::vector<uint32_t> sizes{16, 64, 256, 512, 1024, 2048, 4096};
     mako::glm::Options opts;
     opts.telemetry = mako::glm::Telemetry::summary;
@@ -154,6 +162,10 @@ int main(int argc, char** argv)
         const std::string a = argv[i];
         if (a == "--layers") {
             opts.telemetry = mako::glm::Telemetry::layers;
+            continue;
+        }
+        if (a == "--no-spec") {
+            spec = false;
             continue;
         }
         if (i + 1 >= argc) {
@@ -171,6 +183,10 @@ int main(int argc, char** argv)
             decode = uint32_t(std::stoul(v));
         else if (a == "--turns")
             turns = uint32_t(std::stoul(v));
+        else if (a == "--prompt-file")
+            prompt_file = v;
+        else if (a == "--temp")
+            temp = std::stof(v);
         else if (a == "--prefill-group")
             opts.prefill_group = uint32_t(std::stoul(v));
         else if (a == "--sizes") {
@@ -196,7 +212,16 @@ int main(int argc, char** argv)
     }
     const uint32_t most = *std::ranges::max_element(sizes);
     std::vector<int32_t> ids;
-    const auto text = tok->encode(sources(), false);
+    std::string src = sources();
+    if (!prompt_file.empty()) {
+        std::ifstream in(prompt_file);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        src = ss.str();
+    }
+    const auto text = tok->encode(src, false);
+    if (!prompt_file.empty())
+        base = std::min<uint32_t>(base, uint32_t(text.size()));
     while (ids.size() < base + most)
         ids.insert(ids.end(), text.begin(), text.end());
     opts.max_ctx = base + most + 16;
@@ -208,7 +233,7 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     mako::glm::Engine engine(*model, *cfg, opts, ctx);
     if (decode)
-        return run_decode(engine, std::span(ids).first(base), decode);
+        return run_decode(engine, std::span(ids).first(base), decode, temp, spec);
     if (turns)
         return run_turns(engine, ids, base, turns, kTurnRead, kTurnGen);
 
