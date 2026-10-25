@@ -1,86 +1,11 @@
 #include "glm/config.hpp"
 
+#include "gguf/keys.hpp"
+
 #include <format>
 #include <variant>
 
 namespace mako::glm {
-
-namespace {
-
-class Keys {
-public:
-    explicit Keys(const gguf::File& f) : f_(f) {}
-
-    std::string missing;
-
-    uint32_t u32(std::string_view key)
-    {
-        auto v = f_.get_int(full(key));
-        if (!v) {
-            note(key);
-            return 0;
-        }
-        return static_cast<uint32_t>(*v);
-    }
-
-    float f32(std::string_view key, std::optional<float> fallback = std::nullopt)
-    {
-        auto v = f_.get_float(full(key));
-        if (!v) {
-            if (fallback)
-                return *fallback;
-            note(key);
-            return 0.0f;
-        }
-        return static_cast<float>(*v);
-    }
-
-    bool flag(std::string_view key, bool fallback)
-    {
-        const gguf::Value* v = f_.find(full(key));
-        if (auto* b = v ? std::get_if<bool>(v) : nullptr)
-            return *b;
-        return fallback;
-    }
-
-    // A per-layer array, or one scalar broadcast to every layer.
-    std::vector<double> per_layer(std::string_view key, uint32_t n)
-    {
-        const gguf::Value* v = f_.find(full(key));
-        std::vector<double> out;
-        if (!v) {
-            note(key);
-            return std::vector<double>(n, 0.0);
-        }
-        auto num = [](const gguf::Value& x) -> double {
-            if (auto* u = std::get_if<uint64_t>(&x))
-                return double(*u);
-            if (auto* i = std::get_if<int64_t>(&x))
-                return double(*i);
-            if (auto* d = std::get_if<double>(&x))
-                return *d;
-            return 0.0;
-        };
-        if (auto* a = std::get_if<gguf::Array>(v)) {
-            for (const auto& item : a->items)
-                out.push_back(num(item));
-            if (out.size() != n)
-                missing += std::format(" {}(length {} != {})", key, out.size(), n);
-            out.resize(n, 0.0);
-        } else {
-            out.assign(n, num(*v));
-        }
-        return out;
-    }
-
-private:
-    std::string full(std::string_view key) const { return "glm5-next." + std::string(key); }
-    void note(std::string_view key) { missing += " " + std::string(key); }
-
-    const gguf::File& f_;
-};
-
-} // namespace
 
 std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
 {
@@ -88,7 +13,7 @@ std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
     if (f.get_string("general.architecture").value_or("") != "glm5-next")
         return std::unexpected("not a glm5-next model");
 
-    Keys k(f);
+    gguf::Keys k(f, "glm5-next");
     Config c;
     const uint32_t blocks = k.u32("block_count");
     c.n_layer_mtp = static_cast<uint32_t>(f.get_int("glm5-next.nextn_predict_layers").value_or(0));
