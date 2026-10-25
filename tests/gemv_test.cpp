@@ -99,20 +99,31 @@ int main(int argc, char** argv)
             mako::mtl::Ref<MTL::Buffer> wc(ctx.device()->newBuffer(data.size() * copies, MTL::ResourceStorageModeShared));
             for (uint64_t c = 0; c < copies; ++c)
                 std::memcpy(static_cast<char*>(wc->contents()) + c * data.size(), data.data(), data.size());
-            for (bool own : {false, true}) {
-                gemv.set_own_kernels(own);
-                double best = 1e9;
-                for (int rep = 0; rep < 3; ++rep) {
-                    auto* tcb = ctx.queue()->commandBuffer();
-                    auto* tenc = tcb->computeCommandEncoder();
-                    for (int r = 0; r < 200; ++r)
-                        gemv.encode(tenc, a, wc.get(), (r % copies) * data.size(), x.get(), 0, y.get(), 0);
-                    tenc->endEncoding();
-                    tcb->commit();
-                    tcb->waitUntilCompleted();
-                    best = std::min(best, (tcb->GPUEndTime() - tcb->GPUStartTime()) * 1e6 / 200);
+            // One token, and two (a speculative step) where the batch is 1.
+            mako::mtl::Ref<MTL::Buffer> x2(ctx.device()->newBuffer(uint64_t(k) * 2 * batch * 4, MTL::ResourceStorageModeShared));
+            mako::mtl::Ref<MTL::Buffer> y2(ctx.device()->newBuffer(uint64_t(n) * 2 * batch * 4, MTL::ResourceStorageModeShared));
+            std::memset(x2->contents(), 0, x2->length());
+            for (uint32_t tokens : {1u, 2u}) {
+                if (tokens == 2 && batch != 1)
+                    continue;
+                auto at = a;
+                at.t = tokens;
+                for (bool own : {false, true}) {
+                    gemv.set_own_kernels(own);
+                    double best = 1e9;
+                    for (int rep = 0; rep < 3; ++rep) {
+                        auto* tcb = ctx.queue()->commandBuffer();
+                        auto* tenc = tcb->computeCommandEncoder();
+                        for (int r = 0; r < 200; ++r)
+                            gemv.encode(tenc, at, wc.get(), (r % copies) * data.size(), tokens == 1 ? x.get() : x2.get(), 0,
+                                        tokens == 1 ? y.get() : y2.get(), 0);
+                        tenc->endEncoding();
+                        tcb->commit();
+                        tcb->waitUntilCompleted();
+                        best = std::min(best, (tcb->GPUEndTime() - tcb->GPUStartTime()) * 1e6 / 200);
+                    }
+                    timing += std::format("  t={} {} {:6.1f} us", tokens, own ? "own" : "per-format", best);
                 }
-                timing += std::format("  {} {:6.1f} us", own ? "own" : "per-format", best);
             }
             gemv.set_own_kernels(true);
         }

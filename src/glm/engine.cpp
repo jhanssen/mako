@@ -1792,7 +1792,6 @@ void Engine::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc
         }
 
     gemv(enc, L.router, xn, 0, rlog, 0, 1, T);
-    ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], T);
     const RouteArgs ra{cfg_.n_expert, k, cfg_.expert_weights_norm ? 1u : 0u, cfg_.expert_weights_scale, 1};
     enc->setComputePipelineState(pso("moe_route"));
     enc->setBuffer(rlog, 0, 0);
@@ -1813,6 +1812,8 @@ void Engine::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*& enc
     cb->encodeSignalEvent(routed_.get(), v);
     pending_moe_.push_back({il, v, T});
     enc = encoder(cb, tl, il < cfg_.n_layer ? 2 : -1);
+    // The CPU starts on the misses as soon as the route is known; the shared expert runs meanwhile.
+    ffn_dense(enc, L.sh_gate, L.sh_up, L.sh_down, xn, sho, cfg_.swiglu_clamp_shexp[il], T);
 
     // Resident experts of every token run while the CPU reads the misses; the miss passes (one per token) wait.
     const SwigluArgs sa{T * k * nff, cfg_.swiglu_clamp_exp[il] > 1e-6f ? cfg_.swiglu_clamp_exp[il] : 0.0f};
