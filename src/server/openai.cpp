@@ -34,7 +34,7 @@ struct StreamOptions {
 struct ChatBody {
     std::optional<std::string> model;
     std::vector<MessageIn> messages;
-    std::optional<glz::raw_json> tools, tool_choice, response_format;
+    std::optional<glz::raw_json> tools, tool_choice, response_format, chat_template_kwargs;
     std::optional<std::string> reasoning_effort;
     std::optional<double> temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty, repetition_penalty;
     std::optional<double> max_tokens, max_completion_tokens, n;
@@ -244,6 +244,23 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
         ctx.reasoning_effort = std::move(e);
     }
     r.context = to_json(ctx);
+    if (b.chat_template_kwargs && trim(b.chat_template_kwargs->str) != "null") {
+        // Extra template variables, spliced in as sent (the template's own keys stay the server's).
+        const std::string_view kw = trim(b.chat_template_kwargs->str);
+        glz::generic g;
+        if (glz::read_json(g, kw) || !g.is_object())
+            throw BadRequest("chat_template_kwargs must be an object");
+        for (const char* own : {"messages", "tools", "add_generation_prompt"})
+            if (g.contains(own))
+                throw BadRequest(std::format("chat_template_kwargs may not set {}", own));
+        const std::string_view inner = trim(kw.substr(1, kw.size() - 2));
+        if (!inner.empty()) {
+            r.context.pop_back();
+            r.context += ",";
+            r.context += inner;
+            r.context += "}";
+        }
+    }
 
     auto& s = r.gen.sampling;
     s = sampling;

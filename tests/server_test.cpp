@@ -144,6 +144,26 @@ int main(int argc, char** argv)
         defaults);
     check(no_tools.tools == "[]" && !tmpl.render(no_tools.context).text.contains("# Tools"),
           "tool_choice none leaves the tools out");
+    // Template variables from the request: clear_thinking drops the reasoning of turns before the last user message.
+    const char* earlier = R"({"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b",
+        "reasoning_content":"old thoughts"},{"role":"user","content":"c"}]%s})";
+    auto with = [&](const char* extra) {
+        std::string b = earlier;
+        b.replace(b.find("%s"), 2, extra);
+        return tmpl.render(mako::server::parse_chat_request(b, defaults).context).text;
+    };
+    check(with("").contains("<think>old thoughts</think>"), "earlier reasoning kept by default");
+    check(!with(R"(,"chat_template_kwargs":{"clear_thinking": true})").contains("old thoughts"),
+          "chat_template_kwargs clear_thinking drops it");
+    for (const char* bad : {R"(,"chat_template_kwargs":{"messages":[]})", R"(,"chat_template_kwargs":[1])"}) {
+        bool threw = false;
+        try {
+            with(bad);
+        } catch (const mako::server::BadRequest&) {
+            threw = true;
+        }
+        check(threw, std::format("rejected kwargs: {}", bad));
+    }
     const auto plain = mako::server::parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}]})", defaults);
     check(plain.gen.sampling.temperature == 0.6f && plain.gen.max_tokens == 0 && !plain.stream,
           "defaults without fields");
