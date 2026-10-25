@@ -23,9 +23,10 @@ struct MemInfo {
 };
 MemInfo query_memory(uint64_t working_set);
 
-// Bytes the expert arena may take. The engine's whole anonymous footprint stays under ~60% of a big Mac's RAM
-// (and leaves the file-cache floor plus headroom): above that, a large file write beside the engine pushed its
-// memory into the compressor and froze the machine. Never less than 1 GB.
+// Bytes the expert arena may take: what is available now (less a reserve of 15% of RAM), within the GPU working set,
+// and the engine's whole anonymous footprint under RAM less a margin: a quarter of RAM from 96 GB up, 40% from 64 GB
+// (and at least the file-cache floor plus 12 GB). A large file write beside a bigger footprint once pushed the
+// engine into the compressor and froze the machine. Never less than 1 GB.
 double arena_budget(const MemInfo& m);
 
 // Anonymous memory locked for the object's lifetime (to make the machine look smaller than it is).

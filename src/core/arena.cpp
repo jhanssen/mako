@@ -114,8 +114,13 @@ double arena_budget(const MemInfo& m)
     constexpr double GB = 1e9;
     const double keep = std::max(7 * GB, 0.15 * m.phys);
     double leave = keep;
-    if (m.phys >= 64 * GB)
-        leave = std::max({leave, 0.40 * m.phys, m.filecache_min > 0 ? m.filecache_min + 12 * GB : 0.0});
+    const double floor = m.filecache_min > 0 ? m.filecache_min + 12 * GB : 0.0;
+    // 96 GB and up: a quarter of RAM (stress-tested on 128 GB: a 90 GB arena with 160 GB written beside it kept 22 GB
+    // available, no swapping); smaller Macs keep the earlier 40% (untested lower).
+    if (m.phys >= 96 * GB)
+        leave = std::max({leave, 0.25 * m.phys, floor});
+    else if (m.phys >= 64 * GB)
+        leave = std::max({leave, 0.40 * m.phys, floor});
     const double cap = std::min(m.working_set, m.phys - leave);
     const double gpu = m.working_set - m.footprint - 1 * GB;
     const double ram = m.available - keep;

@@ -13,8 +13,11 @@ unified memory, sampling and speculative decoding with the model's next-token bl
 implementation to within that reference's own precision. It serves an OpenAI-compatible API (`mako_serve`).
 
 DeepSeek-V4.1-Flash-1017 runs decode and batched prompt processing (no speculative drafter yet), with its Engram
-tables read per token, and serves through the same API. On a 128 GB M5 Max with the Maya-S IQ2_XXS quant (about 40%
-of the experts resident) it decodes at 13-21 tokens/s; a prompt costs about 8 s of expert reads plus ~1.8 ms a token.
+tables read per token, and serves through the same API. On a 128 GB M5 Max with the Maya-S IQ2_XXS quant (about 55%
+of the experts resident) it decodes at 16-22 tokens/s and prefills a few thousand tokens at ~350 tokens/s.
+
+The expert cache takes what is available at startup within a margin (a quarter of RAM from 96 GB up, 40% below);
+`--arena-gb N` fixes its size instead, `--stage-gb N` limits the ring prompts' missing experts are read ahead into.
 
 ### DeepSeek-V4.1
 
