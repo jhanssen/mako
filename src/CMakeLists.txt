@@ -44,7 +44,7 @@ target_link_libraries(mako_dsv41 PUBLIC mako_gguf)
 add_library(mako_gen STATIC gen/sampler.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_library(mako_core STATIC core/arena.cpp core/profile.cpp core/telemetry.cpp)
+add_library(mako_core STATIC core/arena.cpp core/engine_base.cpp core/profile.cpp core/telemetry.cpp)
 target_include_directories(mako_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_core PUBLIC mako_mtl mako_gguf)
 target_include_directories(mako_core PRIVATE ${CMAKE_BINARY_DIR}/generated)

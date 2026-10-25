@@ -628,9 +628,17 @@ struct RouteArgs {
     uint n_expert, n_used, norm;
     float scale;
     uint lookup; // look the selection up in slots (one token)
+    uint score;  // 0: sigmoid, 1: sqrt(softplus)
 };
 
-// Router top-k over sigmoid scores, the bias added for the selection only; ties keep the lower expert index.
+static float route_score(float l, uint kind)
+{
+    if (kind == 0)
+        return 1.0f / (1.0f + precise::exp(-l));
+    return precise::sqrt(l > 20.0f ? l : precise::log(1.0f + precise::exp(l)));
+}
+
+// Router top-k over sigmoid or sqrt(softplus) scores, the bias added for the selection only; ties keep the lower expert index.
 // Weights are the unbiased scores of the selected experts, normalized when a.norm, times a.scale.
 // Then each selected expert is looked up in `slots` (this layer's expert -> arena slot, -1 absent): a resident
 // one gets its slot in hit_ids and miss_rank -1; a missing one slot 0 (its result is not used) and its index
@@ -658,7 +666,7 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
         const uint e = lane + 32 * k;
         v[k] = -INFINITY;
         if (e < a.n_expert) {
-            v[k] = 1.0f / (1.0f + precise::exp(-logits[e])) + bias[e];
+            v[k] = route_score(logits[e], a.score) + bias[e];
             biased[e] = v[k];
         }
     }
@@ -679,7 +687,7 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
             mine = e;
     }
     const bool used = lane < a.n_used;
-    const float p = used ? 1.0f / (1.0f + precise::exp(-logits[mine])) : 0.0f;
+    const float p = used ? route_score(logits[mine], a.score) : 0.0f;
     float sum = 0.0f;
     for (uint j = 0; j < a.n_used; ++j)
         sum += simd_shuffle(p, j);
