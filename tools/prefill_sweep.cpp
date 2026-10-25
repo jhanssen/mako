@@ -60,7 +60,7 @@ int run_decode(mako::glm::Engine& engine, std::span<const int32_t> prompt, uint3
     gp.seed = 1;
     gp.speculative = spec;
     gp.max_tokens = n;
-    std::vector<mako::glm::StepStats> steps;
+    std::vector<mako::core::StepStats> steps;
     uint32_t seen = uint32_t(prompt.size());
     const auto r = session.generate(prompt, gp, [&](int32_t) {
         if (engine.position() != seen) {
@@ -116,7 +116,7 @@ int run_turns(mako::glm::Engine& engine, const std::vector<int32_t>& ids, uint32
     for (uint32_t turn = 0; turn <= turns; ++turn) {
         if (turn)
             ctx.insert(ctx.end(), ids.begin() + base + (turn - 1) * read, ids.begin() + base + turn * read);
-        std::vector<mako::glm::StepStats> steps;
+        std::vector<mako::core::StepStats> steps;
         uint32_t seen = uint32_t(ctx.size());
         const auto r = session.generate(ctx, gp, [&](int32_t) {
             if (engine.position() != seen) {
@@ -157,11 +157,11 @@ int main(int argc, char** argv)
     bool spec = true;
     std::vector<uint32_t> sizes{16, 64, 256, 512, 1024, 2048, 4096};
     mako::glm::Options opts;
-    opts.telemetry = mako::glm::Telemetry::summary;
+    opts.telemetry = mako::core::Telemetry::summary;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--layers") {
-            opts.telemetry = mako::glm::Telemetry::layers;
+            opts.telemetry = mako::core::Telemetry::layers;
             continue;
         }
         if (a == "--no-spec") {
@@ -244,9 +244,9 @@ int main(int argc, char** argv)
     const std::span<const int32_t> more = std::span(ids).subspan(base);
 
     std::println("| tokens | run | wall ms | tok/s | GPU ms | resident ms | misses | GB read | read ms |{}",
-                 opts.telemetry == mako::glm::Telemetry::layers ? " KDA | MLA | FFN | experts | rest |" : "");
+                 opts.telemetry == mako::core::Telemetry::layers ? " KDA | MLA | FFN | experts | rest |" : "");
     std::println("|---|---|---|---|---|---|---|---|---|{}",
-                 opts.telemetry == mako::glm::Telemetry::layers ? "---|---|---|---|---|" : "");
+                 opts.telemetry == mako::core::Telemetry::layers ? "---|---|---|---|---|" : "");
     for (uint32_t n : sizes)
         for (uint32_t r = 0; r < repeats; ++r) {
             engine.restore(cp);

@@ -277,7 +277,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     uint64_t working_set = ctx_.info().recommended_working_set;
     uint64_t simulated_lock = 0;
     if (opts_.simulate_ram_gb > 0) {
-        const double phys = query_memory(0).phys, ram = opts_.simulate_ram_gb * 1e9;
+        const double phys = core::query_memory(0).phys, ram = opts_.simulate_ram_gb * 1e9;
         if (ram >= phys)
             throw std::runtime_error("--simulate-ram must be below the machine's RAM");
         // Locking all of phys - ram would also leave less lockable memory than the smaller Mac has (macOS lets
@@ -295,7 +295,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         simulated_ = std::make_unique<LockedMemory>(simulated_lock);
         working_set = uint64_t(double(working_set) * ram / phys);
     }
-    arena_plan_.mem = query_memory(working_set);
+    arena_plan_.mem = core::query_memory(working_set);
     if (opts_.simulate_ram_gb > 0) {
         // The locked difference is not this process's own use on the simulated machine.
         arena_plan_.mem.footprint -= double(simulated_lock);
@@ -313,18 +313,21 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
                 context_bytes += b->length();
     context_bytes += uint64_t(opts_.checkpoints) * checkpoint_bytes();
     arena_plan_.budget = opts_.arena_gb >= 0 ? opts_.arena_gb * 1e9
-                                             : std::max(1e9, arena_budget(arena_plan_.mem) - double(context_bytes));
+                                             : std::max(1e9, core::arena_budget(arena_plan_.mem) - double(context_bytes));
     auto t_phase = Clock::now();
-    routing_key_ = glm::routing_key(model_, cfg_);
+    std::vector<uint32_t> moe_layers;
+    for (uint32_t il = cfg_.n_dense_lead; il < cfg_.n_layer; ++il)
+        moe_layers.push_back(il);
+    routing_key_ = core::routing_key(model_, moe_layers);
     load_.key_ms = ms_since(t_phase);
-    default_profile_ = default_profile_path(routing_key_);
+    default_profile_ = core::default_profile_path(routing_key_);
     if (!opts_.expert_counts.empty())
         loaded_profile_ = opts_.expert_counts;
     else if (std::filesystem::exists(default_profile_))
         loaded_profile_ = default_profile_;
     Counts counts;
     if (!loaded_profile_.empty()) {
-        counts = load_profile(loaded_profile_, uint32_t(layers_.size()), cfg_.n_expert);
+        counts = core::load_profile(loaded_profile_, uint32_t(layers_.size()), cfg_.n_expert);
         counts.resize(layers_.size()); // a row for a next-token block this engine did not load
         // A profile without the next-token block's counts gives each of its experts the trunk's mean count, so
         // the block competes for slots like a typical layer (its live counts then decide which experts stay).
@@ -485,9 +488,9 @@ void Engine::resolve_layer_times(uint64_t cpu0, uint64_t gpu0)
         if (t.section < 0) {
             if (t.kernel.empty())
                 continue;
-            auto it = std::ranges::find(last_step_.kernels, t.kernel, &KernelTime::kernel);
+            auto it = std::ranges::find(last_step_.kernels, t.kernel, &core::KernelTime::kernel);
             if (it == last_step_.kernels.end())
-                it = last_step_.kernels.insert(it, KernelTime{t.kernel, 0, 0});
+                it = last_step_.kernels.insert(it, core::KernelTime{t.kernel, 0, 0});
             it->ms += ms;
             ++it->count;
             continue;
@@ -575,7 +578,7 @@ void Engine::set_prefill_group(uint32_t group)
 void Engine::save_profile(const std::filesystem::path& path, bool merge) const
 {
     const uint32_t nl = uint32_t(layers_.size()); // the next-token block included
-    Counts counts = merge && std::filesystem::exists(path) ? load_profile(path, nl, cfg_.n_expert) : Counts(nl);
+    Counts counts = merge && std::filesystem::exists(path) ? core::load_profile(path, nl, cfg_.n_expert) : Counts(nl);
     const auto& usage = arena_->usage();
     counts.resize(std::max<size_t>(counts.size(), nl)); // rows of layers this engine did not load stay
     for (uint32_t l = 0; l < nl; ++l) {
@@ -585,7 +588,7 @@ void Engine::save_profile(const std::filesystem::path& path, bool merge) const
         for (uint32_t e = 0; e < cfg_.n_expert; ++e)
             counts[l][e] += usage[l][e];
     }
-    glm::save_profile(path, counts);
+    core::save_profile(path, counts);
 }
 
 Engine::~Engine()

@@ -172,7 +172,7 @@ int main(int argc, char** argv)
         else if (a == "--force-route")
             route_dir = v;
         else if (a == "--stats") {
-            const auto t = mako::glm::parse_telemetry(v);
+            const auto t = mako::core::parse_telemetry(v);
             if (!t) {
                 std::println(stderr, "--stats takes summary, steps, layers or kernels");
                 return 2;
@@ -233,13 +233,13 @@ int main(int argc, char** argv)
         engine.set_ablation(std::move(a));
     }
     std::println("loaded in {:.1f} s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    if (!stats_out.empty() && opts.telemetry == mako::glm::Telemetry::off)
-        opts.telemetry = mako::glm::Telemetry::summary;
+    if (!stats_out.empty() && opts.telemetry == mako::core::Telemetry::off)
+        opts.telemetry = mako::core::Telemetry::summary;
     std::ofstream stats_file;
     if (!stats_out.empty())
         stats_file.open(stats_out, std::ios::trunc);
-    mako::glm::Report telemetry(opts.telemetry, stats_out.empty() ? nullptr : &stats_file);
-    telemetry.machine(mako::glm::query_machine(ctx.info()));
+    mako::core::Report telemetry(opts.telemetry, stats_out.empty() ? nullptr : &stats_file);
+    telemetry.machine(mako::core::query_machine(ctx.info()));
     telemetry.load(engine.load_stats());
     {
         const auto& p = engine.arena_plan();
@@ -430,7 +430,7 @@ int main(int argc, char** argv)
         std::println("next-token block: {} of {} guesses matched the greedy token ({:.1f}%)", mtp_hits, mtp_tries,
                      100.0 * mtp_hits / std::max(1, mtp_tries));
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
-    if (opts.telemetry != mako::glm::Telemetry::off)
+    if (opts.telemetry != mako::core::Telemetry::off)
         std::print("\n{}", telemetry.markdown());
     if (!save_counts.empty())
         engine.save_profile(save_counts, false);

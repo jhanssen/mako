@@ -1,4 +1,4 @@
-#include "glm/telemetry.hpp"
+#include "core/telemetry.hpp"
 
 #include "mako_version.hpp"
 
@@ -8,7 +8,7 @@
 #include <format>
 #include <numeric>
 
-namespace mako::glm {
+namespace mako::core {
 
 namespace {
 
@@ -258,4 +258,4 @@ std::string Report::markdown(size_t skip) const
     return md;
 }
 
-} // namespace mako::glm
+} // namespace mako::core

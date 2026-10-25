@@ -44,10 +44,14 @@ target_link_libraries(mako_dsv41 PUBLIC mako_gguf)
 add_library(mako_gen STATIC gen/sampler.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_library(mako_glm STATIC glm/arena.cpp glm/config.cpp glm/engine.cpp glm/profile.cpp glm/session.cpp glm/telemetry.cpp)
-target_link_libraries(mako_glm PUBLIC mako_mtl mako_gguf mako_gen)
-target_include_directories(mako_glm PRIVATE ${CMAKE_BINARY_DIR}/generated)
-add_dependencies(mako_glm mako_version)
+add_library(mako_core STATIC core/arena.cpp core/profile.cpp core/telemetry.cpp)
+target_include_directories(mako_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_core PUBLIC mako_mtl mako_gguf)
+target_include_directories(mako_core PRIVATE ${CMAKE_BINARY_DIR}/generated)
+add_dependencies(mako_core mako_version)
+
+add_library(mako_glm STATIC glm/config.cpp glm/engine.cpp glm/session.cpp)
+target_link_libraries(mako_glm PUBLIC mako_core mako_mtl mako_gguf mako_gen)
 
 set_source_files_properties(mtl/embedded.cpp PROPERTIES
     COMPILE_OPTIONS "--embed-dir=${CMAKE_BINARY_DIR};-Wno-c23-extensions"

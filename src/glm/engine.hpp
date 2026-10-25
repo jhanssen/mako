@@ -1,9 +1,9 @@
 #pragma once
 
-#include "glm/arena.hpp"
+#include "core/arena.hpp"
 #include "glm/config.hpp"
-#include "glm/profile.hpp"
-#include "glm/telemetry.hpp"
+#include "core/profile.hpp"
+#include "core/telemetry.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/ablation.hpp"
 #include "mtl/context.hpp"
@@ -24,6 +24,15 @@
 #include <vector>
 
 namespace mako::glm {
+
+using core::Counts;
+using core::ExpertArena;
+using core::LayerTimes;
+using core::LoadStats;
+using core::LockedMemory;
+using core::MemInfo;
+using core::StepStats;
+using core::Telemetry;
 
 struct Options {
     uint32_t max_ctx = 4096;

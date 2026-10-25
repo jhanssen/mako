@@ -1,4 +1,4 @@
-#include "glm/arena.hpp"
+#include "core/arena.hpp"
 
 #include "gguf/read_pool.hpp"
 
@@ -22,7 +22,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace mako::glm {
+namespace mako::core {
 
 namespace {
 
@@ -534,4 +534,4 @@ bool ExpertArena::reclaim()
     return all;
 }
 
-} // namespace mako::glm
+} // namespace mako::core

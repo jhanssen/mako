@@ -1,4 +1,4 @@
-#include "glm/profile.hpp"
+#include "core/profile.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -8,13 +8,13 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace mako::glm {
+namespace mako::core {
 
-std::string routing_key(const gguf::ModelFiles& model, const Config& cfg)
+std::string routing_key(const gguf::ModelFiles& model, std::span<const uint32_t> moe_layers)
 {
     CC_SHA256_CTX ctx;
     CC_SHA256_Init(&ctx);
-    for (uint32_t il = cfg.n_dense_lead; il < cfg.n_layer; ++il)
+    for (uint32_t il : moe_layers)
         for (const char* name : {"ffn_gate_inp.weight", "exp_probs_b.bias"}) {
             const std::string full = std::format("blk.{}.{}", il, name);
             auto ref = model.find(full);
@@ -89,4 +89,4 @@ void save_profile(const std::filesystem::path& path, const Counts& counts)
     std::filesystem::rename(tmp, path);
 }
 
-} // namespace mako::glm
+} // namespace mako::core

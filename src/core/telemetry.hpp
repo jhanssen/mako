@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace mako::glm {
+namespace mako::core {
 
 // How much the engine measures and reports: summary (machine, load, per-token averages), steps (every step too),
 // layers (every step's per-layer GPU time too), kernels (GPU time per kernel instead of per layer). At the kernels
@@ -83,4 +83,4 @@ private:
     std::vector<std::pair<StepStats, uint32_t>> prefills_;
 };
 
-} // namespace mako::glm
+} // namespace mako::core

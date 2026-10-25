@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace mako::glm {
+namespace mako::core {
 
 // What the arena budget depends on, in bytes.
 struct MemInfo {
@@ -149,4 +149,4 @@ private:
     std::unique_ptr<gguf::ReadPool> readers_;
 };
 
-} // namespace mako::glm
+} // namespace mako::core
