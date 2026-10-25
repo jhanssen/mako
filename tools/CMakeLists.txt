@@ -34,3 +34,6 @@ target_link_libraries(render_template PRIVATE mako_chat mako_gguf)
 
 add_executable(engram_rows engram_rows.cpp)
 target_link_libraries(engram_rows PRIVATE mako_dsv41)
+
+add_executable(ds_run ds_run.cpp)
+target_link_libraries(ds_run PRIVATE mako_dsv41)
