@@ -145,6 +145,7 @@ struct Engine::Drafter {
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : EngineBase(model, ctx, opts.telemetry), cfg_(cfg), opts_(opts)
 {
+    dense_quant_ = opts_.dense_quant;
     const auto t_load = Clock::now();
     if (cfg_.head_dim != 512 || cfg_.n_head != 64 || cfg_.n_rot != 64 || cfg_.hc != 4 || cfg_.n_head * cfg_.head_dim != cfg_.o_groups * 4096 ||
         cfg_.indexer_dim != 128 || cfg_.n_expert_used > 16)
@@ -642,6 +643,9 @@ const std::vector<float>& Engine::step(int32_t token)
     spec_stats_.step_ms += ms_since(t0);
     spec_stats_.step_misses += last_step_.misses;
     spec_stats_.step_read_ms += last_step_.ensure_ms;
+    spec_stats_.step_gpu_ms += last_step_.gpu_ms;
+    spec_stats_.step_wait_ms += last_step_.route_wait_ms;
+    spec_stats_.step_encode_ms += last_step_.encode_ms;
     return logits_;
 }
 

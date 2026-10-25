@@ -32,6 +32,8 @@ struct Options {
     std::string dspark;
     float draft_conf = 0.5f, draft_cum = 0.5f;
     uint32_t max_drafts = 4;
+    // Dense Q8_0 matrices re-quantized at load to this type (Q4_K, Q5_K or Q6_K); unset: as stored.
+    std::optional<gguf::Type> dense_quant;
 };
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from
@@ -85,6 +87,7 @@ public:
     struct SpecStats {
         uint64_t drafts = 0, verifies = 0, verified_tokens = 0, steps = 0, verify_misses = 0, step_misses = 0;
         double draft_ms = 0, verify_ms = 0, step_ms = 0, verify_read_ms = 0, step_read_ms = 0;
+        double step_gpu_ms = 0, step_wait_ms = 0, step_encode_ms = 0;
     };
     const SpecStats& spec_stats() const { return spec_stats_; }
 

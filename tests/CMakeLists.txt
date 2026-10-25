@@ -61,3 +61,7 @@ set_tests_properties(server server_ds41 PROPERTIES LABELS server)
 set_tests_properties(sampler PROPERTIES LABELS sampler)
 set_tests_properties(gemv gemm gemm_ds41 PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
 set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds41 chat server server_ds41 gemv gemm e2e_decode e2e_prefill e2e_parity e2e_spec e2e_session e2e_ablate e2e_long PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(quant_test quant_test.cpp)
+target_link_libraries(quant_test PRIVATE mako_mtl mako_gguf)
+add_test(NAME quant COMMAND quant_test)

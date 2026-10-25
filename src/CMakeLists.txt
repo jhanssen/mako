@@ -2,7 +2,7 @@ add_library(mako_mtl STATIC mtl/ablation.cpp mtl/metal_impl.cpp mtl/context.cpp 
 target_include_directories(mako_mtl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_mtl PUBLIC metal_cpp mako_gguf)
 
-add_library(mako_gguf STATIC gguf/gguf.cpp gguf/model_files.cpp gguf/read_pool.cpp quant/dequant.cpp)
+add_library(mako_gguf STATIC gguf/gguf.cpp gguf/model_files.cpp gguf/read_pool.cpp quant/dequant.cpp quant/quantize.cpp)
 target_include_directories(mako_gguf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(MAKO_METALLIB ${CMAKE_BINARY_DIR}/mako.metallib)

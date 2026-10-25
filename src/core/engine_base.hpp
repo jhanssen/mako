@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -111,7 +112,11 @@ protected:
     EngineBase& operator=(const EngineBase&) = delete;
 
     // Reads a dense tensor into the resident weight buffers (BF16 becomes F32).
+    // Dense weights; Q8_0 matrices are re-quantized to dense_quant_ when it is set.
     DevTensor upload(const std::string& name);
+    DevTensor upload_requant(int fd, const gguf::Tensor& t, gguf::Type to);
+    std::optional<gguf::Type> dense_quant_;
+    uint64_t requant_bytes_ = 0; // bytes the re-quantization saved
     // The same from `bytes` at `offset` of a file (tensors outside the GGUF, e.g. a drafter's own file).
     DevTensor upload_raw(int fd, uint64_t offset, uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims,
                          const std::string& what);

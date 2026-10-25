@@ -4,7 +4,7 @@
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
-//          [--draft-conf F]] [-n N]
+//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [-n N]
 // --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one and
 // --spec is not 0), with the tokens, speed and drafts kept.
 // --split S --width W: prefills the first S ids, then runs the rest W at a time (as a speculative verify step whose
@@ -84,7 +84,18 @@ int main(int argc, char** argv)
             save_profile = v;
         else if (a == "--profile")
             opts.expert_counts = v;
-        else if (a == "--dspark")
+        else if (a == "--dense-quant") {
+            if (v == "q4_k")
+                opts.dense_quant = mako::gguf::Type::Q4_K;
+            else if (v == "q5_k")
+                opts.dense_quant = mako::gguf::Type::Q5_K;
+            else if (v == "q6_k")
+                opts.dense_quant = mako::gguf::Type::Q6_K;
+            else {
+                std::println(stderr, "--dense-quant takes q4_k, q5_k or q6_k");
+                return 2;
+            }
+        } else if (a == "--dspark")
             opts.dspark = v;
         else if (a == "--gen")
             session_n = uint32_t(std::stoul(v));
@@ -210,6 +221,9 @@ int main(int argc, char** argv)
                      ss.verifies ? double(ss.verify_misses) / ss.verifies : 0.0,
                      ss.verifies ? ss.verify_read_ms / ss.verifies : 0.0, ss.steps, ss.steps ? ss.step_ms / ss.steps : 0.0,
                      ss.steps ? double(ss.step_misses) / ss.steps : 0.0, ss.steps ? ss.step_read_ms / ss.steps : 0.0);
+        if (ss.steps)
+            std::println("per step: GPU {:.1f} ms, CPU waiting for routing {:.1f} ms, encoding {:.1f} ms",
+                         ss.step_gpu_ms / ss.steps, ss.step_wait_ms / ss.steps, ss.step_encode_ms / ss.steps);
         return 0;
     }
     if (split > 0 && width > 0) {
