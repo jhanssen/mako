@@ -77,6 +77,17 @@ For pi, a provider in `~/.pi/agent/models.json` with `"api": "openai-completions
 "http://127.0.0.1:8080/v1"`, `"reasoning": true` and `"compat": {"supportsMidConvoSystemMessages": true}` (system
 prompt changes then append instead of rewriting the start of the prompt, which would re-read the whole context).
 
+## Self-check
+
+```sh
+python3 tools/self_check.py --model <model-00001-of-0000N.gguf> [--quick] [--out report.md]
+```
+
+Runs the test suite against the model and a fixed benchmark (prefill of 512 and 4096 new tokens on a 4K-token context,
+decode of 128 tokens with and without drafts; each step a freshly loaded engine, so the decode numbers are the first
+answer after a prompt, not a warmed-up session), and prints a Markdown report to paste into an issue. `--quick` runs
+only the tests that need no GPU work.
+
 ## Tests
 
 ```sh
