@@ -307,8 +307,9 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
                                      + std::max<uint64_t>({cfg_.n_ff, H * R, H * cfg_.head_k, inner}) / 2; // GEMM input
     const uint64_t per_group_token = 3 * E + 3 * hd + 48 + 2 * cfg_.n_expert + 32 + k + 16 + E / 2 + k * E;
     const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (E / 2 + 2 * nff + nff / 2);
+    const uint64_t staging = group >= kStageMinTokens ? staging_bytes() : 0;
     return (uint64_t(chunk) * per_chunk_token + uint64_t(group) * per_group_token + batch) * 4 + sparse_scratch() +
-           (96ull << 20);
+           staging + (96ull << 20);
 }
 
 void Engine::reset()
@@ -1168,6 +1169,11 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                 }
         }
 
+        begin_staging(G);
+        struct StagingEnd {
+            Engine& e;
+            ~StagingEnd() { e.end_staging(); }
+        } staging_end{*this};
         MTL::Timestamp cpu0 = 0, gpu0 = 0;
         if (timing())
             ctx_.device()->sampleTimestamps(&cpu0, &gpu0);

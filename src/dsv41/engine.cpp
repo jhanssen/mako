@@ -255,7 +255,8 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
     const uint64_t scores = uint64_t(kAttnGroup) * cfg_.n_head * (cfg_.sliding_window + top) +
                             (64ull << 20) / 4; // the indexer's
     const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (E / 2 + 2 * nff + nff / 2);
-    return (uint64_t(group) * per_group + uint64_t(chunk) * per_chunk + scores + batch) * 4 + (96ull << 20);
+    const uint64_t staging = group >= kStageMinTokens ? staging_bytes() : 0;
+    return (uint64_t(group) * per_group + uint64_t(chunk) * per_chunk + scores + batch) * 4 + staging + (96ull << 20);
 }
 
 void Engine::reset()
@@ -676,6 +677,12 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         }
     }
 
+    if (!decode)
+        begin_staging(G);
+    struct StagingEnd {
+        Engine& e;
+        ~StagingEnd() { e.end_staging(); }
+    } staging_end{*this};
     MTL::Timestamp cpu0 = 0, gpu0 = 0;
     if (timing())
         ctx_.device()->sampleTimestamps(&cpu0, &gpu0);

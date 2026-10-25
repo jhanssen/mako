@@ -2,6 +2,7 @@
 
 #include "core/arena.hpp"
 #include "core/profile.hpp"
+#include "core/stager.hpp"
 #include "core/telemetry.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
@@ -160,6 +161,16 @@ protected:
     void moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,
                      MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, std::vector<MTL::CommandBuffer*>& committed);
     static constexpr uint32_t kBatchRows = 8192; // prefill expert rows (token, expert pairs) run and combined together
+    // Staged prefill: for a group of at least kStageMinTokens (which routes to nearly every expert of every layer),
+    // the arena's missing experts of every layer are read ahead into a ring (Stager) while the GPU works, and the
+    // layer's MoE runs them from there instead of making them resident. end_staging() once the group's GPU work is
+    // done. staging_bytes(): the ring's size, for scratch estimates (MAKO_STAGE_GB, 0 off).
+    static constexpr uint32_t kStageMinTokens = 512;
+    void begin_staging(uint32_t tokens);
+    void end_staging();
+    uint64_t staging_bytes() const { return staging_wanted() ? stage_bytes_ : 0; }
+    // Whether prefill stages (before the arena exists: whether it may).
+    bool staging_wanted() const;
     // For a prefill: scratch beyond 256 MB takes the memory of lendable arena slots meanwhile; at the end the scratch
     // buffers allocated since go and the slots are read again (unless memory pressure holds them).
     class ScratchLoan {
@@ -235,6 +246,8 @@ protected:
         uint32_t tokens;
     };
     std::vector<PendingMoe> pending_moe_; // not yet served
+    std::unique_ptr<Stager> stager_;
+    uint64_t stage_bytes_ = 3ull << 30;
 
     Probe probe_;
     RouteOverride route_override_;

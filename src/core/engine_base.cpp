@@ -74,6 +74,59 @@ EngineBase::EngineBase(const gguf::ModelFiles& model, mtl::Context& ctx, Telemet
     lib_ = ctx_.load(mtl::kernels_metallib());
     routed_ = mtl::Ref<MTL::SharedEvent>(ctx_.device()->newSharedEvent());
     ready_ = mtl::Ref<MTL::SharedEvent>(ctx_.device()->newSharedEvent());
+    if (const char* g = std::getenv("MAKO_STAGE_GB"))
+        stage_bytes_ = uint64_t(std::max(0.0, std::atof(g)) * double(1ull << 30));
+}
+
+bool EngineBase::staging_wanted() const
+{
+    if (stage_bytes_ == 0)
+        return false;
+    if (!arena_ || std::getenv("MAKO_STAGE_GB"))
+        return true;
+    // Worth it where most experts are missing (measured: DeepSeek-V4.1 at 42% resident +20-25%; GLM-5.3 at 87%
+    // -11%, the ring's borrowed memory costing more resident experts than the overlap saves).
+    uint64_t slots = 0, experts = 0;
+    const uint32_t n_rows = std::min<uint32_t>(uint32_t(arena_->usage().size()), dims_.n_layer);
+    for (uint32_t l = 0; l < n_rows; ++l)
+        if (arena_->part(l, 0).bytes) {
+            slots += arena_->slots(l);
+            experts += dims_.n_expert;
+        }
+    return !experts || double(slots) <= 0.7 * double(experts);
+}
+
+void EngineBase::begin_staging(uint32_t tokens)
+{
+    stager_.reset();
+    if (tokens < kStageMinTokens || !staging_wanted())
+        return;
+    const uint32_t n_rows = std::min<uint32_t>(uint32_t(arena_->usage().size()), dims_.n_layer);
+    auto st = std::make_unique<Stager>(ctx_.device(), *arena_, stage_bytes_);
+    if (!st->ok())
+        return;
+    const auto* table = static_cast<const int32_t*>(arena_->slot_table()->contents());
+    std::vector<std::pair<uint32_t, std::vector<int>>> plan;
+    for (uint32_t l = 0; l < n_rows; ++l) {
+        if (!arena_->part(l, 0).bytes)
+            continue;
+        std::vector<int> missing;
+        for (uint32_t e = 0; e < dims_.n_expert; ++e)
+            if (table[uint64_t(l) * dims_.n_expert + e] < 0)
+                missing.push_back(int(e));
+        plan.emplace_back(l, std::move(missing));
+    }
+    st->start(std::move(plan));
+    stager_ = std::move(st);
+}
+
+void EngineBase::end_staging()
+{
+    if (stager_ && std::getenv("MAKO_STAGE_STATS"))
+        std::fprintf(stderr, "staging: %.1f GB in %.0f ms (%.1f GB/s; readers busy %.0f ms)\n",
+                     stager_->read_bytes() / 1e9, stager_->span_ms(),
+                     stager_->read_bytes() / 1e6 / std::max(1.0, stager_->span_ms()), stager_->read_ms());
+    stager_.reset();
 }
 
 EngineBase::~EngineBase()
@@ -949,9 +1002,17 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         return b0 == b1 ? 0u : start[order[b1 - 1]] + uint32_t(users[order[b1 - 1]].size()) - start[order[b0]];
     };
 
-    // Experts [b0, b1) of order (rows within kBatchRows), all pinned resident: gather their rows, then
+    // Where each part of expert e is: its arena slot, or (staged) its staging slot.
+    std::vector<int32_t> slot(dims_.n_expert, -1);
+    std::vector<Stager::Where> staged(dims_.n_expert);
+    auto weights = [&](int part, int e) -> std::pair<MTL::Buffer*, uint64_t> {
+        if (staged[e].job >= 0)
+            return {staged[e].buf, staged[e].off[part]};
+        return arena_->region(il, part).at(uint32_t(slot[e]));
+    };
+    // Experts [b0, b1) of order (rows within kBatchRows), pinned resident or staged: gather their rows, then
     // in a concurrent encoder gate and up of every expert, the SwiGLU, every down into yg.
-    auto run = [&](size_t b0, size_t b1, const std::vector<int32_t>& slot) {
+    auto run = [&](size_t b0, size_t b1) {
         if (b0 == b1)
             return;
         const uint32_t r0 = start[order[b0]], nr = rows_of(b0, b1);
@@ -967,7 +1028,7 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         enc = encoder(cb, il, 2, MTL::DispatchTypeConcurrent);
         auto gemm_part = [&](int part, int e, MTL::Buffer* xin, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
             const ExpertArena::Part& p = arena_->part(il, part);
-            const auto [wb, wo] = arena_->region(il, part).at(uint32_t(slot[e]));
+            const auto [wb, wo] = weights(part, e);
             gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, xin,
                           uint64_t(start[e] - r0) * xw * 2, y, uint64_t(start[e] - r0) * yw * 4);
         };
@@ -989,7 +1050,7 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         for (size_t i = b0; i < b1; ++i) {
             const int e = order[i];
             const ExpertArena::Part& p = arena_->part(il, 2);
-            const auto [wb, wo] = arena_->region(il, 2).at(uint32_t(slot[e]));
+            const auto [wb, wo] = weights(2, e);
             gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, mb,
                           uint64_t(start[e] - r0) * nff * 2, yg, uint64_t(start[e]) * E * 4);
         }
@@ -998,7 +1059,6 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     };
 
     const auto t_ensure = Clock::now();
-    std::vector<int32_t> slot(dims_.n_expert, -1);
     // Batches go to the GPU in command buffers of their own, so that when the misses run out of
     // unpinned slots only the oldest needs to finish: its experts' slots are then unpinned and reused.
     // Resident experts come first, so the GPU runs them while the misses are read.
@@ -1010,7 +1070,7 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     auto commit = [&](size_t b0, size_t b1) {
         if (b0 == b1)
             return;
-        run(b0, b1, slot);
+        run(b0, b1);
         enc->endEncoding();
         cb->commit();
         InFlight f{cb->retain(), {}};
@@ -1041,11 +1101,42 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         arena_->ensure(il, std::span<const int>(&order[i], 1), &slot[order[i]], true, false);
     }
     commit(b0, n_resident);
+    if (stager_) {
+        // Misses from staging, read ahead of this layer: batches as their experts arrive, each slot released when
+        // the GPU work that reads it completes.
+        Stager* st = stager_.get();
+        for (size_t i = n_resident; i < order.size();) {
+            size_t j = i + 1;
+            while (j < order.size() && j - i < kExpertsPerCommit && rows_of(i, j + 1) <= kBatchRows)
+                ++j;
+            std::vector<int64_t> jobs;
+            for (size_t m = i; m < j; ++m) {
+                staged[order[m]] = st->take(il, order[m]);
+                if (staged[order[m]].job < 0)
+                    throw std::logic_error("routed expert neither resident nor staged");
+                jobs.push_back(staged[order[m]].job);
+            }
+            arena_->touch(il, std::span<const int>(&order[i], j - i));
+            run(i, j);
+            enc->endEncoding();
+            cb->addCompletedHandler([st, jobs](MTL::CommandBuffer*) {
+                for (int64_t job : jobs)
+                    st->release(job);
+            });
+            cb->commit();
+            committed.push_back(cb->retain());
+            cb = ctx_.queue()->commandBuffer();
+            cur_cb_ = cb;
+            enc = encoder(cb, cur_layer_, -1);
+            i = j;
+        }
+        st->release_untaken(il);
+    }
     // Misses are read a few at a time (their chunks in flight together) and each batch goes to the GPU
     // as soon as it is resident, so reading the next overlaps running this one.
     constexpr size_t kMissesPerRead = 4;
     std::vector<int32_t> got(kMissesPerRead);
-    for (size_t i = n_resident; i < order.size();) {
+    for (size_t i = stager_ ? order.size() : n_resident; i < order.size();) {
         size_t j = i + 1;
         while (j < order.size() && j - i < kMissesPerRead && rows_of(i, j + 1) <= kBatchRows)
             ++j;

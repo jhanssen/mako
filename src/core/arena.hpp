@@ -114,6 +114,9 @@ public:
     // note_prefill); the eviction scores are updated either way.
     bool ensure(uint32_t layer, std::span<const int> experts, int32_t* slots_out, bool pin = false,
                 bool count_usage = true);
+    // The eviction scores' update of an ensure() of these experts, without making them resident (experts a prefill
+    // runs from staging).
+    void touch(uint32_t layer, std::span<const int> experts);
     // A prefill group's routing of a layer for usage() (the profile): users[e] tokens selected expert e.
     void note_prefill(uint32_t layer, std::span<const uint32_t> users);
     void unpin(uint32_t layer);

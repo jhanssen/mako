@@ -321,6 +321,15 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
         stats_.read_bytes += loads.size() * p.bytes;
 }
 
+void ExpertArena::touch(uint32_t layer, std::span<const int> experts)
+{
+    static const double decay = std::exp2(-1.0 / 256);
+    for (double& c : score_[layer])
+        c *= decay;
+    for (int e : experts)
+        score_[layer][e] += 1.0;
+}
+
 void ExpertArena::note_prefill(uint32_t layer, std::span<const uint32_t> users)
 {
     for (size_t e = 0; e < users.size() && e < usage_[layer].size(); ++e)

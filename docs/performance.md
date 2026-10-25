@@ -39,7 +39,8 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 
 ### Open
 
-- Decode misses rise after a long prompt (~34 vs ~16 a step for ~75 steps); cause not found.
+- Decode misses rise after a long prompt (~34 vs ~16 a step for ~75 steps). Part of it is prefill's misses
+  evicting decode's resident set (keeping them out cut the rise ~20%); a fix without staging's cost is untried.
 - Expert GEMMs at few rows per expert in short prefills (512 tokens: experts ~714 ms GPU against a ~150 ms
   weight-read bound).
 
@@ -53,23 +54,24 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 | One T-token layer path for decode and prefill; attention reads window and compressed keys in place | prefill working: 1300 tokens 111 tok/s before tuning |
 | Attention through matmul2d (half operands staged in threadgroup memory, float accumulation) | attention section 2.5 s -> 0.83 s on 1300 tokens; prefill 130 tok/s; KL vs the reference unchanged (0.0061) |
 | Prefill group 8192 (was 2048) | 2.4K-token prompt 146 -> 226 tok/s: each group re-reads every missing expert it routes to (~92 GB at ~12 GB/s, ~8 s) |
+| Staged prefill reads: a prefill group of >= 512 tokens routes to nearly every expert, so the arena's missing experts of every layer are read ahead (8 threads, 1 MiB reads, 16 GB/s) into a 3 GB ring while the GPU works, and run from there without becoming resident | 2.4K-token prompt 275 -> 325-349 tok/s (A/B in sequence); now read-bound (~6.1 s of reads in ~7 s). The first version (6 threads, whole-part reads) read at 10.6 GB/s and gained nothing |
 | Routing profile through prefill (per-token counts) | the profile now reflects routing frequency; first attempt counted each expert once per group and made decode worse (41 misses/step) |
 
-Prefill on prompts of a few thousand tokens is SSD-bound: ~8 s of expert reads once per group plus ~1.8 ms/token of
-GPU work. Decode runs 13-21 tok/s; misses per step vary 15-40 with content and history.
+Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads once per group (overlapped with the
+~1.8 ms/token of GPU work since staging). Decode runs 13-21 tok/s; misses per step vary 15-40 with content and history.
 
 ### Tried and rejected
 
 | Idea | Result |
 | --- | --- |
 | Attention on fp32 simdgroup matrices | slower than the scalar kernel: ablation showed the multiply-accumulates themselves bound it (~0.9 TFLOP/s; they do not reach the matrix units) |
+| Staged prefill reads for GLM-5.3 (87% of experts resident) | prefill -11% (429 -> 382 tok/s at 4K): little to read, and the ring's borrowed memory evicts resident experts. Staging is on only below 70% residency. It did cut decode misses in the 40 steps after the prompt from 32.6 to 26.2 a step (prefill misses no longer evict decode's resident set) |
 | One 1024-thread threadgroup per token for the attention output (no repeated reads of probabilities and keys) | no change: redundant reads were not the cost |
 | Per-row key descriptors with vector loads | no change for the output kernel (helped the score kernel slightly) |
 | More query tokens per attention dispatch (32 -> 256) | no change: occupancy was not the cost |
 
 ### Open
 
-- Prefill reads (~8 s a group): only more resident experts or fewer bytes per expert help; overlapping them with
-  the next layer is impossible without knowing its routing.
+- Prefill reads (~6 s a group, now overlapped with the GPU work): more resident experts or fewer bytes per expert.
 - Decode misses (15-40 a step).
 - DSpark (5 drafts verified in one 6-token step) not built yet.
