@@ -228,10 +228,33 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
         const std::string_view c = trim(b.tool_choice->str);
         if (c == "\"none\"")
             use_tools = false;
-        else if (c != "\"auto\"" && c != "null")
-            throw BadRequest("tool_choice other than auto or none is not supported");
+        else if (c == "\"required\"")
+            r.tool_required = true;
+        else if (c != "\"auto\"" && c != "null") {
+            glz::generic g;
+            if (glz::read_json(g, c) || !g.is_object() || !g.contains("function") || !g["function"].is_object() ||
+                !g["function"].contains("name") || !g["function"]["name"].is_string())
+                throw BadRequest("tool_choice must be auto, none, required or {\"type\": \"function\", \"function\": "
+                                 "{\"name\": ...}}");
+            r.tool_required = true;
+            r.tool_name = g["function"]["name"].get_string();
+        }
+        if (r.tool_required && !use_tools)
+            throw BadRequest("tool_choice requires tools");
     }
     r.tools = use_tools ? b.tools->str : "[]";
+    if (!r.tool_name.empty()) {
+        glz::generic defs;
+        bool found = false;
+        if (!glz::read_json(defs, r.tools) && defs.is_array())
+            for (const auto& t : defs.get_array()) {
+                const auto& fn = t.is_object() && t.contains("function") ? t["function"] : t;
+                found |= fn.is_object() && fn.contains("name") && fn["name"].is_string() &&
+                         fn["name"].get_string() == r.tool_name;
+            }
+        if (!found)
+            throw BadRequest(std::format("tool_choice names {}, which is not among the tools", r.tool_name));
+    }
     if (use_tools)
         ctx.tools = std::move(b.tools);
     if (b.reasoning_effort) {
@@ -313,7 +336,7 @@ struct OutputParser::Tools {
 };
 
 OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop)
-    : tools_(std::make_unique<Tools>()), stop_(std::move(stop)), stream_(tok, false)
+    : tools_(std::make_unique<Tools>()), stop_(std::move(stop)), stream_(tok, false), tok_(tok)
 {
     if (glz::read_json(tools_->defs, tools) || !tools_->defs.is_array())
         tools_->defs = glz::generic::array_t{};
@@ -327,6 +350,36 @@ OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, s
 }
 
 OutputParser::~OutputParser() = default;
+
+void OutputParser::require_call(const std::string& name)
+{
+    require_ = true;
+    name_tokens_ = name.empty() ? std::vector<int32_t>{} : tok_.encode(name, false);
+    named_has_args_ = false;
+    for (const auto& t : tools_->defs.get_array()) {
+        const auto& fn = t.is_object() && t.contains("function") ? t["function"] : t;
+        if (!fn.is_object() || !fn.contains("name") || !fn["name"].is_string() || fn["name"].get_string() != name)
+            continue;
+        named_has_args_ = fn.contains("parameters") && fn["parameters"].is_object() &&
+                          fn["parameters"].contains("properties") && fn["parameters"]["properties"].is_object() &&
+                          !fn["parameters"]["properties"].get_object().empty();
+    }
+}
+
+int32_t OutputParser::forced() const
+{
+    if (!require_)
+        return -1;
+    if (mode_ == Mode::content && calls_.empty() && !content_started_ && pending_.empty())
+        return call_begin_;
+    if (mode_ == Mode::name && calls_.size() == 1 && !name_tokens_.empty()) {
+        if (name_seen_ < name_tokens_.size())
+            return name_tokens_[name_seen_];
+        if (name_seen_ == name_tokens_.size())
+            return named_has_args_ ? key_begin_ : call_end_;
+    }
+    return -1;
+}
 
 bool OutputParser::push(int32_t token, Delta& out)
 {
@@ -379,8 +432,11 @@ bool OutputParser::push(int32_t token, Delta& out)
         calls_.back().arguments += frag;
         out.calls.push_back({calls_.size() - 1, "", "", frag});
         mode_ = Mode::content;
-    } else
+    } else {
+        if (mode_ == Mode::name && calls_.size() == 1)
+            ++name_seen_;
         text(stream_.push(token), out);
+    }
     return mode_ != Mode::done;
 }
 

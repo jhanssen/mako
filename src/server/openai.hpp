@@ -27,6 +27,8 @@ struct ChatRequest {
     glm::GenerateParams gen;       // max_tokens 0: up to the context size
     std::vector<std::string> stop; // stop strings (in the answer, not the reasoning)
     bool stream = false, include_usage = false;
+    bool tool_required = false; // tool_choice "required" or a named function
+    std::string tool_name;      // a named function's
 };
 
 // Throws BadRequest. `sampling` holds the model's defaults for the fields the request leaves out.
@@ -56,6 +58,10 @@ public:
     OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop);
     ~OutputParser();
 
+    // The answer must start with a call (of `name`, when given; its tokens are forced, then the arguments' start).
+    void require_call(const std::string& name = {});
+    // The token the next one must be, else -1 (GenerateParams::forced).
+    int32_t forced() const;
     // Returns false once a stop string ended the answer (later tokens are ignored).
     bool push(int32_t token, Delta& out);
     // End of generation: whatever is held back.
@@ -85,6 +91,10 @@ private:
     bool call_open_ = false, first_arg_ = true;
     std::string reasoning_, content_;
     std::vector<ToolCall> calls_;
+    const text::Tokenizer& tok_;
+    bool require_ = false, named_has_args_ = false;
+    std::vector<int32_t> name_tokens_; // a required call's name
+    size_t name_seen_ = 0;             // tokens of the first call's name so far
     int32_t think_end_, call_begin_, call_end_, key_begin_, key_end_, value_begin_, value_end_;
 };
 

@@ -71,6 +71,10 @@ glm::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
     const uint32_t room = engine.max_context() - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
     cr.gen.speculative = opts.speculative;
+    if (cr.tool_required) {
+        parser.require_call(cr.tool_name);
+        cr.gen.forced = [&parser] { return parser.forced(); };
+    }
     bool client_gone = false;
     auto r = session.generate(prompt, cr.gen, [&](int32_t token) {
         Delta d;

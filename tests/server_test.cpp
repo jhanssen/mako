@@ -171,6 +171,7 @@ int main(int argc, char** argv)
                             R"({"messages":[{"role":"user","content":"x"}],"n":2})",
                             R"({"messages":[{"role":"user","content":"x"}],"tools":{"a":1}})",
                             R"({"messages":[{"role":"user","content":"x"}],"tool_choice":"required"})",
+                            R"({"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"a"}}],"tool_choice":{"type":"function","function":{"name":"b"}}})",
                             R"({"messages":[{"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"[1]"}}]}]})",
                             R"({"messages":[{"role":"user","content":"x"}],"temperature":"hot"})", "not json"}) {
         bool threw = false;
@@ -180,6 +181,43 @@ int main(int argc, char** argv)
             threw = true;
         }
         check(threw, std::format("rejected: {}", bad));
+    }
+
+    // A required call: <tool_call> forced right after the reasoning; a named one also forces the name, then the
+    // start of the arguments.
+    {
+        const auto req = mako::server::parse_chat_request(
+            std::format(R"({{"messages":[{{"role":"user","content":"x"}}],"tools":{},"tool_choice":{{"type":"function","function":{{"name":"bash"}}}}}})",
+                        kTools),
+            defaults);
+        check(req.tool_required && req.tool_name == "bash", "named tool_choice parsed");
+        mako::server::OutputParser p(*tok, req.tools, {});
+        p.require_call(req.tool_name);
+        std::vector<int32_t> forced;
+        mako::server::Delta d;
+        check(p.forced() < 0, "nothing forced while reasoning");
+        for (int32_t t : tok->encode("some thought</think>", true))
+            p.push(t, d);
+        for (int32_t f; (f = p.forced()) >= 0;) {
+            forced.push_back(f);
+            p.push(f, d);
+        }
+        const auto want = tok->encode("<tool_call>bash<arg_key>", true);
+        check(forced == want, std::format("forced {} tokens, want {}", forced.size(), want.size()));
+        for (int32_t t : tok->encode("command</arg_key><arg_value>ls</arg_value></tool_call>", true))
+            p.push(t, d);
+        p.finish(d);
+        check(p.calls().size() == 1 && p.calls()[0].name == "bash" && canonical(p.calls()[0].arguments) == canonical(R"({"command":"ls"})"),
+              "the forced call parses");
+        const auto any = mako::server::parse_chat_request(
+            std::format(R"({{"messages":[{{"role":"user","content":"x"}}],"tools":{},"tool_choice":"required"}})", kTools), defaults);
+        mako::server::OutputParser q(*tok, any.tools, {});
+        q.require_call();
+        for (int32_t t : tok->encode("x</think>", true))
+            q.push(t, d);
+        check(any.tool_required && any.tool_name.empty() && q.forced() == tok->find("<tool_call>"), "required forces <tool_call>");
+        q.push(q.forced(), d);
+        check(q.forced() < 0, "required leaves the name to the model");
     }
 
     // Round trip: an assistant turn as the template writes it parses back into what produced it.

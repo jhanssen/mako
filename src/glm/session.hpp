@@ -19,6 +19,9 @@ struct GenerateParams {
     // Polled while the prompt is read (between groups of tokens): true stops (Finish::cancelled, no tokens), keeping
     // the part read so far in the context.
     std::function<bool()> cancelled;
+    // Asked before each token is chosen (after the previous one reached on_token): a token >= 0 is taken instead of
+    // sampling, and a draft is kept only if it matches. -1: sample.
+    std::function<int32_t()> forced;
 };
 
 enum class Finish { stop_token, max_tokens, context_full, cancelled };

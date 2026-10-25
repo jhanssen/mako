@@ -136,7 +136,11 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         return true;
     };
 
-    int32_t token = sampler.sample(lp.data());
+    auto choose = [&](const float* logits) {
+        const int32_t f = p.forced ? p.forced() : -1;
+        return f >= 0 ? f : sampler.sample(logits);
+    };
+    int32_t token = choose(lp.data());
     int32_t draft = spec ? e_.mtp_draft(token) : -1;
     mtp_next_ = spec ? token : -1;
     while (p.max_tokens > 0 && emit(token)) {
@@ -147,7 +151,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             ctx_.push_back(draft);
             ++res.drafts;
             bool accepted = false;
-            const int32_t t1 = sampler.verify(two.data(), draft, accepted);
+            const int32_t f = p.forced ? p.forced() : -1;
+            const int32_t t1 = f >= 0 ? (accepted = f == draft, f) : sampler.verify(two.data(), draft, accepted);
             if (!accepted) {
                 e_.rollback();
                 ctx_.pop_back();
@@ -163,14 +168,14 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
                 mtp_next_ = -1;
                 break;
             }
-            token = sampler.sample(two.data() + nv);
+            token = choose(two.data() + nv);
             const int32_t both[2] = {draft, token};
             draft = e_.mtp_draft(std::span<const int32_t>(both));
             mtp_next_ = token;
         } else {
             const std::vector<float>& l = e_.step(token);
             ctx_.push_back(token);
-            token = sampler.sample(l.data());
+            token = choose(l.data());
             draft = spec ? e_.mtp_draft(token) : -1;
             mtp_next_ = spec ? token : -1;
         }
