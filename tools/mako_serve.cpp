@@ -22,6 +22,7 @@
 // after the last KV source, which only the last few thousand rows need; results unchanged).
 #include "app/presets.hpp"
 #include "chat/template.hpp"
+#include "core/log.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
@@ -183,18 +184,17 @@ int main(int argc, char** argv)
         add_keys(env, ',');
     for (const auto& k : so.api_keys)
         if (k.size() < 16)
-            std::println(stderr, "warning: an API key of {} characters is easy to guess (16 or more; e.g. openssl rand "
-                                 "-hex 24)",
-                         k.size());
+            mako::log::warn("an API key of {} characters is easy to guess (16 or more; e.g. openssl rand -hex 24)",
+                            k.size());
     if (so.host != "127.0.0.1" && so.host != "localhost" && so.host != "::1" && so.api_keys.empty()) {
         std::println(stderr, "--host {} serves beyond this machine: give an --api-key or --api-key-file", so.host);
         return 2;
     }
     const auto t_start = std::chrono::steady_clock::now();
-    std::println(stderr, "reading {}", argv[1]);
+    mako::log::info("reading {}", argv[1]);
     auto model = mako::gguf::ModelFiles::open(argv[1]);
     if (!model) {
-        std::println(stderr, "{}", model.error());
+        mako::log::error("{}", model.error());
         return 1;
     }
     const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
@@ -202,7 +202,7 @@ int main(int argc, char** argv)
         if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1])
                                     : mako::dsv41::Engram::add_files(*model, engram);
             !r) {
-            std::println(stderr, "{}", r.error());
+            mako::log::error("{}", r.error());
             return 1;
         }
     }
@@ -210,14 +210,14 @@ int main(int argc, char** argv)
     auto tok = mako::text::Tokenizer::load(meta);
     const auto source = meta.get_string("tokenizer.chat_template");
     if (!tok || !source) {
-        std::println(stderr, "{}", !tok ? tok.error() : "the model has no chat template");
+        mako::log::error("{}", !tok ? tok.error() : "the model has no chat template");
         return 1;
     }
     std::optional<mako::chat::Template> tmpl;
     try {
         tmpl.emplace(std::string(*source));
     } catch (const std::exception& e) {
-        std::println(stderr, "{}", e.what());
+        mako::log::error("{}", e.what());
         return 1;
     }
     if (auto t = meta.get_float("general.sampling.temp"))
@@ -234,8 +234,8 @@ int main(int argc, char** argv)
         uint64_t bytes = 0;
         for (const auto& f : model->files())
             bytes += f.size();
-        std::println(stderr, "{} files, {:.1f} GB; loading the resident weights and setting up the expert cache",
-                     model->files().size(), bytes / 1e9);
+        mako::log::info("{} files, {:.1f} GB; loading the resident weights and setting up the expert cache",
+                        model->files().size(), bytes / 1e9);
     }
     mako::mtl::Context ctx;
     std::unique_ptr<mako::glm::Engine> glm_engine;
@@ -250,7 +250,7 @@ int main(int argc, char** argv)
         if (deepseek) {
             auto cfg = mako::dsv41::Config::load(*model);
             if (!cfg) {
-                std::println(stderr, "{}", cfg.error());
+                mako::log::error("{}", cfg.error());
                 return 1;
             }
             mako::dsv41::Options opts;
@@ -276,7 +276,7 @@ int main(int argc, char** argv)
         } else {
             auto cfg = mako::glm::Config::load(*model);
             if (!cfg) {
-                std::println(stderr, "{}", cfg.error());
+                mako::log::error("{}", cfg.error());
                 return 1;
             }
             mako::glm::Options opts;
@@ -295,10 +295,10 @@ int main(int argc, char** argv)
             auto a = mako::mtl::Ablation::load(ablate, ctx, n_embd, n_layer, sites);
             a.set_scale(ablate_scale);
             set_ablation(std::move(a));
-            std::println(stderr, "ablating the directions in {} (scale {})", ablate, ablate_scale);
+            mako::log::info("ablating the directions in {} (scale {})", ablate, ablate_scale);
         }
     } catch (const std::exception& e) {
-        std::println(stderr, "{}", e.what());
+        mako::log::error("{}", e.what());
         return 1;
     }
     uint64_t slots = 0, experts = 0;
@@ -309,13 +309,13 @@ int main(int argc, char** argv)
             experts += usage[l].size();
         }
     const double resident = experts ? 100.0 * double(slots) / double(experts) : 100.0;
-    std::println(stderr, "ready in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
-                         "temperature {}, top_p {}",
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(), max_ctx,
-                 base->arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
+    mako::log::info("ready in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
+                    "temperature {}, top_p {}",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(), max_ctx,
+                    base->arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
     if (resident < expected_resident)
-        std::println(stderr, "warning: little memory was free for the expert cache (a process that just exited may "
-                             "still be returning its memory); decoding will read experts from the SSD often");
+        mako::log::warn("little memory was free for the expert cache (a process that just exited may still be "
+                        "returning its memory); decoding will read experts from the SSD often");
     {
         mako::server::Server server(*model_if, *tok, *tmpl, so);
         std::jthread stopper([&] {
@@ -323,17 +323,17 @@ int main(int argc, char** argv)
             sigwait(&stop_signals, &sig);
             server.stop();
         });
-        std::println(stderr, "serving {} on http://{}:{}/v1", so.model_id, so.host, so.port);
+        mako::log::info("serving {} on http://{}:{}/v1", so.model_id, so.host, so.port);
         const bool listened = server.run();
         if (!listened)
-            std::println(stderr, "could not listen on {}:{}", so.host, so.port);
+            mako::log::error("could not listen on {}:{}", so.host, so.port);
         ::kill(::getpid(), SIGTERM); // wakes the stopper if the server ended on its own
         if (!listened)
             return 1;
     } // the server's threads are done before the profile is written
     if (learn) {
         base->save_profile(base->default_profile(), true);
-        std::println(stderr, "routing counts added to {}", base->default_profile().string());
+        mako::log::info("routing counts added to {}", base->default_profile().string());
     }
     return 0;
 }

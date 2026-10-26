@@ -3,6 +3,7 @@
 #include "server/anthropic.hpp"
 #include "server/openai.hpp"
 #include "server/protocol.hpp"
+#include "core/log.hpp"
 
 #include <httplib.h>
 
@@ -33,9 +34,8 @@ void log_result(const std::string& id, const gen::GenerateResult& r, const char*
 {
     const auto rate = [](size_t n, double ms) { return ms > 0 ? n / ms * 1e3 : 0.0; };
     const size_t read = r.prompt_tokens - r.reused_tokens, n = r.tokens.size();
-    std::println(stderr,
-                 "{}: prompt {} tokens ({} reused), prefill {} in {:.0f} ms ({:.0f} tok/s), generated {} in {:.0f} ms "
-                 "({:.1f} tok/s, {:.1f} ms/token){}, {}",
+    log::info("{}: prompt {} tokens ({} reused), prefill {} in {:.0f} ms ({:.0f} tok/s), generated {} in {:.0f} ms "
+              "({:.1f} tok/s, {:.1f} ms/token){}, {}",
                  id, r.prompt_tokens, r.reused_tokens, read, r.prefill_ms, rate(read, r.prefill_ms), n, r.decode_ms,
                  rate(n, r.decode_ms), r.decode_ms / double(std::max<size_t>(n, 1)),
                  r.drafts ? std::format(", {:.0f}% of drafts kept", 100.0 * r.accepted / r.drafts) : "", finish);
@@ -174,7 +174,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
                 return false;
             write(proto->end(e, parser, r));
         } catch (const std::exception& e) {
-            std::println(stderr, "{}: {}", id, e.what());
+            log::error("{}: {}", id, e.what());
             write(proto->stream_error(e.what()));
         }
         sink.done();

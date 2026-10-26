@@ -4,6 +4,7 @@
 #include "mtl/embedded.hpp"
 #include "quant/dequant.hpp"
 #include "quant/quantize.hpp"
+#include "core/log.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -136,9 +137,9 @@ void EngineBase::begin_staging(uint32_t tokens)
 void EngineBase::end_staging()
 {
     if (stager_ && std::getenv("MAKO_STAGE_STATS"))
-        std::fprintf(stderr, "staging: %.1f GB in %.0f ms (%.1f GB/s; readers busy %.0f ms)\n",
-                     stager_->read_bytes() / 1e9, stager_->span_ms(),
-                     stager_->read_bytes() / 1e6 / std::max(1.0, stager_->span_ms()), stager_->read_ms());
+        log::info("staging: {:.1f} GB in {:.0f} ms ({:.1f} GB/s; readers busy {:.0f} ms)", stager_->read_bytes() / 1e9,
+                  stager_->span_ms(), stager_->read_bytes() / 1e6 / std::max(1.0, stager_->span_ms()),
+                  stager_->read_ms());
     stager_.reset();
 }
 
@@ -173,9 +174,9 @@ void EngineBase::init_runtime(ArenaInit init)
             wire_limit = uint64_t(0.85 * phys);
         const double lock = std::min(phys - ram, double(wire_limit) - 0.85 * ram);
         if (lock < phys - ram)
-            std::fprintf(stderr, "mako: simulating %.0f GB with %.1f GB locked (not %.1f): %.1f GB more free than such a "
-                                 "Mac would have\n",
-                         init.simulate_ram_gb, lock / 1e9, (phys - ram) / 1e9, (phys - ram - lock) / 1e9);
+            log::warn("simulating {:.0f} GB with {:.1f} GB locked (not {:.1f}): {:.1f} GB more free than such a Mac would "
+                      "have",
+                      init.simulate_ram_gb, lock / 1e9, (phys - ram) / 1e9, (phys - ram - lock) / 1e9);
         simulated_lock = uint64_t(std::max(0.0, lock)) / 16384 * 16384;
         simulated_ = std::make_unique<LockedMemory>(simulated_lock);
         working_set = uint64_t(double(working_set) * ram / phys);
@@ -410,12 +411,11 @@ void EngineBase::apply_pressure()
     if (level > 0 && !pressure_lent_ && !arena_->lent() && arena_->lendable_bytes()) {
         arena_->lend();
         pressure_lent_ = true;
-        std::fprintf(stderr, "mako: memory pressure (%s): released %.1f GB of expert slots\n",
-                     level > 1 ? "critical" : "warning", arena_->lendable_bytes() / 1e9);
+        log::warn("memory pressure ({}): released {:.1f} GB of expert slots", level > 1 ? "critical" : "warning",
+                  arena_->lendable_bytes() / 1e9);
     } else if (level == 0 && pressure_lent_ && arena_->reclaim()) {
         pressure_lent_ = false;
-        std::fprintf(stderr, "mako: memory pressure over: took back %.1f GB of expert slots\n",
-                     arena_->lendable_bytes() / 1e9);
+        log::info("memory pressure over: took back {:.1f} GB of expert slots", arena_->lendable_bytes() / 1e9);
     }
 }
 

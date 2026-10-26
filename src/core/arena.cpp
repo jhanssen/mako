@@ -1,6 +1,7 @@
 #include "core/arena.hpp"
 
 #include "gguf/read_pool.hpp"
+#include "core/log.hpp"
 
 #include <mach/mach.h>
 #include <sys/mman.h>
@@ -662,8 +663,7 @@ bool ExpertArena::reclaim()
     for (uint32_t l = 0; l < layers_.size(); ++l)
         if (tails_[l].bytes && !tails_[l].mem && !map_tail(l)) {
             // They can stay lent (unused) and come back later.
-            std::fprintf(stderr, "mako: taking back %.1f GB of lent expert slots failed; running without them\n",
-                         tails_[l].bytes / 1e9);
+            log::warn("taking back {:.1f} GB of lent expert slots failed; running without them", tails_[l].bytes / 1e9);
             all = false;
             break;
         }

@@ -1,6 +1,7 @@
 #include "core/stager.hpp"
 
 #include "gguf/read_pool.hpp"
+#include "core/log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -143,8 +144,8 @@ Stager::Where Stager::take(uint32_t layer, int e)
         ++released_upto_;
     cv_.notify_all();
     while (!cv_.wait_for(lock, std::chrono::seconds(5), [&] { return ready_[size_t(i)] || error_ || threads_.empty(); }))
-        std::fprintf(stderr, "stager: waiting for job %lld (layer %u expert %d): next %zu, released up to %lld, %u slots\n",
-                     (long long)i, layer, e, next_, (long long)released_upto_, slots_);
+        log::info("stager: waiting for job {} (layer {} expert {}): next {}, released up to {}, {} slots", i, layer, e,
+                  next_, released_upto_, slots_);
     if (error_)
         std::rethrow_exception(error_);
     if (!ready_[size_t(i)])
