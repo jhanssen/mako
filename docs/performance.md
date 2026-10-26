@@ -166,6 +166,17 @@ the sections below take it to ~25 by default.
 
 - Prefill reads (~6 s a group, now overlapped with the GPU work): more resident experts or fewer bytes per expert.
 - Decode misses (15-40 a step).
+- Resident-expert GEMVs (planned 2026-10-26, bit-identical work only; ceiling ~2-3 ms a step, uncertain). The
+  resident-expert section runs at ~400 GB/s against ~560 for Q8_0 on the same bytes. Two measurements decide it:
+  1. `bench/chain_bench`: a mode for what a MoE layer's event signal and encoder boundary cost a step (40 a step).
+  2. `bench/gemv_bench`: the indexed IQ2_XXS (gate/up, 5120 x 2304) and IQ3_XXS (down, 2304 x 5120) kernels at
+     DeepSeek's shapes, 6 experts a dispatch (plus the merged job dispatch): streaming rate and fixed cost a
+     dispatch, against Q8_0 on the same shapes. GLM's shapes gave IQ2_XXS 527 GB/s + ~9 us a dispatch. The down rows
+     are 2304 wide: 72 blocks of 32, one a lane, is three passes of a simdgroup with 8 of 32 lanes busy in the
+     third (75% lane use; inferred from the kernel's layout, not measured).
+  If the bench shows >= 100 GB/s of headroom: kernels for those shapes (e.g. lanes over the 2304-wide rows without
+  the idle pass, the IQ2_XXS fixed cost), each checked bit-identical with `--logits-out` over per-position decode
+  and A/B timed (three pairs, no telemetry, equal misses); expected 1-2 ms. Below that: record the numbers and stop.
 - DSpark (opt-in, `--dspark DIR`): greedy output identical to plain decoding (verify up to 8 tokens runs the decode
   path); 19.8 -> 22.5 tok/s on code (93% of drafts kept), 23.5 -> 22.8 on a story (70%), its 8 GB costing the cache
   ~9%. Draft rounds take ~11 ms (the reference engine's ~2.4). Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
