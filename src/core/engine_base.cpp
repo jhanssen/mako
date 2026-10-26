@@ -1177,14 +1177,53 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
                                            scratch(std::string("em") + tag, uint64_t(T) * k * nff * 4),
                                            scratch(std::string("ed") + tag, uint64_t(T) * k * E * 4)};
     };
-    // Every expert resident and no observer between: the routed gate and up and the shared gate/up in one
-    // dispatch, both swiglus in one, the routed down and the shared down in one (3 dispatches instead of 8).
-    if (resident && !between && T <= kMaxDecodeTokens && adjacent(mw.sh_gate, mw.sh_up)) {
+    const SwigluArgs sa{T * k * nff, mw.clamp_exp > 1e-6f ? mw.clamp_exp : 0.0f};
+    auto run = [&](int part, uint32_t tokens, bool miss, MTL::Buffer* ids, uint64_t ids_off, MTL::Buffer* in,
+                   uint64_t in_off, MTL::Buffer* out, uint64_t out_off, uint64_t ind_at) {
+        const ExpertArena::Region& r = arena_->region(il, part);
+        const mtl::Gemv::Args a = part_args(part, tokens);
+        const bool labelled = tel_ == Telemetry::kernels || repeat_n_ != 1;
+        const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name, a.k, a.n,
+                                                         miss ? "miss" : "hit")
+                                           : "";
+        for (int rep = repeats(label); rep > 0; --rep)
+            gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, ids_off, in, in_off, out, out_off,
+                                  miss ? indirect : nullptr, ind_at + uint64_t(part) * 12, {r.tail, r.tail_off, r.split});
+        if (tel_ == Telemetry::kernels)
+            after(enc, label);
+    };
+    // The miss passes (one per token) once the CPU has made the misses resident, then the combine with the
+    // resident experts' output `hit`.
+    auto finish_misses = [&](MTL::Buffer* hit) {
+        const auto m = bufs("m");
+        if (!resident) {
+            enc->endEncoding();
+            cb->encodeWait(ready_.get(), v);
+            enc = encoder(cb, tl, il < dims_.n_layer ? 3 : -1);
+            part(enc, "moe miss experts");
+            const uint64_t rows = uint64_t(k) * nff * 4;
+            for (uint32_t t = 0; t < T; ++t) {
+                run(0, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[0], t * rows, ind_off + t * 36);
+                run(1, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[1], t * rows, ind_off + t * 36);
+            }
+            dispatch(enc, "swiglu", {m[0], m[1], m[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1),
+                     MTL::Size(256, 1, 1));
+            for (uint32_t t = 0; t < T; ++t)
+                run(2, 1, true, miss_ids, t * 64, m[2], t * rows, m[3], uint64_t(t) * k * E * 4, ind_off + t * 36);
+        }
+        const CombineArgs ca{E, k};
+        part(enc, "moe combine");
+        dispatch(enc, "moe_combine_split", {hit, m[3], miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
+                 MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+    };
+    const auto h = bufs("h");
+    // The resident experts' gate and up and the shared gate/up in one dispatch, both swiglus in one, the resident
+    // down and the shared down in one (3 dispatches instead of 8), while the CPU reads the misses.
+    if (!probe_ && adjacent(mw.sh_gate, mw.sh_up)) { // probes read the shared expert's intermediate
         const uint32_t nff_sh = uint32_t(mw.sh_gate.dims[1]);
         const uint64_t sh_rows = uint64_t(T) * nff_sh * 4;
         MTL::Buffer* gu = scratch("ffgu", 2 * sh_rows);
         MTL::Buffer* m = scratch("ffm", sh_rows);
-        const auto h = bufs("h");
         auto routed_job = [&](int part, MTL::Buffer* in, MTL::Buffer* out) {
             const ExpertArena::Region& r = arena_->region(il, part);
             mtl::Gemv::Job j;
@@ -1218,11 +1257,9 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
             enc->dispatchThreads(MTL::Size(s2.n0 + s2.n1, 1, 1), MTL::Size(256, 1, 1));
             after(enc, "swiglu2");
             gemv_jobs(enc, down_jobs);
-            const auto mm = bufs("m");
-            const CombineArgs ca{E, k};
-            part(enc, "moe combine");
-            dispatch(enc, "moe_combine_split", {h[3], mm[3], miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
-                     MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+            if (between)
+                between(enc, sho);
+            finish_misses(h[3]);
             return;
         }
     }
@@ -1231,49 +1268,13 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     ffn_dense(enc, mw.sh_gate, mw.sh_up, mw.sh_down, xn, sho, mw.clamp_sh, T);
     if (between)
         between(enc, sho);
-
-    // Resident experts of every token run while the CPU reads the misses; the miss passes (one per token) wait.
-    const SwigluArgs sa{T * k * nff, mw.clamp_exp > 1e-6f ? mw.clamp_exp : 0.0f};
-    auto run = [&](int part, uint32_t tokens, bool miss, MTL::Buffer* ids, uint64_t ids_off, MTL::Buffer* in,
-                   uint64_t in_off, MTL::Buffer* out, uint64_t out_off, uint64_t ind_at) {
-        const ExpertArena::Region& r = arena_->region(il, part);
-        const mtl::Gemv::Args a = part_args(part, tokens);
-        const bool labelled = tel_ == Telemetry::kernels || repeat_n_ != 1;
-        const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name, a.k, a.n,
-                                                         miss ? "miss" : "hit")
-                                           : "";
-        for (int rep = repeats(label); rep > 0; --rep)
-            gemv_->encode_indexed(enc, a, r.buf, r.off, r.stride, ids, ids_off, in, in_off, out, out_off,
-                                  miss ? indirect : nullptr, ind_at + uint64_t(part) * 12, {r.tail, r.tail_off, r.split});
-        if (tel_ == Telemetry::kernels)
-            after(enc, label);
-    };
-    const auto h = bufs("h");
+    // Resident experts of every token run while the CPU reads the misses.
     part(enc, "moe resident experts");
     run(0, T, false, hit_ids, 0, xn, 0, h[0], 0, 0);
     run(1, T, false, hit_ids, 0, xn, 0, h[1], 0, 0);
     dispatch(enc, "swiglu", {h[0], h[1], h[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1), MTL::Size(256, 1, 1));
     run(2, T, false, hit_ids, 0, h[2], 0, h[3], 0, 0);
-    const auto m = bufs("m");
-    if (!resident) {
-        enc->endEncoding();
-        cb->encodeWait(ready_.get(), v);
-        enc = encoder(cb, tl, il < dims_.n_layer ? 3 : -1);
-        part(enc, "moe miss experts");
-        const uint64_t rows = uint64_t(k) * nff * 4;
-        for (uint32_t t = 0; t < T; ++t) {
-            run(0, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[0], t * rows, ind_off + t * 36);
-            run(1, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[1], t * rows, ind_off + t * 36);
-        }
-        dispatch(enc, "swiglu", {m[0], m[1], m[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1),
-                 MTL::Size(256, 1, 1));
-        for (uint32_t t = 0; t < T; ++t)
-            run(2, 1, true, miss_ids, t * 64, m[2], t * rows, m[3], uint64_t(t) * k * E * 4, ind_off + t * 36);
-    }
-    const CombineArgs ca{E, k};
-    part(enc, "moe combine");
-    dispatch(enc, "moe_combine_split", {h[3], m[3], miss_rank, ew, sho, ffo}, &ca, sizeof(ca), MTL::Size(E, T, 1),
-             MTL::Size(256, 1, 1));
+    finish_misses(h[3]);
 }
 
 // G tokens' routed experts of arena row il (rows of xn_g) added into ffo, which holds the shared expert's output:
