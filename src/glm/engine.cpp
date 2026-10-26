@@ -5,6 +5,7 @@
 #include "mtl/embedded.hpp"
 #include "quant/dequant.hpp"
 
+#include <array>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -131,6 +132,12 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     const auto t_load = Clock::now();
     dims_ = {cfg_.n_embd, cfg_.n_layer, cfg_.hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
              cfg_.n_expert, cfg_.n_expert_used, cfg_.n_ff_exp};
+    dense_quant_ = opts.dense_quant;
+    if (!dense_quant_)
+        if (const char* e = std::getenv("MAKO_DENSE_QUANT")) {
+            const std::string_view v(e);
+            dense_quant_ = v == "q4_k" ? gguf::Type::Q4_K : v == "q5_k" ? gguf::Type::Q5_K : gguf::Type::Q6_K;
+        }
     routing_ = {core::Routing::Score::sigmoid, cfg_.expert_weights_norm, cfg_.expert_weights_scale};
     if (cfg_.n_expert_used > 16)
         throw std::runtime_error("more than 16 experts per token");
@@ -368,14 +375,6 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         throw std::runtime_error("the KDA scan kernel needs head_dim 128");
     MTL::Buffer* qkv = scratch("qkv", uint64_t(T) * 3 * inner * 4);
     MTL::Buffer* qkvc = scratch("qkvc", uint64_t(T) * 3 * inner * 4);
-    part(enc, "kda q k v");
-    if (T == 1 && adjacent(L.wq, L.wk) && adjacent(L.wk, L.wv)) {
-        gemv(enc, L.wq, xn, 0, qkv, 0, 3, 1, true);
-    } else {
-        proj(enc, L.wq, xn, 0, qkv, 0, T, 3 * inner);
-        proj(enc, L.wk, xn, 0, qkv, uint64_t(inner) * 4, T, 3 * inner);
-        proj(enc, L.wv, xn, 0, qkv, uint64_t(inner) * 8, T, 3 * inner);
-    }
     // With snap_ (a speculative step), the state after the first snap_ tokens also goes to the alternate buffers.
     const uint32_t snap = snap_ && T > snap_ ? snap_ : 0;
     // f_a's rows, then g_a's (one GEMV when their weights are adjacent); f_b, beta and g_b from those: all before
@@ -387,15 +386,40 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* g = scratch("g", uint64_t(T) * inner * 4);
     MTL::Buffer* beta = scratch("beta", uint64_t(T) * H * 4);
     MTL::Buffer* g2 = scratch("g2", uint64_t(T) * inner * 4);
+    const bool qkv_adjacent = adjacent(L.wq, L.wk) && adjacent(L.wk, L.wv);
+    const bool gates_adjacent = T < gemm_min_tokens_ && adjacent(L.f_a, L.g_a);
+    part(enc, "kda q k v");
+    bool done = false;
+    if (T == 1 && qkv_adjacent && gates_adjacent) {
+        // q/k/v, f_a/g_a and beta (all of xn) in one dispatch: the small ones hide under the large.
+        const std::array<mtl::Gemv::Job, 3> jobs{gemv_job(L.wq, xn, 0, qkv, 0, 3, 1, true),
+                                                  gemv_job(L.f_a, xn, 0, fga, 0, 2, 1, true),
+                                                  gemv_job(L.beta, xn, 0, braw, 0, 1, 1, false)};
+        if (gemv_jobs_ok(jobs)) {
+            gemv_jobs(enc, jobs);
+            done = true;
+        }
+    }
+    if (!done) {
+        if (T == 1 && qkv_adjacent) {
+            gemv(enc, L.wq, xn, 0, qkv, 0, 3, 1, true);
+        } else {
+            proj(enc, L.wq, xn, 0, qkv, 0, T, 3 * inner);
+            proj(enc, L.wk, xn, 0, qkv, uint64_t(inner) * 4, T, 3 * inner);
+            proj(enc, L.wv, xn, 0, qkv, uint64_t(inner) * 8, T, 3 * inner);
+        }
+    }
     part(enc, "kda gates");
-    if (T < gemm_min_tokens_ && adjacent(L.f_a, L.g_a)) {
-        gemv(enc, L.f_a, xn, 0, fga, 0, 2, T, true);
-    } else {
-        proj(enc, L.f_a, xn, 0, fga, 0, T);
-        proj(enc, L.g_a, xn, 0, fga, ga_off, T);
+    if (!done) {
+        if (gates_adjacent) {
+            gemv(enc, L.f_a, xn, 0, fga, 0, 2, T, true);
+        } else {
+            proj(enc, L.f_a, xn, 0, fga, 0, T);
+            proj(enc, L.g_a, xn, 0, fga, ga_off, T);
+        }
+        proj(enc, L.beta, xn, 0, braw, 0, T);
     }
     proj(enc, L.f_b, fga, 0, graw, 0, T);
-    proj(enc, L.beta, xn, 0, braw, 0, T);
     proj(enc, L.g_b, fga, ga_off, g2, 0, T);
     const bool fused = !probe_; // the probes read the conv output before its norm
     if (fused) {
@@ -564,11 +588,38 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* vout = scratch("vout", T * vrow * 4);
 
     part(enc, "mla q kv");
-    proj(enc, L.q_a, xn, 0, qr, 0, T);
-    norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
-    proj(enc, L.q_b, qrn, 0, q, 0, T);
-    proj(enc, L.kv_a, xn, 0, kv, 0, T);
-    norm(enc, kv, &L.kv_a_norm, kvn, T, R, R, cfg_.rms_eps);
+    // A few tokens: the projections of xn (q_a, kv_a, the indexer's key, gate and weights) in one dispatch, then
+    // those of the normed q latent (q_b, the indexer's query) in one.
+    bool projected = false;
+    if (T < gemm_min_tokens_) {
+        const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads;
+        MTL::Buffer* iq = scratch("iq", uint64_t(T) * Hi * Di * 4);
+        MTL::Buffer* ikr = scratch("ikr", uint64_t(T) * Di * 4);
+        MTL::Buffer* iw = scratch("iw", uint64_t(T) * Hi * 4);
+        mtl::Gemv::Job gate = gemv_job(L.idx_gate, xn, 0, idx_cache_[il].get(), uint64_t(pos0) * 2 * Di * 4 + Di * 4,
+                                       1, T, false);
+        gate.ldy = 2 * Di;
+        const std::array<mtl::Gemv::Job, 5> first{gemv_job(L.q_a, xn, 0, qr, 0, 1, T, false),
+                                                  gemv_job(L.kv_a, xn, 0, kv, 0, 1, T, false),
+                                                  gemv_job(L.idx_k, xn, 0, ikr, 0, 1, T, false), gate,
+                                                  gemv_job(L.idx_proj, xn, 0, iw, 0, 1, T, false)};
+        const std::array<mtl::Gemv::Job, 2> second{gemv_job(L.q_b, qrn, 0, q, 0, 1, T, false),
+                                                   gemv_job(L.idx_q_b, qrn, 0, iq, 0, 1, T, false)};
+        if (gemv_jobs_ok(first) && gemv_jobs_ok(second)) {
+            gemv_jobs(enc, first);
+            norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+            gemv_jobs(enc, second);
+            norm(enc, kv, &L.kv_a_norm, kvn, T, R, R, cfg_.rms_eps);
+            projected = true;
+        }
+    }
+    if (!projected) {
+        proj(enc, L.q_a, xn, 0, qr, 0, T);
+        norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+        proj(enc, L.q_b, qrn, 0, q, 0, T);
+        proj(enc, L.kv_a, xn, 0, kv, 0, T);
+        norm(enc, kv, &L.kv_a_norm, kvn, T, R, R, cfg_.rms_eps);
+    }
 
     const uint32_t n = T * R;
     enc->setComputePipelineState(pso("store_half"));
@@ -605,7 +656,7 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     part(enc, "mla k_b v_b");
     per_head(L.k_b, q, cfg_.head_k, qabs, R);
     part(enc, "mla indexer project");
-    indexer_project(enc, L, il, xn, qrn, T, pos0);
+    indexer_project(enc, L, il, xn, qrn, T, pos0, projected);
     part(enc, "mla dense attention");
     const uint32_t kp = cfg_.indexer_kpool, n_top = cfg_.indexer_top_k / kp;
     // Query tokens per attention group: up to 16, fewer when the scores would pass 4M floats.
@@ -638,7 +689,7 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
 // Indexer inputs for T tokens at positions pos0..: their query and weight projections, their key|gate rows of the
 // layer's indexer cache, and the pools those rows complete.
 void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
-                             MTL::Buffer* qrn, uint32_t T, uint32_t pos0)
+                             MTL::Buffer* qrn, uint32_t T, uint32_t pos0, bool projected)
 {
     const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads, kp = cfg_.indexer_kpool;
     MTL::Buffer* iq = scratch("iq", uint64_t(T) * Hi * Di * 4);
@@ -647,9 +698,10 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     MTL::Buffer* cache = idx_cache_[il].get();
     const uint64_t row = uint64_t(pos0) * 2 * Di * 4;
 
-    if (qrn) // else only the cache rows and pools (no queries)
+    if (qrn && !projected) // else only the cache rows and pools (no queries)
         proj(enc, L.idx_q_b, qrn, 0, iq, 0, T);
-    proj(enc, L.idx_k, xn, 0, ikr, 0, T);
+    if (!projected)
+        proj(enc, L.idx_k, xn, 0, ikr, 0, T);
     const LayerNormArgs na{Di, cfg_.norm_eps, 2 * Di};
     enc->setComputePipelineState(pso("layer_norm"));
     enc->setBuffer(ikr, 0, 0);
@@ -660,9 +712,11 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "layer_norm");
-    proj(enc, L.idx_gate, xn, 0, cache, row + Di * 4, T, 2 * Di);
-    if (qrn)
-        proj(enc, L.idx_proj, xn, 0, iw, 0, T);
+    if (!projected) {
+        proj(enc, L.idx_gate, xn, 0, cache, row + Di * 4, T, 2 * Di);
+        if (qrn)
+            proj(enc, L.idx_proj, xn, 0, iw, 0, T);
+    }
 
     const uint32_t first = pos0 / kp, last = (pos0 + T) / kp;
     if (last > first) {

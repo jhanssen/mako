@@ -36,6 +36,9 @@ struct Options {
     Telemetry telemetry = Telemetry::off; // layers: per-layer GPU timestamps (extra encoder boundaries)
     bool mtp = false; // load the next-token block (speculative decoding): its weights, caches and expert slots
     uint32_t checkpoints = 4; // checkpoints (checkpoint()) the memory budget reserves room for
+    // Dense Q6_K and Q8_0 matrices re-quantized to this type at load (fewer bytes a token; measured in
+    // docs/performance.md). Env MAKO_DENSE_QUANT=q4_k|q5_k|q6_k when unset.
+    std::optional<gguf::Type> dense_quant;
     // Nonzero: behave as on a Mac with this much RAM (GB): the difference is locked before loading, and the memory
     // budget uses this RAM size and a proportionally smaller GPU working set.
     double simulate_ram_gb = 0;
@@ -123,8 +126,9 @@ private:
              uint32_t T, uint32_t pos0);
     void attend(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off, MTL::Buffer* out,
                 uint64_t out_off, uint32_t tokens, uint32_t first_kv);
+    // With projected, the query, key, gate and weight projections are already in iq, ikr, the cache and iw.
     void indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
-                         MTL::Buffer* qrn, uint32_t T, uint32_t pos0);
+                         MTL::Buffer* qrn, uint32_t T, uint32_t pos0, bool projected = false);
     bool indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos, uint32_t count = 1);
     void attend_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* cache, MTL::Buffer* q, uint64_t q_off,
                        MTL::Buffer* out, uint64_t out_off, uint32_t tokens);

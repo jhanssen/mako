@@ -1,5 +1,6 @@
 // Runs token ids (or '@text') through the GLM engine and prints the top logits at each position and a greedy continuation.
 //   mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K] [--ref DIR] [--dump DIR] [--indexer-top-k N]
+//            [--dense-quant q4_k|q5_k|q6_k]
 //            [--force DIR] [--force-route DIR] [--arena-gb N] [--stage-gb N] [--expert-counts FILE] [--save-counts FILE] [--learn]
 //            [--stats summary|steps|layers|kernels] [--stats-out FILE] [--prefill-chunk N] [--prefill-group N] [--logits-out DIR]
 //            [--spec] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--seed N] [--ablate FILE] [--ablate-scale S]
@@ -153,6 +154,14 @@ int main(int argc, char** argv)
             n_gen = std::stoi(v);
         else if (a == "--ctx")
             opts.max_ctx = uint32_t(std::stoul(v));
+        else if (a == "--dense-quant") {
+            const std::string_view q(v);
+            if (q != "q4_k" && q != "q5_k" && q != "q6_k") {
+                std::println(stderr, "--dense-quant takes q4_k, q5_k or q6_k");
+                return 1;
+            }
+            opts.dense_quant = q == "q4_k" ? mako::gguf::Type::Q4_K : q == "q5_k" ? mako::gguf::Type::Q5_K : mako::gguf::Type::Q6_K;
+        }
         else if (a == "--top")
             top = std::stoi(v);
         else if (a == "--indexer-top-k")

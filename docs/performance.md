@@ -28,6 +28,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | The step's command buffer committed after layer 0 and the rest encoded into a second one while the GPU runs (`commit_ahead`; the CPU's ~0.3 ms of encoding came before the GPU started) | 24.7 -> 24.4 ms/token; tokens identical |
 | hc_step_a, hc_step_b and the rms norm after them in one dispatch (`hc_step_norm`: the token's last threadgroup, found by a device-scope fence and a counter, mixes the streams and norms x) | 180 fewer dispatches a token: -0.25 ms; outputs bit-identical (e2e tests unchanged) |
 | The router GEMV routing in its last threadgroup (`mako_mul_mv_f32_f32_4_route`); conv, gate and the q/k l2 norm in one kernel per head (`kda_prep`) | 110 fewer dispatches: no measurable change (+-0.1 ms). A dispatch boundary costs ~1 us; what a small kernel costs is its chain of dependent memory round trips (~0.8 us each), which a fused kernel keeps |
+| Independent GEMVs of one input in one dispatch (`mako_mul_mv_jobs`: a job table of GPU addresses, each job its format's kernel over its own threadgroups, 4 simdgroups a threadgroup, every row summed as before): KDA q/k/v + f_a/g_a + beta; routed gate + up + the shared gate/up, both swiglus (`swiglu2`), routed down + shared down; MLA q_a + kv_a + the indexer's key, gate and weights, then q_b + the indexer's query | 24.8-25.3 -> 23.1 ms/token (three A/B pairs, 43.3 tok/s); tokens identical, e2e tests unchanged. ~8 us a merged-away dispatch: one ramp-up and tail for the group, the IQ2_XXS fixed cost once, the small Q6_K and Q8_0 GEMVs hidden under the large ones |
 
 Where a short-prompt decode step goes (2026-10-26, 789-token prompt, 128 tokens, every expert resident, 25.0
 ms/token; ~9.6 GB read a token, ~17.4 ms at 553 GB/s). Each line is the step time saved by leaving those dispatches
@@ -56,11 +57,24 @@ MB GEMV adds ~4 us over free-running). Fusing kernels removes the ~1 us boundary
 (`gemv_bench`, time against matrices a dispatch): Q6_K streams at ~580 GB/s with ~3 us fixed a dispatch, IQ2_XXS
 527 GB/s + ~9 us, IQ2_S 463 GB/s + ~7 us, IQ3_XXS 580 GB/s + ~7 us, Q8_0 4096x128 575 GB/s + ~2 us, the F32 router
 475 GB/s; so the big GEMVs hold ~1.5-2 ms (the IQ2_S kernel, the IQ2_XXS fixed cost, independent GEMVs in separate
-dispatches), the small kernels ~4.5 ms, the dense weights the rest.
+dispatches), the small kernels ~4.5 ms, the dense weights the rest. With the multi-GEMV dispatches: 23.1 ms/token.
 
 Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
 10-19 ms (not overlapped), drafting ~2.3 ms. The big GEMVs already run at ~400 GB/s of the 553 GB/s measured (614
 GB/s specified); the estimated bandwidth floor is ~20 ms/step.
+
+Dense re-quantization at load (`mako_run --dense-quant q5_k|q4_k`, or `MAKO_DENSE_QUANT`; every Q6_K and Q8_0
+dense matrix, from the stored Q6_K rows, unweighted), 512-token parity prompt against the reference (`regress_test
+parity`; the stored weights' decode numbers are the passing test's):
+
+| Dense | ms/token | KL prefill / decode | Top-1 prefill / decode |
+| --- | ---: | ---: | ---: |
+| Q6_K as stored (7.1 GB) | 24.5 | 0.0091 / ~0.012 | 95.5% / 94.5% |
+| Q5_K (6.0 GB) | 22.5 | 0.0154 / 0.0230 | 93.6% / 90.6% |
+| Q4_K (5.0 GB) | 20.6 | 0.0251 / 0.0368 | 92.2% / 85.9% |
+
+Loading takes ~24 s longer (the CPU re-quantizes 7 GB). A build from the original weights, or re-quantizing only
+the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither is measured.
 
 ### Tried and rejected
 

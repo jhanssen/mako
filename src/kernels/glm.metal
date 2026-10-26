@@ -810,6 +810,34 @@ template [[host_name("swiglu")]] kernel void swiglu<float>(device const float*, 
 template [[host_name("swiglu_half")]] kernel void swiglu<half>(device const float*, device const float*, device half*,
                                                               constant SwigluArgs&, uint);
 
+struct Swiglu2Args {
+    uint n0, n1;
+    float limit0, limit1;
+};
+
+// Two swiglus in one dispatch: (g0, u0) -> y0 over n0 and (g1, u1) -> y1 over n1, each as swiglu computes it.
+kernel void swiglu2(device const float* g0 [[buffer(0)]], device const float* u0 [[buffer(1)]],
+                    device float* y0 [[buffer(2)]], device const float* g1 [[buffer(3)]],
+                    device const float* u1 [[buffer(4)]], device float* y1 [[buffer(5)]],
+                    constant Swiglu2Args& a [[buffer(6)]], uint i [[thread_position_in_grid]])
+{
+    if (i >= a.n0 + a.n1)
+        return;
+    const bool second = i >= a.n0;
+    const uint idx = second ? i - a.n0 : i;
+    const float limit = second ? a.limit1 : a.limit0;
+    float g = second ? g1[idx] : g0[idx], u = second ? u1[idx] : u0[idx];
+    if (limit > 0.0f) {
+        g = min(g, limit);
+        u = clamp(u, -limit, limit);
+    }
+    const float v = g * sigmoidf(g) * u;
+    if (second)
+        y1[idx] = v;
+    else
+        y0[idx] = v;
+}
+
 struct CombineArgs {
     uint n;
     uint n_used;

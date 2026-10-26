@@ -52,6 +52,10 @@ struct SwigluArgs {
     uint32_t n;
     float limit;
 };
+struct Swiglu2Args {
+    uint32_t n0, n1;
+    float limit0, limit1;
+};
 struct CombineArgs {
     uint32_t n, n_used;
 };
@@ -465,12 +469,13 @@ EngineBase::DevTensor EngineBase::upload(const std::string& name)
     if (!ref)
         throw std::runtime_error("missing tensor " + name);
     const gguf::Tensor& t = *ref.tensor;
-    if (dense_quant_ && t.type == gguf::Type::Q8_0 && t.dims[0] % 256 == 0)
+    if (dense_quant_ && (t.type == gguf::Type::Q8_0 || t.type == gguf::Type::Q6_K) && t.type != *dense_quant_ &&
+        t.dims[0] % 256 == 0)
         return upload_requant(ref.file->fd(), t, *dense_quant_, name);
     return upload_raw(ref.file->fd(), t.offset, t.bytes, t.type, t.dims, name);
 }
 
-// Q8_0 rows dequantized and quantized again to `to`, on all cores.
+// Q8_0 or Q6_K rows dequantized and quantized again to `to`, on all cores.
 EngineBase::DevTensor EngineBase::upload_requant(int fd, const gguf::Tensor& t, gguf::Type to, const std::string& name)
 {
     const uint64_t k = t.dims[0], src_rb = mtl::Gemv::row_bytes(t.type, uint32_t(k));
@@ -930,6 +935,47 @@ void EngineBase::note_resident()
     }
 }
 
+mtl::Gemv::Job EngineBase::gemv_job(const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
+                                    uint64_t y_off, uint32_t batch, uint32_t t, bool x_shared) const
+{
+    mtl::Gemv::Job j;
+    j.a.type = w.type;
+    j.a.k = uint32_t(w.dims[0]);
+    j.a.n = uint32_t(w.dims[1]);
+    j.a.t = t;
+    j.a.batch = batch;
+    j.a.x_shared = x_shared;
+    j.w = w.buf;
+    j.w_off = w.off;
+    j.x = x;
+    j.x_off = x_off;
+    j.y = y;
+    j.y_off = y_off;
+    return j;
+}
+
+bool EngineBase::gemv_jobs_ok(std::span<const mtl::Gemv::Job> jobs) const
+{
+    if (jobs.empty() || repeat_n_ != 1 || tel_ == Telemetry::kernels)
+        return false;
+    for (const auto& j : jobs)
+        if (!gemv_->job_supported(j.a) || j.a.t != jobs[0].a.t)
+            return false;
+    return true;
+}
+
+void EngineBase::gemv_jobs(MTL::ComputeCommandEncoder*& enc, std::span<const mtl::Gemv::Job> jobs)
+{
+    constexpr uint64_t kTableBytes = 1 << 20;
+    if (!jobs_table_)
+        jobs_table_ = mtl::Ref<MTL::Buffer>(ctx_.device()->newBuffer(kTableBytes, MTL::ResourceStorageModeShared));
+    const uint64_t bytes = jobs.size() * mtl::Gemv::kJobBytes;
+    if (jobs_off_ + bytes > kTableBytes)
+        throw std::runtime_error("too many GEMV jobs in one step");
+    gemv_->encode_jobs(enc, jobs, jobs_table_.get(), jobs_off_);
+    jobs_off_ += bytes;
+}
+
 void EngineBase::finish(MTL::CommandBuffer* cb)
 {
     auto t0 = Clock::now();
@@ -950,6 +996,7 @@ void EngineBase::finish(MTL::CommandBuffer* cb)
                                                  c->error() ? c->error()->localizedDescription()->utf8String() : "?"));
     }
     ahead_.clear();
+    jobs_off_ = 0; // every dispatch that read the job tables has completed
     deliver_probes();
 }
 
@@ -1124,6 +1171,61 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
         pending_moe_.push_back({il, v, T, predict ? ahead : 0u});
         enc = encoder(cb, tl, il < dims_.n_layer ? 2 : -1);
     }
+    auto bufs = [&](const char* tag) {
+        return std::array<MTL::Buffer*, 4>{scratch(std::string("eg") + tag, uint64_t(T) * k * nff * 4),
+                                           scratch(std::string("eu") + tag, uint64_t(T) * k * nff * 4),
+                                           scratch(std::string("em") + tag, uint64_t(T) * k * nff * 4),
+                                           scratch(std::string("ed") + tag, uint64_t(T) * k * E * 4)};
+    };
+    // Every expert resident and no observer between: the routed gate and up and the shared gate/up in one
+    // dispatch, both swiglus in one, the routed down and the shared down in one (3 dispatches instead of 8).
+    if (resident && !between && T <= kMaxDecodeTokens && adjacent(mw.sh_gate, mw.sh_up)) {
+        const uint32_t nff_sh = uint32_t(mw.sh_gate.dims[1]);
+        const uint64_t sh_rows = uint64_t(T) * nff_sh * 4;
+        MTL::Buffer* gu = scratch("ffgu", 2 * sh_rows);
+        MTL::Buffer* m = scratch("ffm", sh_rows);
+        const auto h = bufs("h");
+        auto routed_job = [&](int part, MTL::Buffer* in, MTL::Buffer* out) {
+            const ExpertArena::Region& r = arena_->region(il, part);
+            mtl::Gemv::Job j;
+            j.a = part_args(part, T);
+            j.w = r.buf;
+            j.w_off = r.off;
+            j.x = in;
+            j.y = out;
+            j.ids = hit_ids;
+            j.stride = r.stride;
+            j.tail = {r.tail, r.tail_off, r.split};
+            return j;
+        };
+        const std::array<mtl::Gemv::Job, 3> up_jobs{routed_job(0, xn, h[0]), routed_job(1, xn, h[1]),
+                                                     gemv_job(mw.sh_gate, xn, 0, gu, 0, 2, T, true)};
+        const std::array<mtl::Gemv::Job, 2> down_jobs{routed_job(2, h[2], h[3]),
+                                                       gemv_job(mw.sh_down, m, 0, sho, 0, 1, T, false)};
+        if (gemv_jobs_ok(up_jobs) && gemv_jobs_ok(down_jobs)) {
+            part(enc, "moe resident experts");
+            gemv_jobs(enc, up_jobs);
+            const Swiglu2Args s2{T * k * nff, T * nff_sh, mw.clamp_exp > 1e-6f ? mw.clamp_exp : 0.0f,
+                                 mw.clamp_sh > 1e-6f ? mw.clamp_sh : 0.0f};
+            enc->setComputePipelineState(pso("swiglu2"));
+            enc->setBuffer(h[0], 0, 0);
+            enc->setBuffer(h[1], 0, 1);
+            enc->setBuffer(h[2], 0, 2);
+            enc->setBuffer(gu, 0, 3);
+            enc->setBuffer(gu, sh_rows, 4);
+            enc->setBuffer(m, 0, 5);
+            enc->setBytes(&s2, sizeof(s2), 6);
+            enc->dispatchThreads(MTL::Size(s2.n0 + s2.n1, 1, 1), MTL::Size(256, 1, 1));
+            after(enc, "swiglu2");
+            gemv_jobs(enc, down_jobs);
+            const auto mm = bufs("m");
+            const CombineArgs ca{E, k};
+            part(enc, "moe combine");
+            dispatch(enc, "moe_combine_split", {h[3], mm[3], miss_rank, ew, sho, ffo}, &ca, sizeof(ca),
+                     MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+            return;
+        }
+    }
     part(enc, "moe shared expert");
     // The CPU starts on the misses as soon as the route is known; the shared expert runs meanwhile.
     ffn_dense(enc, mw.sh_gate, mw.sh_up, mw.sh_down, xn, sho, mw.clamp_sh, T);
@@ -1145,12 +1247,6 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
                                   miss ? indirect : nullptr, ind_at + uint64_t(part) * 12, {r.tail, r.tail_off, r.split});
         if (tel_ == Telemetry::kernels)
             after(enc, label);
-    };
-    auto bufs = [&](const char* tag) {
-        return std::array<MTL::Buffer*, 4>{scratch(std::string("eg") + tag, uint64_t(T) * k * nff * 4),
-                                           scratch(std::string("eu") + tag, uint64_t(T) * k * nff * 4),
-                                           scratch(std::string("em") + tag, uint64_t(T) * k * nff * 4),
-                                           scratch(std::string("ed") + tag, uint64_t(T) * k * E * 4)};
     };
     const auto h = bufs("h");
     part(enc, "moe resident experts");

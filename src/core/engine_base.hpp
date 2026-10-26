@@ -115,7 +115,7 @@ protected:
     EngineBase& operator=(const EngineBase&) = delete;
 
     // Reads a dense tensor into the resident weight buffers (BF16 becomes F32).
-    // Dense weights; Q8_0 matrices are re-quantized to dense_quant_ when it is set.
+    // Dense weights; Q8_0 and Q6_K matrices are re-quantized to dense_quant_ when it is set.
     DevTensor upload(const std::string& name);
     DevTensor upload_requant(int fd, const gguf::Tensor& t, gguf::Type to, const std::string& name);
     std::optional<gguf::Type> dense_quant_;
@@ -171,6 +171,12 @@ protected:
     void hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
                  const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc,
                  uint32_t T = 1, const DevTensor* norm_w = nullptr, MTL::Buffer* xn = nullptr);
+    // Independent GEMVs over the same tokens in one dispatch (Gemv::encode_jobs), when every job's format has a
+    // kernel there (gemv_jobs_ok); the table rows come from the step's jobs_table_.
+    bool gemv_jobs_ok(std::span<const mtl::Gemv::Job> jobs) const;
+    void gemv_jobs(MTL::ComputeCommandEncoder*& enc, std::span<const mtl::Gemv::Job> jobs);
+    mtl::Gemv::Job gemv_job(const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y, uint64_t y_off,
+                            uint32_t batch, uint32_t t, bool x_shared) const;
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
                    uint64_t x_off = 0, uint64_t out_off = 0);
@@ -326,6 +332,8 @@ protected:
     std::vector<MTL::CommandBuffer*> ahead_; // committed by commit_ahead, waited for in finish()
     mtl::Ref<MTL::Buffer> hc_counters_;      // hc_step_norm: a threadgroup counter per token, zero between dispatches
     mtl::Ref<MTL::Buffer> route_counters_;   // the routing router GEMV: the same
+    mtl::Ref<MTL::Buffer> jobs_table_;       // multi-GEMV dispatches' job tables of the step, jobs_off_ used so far
+    uint64_t jobs_off_ = 0;
     uint32_t cur_layer_ = 0;
     std::vector<mtl::Ref<MTL::CounterSampleBuffer>> samples_; // kSamplesPerBuffer each; index / that picks one
     std::vector<Timed> timed_;
