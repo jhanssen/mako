@@ -17,12 +17,13 @@ int main(int argc, char** argv)
         std::println(stderr, "usage: engram_test <model-00001.gguf> <engram.gguf> <expected.txt>");
         return 2;
     }
-    if (!std::filesystem::exists(argv[1]) || !std::filesystem::exists(argv[2])) {
+    const std::string engram_list = argv[2], first_engram = engram_list.substr(0, engram_list.find(','));
+    if (!std::filesystem::exists(argv[1]) || !std::filesystem::exists(first_engram)) {
         std::println("model {} or Engram tables {} not found: skipped", argv[1], argv[2]);
         return 77;
     }
     auto m = mako::gguf::ModelFiles::open(argv[1]);
-    if (!m || !m->add(argv[2]) || !mako::dsv41::Engram::add_named(*m, argv[1])) {
+    if (!m || !mako::dsv41::Engram::add_files(*m, argv[2]) || !mako::dsv41::Engram::add_named(*m, argv[1])) {
         std::println(stderr, "cannot open the model files");
         return 1;
     }

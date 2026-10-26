@@ -177,7 +177,10 @@ int main(int argc, char** argv)
         std::println(stderr, "{}", m.error());
         return 1;
     }
-    if (auto r = m->add(argv[2]).and_then([&] { return mako::dsv41::Engram::add_named(*m, argv[1]); }); !r) {
+    if (auto r = mako::dsv41::Engram::add_files(*m, argv[2]).and_then([&] {
+            return mako::dsv41::Engram::add_named(*m, argv[1]);
+        });
+        !r) {
         std::println(stderr, "{}", r.error());
         return 1;
     }

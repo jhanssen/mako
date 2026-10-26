@@ -51,6 +51,18 @@ std::expected<void, std::string> Engram::add_named(gguf::ModelFiles& m, const st
     return {};
 }
 
+std::expected<void, std::string> Engram::add_files(gguf::ModelFiles& m, const std::string& list)
+{
+    for (size_t at = 0; at <= list.size();) {
+        const size_t end = std::min(list.find(',', at), list.size());
+        if (end > at)
+            if (auto r = m.add(list.substr(at, end - at)); !r)
+                return r;
+        at = end + 1;
+    }
+    return {};
+}
+
 std::expected<Engram, std::string> Engram::open(const Config& cfg, const gguf::ModelFiles& m)
 {
     const auto& c = cfg.engram;

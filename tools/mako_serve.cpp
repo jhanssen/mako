@@ -152,7 +152,9 @@ int main(int argc, char** argv)
     }
     const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
     if (deepseek) {
-        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1]) : model->add(engram); !r) {
+        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1])
+                                    : mako::dsv41::Engram::add_files(*model, engram);
+            !r) {
             std::println(stderr, "{}", r.error());
             return 1;
         }

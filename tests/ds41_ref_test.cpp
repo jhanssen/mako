@@ -165,7 +165,8 @@ int main(int argc, char** argv)
         return 2;
     }
     const std::string mode = argv[3];
-    if (!fs::exists(argv[1]) || !fs::exists(argv[2])) {
+    const std::string engram_list = argv[2], first_engram = engram_list.substr(0, engram_list.find(','));
+    if (!fs::exists(argv[1]) || !fs::exists(first_engram)) {
         std::println("model {} or Engram tables {} not found: skipped", argv[1], argv[2]);
         return 77;
     }
@@ -175,7 +176,7 @@ int main(int argc, char** argv)
         return 77;
     }
     auto m = mako::gguf::ModelFiles::open(argv[1]);
-    if (!m || !m->add(argv[2]) || !mako::dsv41::Engram::add_named(*m, argv[1])) {
+    if (!m || !mako::dsv41::Engram::add_files(*m, argv[2]) || !mako::dsv41::Engram::add_named(*m, argv[1])) {
         std::println(stderr, "cannot open the model files");
         return 1;
     }
