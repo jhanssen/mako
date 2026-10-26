@@ -79,13 +79,28 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
     const uint32_t room = engine.max_context() - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
     cr.gen.speculative = opts.speculative;
-    if (cr.tool_required) {
-        parser.require_call(cr.tool_name);
-        cr.gen.forced = [&parser] { return parser.forced(); };
+    // The reasoning budget, cut to leave a capped reply room to answer.
+    uint32_t budget = cr.reasoning_budget.value_or(opts.reasoning_budget);
+    if (cr.max_tokens_given && cr.gen.max_tokens >= 1024) {
+        const uint32_t m = cr.gen.max_tokens, cap = m - std::min(std::max(512u, m / 4), m / 2);
+        budget = budget ? std::min(budget, cap) : cap;
     }
+    std::optional<ReasoningBudget> rb;
+    if (budget && cr.reasoning_first)
+        rb.emplace(tok, budget);
+    if (cr.tool_required)
+        parser.require_call(cr.tool_name);
+    if (rb || cr.tool_required)
+        cr.gen.forced = [&, nv = engine.n_vocab()](const float* logits) {
+            if (rb && parser.in_reasoning())
+                return rb->forced(logits, nv);
+            return parser.forced();
+        };
     bool client_gone = false;
     auto r = session.generate(prompt, cr.gen, [&](int32_t token) {
         Delta d;
+        if (rb)
+            rb->push(token, parser.in_reasoning());
         const bool more = parser.push(token, d);
         if (!d.empty() && !on_delta(d)) {
             client_gone = true;
@@ -98,6 +113,9 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
     parser.finish(d);
     if (!d.empty() && !client_gone)
         on_delta(d);
+    if (rb && rb->how())
+        log::info("reasoning {} after {} tokens (budget {})", rb->how() == 1 ? "closed early" : "cut", rb->thought(),
+                  budget);
     return r;
 }
 

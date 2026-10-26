@@ -58,6 +58,14 @@ GLM-5.3's template knows low and high and always reasons).
 `--reasoning-effort none|low|medium|high|max|N` sets the effort for requests that name none; a value the template
 cannot take stops the server at startup. The effort is what the model was trained to follow, not a token limit.
 
+A budget is the limit: `--reasoning-budget N` for requests that name none, `reasoning_budget_tokens` (or
+`thinking_budget_tokens`) in a Chat Completions request, `thinking.budget_tokens` in an Anthropic one (0: none). In
+the last stretch before it (a quarter of the budget, at most 1024 tokens) the reasoning is closed as soon as
+`</think>` is among the model's three likeliest tokens; at the budget the server writes "I have to stop thinking here
+and give my answer." and `</think>`, and the model answers. A reply capped at 1024 tokens or more also keeps a quarter
+of the cap (512 tokens up to half of it) for the answer, budget or not. The log says when either cut the reasoning.
+A cut in the middle of a calculation can leave the answer wrong.
+
 ## Behaviour
 
 - Prompts use the GGUF's chat template, sampling defaults its `general.sampling.*` metadata.

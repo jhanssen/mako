@@ -293,6 +293,9 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
         s.top_k = uint32_t(std::max(0.0, *b.top_k));
     r.gen.seed = (uint64_t(std::random_device{}()) << 32) | std::random_device{}();
     r.gen.max_tokens = b.max_tokens ? uint32_t(std::clamp(*b.max_tokens, 1.0, 4e9)) : 0;
+    r.max_tokens_given = r.gen.max_tokens > 0;
+    if (r.show_reasoning && b.thinking->budget_tokens)
+        r.reasoning_budget = uint32_t(std::clamp<int64_t>(*b.thinking->budget_tokens, 0, UINT32_MAX));
     if (b.stop_sequences)
         for (const auto& x : *b.stop_sequences)
             if (!x.empty())

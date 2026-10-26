@@ -36,6 +36,8 @@ struct ChatRequest {
     bool tool_required = false; // tool_choice "required" or a named function
     std::string tool_name;      // a named function's
     bool reasoning_first = true; // the rendered prompt opened the reasoning (ends in <think>)
+    std::optional<uint32_t> reasoning_budget; // the request's (0: none); unset: the server's
+    bool max_tokens_given = false;            // the client capped the reply
 };
 
 // A reasoning effort: a level name, or a number for templates that take one (1..100; 0 as "none").
@@ -98,6 +100,7 @@ public:
     void require_call(const std::string& name = {});
     // The token the next one must be, else -1 (GenerateParams::forced).
     int32_t forced() const;
+    bool in_reasoning() const { return mode_ == Mode::reasoning; }
     // Returns false once a stop string ended the answer (later tokens are ignored).
     bool push(int32_t token, Delta& out);
     // End of generation: whatever is held back.
@@ -141,6 +144,29 @@ private:
     std::string dsml_;             // DSML text not yet parsed
     std::vector<int32_t> forced_;  // DSML: a required call's opening tokens
     size_t forced_seen_ = 0;
+};
+
+// Ends the reasoning after `budget` tokens of it: in the last stretch before (a quarter of the budget, at most 1024
+// tokens) as soon as </think> is among the model's three likeliest tokens, at the budget by forcing a short closing
+// sentence and </think>.
+class ReasoningBudget {
+public:
+    ReasoningBudget(const text::Tokenizer& tok, uint32_t budget);
+    // Each generated token, and whether the reasoning was still open when it came.
+    void push(int32_t token, bool reasoning);
+    // GenerateParams::forced while the reasoning is open: the token the next must be, else -1.
+    int32_t forced(const float* logits, uint32_t n_vocab) const;
+    uint32_t thought() const { return thought_; }
+    // How the reasoning ended: 0 by itself (or not yet), 1 closed early, 2 cut at the budget.
+    int how() const { return how_; }
+
+private:
+    std::vector<int32_t> wrap_; // the closing sentence, then </think>
+    int32_t think_end_;
+    uint32_t budget_, soft_from_, thought_ = 0;
+    size_t wrapped_ = 0;
+    int how_ = 0;
+    mutable int64_t soft_at_ = -1; // thought_ when forced() closed early
 };
 
 // Chat Completions response bodies (JSON). A chunk with `role` opens the stream; one with `usage` closes it.

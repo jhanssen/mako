@@ -140,7 +140,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     };
 
     auto choose = [&](const float* logits) {
-        const int32_t f = p.forced ? p.forced() : -1;
+        const int32_t f = p.forced ? p.forced(logits) : -1;
         return f >= 0 ? f : sampler.sample(logits);
     };
     int32_t token = choose(lp.data());
@@ -168,7 +168,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             bool more = true;
             for (; kept < drafts.size(); ++kept) {
                 bool accepted = false;
-                const int32_t f = p.forced ? p.forced() : -1;
+                const int32_t f = p.forced ? p.forced(rows.data() + uint64_t(kept) * nv) : -1;
                 const int32_t t = f >= 0 ? (accepted = f == drafts[kept], f)
                                          : sampler.verify(rows.data() + uint64_t(kept) * nv, drafts[kept], accepted);
                 if (!accepted) {
@@ -201,7 +201,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             ctx_.push_back(draft);
             ++res.drafts;
             bool accepted = false;
-            const int32_t f = p.forced ? p.forced() : -1;
+            const int32_t f = p.forced ? p.forced(two.data()) : -1;
             const int32_t t1 = f >= 0 ? (accepted = f == draft, f) : sampler.verify(two.data(), draft, accepted);
             if (!accepted) {
                 e_.rollback();

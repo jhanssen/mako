@@ -87,8 +87,54 @@ std::pair<Parsed, Parsed> parse(const mako::text::Tokenizer& tok, const std::str
 }
 
 // DeepSeek-V4.1's markup: reasoning only when the prompt opened it, DSML tool calls.
+// ReasoningBudget with synthetic logits: nothing forced before the last stretch; there, </think> only when it is among
+// the three likeliest; at the budget the closing sentence and </think>, in order.
+void budget_checks(const mako::text::Tokenizer& tok)
+{
+    const int32_t end = tok.find("</think>"), filler = tok.encode("a", false).front();
+    const uint32_t nv = uint32_t(std::max(end, filler)) + 16;
+    std::vector<float> logits(nv, 0.0f);
+    {
+        mako::server::ReasoningBudget b(tok, 40); // last stretch from 30
+        for (int i = 0; i < 29; ++i) {
+            check(b.forced(logits.data(), nv) < 0, "budget: nothing forced early");
+            b.push(filler, true);
+        }
+        logits[end] = 1.0f;
+        check(b.forced(logits.data(), nv) < 0, "budget: </think> on top but before the last stretch");
+        b.push(filler, true);
+        for (int i = 0; i < 3; ++i)
+            logits[i] = 2.0f; // three above </think>
+        check(b.forced(logits.data(), nv) < 0, "budget: </think> fourth is not closed early");
+        logits[2] = 0.0f;
+        check(b.forced(logits.data(), nv) == end, "budget: </think> third closes early");
+        b.push(end, true);
+        check(b.how() == 1 && b.thought() == 31, "budget: closed early, counted");
+    }
+    {
+        std::ranges::fill(logits, 0.0f);
+        logits[filler] = 5.0f;
+        mako::server::ReasoningBudget b(tok, 8);
+        for (int i = 0; i < 8; ++i)
+            b.push(filler, true);
+        std::vector<int32_t> got;
+        for (int32_t f; got.size() < 64 && (f = b.forced(logits.data(), nv)) >= 0;) {
+            got.push_back(f);
+            b.push(f, true);
+            if (f == end)
+                break;
+        }
+        auto want = tok.encode("\n\nI have to stop thinking here and give my answer.\n", false);
+        want.push_back(end);
+        check(got == want, std::format("budget: closing sentence and </think> forced ({} of {} tokens)", got.size(),
+                                       want.size()));
+        check(b.how() == 2, "budget: cut at the budget");
+    }
+}
+
 int deepseek(const mako::text::Tokenizer& tok, const mako::chat::Template& tmpl)
 {
+    budget_checks(tok);
     {
         const auto [p, s] = parse(tok, "Weighing it.</think>The answer is 4.", kTools);
         check(p.reasoning == "Weighing it." && p.content == "The answer is 4." && p.calls.empty(), "reasoning, answer");
@@ -487,6 +533,7 @@ int main(int argc, char** argv)
     const auto [cut, cut_s] = parse(*tok, "unfinished reasoning", "[]");
     check(cut.reasoning == "unfinished reasoning" && cut.content.empty(), "reasoning cut off");
 
+    budget_checks(*tok);
     // Thinking controls: this template knows low and high only and always reasons.
     {
         using mako::server::BadRequest;

@@ -39,6 +39,7 @@ struct ChatBody {
     std::vector<MessageIn> messages;
     std::optional<glz::raw_json> tools, tool_choice, response_format, chat_template_kwargs;
     std::optional<Effort> reasoning_effort;
+    std::optional<int64_t> reasoning_budget_tokens, thinking_budget_tokens;
     std::optional<double> temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty, repetition_penalty;
     std::optional<double> max_tokens, max_completion_tokens, n;
     std::optional<int64_t> seed;
@@ -359,6 +360,9 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
             throw BadRequest("max_tokens must be positive");
         r.gen.max_tokens = uint32_t(std::min(*mt, 4e9));
     }
+    r.max_tokens_given = r.gen.max_tokens > 0;
+    if (const auto& rb = b.reasoning_budget_tokens ? b.reasoning_budget_tokens : b.thinking_budget_tokens)
+        r.reasoning_budget = uint32_t(std::clamp<int64_t>(*rb, 0, UINT32_MAX));
     if (b.n && *b.n != 1)
         throw BadRequest("n other than 1 is not supported");
     if (b.logprobs && *b.logprobs)
@@ -448,6 +452,41 @@ int32_t OutputParser::forced() const
             return named_has_args_ ? key_begin_ : call_end_;
     }
     return -1;
+}
+
+ReasoningBudget::ReasoningBudget(const text::Tokenizer& tok, uint32_t budget)
+    : wrap_(tok.encode("\n\nI have to stop thinking here and give my answer.\n", false)),
+      think_end_(tok.find("</think>")), budget_(budget), soft_from_(budget - std::min(1024u, budget / 4))
+{
+    wrap_.push_back(think_end_);
+}
+
+void ReasoningBudget::push(int32_t token, bool reasoning)
+{
+    if (!reasoning)
+        return;
+    if (thought_ >= budget_ && wrapped_ < wrap_.size() && token == wrap_[wrapped_])
+        ++wrapped_;
+    if (token == think_end_ && how_ == 0)
+        how_ = wrapped_ > 0 ? 2 : soft_at_ == int64_t(thought_) ? 1 : 0;
+    ++thought_;
+}
+
+int32_t ReasoningBudget::forced(const float* logits, uint32_t n_vocab) const
+{
+    if (think_end_ < 0)
+        return -1;
+    if (thought_ >= budget_)
+        return wrap_[std::min(wrapped_, wrap_.size() - 1)];
+    if (thought_ < soft_from_ || uint32_t(think_end_) >= n_vocab)
+        return -1;
+    const float v = logits[think_end_];
+    uint32_t above = 0;
+    for (uint32_t i = 0; i < n_vocab; ++i)
+        if (logits[i] > v && ++above >= 3)
+            return -1;
+    soft_at_ = thought_;
+    return think_end_;
 }
 
 bool OutputParser::push(int32_t token, Delta& out)

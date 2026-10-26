@@ -68,7 +68,7 @@ int main(int argc, char** argv)
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
                              "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
-                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N]");
+                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -166,6 +166,8 @@ int main(int argc, char** argv)
             so.dump_dir = v;
         else if (a == "--reasoning-effort")
             so.reasoning_effort = mako::server::parse_effort(v);
+        else if (a == "--reasoning-budget")
+            so.reasoning_budget = uint32_t(std::stoul(v));
         else if (a == "--api-key")
             add_keys(v, ',');
         else if (a == "--api-key-file") {
