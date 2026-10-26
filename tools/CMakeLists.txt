@@ -15,9 +15,6 @@ set_source_files_properties(mako_calibrate.cpp PROPERTIES
 
 add_executable(logit_compare logit_compare.cpp)
 
-add_executable(ffn_check ffn_check.cpp)
-target_link_libraries(ffn_check PRIVATE mako_glm)
-
 if(MAKO_REF_SRC AND MAKO_REF_BUILD)
     add_subdirectory(ref_dump)
 endif()

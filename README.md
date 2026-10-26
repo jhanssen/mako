@@ -161,4 +161,4 @@ numerical change, `regress_test <model> --update` re-records `tests/data/regress
 | `src/text` | tokenizer, UTF-8 streaming detokenizer |
 | `tools` | `mako_run`, `mako_serve`, `prefill_sweep`, `render_template`, `mako_calibrate`, `ds_run`, `engram_rows`, `logit_compare`, `gguf_dump`, optional `ref_dump` for parity checks |
 | `tests` | kernel, tokenizer, chat template, server, sampler and end-to-end regression tests (ctest) |
-| `bench` | SSD, sync, matmul and quantization-format microbenchmarks |
+| `bench` | SSD, matmul, GEMV and GEMM microbenchmarks |
