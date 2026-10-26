@@ -23,9 +23,10 @@ only on the M5 Max, and M3 is untested.
 - **DeepSeek-V4.1-Flash-1017**: `Maya-S/` from
   [peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)
   (6 files, the model and its Engram tables), and optionally `dspark/` (the drafter for speculative decoding).
-  Or, smaller and faster: the four `IQ2_XS` files and `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` from
+- **DeepSeek-V4.1-Flash-1017, smaller and faster**: the four `IQ2_XS` files and
+  `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` from
   [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
-  in one folder (mako opens the Engram file from there).
+  in one folder (mako opens the Engram file from there). The `dspark/` drafter has not been tried with it yet.
 
 ## Build
 
