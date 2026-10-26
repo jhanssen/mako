@@ -108,6 +108,24 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 - Decode misses still rise after a long prompt, less since staging (GLM: ~27 vs ~15 a step for the first 40 steps).
 - Expert GEMMs at few rows per expert in short prefills (512 tokens: experts ~714 ms GPU against a ~150 ms
   weight-read bound).
+- Decode at 23.1 ms/token, the weights ~16.3 ms of it. Not built, by expected gain:
+  - More independent GEMVs in one dispatch (`mako_mul_mv_jobs`): f_b + g_b (rows of 128: the job kernel needs the
+    short-row kernel as a job type), the MLA per-head k_b and v_b with their neighbours, hc_mean + the output norm.
+    ~0.3 ms.
+  - An IQ2_S decode kernel at the IQ3_XXS kernel's rate (463 -> ~580 GB/s on the 34 down projections): ~0.5 ms;
+    the IQ3_XXS rewrite was not bit-identical (compiler fusion), so expect a re-baseline.
+  - Sampling on the GPU with the next step encoded and committed before this one ends (the token read from a
+    buffer, the embedding row gathered on the GPU): the remaining CPU gap between steps, ~0.2-0.3 ms.
+  - Trimming dependent memory round trips inside the small kernels (loads issued before the waits they do not
+    depend on, e.g. hc_step_norm's phase B reading R before the parts): ~0.8 us a round trip, ~1 ms across the
+    ~400 small dispatches at most.
+  - The IQ2_XXS kernel's ~9 us fixed cost a dispatch (the grid table into threadgroup memory before the first
+    weight loads): issue the first weight loads before the table build. ~0.3 ms.
+  - Several sequences a step (continuous batching in the server) for parallel agent requests: throughput, not
+    latency; the kernels take T <= 8 rows already, the KDA/MLA state and the session API do not.
+  - An exact top-k head from a low-bit sketch (bounded error per row from the quantization residual and ||x||)
+    with exact rescoring of the candidates: ~0.3-0.6 ms of the head's 0.9, greedy/top-k sampling only.
+  - Dense weights below Q6_K: measured above and declined (Q5_K drops decode top-1 to ~90%).
 
 ## DeepSeek-V4.1-Flash-1017 (Maya-S IQ2_XXS, ~178 GB; ~40% of experts resident on 128 GB)
 
