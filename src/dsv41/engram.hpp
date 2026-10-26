@@ -19,6 +19,8 @@ public:
     // The GGUF holding a model's Engram tables when they are not in the model's own files: a .gguf with them in
     // <model dir>/Engram or <model dir>/../Engram. Empty when none is found.
     static std::string find_tables(const std::string& first_shard);
+    // Whether `m` already holds Engram tables (then find_tables is not needed).
+    static bool has_tables(const gguf::ModelFiles& m);
 
     // Finds the tables in `m` (one tensor holding every layer's table in turn, or one per layer).
     static std::expected<Engram, std::string> open(const Config& cfg, const gguf::ModelFiles& m);

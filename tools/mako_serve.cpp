@@ -7,8 +7,9 @@
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
 // per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
 // DeepSeek-V4.1 attn_out and shexp_out); --ablate-scale multiplies their strength. --engram: the GGUF with
-// DeepSeek-V4.1's Engram tables (default: found beside the model, Engram::find_tables). --stage-gb limits the ring
-// that prompts' missing experts are read ahead into (0: off; default: two layers' worth, at most 3 GB). --dspark:
+// DeepSeek-V4.1's Engram tables (default: the model's own shards, else found beside the model,
+// Engram::find_tables). --stage-gb limits the ring that prompts' missing experts are read ahead into (0: off;
+// default: two layers' worth, at most 3 GB). --dspark:
 // DeepSeek-V4.1's drafter (dspark.json and dspark.bin) for speculative decoding; its 8 GB come out of the expert
 // cache (measured: +13% on code, -3% on prose). DeepSeek-V4.1 trade-offs (accuracy for speed, docs/performance.md):
 // --miss-penalty lowers the routing score of experts not in memory (fewer SSD reads; output then depends on what is
@@ -151,7 +152,7 @@ int main(int argc, char** argv)
     }
     const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
     if (deepseek) {
-        if (engram.empty())
+        if (engram.empty() && !mako::dsv41::Engram::has_tables(*model))
             engram = mako::dsv41::Engram::find_tables(argv[1]);
         if (!engram.empty())
             if (auto r = model->add(engram); !r) {

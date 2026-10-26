@@ -2,7 +2,8 @@
 // experts stay resident (GLM-5.3: step by step; DeepSeek-V4.1: through prefill, the same routing per token).
 //   mako_calibrate <model.gguf> [--corpus FILE] [--out FILE] [--arena-gb N] [--engram FILE]
 // Without --corpus it uses the built-in corpus; without --out it writes the model's default profile. --engram: the
-// GGUF with DeepSeek-V4.1's Engram tables (default: found beside the model, Engram::find_tables).
+// GGUF with DeepSeek-V4.1's Engram tables (default: the model's own shards, else found beside the model,
+// Engram::find_tables).
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
 #include "glm/config.hpp"
@@ -78,7 +79,7 @@ int main(int argc, char** argv)
     std::println("calibrating on {} tokens ({})", ids.size(), corpus_path.empty() ? "built-in corpus" : corpus_path);
     const auto t0 = std::chrono::steady_clock::now();
     if (model->meta().get_string("general.architecture").value_or("") == "deepseek41") {
-        if (engram.empty())
+        if (engram.empty() && !mako::dsv41::Engram::has_tables(*model))
             engram = mako::dsv41::Engram::find_tables(argv[1]);
         if (!engram.empty())
             if (auto r = model->add(engram); !r) {

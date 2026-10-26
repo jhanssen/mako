@@ -21,8 +21,10 @@ The expert cache takes what is available at startup within a margin (a quarter o
 
 ### DeepSeek-V4.1
 
-The Engram tables live in their own GGUF (the MXFP8 shard of the full model); `mako_serve`, `mako_calibrate` and
-`ds_run` find it in an `Engram` folder next to the model's folder (or inside it), or take `--engram FILE`.
+The current Maya-S set carries its Engram tables (Q6_K) in its last two shards. Older layouts keep them in a GGUF
+of their own (MXFP8); `mako_serve` and `mako_calibrate` then find it in an `Engram` folder next to the model's
+folder (or inside it), or take `--engram FILE`. `ds_run` and the tests take the file as an argument (one of the
+model's own shards for the current set).
 
 ```sh
 build/tools/mako_calibrate <DeepSeek shard 1>                    # routing profile (once): which experts start resident

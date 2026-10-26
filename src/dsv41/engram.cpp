@@ -60,6 +60,11 @@ std::string Engram::find_tables(const std::string& first_shard)
     return {};
 }
 
+bool Engram::has_tables(const gguf::ModelFiles& m)
+{
+    return m.find("per_layer_token_embd.weight") || m.find("blk.1.engram_embd.weight");
+}
+
 std::expected<Engram, std::string> Engram::open(const Config& cfg, const gguf::ModelFiles& m)
 {
     const auto& c = cfg.engram;
