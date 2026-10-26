@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mako::server {
 
@@ -19,7 +20,21 @@ struct ServerOptions {
     bool speculative = true;
     uint32_t max_waiting = 4; // requests waiting behind the one generating; more get HTTP 503
     std::string dump_dir;     // non-empty: each generation request's body is written there (client debugging)
+    // Non-empty: every request but /health needs one of them, as "Authorization: Bearer <key>" (OpenAI clients) or
+    // "x-api-key: <key>" (Anthropic clients); others get HTTP 401. Empty: requests from web pages are refused instead
+    // (a Host header other than a loopback name or address, or an Origin other than a loopback one: HTTP 403), so a
+    // site the user visits cannot reach the server through the browser.
+    std::vector<std::string> api_keys;
 };
+
+// Whether a request's credentials (the Authorization or x-api-key header value) carry one of `keys`; each compared in
+// constant time.
+bool key_matches(const std::string& authorization, const std::string& x_api_key, const std::vector<std::string>& keys);
+// Without keys: whether a Host header names this machine's loopback (localhost, 127.0.0.1, [::1], with any port) or is
+// empty (a client that sends none).
+bool host_allowed(const std::string& host);
+// Without keys: whether an Origin header is absent or a loopback page (http(s)://localhost, 127.0.0.1 or [::1]).
+bool origin_allowed(const std::string& origin);
 
 // OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health.
 // Generation runs one request at a time; a request waits for the one before it, up to max_waiting of them.

@@ -6,6 +6,7 @@
 #include "gguf/gguf.hpp"
 #include "server/anthropic.hpp"
 #include "server/openai.hpp"
+#include "server/server.hpp"
 #include "text/tokenizer.hpp"
 
 #include <glaze/glaze.hpp>
@@ -160,9 +161,35 @@ int main(int argc, char** argv)
         std::println(stderr, "usage: server_test <model.gguf>");
         return 2;
     }
+    {
+        using mako::server::key_matches;
+        const std::vector<std::string> keys{"s3cret-one-0123456", "s3cret-two-0123456"};
+        check(key_matches("Bearer s3cret-two-0123456", "", keys), "an API key as a bearer token (the second of two)");
+        check(key_matches("", "s3cret-one-0123456", keys), "an API key as x-api-key");
+        check(!key_matches("Bearer s3cret-one-012345", "", keys) &&
+                  !key_matches("Bearer s3cret-one-01234567", "", keys),
+              "a shorter or longer key is refused");
+        check(!key_matches("s3cret-one-0123456", "", keys), "the Authorization header needs the Bearer scheme");
+        check(!key_matches("Bearer wrong", "wrong", keys) && !key_matches("", "", keys),
+              "a wrong or missing key is refused");
+        check(!key_matches("Bearer ", "", {""}) && !key_matches("Bearer x", "x", {}), "no or empty keys match nothing");
+        using mako::server::host_allowed, mako::server::origin_allowed;
+        check(host_allowed("localhost:8080") && host_allowed("127.0.0.1") && host_allowed("[::1]:8080") &&
+                  host_allowed(""),
+              "loopback Host headers (and none)");
+        check(!host_allowed("evil.example.com") && !host_allowed("localhost.evil.com:8080") &&
+                  !host_allowed("192.168.1.5:8080"),
+              "other Host headers refused without a key");
+        check(origin_allowed("") && origin_allowed("http://localhost:3000") && origin_allowed("https://127.0.0.1") &&
+                  origin_allowed("http://[::1]:8080"),
+              "loopback Origins (and none)");
+        check(!origin_allowed("https://evil.example.com") && !origin_allowed("http://localhost.evil.com") &&
+                  !origin_allowed("null") && !origin_allowed("file://"),
+              "other Origins refused without a key");
+    }
     if (!std::filesystem::exists(argv[1])) {
         std::println("model {} not found: skipped", argv[1]);
-        return 77;
+        return failures ? 1 : 77;
     }
     auto f = mako::gguf::File::open(argv[1]);
     if (!f) {

@@ -40,8 +40,8 @@ The first configure downloads pinned dependencies.
 ```
 
 Then point a client at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic; Claude Code with
-`ANTHROPIC_BASE_URL`). For DeepSeek's drafter add `--dspark <dspark dir>`. The server has no authentication and
-listens on 127.0.0.1.
+`ANTHROPIC_BASE_URL`). For DeepSeek's drafter add `--dspark <dspark dir>`. It listens on 127.0.0.1; for access
+from other machines, see [Server](docs/server.md#access) (API key, encrypted transport).
 
 Named option sets go in `~/Library/Application Support/mako/presets.json` (`--preset NAME`; examples in
 `docs/presets.example.json`).

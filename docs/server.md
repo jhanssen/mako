@@ -5,7 +5,23 @@
 ```
 
 One request runs at a time on one session, so a conversation's next turn reuses the context the previous one left.
-The server has no authentication; it listens on 127.0.0.1 unless `--host` says otherwise.
+
+## Access
+
+The server listens on 127.0.0.1 unless `--host` says otherwise.
+
+- **API keys**: `--api-key KEY[,KEY...]`, `--api-key-file FILE` (a key per line; keeps keys out of the shell history
+  and the process list) or `MAKO_API_KEY` (when neither is given). Every request but `/health` then needs one of them:
+  `Authorization: Bearer KEY` (OpenAI clients' API key setting) or `x-api-key: KEY` (Anthropic clients, Claude Code's
+  `ANTHROPIC_API_KEY`); others get HTTP 401. Several keys let one client's key be withdrawn. Keys under 16 characters
+  get a warning (`openssl rand -hex 24` makes a good one). Another `--host` requires a key.
+- **Without a key**, requests a web page could make through your browser are refused (HTTP 403): an `Origin` header
+  that is not a loopback page, or a `Host` header that is not `localhost`, `127.0.0.1` or `[::1]` (against DNS
+  rebinding). Clients on this machine (curl, SDKs, Claude Code) send a loopback `Host` and no `Origin`, so they are
+  unaffected.
+
+The key travels in clear text: for access from other machines, use an encrypted path (an SSH tunnel, Tailscale, or a
+reverse proxy with TLS) rather than exposing the port. Not meant for the open internet.
 
 ## OpenAI
 

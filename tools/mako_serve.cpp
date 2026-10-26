@@ -2,7 +2,10 @@
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--stage-gb N] [--no-spec]
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
-//              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1]
+//              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
+// --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
+// requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
+// address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
 // per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
@@ -29,15 +32,18 @@
 #include "server/server.hpp"
 #include "text/tokenizer.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <csignal>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <print>
 #include <string>
 #include <thread>
@@ -60,7 +66,8 @@ int main(int argc, char** argv)
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
-                             "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1]");
+                             "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
+                             "[--api-key KEY | --api-key-file FILE]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -71,6 +78,22 @@ int main(int argc, char** argv)
     pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
     bool learn = false;
     mako::server::ServerOptions so;
+    // Keys separated by `sep`, surrounding whitespace dropped; false when none.
+    auto add_keys = [&](std::string_view list, char sep) {
+        const size_t before = so.api_keys.size();
+        for (size_t at = 0; at <= list.size();) {
+            const size_t end = std::min(list.find(sep, at), list.size());
+            std::string_view k = list.substr(at, end - at);
+            while (!k.empty() && std::isspace(static_cast<unsigned char>(k.front())))
+                k.remove_prefix(1);
+            while (!k.empty() && std::isspace(static_cast<unsigned char>(k.back())))
+                k.remove_suffix(1);
+            if (!k.empty())
+                so.api_keys.emplace_back(k);
+            at = end + 1;
+        }
+        return so.api_keys.size() > before;
+    };
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1;
     std::string ablate, engram, dspark, imatrix;
@@ -140,10 +163,32 @@ int main(int argc, char** argv)
             so.max_waiting = uint32_t(std::stoul(v));
         else if (a == "--dump-requests")
             so.dump_dir = v;
+        else if (a == "--api-key")
+            add_keys(v, ',');
+        else if (a == "--api-key-file") {
+            std::ifstream in(v);
+            std::stringstream text;
+            text << in.rdbuf();
+            if (!in || !add_keys(text.str(), '\n')) {
+                std::println(stderr, "cannot read an API key from {}", v);
+                return 2;
+            }
+        }
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
         }
+    }
+    if (const char* env = std::getenv("MAKO_API_KEY"); env && so.api_keys.empty())
+        add_keys(env, ',');
+    for (const auto& k : so.api_keys)
+        if (k.size() < 16)
+            std::println(stderr, "warning: an API key of {} characters is easy to guess (16 or more; e.g. openssl rand "
+                                 "-hex 24)",
+                         k.size());
+    if (so.host != "127.0.0.1" && so.host != "localhost" && so.host != "::1" && so.api_keys.empty()) {
+        std::println(stderr, "--host {} serves beyond this machine: give an --api-key or --api-key-file", so.host);
+        return 2;
     }
     auto model = mako::gguf::ModelFiles::open(argv[1]);
     if (!model) {

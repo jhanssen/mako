@@ -195,10 +195,82 @@ void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& 
     }
 }
 
+bool key_matches(const std::string& authorization, const std::string& x_api_key, const std::vector<std::string>& keys)
+{
+    const auto same = [](std::string_view got, const std::string& key) {
+        if (key.empty() || got.size() != key.size())
+            return false;
+        unsigned char diff = 0;
+        for (size_t i = 0; i < key.size(); ++i)
+            diff |= static_cast<unsigned char>(got[i] ^ key[i]);
+        return diff == 0;
+    };
+    constexpr std::string_view bearer = "Bearer ";
+    const std::string_view b = authorization.starts_with(bearer) ? std::string_view(authorization).substr(bearer.size())
+                                                                  : std::string_view();
+    bool ok = false;
+    for (const auto& key : keys) { // every key compared, whichever matches
+        ok |= same(b, key);
+        ok |= same(x_api_key, key);
+    }
+    return ok;
+}
+
+namespace {
+
+// The host part of "name[:port]" or "[v6]:port".
+std::string_view host_part(std::string_view h)
+{
+    if (h.starts_with('['))
+        return h.substr(0, h.find(']') + 1);
+    return h.substr(0, h.find(':'));
+}
+
+bool loopback_name(std::string_view h)
+{
+    return h == "localhost" || h == "127.0.0.1" || h == "[::1]";
+}
+
+} // namespace
+
+bool host_allowed(const std::string& host)
+{
+    return host.empty() || loopback_name(host_part(host));
+}
+
+bool origin_allowed(const std::string& origin)
+{
+    if (origin.empty())
+        return true;
+    std::string_view o(origin);
+    for (const std::string_view scheme : {"http://", "https://"})
+        if (o.starts_with(scheme))
+            return loopback_name(host_part(o.substr(scheme.size())));
+    return false;
+}
+
 Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts)
     : impl_(std::make_unique<Impl>(engine, tok, tmpl, std::move(opts)))
 {
     auto& h = impl_->http;
+    h.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        const auto& keys = impl_->opts.api_keys;
+        const bool ok = req.path == "/health" ||
+                        (keys.empty() ? host_allowed(req.get_header_value("Host")) &&
+                                            origin_allowed(req.get_header_value("Origin"))
+                                      : key_matches(req.get_header_value("Authorization"),
+                                                    req.get_header_value("x-api-key"), keys));
+        if (ok)
+            return httplib::Server::HandlerResponse::Unhandled;
+        const char* message = keys.empty() ? "without an API key, requests from web pages or other hosts are refused"
+                                           : "invalid API key";
+        res.status = keys.empty() ? 403 : 401;
+        res.set_content(req.path.starts_with("/v1/messages")
+                            ? anthropic_error(message, keys.empty() ? "permission_error" : "authentication_error")
+                            : error_body(message, keys.empty() ? "permission_denied" : "invalid_api_key"),
+                        "application/json");
+        return httplib::Server::HandlerResponse::Handled;
+    });
     const auto chat = [this](const httplib::Request& req, httplib::Response& res) {
         auto& im = *impl_;
         const int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
