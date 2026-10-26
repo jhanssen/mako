@@ -916,6 +916,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
         std::swap(R, R2);
         prev = pcs[cur];
         cur ^= 1;
+        if (decode && !timing() && il == 0) // the GPU starts on layer 0's attention while the rest is encoded
+            commit_ahead(cb, enc);
         if (timing()) {
             enc->endEncoding();
             enc = encoder(cb, il, 1);

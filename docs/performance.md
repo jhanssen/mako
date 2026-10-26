@@ -141,7 +141,8 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 | Expert cache margin a quarter of RAM from 96 GB up (was 40%): DeepSeek 74 -> 94.5 GB, GLM-5.3 74 -> 86 GB (every expert resident) | DeepSeek at 90 GB: prefill +16% (352 vs 304 tok/s), decode after the prompt +13% (misses 28.8 -> 19.8 a step). Stress test (160 GB written beside decode): lowest available 20.4 GB (DeepSeek) / 32.4 GB (GLM), no swapping |
 | Routing profile through prefill (per-token counts) | the profile now reflects routing frequency; first attempt counted each expert once per group and made decode worse (41 misses/step) |
 | Prefill skips work the result does not depend on: from layer 20 (the last KV source) on, a long prompt's earlier rows only add that layer's compressed rows and index keys, and each later layer starts one window later | 8K tokens 14.3 -> 10.5 s, 16K 31.2 -> 21.5 s, 24K 52.9 -> 30.4 s; 4K unchanged (SSD-bound); the last 1024 positions' logits and later decode identical against the reference (ds41_long) |
-| Decode MoE layers with misses: the resident experts' gate and up with the shared gate/up in one dispatch (`mako_mul_mv_jobs`), both swiglus in one, the resident down with the shared down in one, all before the miss pass (the CPU reads the misses meanwhile, as before) | 42.4 -> 41.9 ms/step at 9.3 misses a step in both arms (three A/B pairs, 128 tokens, short story prompt); tokens identical |
+| Decode MoE layers with misses: the resident experts' gate and up with the shared gate/up in one dispatch (`mako_mul_mv_jobs`), both swiglus in one, the resident down with the shared down in one, all before the miss pass (the CPU reads the misses meanwhile, as before) | 42.4 -> 41.9 ms/step with `--telemetry layers`, 41.7 -> 41.3 without (9.3 misses a step in both arms; three A/B pairs each, 128 tokens, short story prompt); tokens identical |
+| Decode: the step's command buffer committed after layer 0's attention (`commit_ahead`; the next commits stay every 4 layers), so the GPU starts while the rest is encoded | 41.4 -> 41.2 ms/step median (41.8/41.3/41.4 vs 41.5/41.2/41.2, three A/B pairs without telemetry, 9.3 misses a step in both arms; the routing wait unchanged); tokens identical. Under `--telemetry layers` no commit is made early |
 
 Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads once per group (overlapped with the
 ~1.8 ms/token of GPU work since staging). Decode first ran 13-21 tok/s (misses per step 15-40 with content and history);
@@ -157,6 +158,7 @@ the sections below take it to ~25 by default.
 | One 1024-thread threadgroup per token for the attention output (no repeated reads of probabilities and keys) | no change: redundant reads were not the cost |
 | Per-row key descriptors with vector loads | no change for the output kernel (helped the score kernel slightly) |
 | More query tokens per attention dispatch (32 -> 256) | no change: occupancy was not the cost |
+| Decode attention GEMVs in multi-GEMV dispatches: q_a + kv (+ the compressor's kv and gate, + the indexer's weights) on the attention input, q_b (+ the indexer's query) on the normed q latent | tokens identical, no measurable gain: short prompt 42.2 vs 42.2 ms/step with `--telemetry layers` (six A/B pairs, 9.3 misses a step) and 41.3 vs 41.2 without (three pairs), 3000-token prompt 49.9 vs 50.1 (three pairs, 16.2 misses). Q8_0 GEMVs have ~2-3 us fixed a dispatch (IQ2_XXS ~9), so ~40 merged-away dispatches are worth ~0.1 ms (inferred, not measured). Reverted |
 
 ### Open
 
