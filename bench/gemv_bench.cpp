@@ -49,8 +49,8 @@ int main(int argc, char** argv)
             const size_t e = std::min(list.find(',', p), list.size());
             const std::string t = list.substr(p, e - p);
             p = e + 1;
-            for (Type c : {Type::Q8_0, Type::Q6_K, Type::Q5_K, Type::Q4_K, Type::IQ2_XXS, Type::IQ2_S, Type::IQ3_XXS,
-                           Type::IQ3_S, Type::F32})
+            for (Type c : {Type::Q8_0, Type::Q6_K, Type::Q5_K, Type::Q4_K, Type::IQ1_S, Type::IQ1_M, Type::IQ2_XXS,
+                           Type::IQ2_XS, Type::IQ2_S, Type::IQ3_XXS, Type::IQ3_S, Type::F32})
                 if (std::string(mako::gguf::traits(c).name) == t || [&] {
                         std::string u = t;
                         for (auto& ch : u)
