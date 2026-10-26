@@ -13,7 +13,7 @@
 namespace mako::dsv41 {
 
 // The Engram tables: per Engram layer and position, (max_ngram - 1) * heads hashed n-gram rows of head_dim values,
-// MXFP8 (blocks of an E8M0 scale and 32 E4M3 codes) or Q6_K on disk.
+// MXFP8 (blocks of an E8M0 scale and 32 E4M3 codes), Q6_K or IQ4_NL on disk.
 class Engram {
 public:
 

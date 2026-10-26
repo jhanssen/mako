@@ -1,7 +1,8 @@
 // Prefill GEMM against CPU dequantization on real tensors, for several token counts, plus its speed. For expert
 // tensors (one expert's matrix) and formats without CPU dequantization the reference is the per-format GEMV.
 //   gemm_test <model shard.gguf> [tensor ...]
-//   gemm_test --synthetic   random blocks of formats no test model carries (IQ4_XS), against the GEMV
+//   gemm_test --synthetic   random blocks of formats no test model carries (IQ4_XS, IQ2_XS, IQ1_S, IQ1_M), against
+//                           the GEMV
 #include "gguf/gguf.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemm.hpp"
@@ -37,7 +38,7 @@ int main(int argc, char** argv)
     }
     std::vector<std::string> names(argv + 2, argv + argc);
     if (synthetic)
-        names = {"iq4_xs"};
+        names = {"iq4_xs", "iq2_xs", "iq1_s", "iq1_m"};
     else if (names.empty())
         names = {"blk.0.attn_q.weight",       "blk.0.ffn_down.weight",      "blk.0.ssm_f_a.weight",
                  "blk.0.hc_attn_fn.weight",   "blk.3.ffn_gate_inp.weight",  "blk.3.ffn_gate_exps.weight",
@@ -55,17 +56,29 @@ int main(int argc, char** argv)
         const mako::gguf::Tensor* t = &synth;
         std::span<const std::byte> data;
         if (synthetic) {
-            // An expert-down-sized IQ4_XS matrix: random nibbles and scales, d small enough for half activations.
-            synth.type = mako::gguf::Type::IQ4_XS;
+            // An expert-down-sized matrix of random blocks, the block scale d small enough for half activations
+            // (IQ1_M keeps d in the top nibbles of its four 16-bit scale words).
+            using T = mako::gguf::Type;
+            synth.type = name == "iq4_xs" ? T::IQ4_XS : name == "iq2_xs" ? T::IQ2_XS : name == "iq1_s" ? T::IQ1_S : T::IQ1_M;
             synth.dims = {2048, 4096};
+            const uint32_t bb = uint32_t(mako::gguf::traits(synth.type).block_bytes);
             const uint64_t blocks = 2048 / 256 * 4096;
-            fake.resize(blocks * 136);
+            fake.resize(blocks * bb);
             std::uniform_int_distribution<int> byte(0, 255);
             for (auto& b : fake)
                 b = std::byte(byte(rng));
             for (uint64_t i = 0; i < blocks; ++i) {
                 const __fp16 d = __fp16(0.001f * (1 + i % 7));
-                std::memcpy(fake.data() + i * 136, &d, 2);
+                if (synth.type != T::IQ1_M) {
+                    std::memcpy(fake.data() + i * bb, &d, 2);
+                    continue;
+                }
+                uint16_t bits, sc[4];
+                std::memcpy(&bits, &d, 2);
+                std::memcpy(sc, fake.data() + i * bb + 48, 8);
+                for (int w = 0; w < 4; ++w)
+                    sc[w] = uint16_t((sc[w] & 0x0fff) | (((bits >> (4 * w)) & 0xf) << 12));
+                std::memcpy(fake.data() + i * bb + 48, sc, 8);
             }
         } else if (!(t = f->tensor(name)) || t->dims.size() < 2) {
             std::println("{:28} missing or not a matrix", name);

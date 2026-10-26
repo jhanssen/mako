@@ -82,7 +82,7 @@ struct EngramArgs {
     float eps;
 };
 struct EngramDecodeArgs {
-    uint32_t dim, tokens, layers, cols, q6k;
+    uint32_t dim, tokens, layers, cols, format; // format: 0 MXFP8, 1 Q6_K, 2 IQ4_NL
 };
 
 constexpr uint32_t kFp8 = 0, kFp4E4m3 = 1, kFp4Pow2 = 2; // ds_round kinds
@@ -846,7 +846,10 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
         }
         committed.clear();
     };
-    const EngramDecodeArgs eda{eg_dim, G, eg_layers, eg_cols, engram_->type() == gguf::Type::Q6_K};
+    const EngramDecodeArgs eda{eg_dim, G, eg_layers, eg_cols,
+                               engram_->type() == gguf::Type::Q6_K    ? 1u
+                               : engram_->type() == gguf::Type::IQ4_NL ? 2u
+                                                                       : 0u};
     dispatch(enc, "ds_engram_decode", {eg_raw, eg}, &eda, sizeof(eda), MTL::Size(eg_dim, eg_rows, 1),
              MTL::Size(256, 1, 1));
     const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, G};

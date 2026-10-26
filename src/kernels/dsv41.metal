@@ -545,13 +545,16 @@ kernel void ds_topk(device const float* vall [[buffer(0)]], device int* idsall [
     }
 }
 
+constant char kIq4nlValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
 struct EngramDecodeArgs {
     uint dim, tokens, layers, cols;
-    uint q6k; // Q6_K rows instead of MXFP8
+    uint format; // 0 MXFP8, 1 Q6_K, 2 IQ4_NL
 };
 
-// Engram rows from their bytes to float: MXFP8 (per 32 values an E8M0 scale byte, then 32 E4M3 codes) or Q6_K (per
-// 256: ql[128], qh[64], int8 scales[16] per 16 values, half d). Raw rows are [token][layer][column]; y rows
+// Engram rows from their bytes to float: MXFP8 (per 32 values an E8M0 scale byte, then 32 E4M3 codes), Q6_K (per
+// 256: ql[128], qh[64], int8 scales[16] per 16 values, half d) or IQ4_NL (per 32: half d, 16 bytes of nibbles into
+// the non-linear table, low nibbles values 0-15). Raw rows are [token][layer][column]; y rows
 // [layer][token][column] of dim values (each layer's rows contiguous). Grid (dim, rows).
 kernel void ds_engram_decode(device const uchar* raw [[buffer(0)]], device float* y [[buffer(1)]],
                              constant EngramDecodeArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
@@ -561,7 +564,15 @@ kernel void ds_engram_decode(device const uchar* raw [[buffer(0)]], device float
         return;
     const uint t = r / (a.layers * a.cols), l = (r / a.cols) % a.layers, c = r % a.cols;
     const uint out = (l * a.tokens + t) * a.cols + c;
-    if (a.q6k) {
+    if (a.format == 2) {
+        device const uchar* blk = raw + uint64_t(r) * (dim / 32 * 18) + (i / 32) * 18;
+        const uint j = i % 32;
+        const uchar q = blk[2 + j % 16];
+        const float d = float(*reinterpret_cast<device const half*>(blk));
+        y[uint64_t(out) * dim + i] = d * float(kIq4nlValues[j < 16 ? q & 0xF : q >> 4]);
+        return;
+    }
+    if (a.format == 1) {
         device const uchar* blk = raw + uint64_t(r) * (dim / 256 * 210) + (i / 256) * 210;
         const uint j = i % 256, n = j / 128, qt = (j % 128) / 32, l32 = j % 32;
         const uchar ql = blk[64 * n + (qt & 1) * 32 + l32], qh = blk[128 + 32 * n + l32];
