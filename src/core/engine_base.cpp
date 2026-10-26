@@ -46,6 +46,7 @@ struct HcArgs {
 struct HcStepArgs {
     uint32_t n_embd, expand, parts, iters;
     float eps, rms_eps;
+    uint32_t wn;
 };
 struct SwigluArgs {
     uint32_t n;
@@ -735,11 +736,37 @@ void EngineBase::hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::
 
 void EngineBase::hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
                          const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x,
-                         MTL::Buffer* pc, uint32_t T)
+                         MTL::Buffer* pc, uint32_t T, const DevTensor* norm_w, MTL::Buffer* xn)
 {
     constexpr uint32_t kParts = 32; // at most 64 (hc_step_b)
-    const HcStepArgs a{dims_.n_embd, post_x ? 1u : 0u, kParts, dims_.hc_iters, dims_.hc_eps, dims_.rms_eps};
+    const HcStepArgs a{dims_.n_embd, post_x ? 1u : 0u, kParts, dims_.hc_iters, dims_.hc_eps, dims_.rms_eps,
+                       norm_w ? dims_.n_embd : 0u};
     MTL::Buffer* part = scratch("hc_part", uint64_t(kMaxDecodeTokens) * kParts * 25 * 4);
+    if (norm_w && xn) {
+        if (!hc_counters_) {
+            hc_counters_ = mtl::Ref<MTL::Buffer>(
+                ctx_.device()->newBuffer(kMaxDecodeTokens * 4, MTL::ResourceStorageModeShared));
+            std::memset(hc_counters_->contents(), 0, kMaxDecodeTokens * 4);
+        }
+        enc->setComputePipelineState(pso("hc_step_norm"));
+        enc->setBuffer(post_x ? post_x : R, 0, 0);
+        enc->setBuffer(R, 0, 1);
+        enc->setBuffer(pc, 0, 2);
+        enc->setBuffer(post_x ? R_out : R, 0, 3);
+        enc->setBuffer(fn.buf, fn.off, 4);
+        enc->setBuffer(part, 0, 5);
+        enc->setBytes(&a, sizeof(a), 6);
+        enc->setBuffer(scale.buf, scale.off, 7);
+        enc->setBuffer(base.buf, base.off, 8);
+        enc->setBuffer(x, 0, 9);
+        enc->setBuffer(norm_w->buf, norm_w->off, 10);
+        enc->setBuffer(xn, 0, 11);
+        enc->setBuffer(hc_counters_.get(), 0, 12);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreadgroups(MTL::Size(kParts, T, 1), MTL::Size(256, 1, 1));
+        after(enc, "hc_step_norm");
+        return;
+    }
     enc->setComputePipelineState(pso("hc_step_a"));
     enc->setBuffer(post_x ? post_x : R, 0, 0);
     enc->setBuffer(R, 0, 1);
@@ -915,11 +942,31 @@ void EngineBase::finish(MTL::CommandBuffer* cb)
     cb->waitUntilCompleted();
     note_resident();
     stats_.gpu_wait_ms += ms_since(t0);
-    stats_.gpu_exec_ms += (cb->GPUEndTime() - cb->GPUStartTime()) * 1e3;
-    if (cb->status() != MTL::CommandBufferStatusCompleted)
-        throw std::runtime_error(std::format("command buffer failed: {}",
-                                             cb->error() ? cb->error()->localizedDescription()->utf8String() : "?"));
+    ahead_.push_back(cb);
+    for (MTL::CommandBuffer* c : ahead_) { // the earlier ones completed first: one queue, in order
+        stats_.gpu_exec_ms += (c->GPUEndTime() - c->GPUStartTime()) * 1e3;
+        if (c->status() != MTL::CommandBufferStatusCompleted)
+            throw std::runtime_error(std::format("command buffer failed: {}",
+                                                 c->error() ? c->error()->localizedDescription()->utf8String() : "?"));
+    }
+    ahead_.clear();
     deliver_probes();
+}
+
+void EngineBase::commit_ahead(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc)
+{
+    if (!pending_moe_.empty())
+        return;
+    enc->endEncoding();
+    if (encoding_) {
+        stats_.encode_ms += std::chrono::duration<double, std::milli>(Clock::now() - step_start_).count();
+        encoding_ = false;
+    }
+    cb->commit();
+    ahead_.push_back(cb);
+    cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    enc = encoder(cb, cur_layer_, -1);
 }
 
 void EngineBase::submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc)
@@ -1011,25 +1058,49 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
         ++resident_calls_[il];
     }
     part(enc, "moe router");
-    gemv(enc, mw.router, xn, 0, rlog, 0, 1, T);
     const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, resident ? 2u : 1u,
                        uint32_t(routing_.score), routing_.miss_penalty};
-    enc->setComputePipelineState(pso("moe_route"));
-    enc->setBuffer(rlog, 0, 0);
-    enc->setBuffer(mw.bias.buf, mw.bias.off, 1);
-    enc->setBuffer(scratch("msel", id_rows), 0, 2);
-    enc->setBuffer(ew, 0, 3);
-    enc->setBuffer(scratch("mbiased", uint64_t(kMaxDecodeTokens) * dims_.n_expert * 4), 0, 4);
-    enc->setBytes(&ra, sizeof(ra), 5);
-    enc->setBuffer(arena_->slot_table(), uint64_t(il) * dims_.n_expert * 4, 6);
-    enc->setBuffer(hit_ids, 0, 7);
-    enc->setBuffer(miss_rank, 0, 8);
-    enc->setBuffer(indirect, ind_off, 9);
-    if (resident)
-        enc->setBuffer(resident_counts_.get(), uint64_t(il) * dims_.n_expert * 4, 10);
-    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(32, 1, 1));
-    after(enc, "moe_route");
+    // The route's buffers, after the router GEMV's: moe_route's 1..10 at `from`.
+    auto bind_route = [&](MTL::ComputeCommandEncoder* e, uint32_t from) {
+        e->setBuffer(mw.bias.buf, mw.bias.off, from);
+        e->setBuffer(scratch("msel", id_rows), 0, from + 1);
+        e->setBuffer(ew, 0, from + 2);
+        e->setBuffer(scratch("mbiased", uint64_t(kMaxDecodeTokens) * dims_.n_expert * 4), 0, from + 3);
+        e->setBytes(&ra, sizeof(ra), from + 4);
+        e->setBuffer(arena_->slot_table(), uint64_t(il) * dims_.n_expert * 4, from + 5);
+        e->setBuffer(hit_ids, 0, from + 6);
+        e->setBuffer(miss_rank, 0, from + 7);
+        e->setBuffer(indirect, ind_off, from + 8);
+        if (resident)
+            e->setBuffer(resident_counts_.get(), uint64_t(il) * dims_.n_expert * 4, from + 9);
+    };
+    // The router GEMV routes in its last threadgroup when it can (F32 router, a few tokens): one dispatch.
+    bool routed = false;
+    if (mw.router.type == gguf::Type::F32 && repeat_n_ == 1 && tel_ != Telemetry::kernels) {
+        if (!route_counters_) {
+            route_counters_ = mtl::Ref<MTL::Buffer>(
+                ctx_.device()->newBuffer(kMaxDecodeTokens * 4, MTL::ResourceStorageModeShared));
+            std::memset(route_counters_->contents(), 0, kMaxDecodeTokens * 4);
+        }
+        mtl::Gemv::Args a;
+        a.type = mw.router.type;
+        a.k = uint32_t(mw.router.dims[0]);
+        a.n = uint32_t(mw.router.dims[1]);
+        a.t = T;
+        routed = gemv_->encode_router(enc, a, mw.router.buf, mw.router.off, xn, 0, rlog, 0, [&](auto* e) {
+            bind_route(e, 4);
+            e->setBuffer(route_counters_.get(), 0, 14);
+        });
+    }
+    if (!routed) {
+        gemv(enc, mw.router, xn, 0, rlog, 0, 1, T);
+        enc->setComputePipelineState(pso("moe_route"));
+        enc->setBuffer(rlog, 0, 0);
+        bind_route(enc, 1);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(32, 1, 1));
+        after(enc, "moe_route");
+    }
     // The prediction costs a router GEMV: skipped while reads ahead are not paying off (ExpertArena decides).
     const bool predict =
         !resident && next && predict_k && T == 1 && il + ahead < arena_rows && arena_->prefetch_worthwhile();

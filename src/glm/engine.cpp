@@ -57,6 +57,10 @@ struct L2Args {
 struct ScanArgs {
     uint32_t head_dim, tokens, qkv_stride, inner, heads, snap;
 };
+struct PrepArgs {
+    uint32_t channels, kernel_len, tokens, snap, head_dim, heads;
+    float lower_bound, l2_eps;
+};
 struct SwigluArgs {
     uint32_t n;
     float limit;
@@ -374,32 +378,15 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     }
     // With snap_ (a speculative step), the state after the first snap_ tokens also goes to the alternate buffers.
     const uint32_t snap = snap_ && T > snap_ ? snap_ : 0;
-    part(enc, "kda conv");
-    const ConvArgs ca{inner, cfg_.conv_kernel, T, snap};
-    enc->setComputePipelineState(pso("kda_conv"));
-    enc->setBuffer(qkv, 0, 0);
-    enc->setBuffer(L.conv_q.buf, L.conv_q.off, 1);
-    enc->setBuffer(L.conv_k.buf, L.conv_k.off, 2);
-    enc->setBuffer(L.conv_v.buf, L.conv_v.off, 3);
-    enc->setBuffer(conv_state_[il].get(), 0, 4);
-    enc->setBuffer(qkvc, 0, 5);
-    enc->setBytes(&ca, sizeof(ca), 6);
-    enc->setBuffer(snap ? conv_state_alt_[il].get() : conv_state_[il].get(), 0, 7);
-    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreads(MTL::Size(3 * inner, 1, 1), MTL::Size(256, 1, 1));
-    after(enc, "kda_conv");
-    if (probes) {
-        probe(enc, "kda_q_conv", int(il), qkvc, inner);
-        probe(enc, "kda_v_conv", int(il), qkvc, inner, uint64_t(inner) * 8);
-    }
-
-    // f_a's rows, then g_a's (one GEMV when their weights are adjacent).
+    // f_a's rows, then g_a's (one GEMV when their weights are adjacent); f_b, beta and g_b from those: all before
+    // the conv, which needs none of them.
     MTL::Buffer* fga = scratch("fga", uint64_t(T) * D * 8);
     const uint64_t ga_off = uint64_t(T) * D * 4;
     MTL::Buffer* graw = scratch("graw", uint64_t(T) * inner * 4);
     MTL::Buffer* braw = scratch("braw", uint64_t(T) * H * 4);
     MTL::Buffer* g = scratch("g", uint64_t(T) * inner * 4);
     MTL::Buffer* beta = scratch("beta", uint64_t(T) * H * 4);
+    MTL::Buffer* g2 = scratch("g2", uint64_t(T) * inner * 4);
     part(enc, "kda gates");
     if (T < gemm_min_tokens_ && adjacent(L.f_a, L.g_a)) {
         gemv(enc, L.f_a, xn, 0, fga, 0, 2, T, true);
@@ -409,29 +396,73 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     }
     proj(enc, L.f_b, fga, 0, graw, 0, T);
     proj(enc, L.beta, xn, 0, braw, 0, T);
-    const GateArgs ga{D, H, cfg_.kda_gate_lower_bound};
-    enc->setComputePipelineState(pso("kda_gate"));
-    enc->setBuffer(graw, 0, 0);
-    enc->setBuffer(L.dt_b.buf, L.dt_b.off, 1);
-    enc->setBuffer(L.ssm_a.buf, L.ssm_a.off, 2);
-    enc->setBuffer(braw, 0, 3);
-    enc->setBuffer(g, 0, 4);
-    enc->setBuffer(beta, 0, 5);
-    enc->setBytes(&ga, sizeof(ga), 6);
-    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreads(MTL::Size(inner, T, 1), MTL::Size(256, 1, 1));
-    after(enc, "kda_gate");
+    proj(enc, L.g_b, fga, ga_off, g2, 0, T);
+    const bool fused = !probe_; // the probes read the conv output before its norm
+    if (fused) {
+        // Conv, gate and the q/k norm in one dispatch, a threadgroup per head.
+        part(enc, "kda conv");
+        const PrepArgs pa{inner, cfg_.conv_kernel, T, snap, D, H, cfg_.kda_gate_lower_bound, 1e-6f};
+        enc->setComputePipelineState(pso("kda_prep"));
+        enc->setBuffer(qkv, 0, 0);
+        enc->setBuffer(L.conv_q.buf, L.conv_q.off, 1);
+        enc->setBuffer(L.conv_k.buf, L.conv_k.off, 2);
+        enc->setBuffer(L.conv_v.buf, L.conv_v.off, 3);
+        enc->setBuffer(conv_state_[il].get(), 0, 4);
+        enc->setBuffer(qkvc, 0, 5);
+        enc->setBytes(&pa, sizeof(pa), 6);
+        enc->setBuffer(snap ? conv_state_alt_[il].get() : conv_state_[il].get(), 0, 7);
+        enc->setBuffer(graw, 0, 8);
+        enc->setBuffer(L.dt_b.buf, L.dt_b.off, 9);
+        enc->setBuffer(L.ssm_a.buf, L.ssm_a.off, 10);
+        enc->setBuffer(braw, 0, 11);
+        enc->setBuffer(g, 0, 12);
+        enc->setBuffer(beta, 0, 13);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(D, 1, 1));
+        after(enc, "kda_prep");
+    } else {
+        part(enc, "kda conv");
+        const ConvArgs ca{inner, cfg_.conv_kernel, T, snap};
+        enc->setComputePipelineState(pso("kda_conv"));
+        enc->setBuffer(qkv, 0, 0);
+        enc->setBuffer(L.conv_q.buf, L.conv_q.off, 1);
+        enc->setBuffer(L.conv_k.buf, L.conv_k.off, 2);
+        enc->setBuffer(L.conv_v.buf, L.conv_v.off, 3);
+        enc->setBuffer(conv_state_[il].get(), 0, 4);
+        enc->setBuffer(qkvc, 0, 5);
+        enc->setBytes(&ca, sizeof(ca), 6);
+        enc->setBuffer(snap ? conv_state_alt_[il].get() : conv_state_[il].get(), 0, 7);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreads(MTL::Size(3 * inner, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "kda_conv");
+        if (probes) {
+            probe(enc, "kda_q_conv", int(il), qkvc, inner);
+            probe(enc, "kda_v_conv", int(il), qkvc, inner, uint64_t(inner) * 8);
+        }
+        const GateArgs ga{D, H, cfg_.kda_gate_lower_bound};
+        enc->setComputePipelineState(pso("kda_gate"));
+        enc->setBuffer(graw, 0, 0);
+        enc->setBuffer(L.dt_b.buf, L.dt_b.off, 1);
+        enc->setBuffer(L.ssm_a.buf, L.ssm_a.off, 2);
+        enc->setBuffer(braw, 0, 3);
+        enc->setBuffer(g, 0, 4);
+        enc->setBuffer(beta, 0, 5);
+        enc->setBytes(&ga, sizeof(ga), 6);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreads(MTL::Size(inner, T, 1), MTL::Size(256, 1, 1));
+        after(enc, "kda_gate");
 
-    part(enc, "kda l2 norm");
-    const L2Args la{D, 1e-6f, 3 * inner};
-    enc->setComputePipelineState(pso("l2_norm"));
-    enc->setBuffer(qkvc, 0, 0);
-    enc->setBytes(&la, sizeof(la), 1);
-    const uint32_t l2_rows = 2 * H; // q and k heads
-    enc->setBytes(&l2_rows, sizeof(l2_rows), 2);
-    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size((l2_rows + 3) / 4, T, 1), MTL::Size(128, 1, 1));
-    after(enc, "l2_norm");
+        part(enc, "kda l2 norm");
+        const L2Args la{D, 1e-6f, 3 * inner};
+        enc->setComputePipelineState(pso("l2_norm"));
+        enc->setBuffer(qkvc, 0, 0);
+        enc->setBytes(&la, sizeof(la), 1);
+        const uint32_t l2_rows = 2 * H; // q and k heads
+        enc->setBytes(&l2_rows, sizeof(l2_rows), 2);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreadgroups(MTL::Size((l2_rows + 3) / 4, T, 1), MTL::Size(128, 1, 1));
+        after(enc, "l2_norm");
+    }
 
     MTL::Buffer* o = scratch("o", uint64_t(T) * inner * 4);
     part(enc, "kda scan");
@@ -455,10 +486,8 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         probe(enc, "kda_scan_out", int(il), o, inner);
     }
 
-    MTL::Buffer* g2 = scratch("g2", uint64_t(T) * inner * 4);
     MTL::Buffer* gated = scratch("gated", uint64_t(T) * inner * 4);
     part(enc, "kda output gate");
-    proj(enc, L.g_b, fga, ga_off, g2, 0, T);
     if (probes)
         probe(enc, "kda_g2", int(il), g2, inner);
     const NormArgs na{D, D, cfg_.rms_eps, 0};
@@ -851,9 +880,10 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
             hc_pre(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, scratch("R", rows * hd * 4), x, pc, T);
         else if (il == 0)
             hc_step(enc, nullptr, scratch("R", rows * hd * 4), nullptr, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, x, pc,
-                    T);
+                    T, &L.attn_norm, xn);
         probe(enc, "hc_attn_pre", int(il), x, E);
-        norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
+        if (!fused) // fused: the stream step wrote xn
+            norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
         probe(enc, "attn_norm", int(il), xn, E);
         if (L.kda)
             kda(enc, L, il, xn, att, T);
@@ -866,7 +896,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
         }
         if (fused) {
             hc_step(enc, att, scratch("R", rows * hd * 4), scratch("R2", rows * hd * 4), L.hc_ffn_fn, L.hc_ffn_scale,
-                    L.hc_ffn_base, x, pc, T);
+                    L.hc_ffn_base, x, pc, T, &L.ffn_norm, xn);
             std::swap(scratch_["R"], scratch_["R2"]);
         } else {
             hc_post(enc, att, scratch("R", rows * hd * 4), scratch("R2", rows * hd * 4), pc, T);
@@ -875,7 +905,8 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
         }
         probe(enc, "hc_ffn_pre", int(il), x, E);
         probe(enc, "hc_mixes", int(il), scratch("mixes", 32 * 4), 24);
-        norm(enc, x, &L.ffn_norm, xn, T, E, E, cfg_.rms_eps);
+        if (!fused)
+            norm(enc, x, &L.ffn_norm, xn, T, E, E, cfg_.rms_eps);
         probe(enc, "ffn_norm", int(il), xn, E);
         if (L.dense) {
             ffn_dense(enc, L.ffn_gate, L.ffn_up, L.ffn_down, xn, ffo, cfg_.swiglu_clamp_shexp[il], T);
@@ -888,12 +919,14 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
         if (fused && il + 1 < cfg_.n_layer) {
             const Layer& N = *layers_[il + 1];
             hc_step(enc, ffo, scratch("R", rows * hd * 4), scratch("R2", rows * hd * 4), N.hc_attn_fn, N.hc_attn_scale,
-                    N.hc_attn_base, x, pc, T);
+                    N.hc_attn_base, x, pc, T, &N.attn_norm, xn);
         } else {
             hc_post(enc, ffo, scratch("R", rows * hd * 4), scratch("R2", rows * hd * 4), pc, T);
         }
         std::swap(scratch_["R"], scratch_["R2"]);
         probe(enc, "l_out", int(il), scratch("R", rows * hd * 4), hd);
+        if (il == 0) // the GPU starts on the first layer while the rest is encoded (~0.3 ms)
+            commit_ahead(cb, enc);
     }
 
     cur_layer_ = cfg_.n_layer;

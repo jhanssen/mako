@@ -13,3 +13,6 @@ target_link_libraries(gemm_bench PRIVATE mako_mtl)
 
 add_executable(gemv_bench gemv_bench.cpp)
 target_link_libraries(gemv_bench PRIVATE mako_mtl mako_gguf)
+
+add_executable(chain_bench chain_bench.cpp)
+target_link_libraries(chain_bench PRIVATE mako_mtl)

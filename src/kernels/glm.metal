@@ -212,6 +212,7 @@ struct HcStepArgs {
     uint iters;
     float eps;  // hc
     float rms_eps;
+    uint wn;    // hc_step_norm: norm weight length (0: none)
 };
 constant uint HC_TG = 256;
 
@@ -319,6 +320,138 @@ kernel void hc_step_b(device const float* part [[buffer(0)]], device const float
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < a.n_embd; i += nt)
         x[i] = Rn[i] * pre[0] + Rn[a.n_embd + i] * pre[1] + Rn[2 * a.n_embd + i] * pre[2] + Rn[3 * a.n_embd + i] * pre[3];
+}
+
+// hc_step_a and hc_step_b in one dispatch (grid (parts, tokens) as A), then the rms norm of x: the last threadgroup
+// to finish a token's part (a device-scope fence, then a counter) does B for that token and writes
+// xn = rms_norm(x) * w (w of n_embd; none when wn is 0), summing as rms_norm does. counters: one per token, zero
+// before the dispatch and left zero after.
+kernel void hc_step_norm(device const float* x_post [[buffer(0)]], device const float* R [[buffer(1)]],
+                         device float* pc [[buffer(2)]], device float* out [[buffer(3)]],
+                         device const float* fn [[buffer(4)]], device float* part [[buffer(5)]],
+                         constant HcStepArgs& a [[buffer(6)]], device const float* scale [[buffer(7)]],
+                         device const float* base [[buffer(8)]], device float* x [[buffer(9)]],
+                         device const float* w [[buffer(10)]], device float* xn [[buffer(11)]],
+                         device atomic_uint* counters [[buffer(12)]], uint2 tg2 [[threadgroup_position_in_grid]],
+                         uint2 tid2 [[thread_position_in_threadgroup]])
+{
+    threadgroup float red[25][HC_TG / 32];
+    threadgroup float mixes[25];
+    threadgroup float pre[4];
+    threadgroup float parts[64 * 25];
+    threadgroup float scratch[TG / 32];
+    threadgroup uint last[1];
+    const uint tg = tg2.x, tok = tg2.y, tid = tid2.x;
+    const uint hd = 4 * a.n_embd, per = (hd + a.parts - 1) / a.parts;
+    x_post += uint64_t(tok) * a.n_embd;
+    R += uint64_t(tok) * hd;
+    pc += tok * 24;
+    out += uint64_t(tok) * hd;
+    part += uint64_t(tok) * a.parts * 25;
+    x += uint64_t(tok) * a.n_embd;
+    xn += uint64_t(tok) * a.n_embd;
+    {
+        const uint j0 = tg * per, j1 = min(hd, j0 + per);
+        float acc[25] = {};
+        for (uint j = j0 + tid; j < j1; j += HC_TG) {
+            float r;
+            if (a.expand) {
+                const uint h = j / a.n_embd, i = j % a.n_embd;
+                r = x_post[i] * pc[4 + h];
+                for (uint src = 0; src < 4; ++src)
+                    r += pc[8 + src * 4 + h] * R[src * a.n_embd + i];
+                out[j] = r;
+            } else {
+                r = R[j];
+            }
+            acc[24] += r * r;
+            for (uint m = 0; m < 24; ++m)
+                acc[m] += fn[uint64_t(m) * hd + j] * r;
+        }
+        for (uint m = 0; m < 25; ++m) {
+            const float v = simd_sum(acc[m]);
+            if (tid % 32 == 0)
+                red[m][tid / 32] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 25) {
+            float v = 0.0f;
+            for (uint w = 0; w < HC_TG / 32; ++w)
+                v += red[tid][w];
+            part[tg * 25 + tid] = v;
+        }
+    }
+    // The token's last threadgroup goes on; every other one has written its part and read pc by now.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        last[0] = atomic_fetch_add_explicit(counters + tok, 1u, memory_order_relaxed) + 1 == a.parts ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!last[0])
+        return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    device const float* Rn = a.expand ? out : R;
+    for (uint i = tid; i < a.parts * 25; i += HC_TG)
+        parts[i] = part[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 25) {
+        float v = 0.0f;
+        for (uint p = 0; p < a.parts; ++p)
+            v += parts[p * 25 + tid];
+        mixes[tid] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        const uint lane = tid, s = (lane / 4) % 4, d = lane % 4;
+        const float inv = rsqrt(mixes[24] / float(4 * a.n_embd) + a.rms_eps);
+        if (lane < 4) {
+            pre[lane] = sigmoidf(mixes[lane] * inv * scale[0] + base[lane]) + a.eps;
+            pc[lane] = pre[lane];
+            pc[4 + lane] = 2.0f * sigmoidf(mixes[4 + lane] * inv * scale[1] + base[4 + lane]);
+        }
+        float c = mixes[8 + (lane % 16)] * inv * scale[2] + base[8 + (lane % 16)];
+        const float mx = max(max(simd_shuffle(c, s * 4), simd_shuffle(c, s * 4 + 1)),
+                             max(simd_shuffle(c, s * 4 + 2), simd_shuffle(c, s * 4 + 3)));
+        c = exp(c - mx);
+        float sum = simd_shuffle(c, s * 4) + simd_shuffle(c, s * 4 + 1) + simd_shuffle(c, s * 4 + 2) +
+                    simd_shuffle(c, s * 4 + 3);
+        c = c / sum + a.eps;
+        for (uint it = 0; it < a.iters; ++it) {
+            if (it > 0) {
+                sum = simd_shuffle(c, s * 4) + simd_shuffle(c, s * 4 + 1) + simd_shuffle(c, s * 4 + 2) +
+                      simd_shuffle(c, s * 4 + 3);
+                c /= sum + a.eps;
+            }
+            sum = simd_shuffle(c, d) + simd_shuffle(c, 4 + d) + simd_shuffle(c, 8 + d) + simd_shuffle(c, 12 + d);
+            c /= sum + a.eps;
+        }
+        if (lane < 16)
+            pc[8 + lane] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // x = sum_h pre[h] * R_new[h], each thread the elements of the float4s rms_norm's thread would read, then the
+    // norm as rms_norm sums it.
+    const uint n4 = a.n_embd / 4;
+    device float4* x4 = reinterpret_cast<device float4*>(x);
+    device float4* xn4 = reinterpret_cast<device float4*>(xn);
+    device const float4* w4 = reinterpret_cast<device const float4*>(w);
+    float s = 0.0f;
+    for (uint i4 = tid; i4 < n4; i4 += HC_TG) {
+        float4 v;
+        for (uint c = 0; c < 4; ++c) {
+            const uint i = 4 * i4 + c;
+            v[c] = Rn[i] * pre[0] + Rn[a.n_embd + i] * pre[1] + Rn[2 * a.n_embd + i] * pre[2] +
+                   Rn[3 * a.n_embd + i] * pre[3];
+        }
+        x4[i4] = v;
+        s += dot(v, v);
+    }
+    const float inv = rsqrt(tg_sum(s, scratch, tid) / float(a.n_embd) + a.rms_eps);
+    for (uint i4 = tid; i4 < n4; i4 += HC_TG)
+        xn4[i4] = x4[i4] * inv * (a.wn ? w4[i4] : float4(1.0f));
+    if (tid == 0)
+        atomic_store_explicit(counters + tok, 0u, memory_order_relaxed);
 }
 
 // Mean of the 4 streams; grid (n_embd, tokens).
@@ -489,6 +622,74 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
         Mg[lane + n * LANES] = M[n];
 }
 
+struct PrepArgs {
+    uint channels;   // per projection (heads * head_dim)
+    uint kernel_len; // conv taps, the last one multiplies the current token (at most 8)
+    uint tokens;
+    uint snap;       // nonzero: also write the conv state after this many tokens to snap_state
+    uint head_dim;   // 128
+    uint heads;
+    float lower_bound; // gate
+    float l2_eps;
+};
+
+// kda_conv, kda_gate and the q/k l2 norm in one dispatch: a threadgroup of head_dim threads per head, thread c its
+// q, k and v channel, the tokens in order. The conv and gate as those kernels compute them; the norm sums as
+// l2_norm does (each 32 channels in its simdgroup, then the partials in lane order).
+kernel void kda_prep(device const float* x [[buffer(0)]], device const float* wq [[buffer(1)]],
+                     device const float* wk [[buffer(2)]], device const float* wv [[buffer(3)]],
+                     device float* state [[buffer(4)]], device float* y [[buffer(5)]],
+                     constant PrepArgs& a [[buffer(6)]], device float* snap_state [[buffer(7)]],
+                     device const float* raw [[buffer(8)]], device const float* dt_bias [[buffer(9)]],
+                     device const float* A [[buffer(10)]], device const float* raw_beta [[buffer(11)]],
+                     device float* g [[buffer(12)]], device float* beta [[buffer(13)]],
+                     uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[32];
+    const uint width = 3 * a.channels, taps = a.kernel_len - 1, ch = h * a.head_dim + tid;
+    float hist[3][7];
+    for (uint p = 0; p < 3; ++p)
+        for (uint j = 0; j < taps; ++j)
+            hist[p][j] = state[uint64_t(p * a.channels + ch) * taps + j];
+    for (uint t = 0; t < a.tokens; ++t) {
+        float conv[3];
+        for (uint p = 0; p < 3; ++p) {
+            const uint c = p * a.channels + ch;
+            device const float* w = (p == 0 ? wq : p == 1 ? wk : wv) + uint64_t(ch) * a.kernel_len;
+            const float xc = x[uint64_t(t) * width + c];
+            float acc = w[taps] * xc;
+            for (uint j = 0; j < taps; ++j)
+                acc += w[j] * hist[p][j];
+            for (uint j = 0; j + 1 < taps; ++j)
+                hist[p][j] = hist[p][j + 1];
+            hist[p][taps - 1] = xc;
+            conv[p] = acc * sigmoidf(acc);
+            if (t + 1 == a.snap)
+                for (uint j = 0; j < taps; ++j)
+                    snap_state[uint64_t(c) * taps + j] = hist[p][j];
+        }
+        for (uint p = 0; p < 2; ++p) {
+            const float psum = simd_sum(conv[p] * conv[p]);
+            if (lane == 0)
+                part[sg] = psum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float total = simd_sum(lane < a.head_dim / 32 ? part[lane] : 0.0f);
+            conv[p] *= 1.0f / max(sqrt(total), a.l2_eps);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint p = 0; p < 3; ++p)
+            y[uint64_t(t) * width + p * a.channels + ch] = conv[p];
+        const float v = (raw[uint64_t(t) * a.channels + ch] + dt_bias[ch]) * A[h];
+        g[uint64_t(t) * a.channels + ch] = a.lower_bound * sigmoidf(-v);
+        if (tid == 0)
+            beta[t * a.heads + h] = sigmoidf(raw_beta[t * a.heads + h]);
+    }
+    for (uint p = 0; p < 3; ++p)
+        for (uint j = 0; j < taps; ++j)
+            state[uint64_t(p * a.channels + ch) * taps + j] = hist[p][j];
+}
+
 // y = rms_norm(x) * w * sigmoid(gate), one threadgroup per head row.
 kernel void rms_norm_gate(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                           device const float* gate [[buffer(2)]], device float* y [[buffer(3)]],
@@ -627,29 +828,10 @@ kernel void moe_combine(device const float* x [[buffer(0)]], device const float*
     y[i] = acc;
 }
 
-struct RouteArgs {
-    uint n_expert, n_used, norm;
-    float scale;
-    uint lookup; // 1: look the selection up in slots (one token); 2: also count it in `counts`
-    uint score;  // 0: sigmoid, 1: sqrt(softplus)
-    float miss_penalty; // > 0: subtracted from the selection score (not the weight) of an expert slots lacks
-};
+#include "moe_route.h"
 
-static float route_score(float l, uint kind)
-{
-    if (kind == 0)
-        return 1.0f / (1.0f + precise::exp(-l));
-    return precise::sqrt(l > 20.0f ? l : precise::log(1.0f + precise::exp(l)));
-}
-
-// Router top-k over sigmoid or sqrt(softplus) scores, the bias added for the selection only; ties keep the lower expert index.
-// Weights are the unbiased scores of the selected experts, normalized when a.norm, times a.scale.
-// Then each selected expert is looked up in `slots` (this layer's expert -> arena slot, -1 absent): a resident
-// one gets its slot in hit_ids and miss_rank -1; a missing one slot 0 (its result is not used) and its index
-// among the misses. The miss count goes to the z of the three indirect dispatches (gate, up, down).
-// One simdgroup (32 threads) per token t: logits and biased rows of n_expert (<= 512), sel, w, hit_ids and
-// miss_rank rows of 16 (n_used <= 16 used), indirect rows of 9 (the last three only with a.lookup). Lane l keeps experts l, l + 32, ... in
-// registers; each of the n_used rounds takes the largest biased score left (lowest index on ties).
+// moe_route_token for each token t (one simdgroup each): rows of n_expert (<= 512) for logits and biased, of 16 for
+// sel, w, hit_ids and miss_rank, of 9 for indirect.
 kernel void moe_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]],
                       device int* sel [[buffer(2)]], device float* w [[buffer(3)]], device float* biased [[buffer(4)]],
                       constant RouteArgs& a [[buffer(5)]], device const int* slots [[buffer(6)]],
@@ -658,66 +840,8 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
                       uint lane [[thread_position_in_threadgroup]],
                       uint t [[threadgroup_position_in_grid]])
 {
-    constexpr uint K = 16;
-    logits += uint64_t(t) * a.n_expert;
-    biased += uint64_t(t) * a.n_expert;
-    sel += t * 16;
-    w += t * 16;
-    hit_ids += t * 16;
-    miss_rank += t * 16;
-    indirect += t * 9;
-    float v[K];
-    for (uint k = 0; k < K; ++k) {
-        const uint e = lane + 32 * k;
-        v[k] = -INFINITY;
-        if (e < a.n_expert) {
-            v[k] = route_score(logits[e], a.score) + bias[e];
-            biased[e] = v[k];
-            if (a.miss_penalty > 0.0f && slots[e] < 0)
-                v[k] -= a.miss_penalty;
-        }
-    }
-    uint mine = 0xffffffffu; // the expert chosen in round `lane`
-    for (uint r = 0; r < a.n_used; ++r) {
-        float bv = -INFINITY;
-        uint bk = 0;
-        for (uint k = 0; k < K; ++k)
-            if (v[k] > bv) { // ascending e within the lane: strict > keeps the lowest index on ties
-                bv = v[k];
-                bk = k;
-            }
-        const float m = simd_max(bv);
-        const uint e = simd_min(bv == m && bv > -INFINITY ? lane + 32 * bk : 0xffffffffu);
-        if (e % 32 == lane)
-            v[e / 32] = -INFINITY;
-        if (lane == r)
-            mine = e;
-    }
-    const bool used = lane < a.n_used;
-    const float p = used ? route_score(logits[mine], a.score) : 0.0f;
-    float sum = 0.0f;
-    for (uint j = 0; j < a.n_used; ++j)
-        sum += simd_shuffle(p, j);
-    if (a.norm)
-        sum = max(sum, 6.103515625e-5f);
-    if (used) {
-        sel[lane] = int(mine);
-        w[lane] = (a.norm ? p / sum : p) * a.scale;
-    }
-    if (a.lookup) {
-        const int s = used ? slots[mine] : 0;
-        const uint miss = used && s < 0 ? 1u : 0u;
-        const uint rank = simd_prefix_exclusive_sum(miss);
-        if (used) {
-            hit_ids[lane] = max(s, 0);
-            miss_rank[lane] = miss ? int(rank) : -1;
-        }
-        if (a.lookup == 2 && used)
-            atomic_fetch_add_explicit(&counts[mine], 1u, memory_order_relaxed);
-        const uint misses = simd_sum(miss);
-        if (lane < 3)
-            indirect[lane * 3 + 2] = misses;
-    }
+    moe_route_token(logits + uint64_t(t) * a.n_expert, bias, sel + t * 16, w + t * 16, biased + uint64_t(t) * a.n_expert,
+                    a, slots, hit_ids + t * 16, miss_rank + t * 16, indirect + t * 9, counts, lane);
 }
 
 struct PredictArgs {

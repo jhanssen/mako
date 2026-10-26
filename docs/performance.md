@@ -25,6 +25,9 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | KDA scan with each thread's 32 state columns in registers (was threadgroup memory, read and written twice per token: ~2.2 TB/s of traffic) | scan ~1.05 s -> ~0.3 s on 4096 tokens; prefill +6-8% (562 -> 609, 464 -> 493 tok/s in A/B pairs); logits unchanged against the reference |
 | MoE layers whose experts are all resident (every GLM layer on 128 GB) skip the CPU round trip and the miss pass: `moe_route` counts the selections on the GPU, passed to the arena after the step (usage, eviction scores, `--learn` unchanged) | 25.7 -> 25.1 ms/token (two A/B pairs), speculative step 32.9 -> 32.2 ms; tokens identical |
 | Batched GEMVs for same-shape matrices on one input, weights adjacent: shared-expert and dense gate/up, KDA q/k/v (one token), KDA f_a/g_a | 25.1 -> 24.9 ms/token; tokens identical |
+| The step's command buffer committed after layer 0 and the rest encoded into a second one while the GPU runs (`commit_ahead`; the CPU's ~0.3 ms of encoding came before the GPU started) | 24.7 -> 24.4 ms/token; tokens identical |
+| hc_step_a, hc_step_b and the rms norm after them in one dispatch (`hc_step_norm`: the token's last threadgroup, found by a device-scope fence and a counter, mixes the streams and norms x) | 180 fewer dispatches a token: -0.25 ms; outputs bit-identical (e2e tests unchanged) |
+| The router GEMV routing in its last threadgroup (`mako_mul_mv_f32_f32_4_route`); conv, gate and the q/k l2 norm in one kernel per head (`kda_prep`) | 110 fewer dispatches: no measurable change (+-0.1 ms). A dispatch boundary costs ~1 us; what a small kernel costs is its chain of dependent memory round trips (~0.8 us each), which a fused kernel keeps |
 
 Where a short-prompt decode step goes (2026-10-26, 789-token prompt, 128 tokens, every expert resident, 25.0
 ms/token; ~9.6 GB read a token, ~17.4 ms at 553 GB/s). Each line is the step time saved by leaving those dispatches
@@ -44,8 +47,16 @@ out (`MAKO_REPEAT=label:0`; output meaningless, timing valid; noise ~0.2 ms):
 | moe_route, KDA scan, Q8_0 4096x128, rms_norm | | 0.7, 0.6, 0.6, 0.3 ms | |
 | swiglu, kda_gate, kda_conv, l2_norm, rms_norm_gate, MLA projections and attention | | <= 0.5 ms each | |
 
-The weights alone would take ~17.4 ms. The remaining ~7.5 ms is the GEMVs running below the bandwidth (the IQ
-expert kernels are arithmetic-bound, the smaller Q6_K GEMVs do not fill the GPU) more than the small kernels.
+The weights alone would take ~17.4 ms (~16.3 at the 589 GB/s a free-running chain of f16 GEMVs reads at). Leaving
+out every small helper kernel at once (`MAKO_REPEAT=hc_step,rms_norm,swiglu,kda_conv,kda_gate,l2_norm,rms_norm_gate,
+moe_route,moe_combine,hc_init,hc_mean:0`) saves 3.3-3.5 ms, and the Q8_0 projections another 1.0-1.3 ms: ~4.5 ms in
+~700 dispatches of 1-15 us, each a chain of dependent memory round trips at ~0.8 us (`bench/chain_bench`: a chain of
+tiny dependent dispatches costs 0.9 us a link in a serial encoder; a small kernel with 4 dependent loads before a 32
+MB GEMV adds ~4 us over free-running). Fusing kernels removes the ~1 us boundary, not the chain. Isolated
+(`gemv_bench`, time against matrices a dispatch): Q6_K streams at ~580 GB/s with ~3 us fixed a dispatch, IQ2_XXS
+527 GB/s + ~9 us, IQ2_S 463 GB/s + ~7 us, IQ3_XXS 580 GB/s + ~7 us, Q8_0 4096x128 575 GB/s + ~2 us, the F32 router
+475 GB/s; so the big GEMVs hold ~1.5-2 ms (the IQ2_S kernel, the IQ2_XXS fixed cost, independent GEMVs in separate
+dispatches), the small kernels ~4.5 ms, the dense weights the rest.
 
 Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
 10-19 ms (not overlapped), drafting ~2.3 ms. The big GEMVs already run at ~400 GB/s of the 553 GB/s measured (614
@@ -76,6 +87,7 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 | Routing, shared expert and routed experts of a resident MoE layer in one concurrent encoder (barriers only where data flows) | 24.9 -> 24.9 ms/token: overlapping independent GEMVs does not recover that ramp-up and tail |
 | `MAKO_REPEAT=label:2` for in-place costs of weights under ~50 MB | the repeat reads weights the cache still holds: Q6_K 4096x8192 came out at ~880 GB/s. `label:0` (leave out) instead |
 | Per-kernel telemetry to find slow kernels | timestamps around each dispatch inflate small kernels several-fold (one "slow" shared-expert GEMV was 93 us measured, 13 us real); repeat-in-place costs (`MAKO_REPEAT`) replaced it |
+| Software dependency tracking instead of encoder barriers: every dispatch in one concurrent encoder, each threadgroup waiting on a device counter the previous dispatch's threadgroups bump after a device-scope fence, the weights read into registers before the wait (`bench/chain_bench`) | 64 chained f16 GEMVs of 32 MB: 65 -> 63 us a link (free-running 57); a chain alternating a latency-bound small kernel and a GEMV: no change (one counter a dispatch: 20% slower from the atomics' contention; 32 counters: equal to serial). Outputs stayed bit-identical, no wait gave up. Not worth the hazard |
 
 ### Open
 

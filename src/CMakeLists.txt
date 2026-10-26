@@ -16,7 +16,7 @@ foreach(src ${MAKO_METAL_SOURCES})
     add_custom_command(OUTPUT ${air}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/kernels
         COMMAND xcrun -sdk macosx metal -std=metal4.0 -Wall -I ${GEMV_KERNELS_DIR} -c ${src} -o ${air}
-        DEPENDS ${src} ${GEMV_KERNELS_DIR}/ggml-common.h
+        DEPENDS ${src} ${GEMV_KERNELS_DIR}/ggml-common.h ${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe_route.h
         COMMENT "Compiling ${stem}.metal")
     list(APPEND _airs ${air})
 endforeach()

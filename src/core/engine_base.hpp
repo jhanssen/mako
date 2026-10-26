@@ -167,9 +167,10 @@ protected:
                  uint32_t T, uint64_t r_off = 0, uint64_t x_off = 0, uint64_t pc_off = 0);
     // T tokens: hc_post(post_x, R -> R_out, pc) when post_x is set (else R_out is R), then hc_pre of the next block
     // on the new stream (fn, scale, base) into x and pc, in two dispatches.
+    // With norm_w and xn: one dispatch that also writes xn = rms_norm(x) * norm_w (the token's last threadgroup).
     void hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
                  const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc,
-                 uint32_t T = 1);
+                 uint32_t T = 1, const DevTensor* norm_w = nullptr, MTL::Buffer* xn = nullptr);
     void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
                    const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
                    uint64_t x_off = 0, uint64_t out_off = 0);
@@ -229,6 +230,9 @@ protected:
     void resolve_layer_times(uint64_t cpu0, uint64_t gpu0);
     void finish(MTL::CommandBuffer* cb);
     void submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
+    // Commits what cb holds, so the GPU starts on it while the rest of the step is encoded into a new command
+    // buffer (finish() accounts for both). Not while a MoE layer waits for the CPU: finish() serves those.
+    void commit_ahead(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
     void probe(MTL::ComputeCommandEncoder*& enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
     void deliver_probes();
@@ -237,12 +241,20 @@ protected:
     // At the layers level with part timing on: the dispatches from here to the next part() (or the end of the
     // section's encoder) are timed as `name`, within the current section.
     void part(MTL::ComputeCommandEncoder*& enc, std::string_view name);
-    // MAKO_REPEAT=<label substring>:<n> encodes matching GEMVs, norms and helper dispatches n times, so the extra
+    // MAKO_REPEAT=<label substrings, comma-separated>:<n> encodes matching GEMVs, norms and helper dispatches n times, so the extra
     // step time measures their cost in place (they all recompute their output from their inputs). Repeats read
     // weights the cache may still hold; n = 0 leaves them out instead (the output is then meaningless).
     int repeats(std::string_view label) const
     {
-        return repeat_n_ != 1 && label.find(repeat_label_) != std::string_view::npos ? repeat_n_ : 1;
+        if (repeat_n_ == 1)
+            return 1;
+        for (size_t p = 0; p <= repeat_label_.size();) { // comma-separated label substrings
+            const size_t e = std::min(repeat_label_.find(',', p), repeat_label_.size());
+            if (e > p && label.find(std::string_view(repeat_label_).substr(p, e - p)) != std::string_view::npos)
+                return repeat_n_;
+            p = e + 1;
+        }
+        return 1;
     }
 
     const gguf::ModelFiles& model_;
@@ -311,6 +323,9 @@ protected:
     int repeat_n_ = 1;
     std::string last_pso_; // the kernel a direct dispatch runs, for repeats()
     MTL::CommandBuffer* cur_cb_ = nullptr;
+    std::vector<MTL::CommandBuffer*> ahead_; // committed by commit_ahead, waited for in finish()
+    mtl::Ref<MTL::Buffer> hc_counters_;      // hc_step_norm: a threadgroup counter per token, zero between dispatches
+    mtl::Ref<MTL::Buffer> route_counters_;   // the routing router GEMV: the same
     uint32_t cur_layer_ = 0;
     std::vector<mtl::Ref<MTL::CounterSampleBuffer>> samples_; // kSamplesPerBuffer each; index / that picks one
     std::vector<Timed> timed_;
