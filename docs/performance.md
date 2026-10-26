@@ -287,6 +287,29 @@ are arithmetic-bound. Q5_K (ISTA's dense weights) already runs at 430-540 GB/s a
 mako's own would gain ~1 ms a step at most; not written. The per-kernel timing mode serializes the GPU and inflated
 both estimates beforehand; isolated benchmarks (`gemv_bench`) are the better guide.
 
+## Both models: the first GPU work after a few seconds idle (2026-10-26)
+
+A conversation's next turn with a handful of new tokens took ~0.6 s in a server session (GLM-5.3: 7 new tokens 568 ms,
+22 in 665 ms), against ~0.15-0.25 s back to back. The engine's own prefill of those tokens is not it (`prefill_sweep`
+at a 4K context: 8 tokens 130 ms, 16 in 180 ms). Timing each part of a turn showed the first GPU work of the turn (for
+GLM the next-token block's seeding, normally 1.5-2.5 ms) taking ~350-370 ms when the server had been idle for 3 s or
+more (10 s and 30 s the same; 1 s not). An empty command buffer is instant then, and the GPU executes the seeding's
+command buffer in ~346 ms: the cost is the first pass that reads the expert arena's buffer (88.7 GB, one allocation).
+A pass that only touches that buffer took 354-361 ms after a 10 s pause (0.2 ms back to back), and the seeding after
+it 14 ms. It is the driver cost startup already pays once (the warm-up pass after the arena is built), paid again
+after idle; DeepSeek uses the same arena code.
+
+Residency sets (`MTLResidencySet` with the arena's buffers) did not help:
+
+| Variant | Seeding after a 10 s pause | Requests |
+| --- | ---: | --- |
+| none | ~350 ms | normal |
+| `requestResidency` only (set not attached to the queue) | ~355 ms | normal |
+| set attached to the command queue, with or without `requestResidency`, with or without the arena's `mlock` | - | the first request timed out (> 90 s) |
+
+Not pursued: a keep-alive (touching the arena about once a second while idle) would likely remove the ~0.35 s, but adds
+a periodic GPU wake-up and its management for a cost paid only after pauses. Left as it is.
+
 ## Apple10 (M5) versus Apple9 (M3/M4)
 
 No code path checks the GPU family; the Apple10 hardware is reached through the same Metal 4 calls that run on Apple9.
