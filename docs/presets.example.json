@@ -9,43 +9,43 @@
     "--ablate": "/path/to/glm-ablation.abl"
   },
   "ds": {
-    "description": "DeepSeek-V4.1-Flash-1017, defaults (Engram tables found beside the model; expert read-ahead on)",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf"
+    "description": "DeepSeek-V4.1-Flash-1017, defaults (expert read-ahead on)",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf"
   },
   "ds-abl": {
     "description": "DeepSeek with an ablation file (sites attn_out, shexp_out)",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--ablate": "/path/to/deepseek-ablation.abl"
   },
   "ds-dspark": {
     "description": "DeepSeek with the DSpark drafter (helps on code; its 8 GB come out of the expert cache)",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--dspark": "/path/to/dspark"
   },
   "ds-route-0.05": {
     "description": "DeepSeek, cache-aware routing: story 24.6 -> 27.7 tok/s with read-ahead; KL vs the reference +20%",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--miss-penalty": 0.05
   },
   "ds-route-0.1": {
     "description": "DeepSeek, cache-aware routing: story -> 29.1 tok/s with read-ahead; KL +58%",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--miss-penalty": 0.1
   },
   "ds-route-0.2": {
     "description": "DeepSeek, cache-aware routing: misses 4.4 a token; KL +79%",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--miss-penalty": 0.2
   },
   "ds-q6": {
     "description": "DeepSeek, dense weights re-quantized to Q6_K at load (with activation statistics): KL +15%",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--dense-quant": "q6_k",
     "--imatrix": "/path/to/deepseek.imatrix"
   },
   "ds-route-0.1-abl": {
     "description": "DeepSeek, cache-aware routing 0.1 with an ablation file",
-    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf",
     "--miss-penalty": 0.1,
     "--ablate": "/path/to/deepseek-ablation.abl"
   }
