@@ -81,6 +81,12 @@ public:
     // expert's output (shexp_out), each before it is added in.
     static constexpr std::array<std::string_view, 2> kAblationSites{"attn_out", "shexp_out"};
     void set_ablation(std::optional<mtl::Ablation> ablation);
+    // Options::miss_penalty.
+    void set_miss_penalty(float penalty)
+    {
+        opts_.miss_penalty = penalty;
+        routing_.miss_penalty = penalty;
+    }
     // Options::prefetch_k and prefetch_ahead.
     void set_prefetch(uint32_t k, uint32_t ahead)
     {

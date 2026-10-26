@@ -73,3 +73,13 @@ add_test(NAME presets COMMAND presets_test ${CMAKE_CURRENT_BINARY_DIR})
 add_executable(gemv_own_test gemv_own_test.cpp)
 target_link_libraries(gemv_own_test PRIVATE mako_mtl)
 add_test(NAME gemv_own COMMAND gemv_own_test)
+
+# DeepSeek-V4.1 against the reference engine's logits (tests/data/ds41_*): short prose, a 24K-token prompt's tail, the
+# miss penalty, dense Q6_K, and the drafter (MAKO_DS41_DSPARK).
+add_executable(ds41_ref_test ds41_ref_test.cpp)
+target_link_libraries(ds41_ref_test PRIVATE mako_dsv41 mako_gen)
+target_compile_definitions(ds41_ref_test PRIVATE MAKO_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
+foreach(m short long penalty q6k dspark)
+    add_test(NAME ds41_${m} COMMAND ds41_ref_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_ENGRAM}" ${m} "${MAKO_DS41_DSPARK}")
+    set_tests_properties(ds41_${m} PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
+endforeach()
