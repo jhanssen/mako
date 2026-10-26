@@ -69,9 +69,11 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 | Staged prefill reads: a prefill group of >= 512 tokens routes to nearly every expert, so the arena's missing experts of every layer are read ahead (8 threads, 1 MiB reads, 16 GB/s) into a 3 GB ring while the GPU works, and run from there without becoming resident | 2.4K-token prompt 275 -> 325-349 tok/s (A/B in sequence); now read-bound (~6.1 s of reads in ~7 s). The first version (6 threads, whole-part reads) read at 10.6 GB/s and gained nothing |
 | Expert cache margin a quarter of RAM from 96 GB up (was 40%): DeepSeek 74 -> 94.5 GB, GLM-5.3 74 -> 86 GB (every expert resident) | DeepSeek at 90 GB: prefill +16% (352 vs 304 tok/s), decode after the prompt +13% (misses 28.8 -> 19.8 a step). Stress test (160 GB written beside decode): lowest available 20.4 GB (DeepSeek) / 32.4 GB (GLM), no swapping |
 | Routing profile through prefill (per-token counts) | the profile now reflects routing frequency; first attempt counted each expert once per group and made decode worse (41 misses/step) |
+| Prefill skips work the result does not depend on: from layer 20 (the last KV source) on, a long prompt's earlier rows only add that layer's compressed rows and index keys, and each later layer starts one window later | 8K tokens 14.3 -> 10.5 s, 16K 31.2 -> 21.5 s, 24K 52.9 -> 30.4 s; 4K unchanged (SSD-bound); the last 1024 positions' logits and later decode identical against the reference (ds41_long) |
 
 Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads once per group (overlapped with the
-~1.8 ms/token of GPU work since staging). Decode runs 13-21 tok/s; misses per step vary 15-40 with content and history.
+~1.8 ms/token of GPU work since staging). Decode first ran 13-21 tok/s (misses per step 15-40 with content and history);
+the sections below take it to ~25 by default.
 
 ### Tried and rejected
 
