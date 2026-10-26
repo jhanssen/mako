@@ -45,6 +45,8 @@ add_test(NAME engram_ds41 COMMAND engram_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_
                                   ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_engram_expected.txt)
 add_test(NAME gemv COMMAND gemv_test "${MAKO_MODEL}")
 add_test(NAME gemm COMMAND gemm_test "${MAKO_MODEL}")
+add_test(NAME gemm_synthetic COMMAND gemm_test --synthetic)
+set_tests_properties(gemm_synthetic PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
 # DeepSeek-V4.1's expert formats (IQ3_S down projections, IQ2_S gate) against the GEMV.
 add_test(NAME gemm_ds41 COMMAND gemm_test "${MAKO_DS41_MODEL}" blk.0.ffn_down_exps.weight blk.0.ffn_gate_exps.weight)
 foreach(c decode prefill parity spec session ablate long)

@@ -553,7 +553,7 @@ ExpertArena::Part EngineBase::expert(const std::string& name, bool prefill)
         throw std::runtime_error(std::format("{}: unsupported type {}", name, gguf::traits(t.type).name));
     if (prefill && !mtl::Gemm::supports(t.type))
         throw std::runtime_error(std::format("{}: type {} has no prefill GEMM (experts: IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, "
-                                             "Q6_K, Q8_0, F16, F32)",
+                                             "IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, F16, F32)",
                                              name, gguf::traits(t.type).name));
     auto [it, fresh] = nocache_fds_.try_emplace(ref.file->path(), -1);
     if (fresh) {

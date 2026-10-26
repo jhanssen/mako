@@ -1,6 +1,7 @@
 // Prefill GEMM against CPU dequantization on real tensors, for several token counts, plus its speed. For expert
 // tensors (one expert's matrix) and formats without CPU dequantization the reference is the per-format GEMV.
 //   gemm_test <model shard.gguf> [tensor ...]
+//   gemm_test --synthetic   random blocks of formats no test model carries (IQ4_XS), against the GEMV
 #include "gguf/gguf.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemm.hpp"
@@ -10,6 +11,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <expected>
+#include <span>
 #include <filesystem>
 #include <print>
 #include <random>
@@ -19,20 +22,23 @@
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::println(stderr, "usage: gemm_test <model.gguf> [tensor ...]");
+        std::println(stderr, "usage: gemm_test <model.gguf> [tensor ...] | --synthetic");
         return 2;
     }
-    if (!std::filesystem::exists(argv[1])) {
+    const bool synthetic = std::string_view(argv[1]) == "--synthetic";
+    if (!synthetic && !std::filesystem::exists(argv[1])) {
         std::println("model {} not found: skipped", argv[1]);
         return 77;
     }
-    auto f = mako::gguf::File::open(argv[1]);
-    if (!f) {
+    std::expected<mako::gguf::File, std::string> f = std::unexpected("synthetic");
+    if (!synthetic && !(f = mako::gguf::File::open(argv[1]))) {
         std::println(stderr, "{}", f.error());
         return 1;
     }
     std::vector<std::string> names(argv + 2, argv + argc);
-    if (names.empty())
+    if (synthetic)
+        names = {"iq4_xs"};
+    else if (names.empty())
         names = {"blk.0.attn_q.weight",       "blk.0.ffn_down.weight",      "blk.0.ssm_f_a.weight",
                  "blk.0.hc_attn_fn.weight",   "blk.3.ffn_gate_inp.weight",  "blk.3.ffn_gate_exps.weight",
                  "blk.3.ffn_down_exps.weight", "blk.10.ffn_down_exps.weight"};
@@ -43,9 +49,25 @@ int main(int argc, char** argv)
     std::mt19937 rng(5);
     std::normal_distribution<float> nd;
     int failures = 0;
+    std::vector<std::byte> fake;
     for (const auto& name : names) {
-        const mako::gguf::Tensor* t = f->tensor(name);
-        if (!t || t->dims.size() < 2) {
+        mako::gguf::Tensor synth;
+        const mako::gguf::Tensor* t = &synth;
+        std::span<const std::byte> data;
+        if (synthetic) {
+            // An expert-down-sized IQ4_XS matrix: random nibbles and scales, d small enough for half activations.
+            synth.type = mako::gguf::Type::IQ4_XS;
+            synth.dims = {2048, 4096};
+            const uint64_t blocks = 2048 / 256 * 4096;
+            fake.resize(blocks * 136);
+            std::uniform_int_distribution<int> byte(0, 255);
+            for (auto& b : fake)
+                b = std::byte(byte(rng));
+            for (uint64_t i = 0; i < blocks; ++i) {
+                const __fp16 d = __fp16(0.001f * (1 + i % 7));
+                std::memcpy(fake.data() + i * 136, &d, 2);
+            }
+        } else if (!(t = f->tensor(name)) || t->dims.size() < 2) {
             std::println("{:28} missing or not a matrix", name);
             ++failures;
             continue;
@@ -53,7 +75,10 @@ int main(int argc, char** argv)
         const uint32_t k = uint32_t(t->dims[0]), n = uint32_t(t->dims[1]);
         const auto tr = mako::gguf::traits(t->type);
         const uint64_t rb = uint64_t(k) / tr.block_elems * tr.block_bytes;
-        auto data = f->data(*t).subspan(t->dims.size() > 2 ? 7 * rb * n : 0, rb * n); // expert 7
+        if (synthetic)
+            data = fake;
+        else
+            data = f->data(*t).subspan(t->dims.size() > 2 ? 7 * rb * n : 0, rb * n); // expert 7
         const bool cpu_ref = mako::quant::can_dequant(t->type);
         auto buffer = [&](uint64_t bytes) {
             return mako::mtl::Ref<MTL::Buffer>(ctx.device()->newBuffer(bytes, MTL::ResourceStorageModeShared));
