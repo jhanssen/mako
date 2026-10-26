@@ -1064,7 +1064,11 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     MTL::Buffer* ew = scratch("p_ew", uint64_t(G) * 16 * 4);
     proj(enc, mw.router, xn_g, 0, rlog, 0, G);
     // Routing only; the CPU assigns slots after this sync.
-    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score), 0.0f};
+    // A group too small to stage its reads routes with the decode steps' miss penalty (a large one reads every
+    // missing expert ahead anyway).
+    const bool penalize = routing_.miss_penalty > 0.0f && G < kStageMinTokens;
+    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score),
+                       penalize ? routing_.miss_penalty : 0.0f};
     MTL::Buffer* unused = scratch("p_unused", 64);
     enc->setComputePipelineState(pso("moe_route"));
     enc->setBuffer(rlog, 0, 0);
@@ -1073,7 +1077,10 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     enc->setBuffer(ew, 0, 3);
     enc->setBuffer(scratch("p_biased", uint64_t(G) * dims_.n_expert * 4), 0, 4);
     enc->setBytes(&ra, sizeof(ra), 5);
-    enc->setBuffer(unused, 0, 6);
+    if (penalize)
+        enc->setBuffer(arena_->slot_table(), uint64_t(il) * dims_.n_expert * 4, 6);
+    else
+        enc->setBuffer(unused, 0, 6);
     enc->setBuffer(unused, 0, 7);
     enc->setBuffer(unused, 0, 8);
     enc->setBuffer(unused, 0, 9);

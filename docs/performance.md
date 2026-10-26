@@ -230,6 +230,11 @@ defaults then miss penalty 0.05, 0.1, 0.2, Q6_K + statistics, penalty 0.1 + abla
 2.893, 1.860 / 2.900, 1.863 / 2.906, 1.868 / 2.919, 1.851 / 2.887 (the reference: 1.877 on the prose). The speed
 options' extra KL against the reference does not show up as worse prediction of the text.
 
+Short prompt additions (a conversation's next turn): after an 8K-token context, 16 / 32 new tokens took 558 / 891 ms
+through prefill, 463 / 798 of it misses (~30 a token, against ~10 in steady decoding; with the experts resident, 8
+tokens take ~110 ms). Running them as decode steps of 8 was slower (698 / 1211 ms, the same misses). Prefill groups
+too small to stage now route with the miss penalty: at 0.1, 428 / 626 ms (312 / 525 misses). `ds_run --tail N`.
+
 Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
 projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
 GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against

@@ -632,7 +632,7 @@ struct RouteArgs {
     float scale;
     uint lookup; // look the selection up in slots (one token)
     uint score;  // 0: sigmoid, 1: sqrt(softplus)
-    float miss_penalty; // with lookup: subtracted from a non-resident expert's selection score (not its weight)
+    float miss_penalty; // > 0: subtracted from the selection score (not the weight) of an expert slots lacks
 };
 
 static float route_score(float l, uint kind)
@@ -672,7 +672,7 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
         if (e < a.n_expert) {
             v[k] = route_score(logits[e], a.score) + bias[e];
             biased[e] = v[k];
-            if (a.lookup && a.miss_penalty > 0.0f && slots[e] < 0)
+            if (a.miss_penalty > 0.0f && slots[e] < 0)
                 v[k] -= a.miss_penalty;
         }
     }

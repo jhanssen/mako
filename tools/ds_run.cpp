@@ -5,6 +5,8 @@
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [-n N]
+// --tail N: the ids but the last N through prefill(), then the last N timed through prefill() and, from the same
+// checkpoint, as decode steps of up to 8 tokens; the misses and expert reads of each.
 // --ref-from N: the reference's first position is N (a tail of a long prompt's logits). --steps-from N: the first N ids
 // through prefill(), the rest one step each. Comparisons also report the perplexity of the ids' own next tokens.
 // --imatrix-out FILE (with --gen N): the mean square of each input channel of the dense matrices' inputs over the
@@ -77,7 +79,7 @@ int main(int argc, char** argv)
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0, study_n = 0;
     bool part_timing = false;
-    size_t ref_from = 0, steps_from = 0;
+    size_t ref_from = 0, steps_from = 0, tail = 0;
     std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
@@ -134,6 +136,8 @@ int main(int argc, char** argv)
             opts.dspark = v;
         else if (a == "--gen")
             session_n = uint32_t(std::stoul(v));
+        else if (a == "--tail")
+            tail = std::stoul(v);
         else if (a == "--ref-from")
             ref_from = std::stoul(v);
         else if (a == "--steps-from")
@@ -250,6 +254,46 @@ int main(int argc, char** argv)
             std::println("verify of {}: {:.1f} ms (position {} -> {})", v->size(), ms, p0, engine.position());
             engine.reset();
             engine.prefill(ids);
+        }
+        return 0;
+    }
+    if (tail > 0 && tail < ids.size()) {
+        const std::span<const int32_t> all(ids);
+        engine.prefill(all.first(ids.size() - tail));
+        const auto cp = engine.checkpoint();
+        const auto rest = all.last(tail);
+        // DS_TAIL_ORDER=steps: the steps first (each method's first run then starts from the same cache).
+        const bool steps_first = std::getenv("DS_TAIL_ORDER") && std::string_view(std::getenv("DS_TAIL_ORDER")) == "steps";
+        if (steps_first) {
+            engine.restore(cp);
+            const auto s0 = engine.arena().stats();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < rest.size(); i += 8)
+                engine.prefill(rest.subspan(i, std::min<size_t>(8, rest.size() - i)));
+            const auto s1 = engine.arena().stats();
+            std::println("{} tokens after {}: steps of 8 first {:.0f} ms ({} misses, {:.0f} ms reading)", tail,
+                         ids.size() - tail,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                         s1.misses - s0.misses, s1.read_ms - s0.read_ms);
+            return 0;
+        }
+        for (int rep = 0; rep < 2; ++rep) {
+            engine.restore(cp);
+            auto st0 = engine.arena().stats();
+            auto t0 = std::chrono::steady_clock::now();
+            engine.prefill(rest);
+            const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto st1 = engine.arena().stats();
+            engine.restore(cp);
+            t0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < rest.size(); i += 8)
+                engine.prefill(rest.subspan(i, std::min<size_t>(8, rest.size() - i)));
+            const double dms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto st2 = engine.arena().stats();
+            std::println("{} tokens after {}: prefill {:.0f} ms ({} misses, {:.0f} ms reading), steps of 8 {:.0f} ms ({} misses, "
+                         "{:.0f} ms reading)",
+                         tail, ids.size() - tail, pms, st1.misses - st0.misses, st1.read_ms - st0.read_ms, dms,
+                         st2.misses - st1.misses, st2.read_ms - st1.read_ms);
         }
         return 0;
     }
