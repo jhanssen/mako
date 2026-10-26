@@ -5,6 +5,8 @@
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [-n N]
+// --ref-from N: the reference's first position is N (a tail of a long prompt's logits). --steps-from N: the first N ids
+// through prefill(), the rest one step each. Comparisons also report the perplexity of the ids' own next tokens.
 // --imatrix-out FILE (with --gen N): the mean square of each input channel of the dense matrices' inputs over the
 // generated steps, for --imatrix (activation-weighted rounding in --dense-quant).
 // --route-study N: N greedy tokens without drafts, then how well each expert-miss predictor would have done: layer
@@ -75,6 +77,7 @@ int main(int argc, char** argv)
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0, study_n = 0;
     bool part_timing = false;
+    size_t ref_from = 0, steps_from = 0;
     std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
@@ -131,6 +134,10 @@ int main(int argc, char** argv)
             opts.dspark = v;
         else if (a == "--gen")
             session_n = uint32_t(std::stoul(v));
+        else if (a == "--ref-from")
+            ref_from = std::stoul(v);
+        else if (a == "--steps-from")
+            steps_from = std::stoul(v);
         else if (a == "--imatrix-out")
             imatrix_out = v;
         else if (a == "--imatrix")
@@ -196,14 +203,19 @@ int main(int argc, char** argv)
     std::ofstream lo;
     if (!out.empty())
         lo.open(out, std::ios::binary);
-    double kl_sum = 0;
-    int agree = 0, compared = 0;
+    double kl_sum = 0, nll_sum = 0, ref_nll_sum = 0;
+    int agree = 0, compared = 0, scored = 0;
     auto check = [&](size_t t, const float* lg, double ms) {
         if (lo)
             lo.write(reinterpret_cast<const char*>(lg), std::streamsize(V * 4));
         const size_t top = size_t(std::max_element(lg, lg + V) - lg);
-        if ((t + 1) * V <= want.size()) {
-            const float* w = want.data() + t * V;
+        if (t + 1 < ids.size() && t >= ref_from) {
+            const auto lq = log_softmax(lg, V);
+            nll_sum -= double(lq[size_t(ids[t + 1])]);
+            ++scored;
+        }
+        if (t >= ref_from && (t - ref_from + 1) * V <= want.size()) {
+            const float* w = want.data() + (t - ref_from) * V;
             const auto lp = log_softmax(w, V), lq = log_softmax(lg, V);
             double kl = 0;
             for (size_t i = 0; i < V; ++i)
@@ -211,6 +223,8 @@ int main(int argc, char** argv)
             const size_t wtop = size_t(std::max_element(w, w + V) - w);
             kl_sum += kl;
             agree += wtop == top;
+            if (t + 1 < ids.size())
+                ref_nll_sum -= double(lp[size_t(ids[t + 1])]);
             ++compared;
             std::println("pos {:4} token {:6}: top {:6} (ref {:6}) KL {:.5f}  {:.1f} ms", t, ids[t], top, wtop, kl, ms);
         } else {
@@ -486,7 +500,11 @@ int main(int argc, char** argv)
                          "misses and the rest {:.0f}",
                          at, ff, hit, miss);
     } else {
-        for (size_t t = 0; t < ids.size(); ++t) {
+        if (steps_from) {
+            engine.prefill(std::span<const int32_t>(ids).first(std::min(steps_from, ids.size())));
+            std::println("prefilled {} ids", engine.position());
+        }
+        for (size_t t = steps_from; t < ids.size(); ++t) {
             const auto s0 = std::chrono::steady_clock::now();
             const auto& lg = engine.step(ids[t]);
             step_misses += engine.last_step().misses;
@@ -495,7 +513,12 @@ int main(int argc, char** argv)
     }
     if (compared)
         std::println("{} positions: top-1 agreement {:.1f}%, KL mean {:.5f}, {:.2f} expert misses a step", compared,
-                     100.0 * agree / compared, kl_sum / compared, double(step_misses) / double(ids.size()));
+                     100.0 * agree / compared, kl_sum / compared,
+                     double(step_misses) / double(ids.size() - std::min(steps_from, ids.size())));
+    if (scored)
+        std::println("perplexity of the next ids over {} positions: {:.4f} (mean NLL {:.5f}){}", scored,
+                     std::exp(nll_sum / scored), nll_sum / scored,
+                     compared ? std::format("; the reference's {:.4f}", std::exp(ref_nll_sum / compared)) : "");
     int32_t next = int32_t(std::max_element(engine.logits().begin(), engine.logits().end()) - engine.logits().begin());
     std::vector<int32_t> gen_ids;
     const auto g0 = std::chrono::steady_clock::now();

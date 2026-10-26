@@ -2,6 +2,7 @@
 //   io_bench create <file> <GiB>
 //   io_bench read <file> [threads] [block_KiB] [seconds]
 //   io_bench sweep <file> [seconds]
+//   io_bench pair <file> <copy on another drive> [reps]   one 10 or 14 MB span split between the two copies
 //   io_bench batch <file> [reps]   time to read one span of 7 or 14 MB (a decode step's missing experts) as parallel
 //                                  chunks from persistent threads, across thread counts and chunk sizes
 #include <fcntl.h>
@@ -224,6 +225,41 @@ int run_batch(const char* path, int reps)
     return 0;
 }
 
+// One span read from two copies of a file on different drives at once: a fraction of it (whole chunks) from the
+// second copy, the rest from the first, each with its own threads.
+int run_pair(const char* path_a, const char* path_b, int reps)
+{
+    const int fa = open_nocache(path_a, O_RDONLY), fb = open_nocache(path_b, O_RDONLY);
+    const uint64_t size = std::min(uint64_t(::lseek(fa, 0, SEEK_END)), uint64_t(::lseek(fb, 0, SEEK_END)));
+    char* dst = static_cast<char*>(map_anon(16 << 20));
+    std::memset(dst, 0, 16 << 20);
+    std::mt19937_64 rng(2);
+    const uint64_t chunk = 1 << 20;
+    Pool pa(8), pb(8);
+    std::println("| MB | from the second | median ms | GB/s at median |\n|---|---|---|---|");
+    for (uint64_t mb : {10, 14})
+        for (double frac : {0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 1.0}) {
+            const uint64_t bytes = mb << 20, nb = uint64_t(frac * double(bytes / chunk) + 0.5) * chunk;
+            std::vector<double> ms;
+            for (int r = 0; r < reps; ++r) {
+                const uint64_t off = (rng() % ((size - (16 << 20)) >> 16)) << 16;
+                const auto t0 = Clock::now();
+                std::jthread second;
+                if (nb)
+                    second = std::jthread([&] { pb.run(fb, dst, off, nb, chunk); });
+                if (bytes > nb)
+                    pa.run(fa, dst + nb, off + nb, bytes - nb, chunk);
+                if (second.joinable())
+                    second.join();
+                ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            }
+            std::ranges::sort(ms);
+            const double med = ms[ms.size() / 2];
+            std::println("| {} | {:.0f}% | {:.3f} | {:.1f} |", mb, 100 * frac, med, bytes / med / 1e6);
+        }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) {
@@ -243,6 +279,8 @@ int main(int argc, char** argv)
     }
     if (cmd == "batch")
         return run_batch(path, argc > 3 ? std::stoi(argv[3]) : 200);
+    if (cmd == "pair" && argc > 3)
+        return run_pair(path, argv[3], argc > 4 ? std::stoi(argv[4]) : 60);
     if (cmd == "sweep") {
         double secs = argc > 3 ? std::stod(argv[3]) : 3.0;
         for (size_t kib : {128, 512, 1024, 2048, 4096, 8192})

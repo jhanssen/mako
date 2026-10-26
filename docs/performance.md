@@ -207,6 +207,13 @@ Decode steps committed every 4 layers, with layers whose routing is back served 
 blocking), and no empty command buffer after the logits: the GPU starts while the CPU still encodes. 41.4 -> 41.0 ms a
 step (+1%, two A/B pairs); wall time is now ~0.5 ms over GPU time.
 
+A second copy of the experts on an external drive (Thunderbolt 3 enclosure, PCIe 3.0 x4 drive): one 7-14 MB read from
+it alone runs at 2.3-2.4 GB/s (`io_bench batch`). Split between the internal SSD and it (`io_bench pair`, chunks of
+1 MiB): 10 MB spans 11.1 GB/s from the internal SSD alone, 11.7 with 10% from the external one, 8.9 with 20%; 14 MB
+11.6 -> 12.4 with 15%. The drives do not slow each other, but beyond one chunk in ten the external share is the
+slowest: ~5% off miss time, not built. A drive at ~6-7 GB/s (PCIe 4.0 over Thunderbolt 5) would move the best split
+to ~35-40%: to measure with `io_bench pair` when one is available.
+
 Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
 projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
 GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against
