@@ -182,7 +182,7 @@ the sections below take it to ~25 by default.
 | Resident experts (IQ2_XXS / IQ3_XXS indexed GEMV) | 7.8 | the IQ kernels run at 360-385 GB/s (Q8_0 at 566-580 on the same shapes): ~4.6 ms at bandwidth |
 | Attention output (out_a, out_b) | 6.1 | 3.2 GB of Q8_0, near bandwidth |
 | Attention q/kv projections | 4.8 | 2.2 GB of Q8_0 |
-| Shared expert | 3.6 | 1.5 GB of Q8_0 |
+| Shared expert | 3.6 | 1.5 GB of Q8_0; since the multi-GEMV MoE dispatches (2026-10-26) `parts` counts it under the resident experts |
 | Router + routing | 2.1 | the F32 router GEMV is ~0.6; the route kernel and the event signal the rest |
 | hc and norm (attention and FFN) | 1.9 | small kernels |
 | Attention core | 1.8 | |
