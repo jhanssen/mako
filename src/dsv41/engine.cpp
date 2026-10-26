@@ -36,6 +36,11 @@ struct HcArgs {
     float eps;
     uint32_t tokens;
 };
+struct HcLaggedArgs {
+    uint32_t n_embd;
+    float rms_eps;
+    uint32_t wn, row_groups, groups;
+};
 struct RopeArgs {
     uint32_t head_dim, heads, n_rot, stride, pos0, pos_step, inverse;
 };
@@ -455,6 +460,51 @@ void Engine::hc_lagged(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, co
     enc->setBytes(&ha, sizeof(ha), 3);
     enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
     after(enc, "hc_collapse");
+}
+
+void Engine::hc_lagged_norm(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale,
+                            const DevTensor& base, MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc,
+                            MTL::Buffer* pc_prev, uint32_t T, uint64_t r_off, uint64_t pc_off, const DevTensor& norm_w,
+                            MTL::Buffer* xn, bool fused)
+{
+    const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E;
+    fused = fused && !probe_ && repeat_n_ == 1 && tel_ != core::Telemetry::kernels && T <= kMaxDecodeTokens && !r_off &&
+            !pc_off && cfg_.hc == 4 && fn.type == gguf::Type::F32 && fn.dims.size() == 2 && fn.dims[0] == hd &&
+            fn.dims[1] == 24 && hd % 32 == 0 && E % 4 == 0;
+    if (!fused) {
+        hc_lagged(enc, fn, scale, base, R, x, pc, pc_prev, T, r_off, pc_off);
+        norm(enc, x, &norm_w, xn, T, E, E, cfg_.rms_eps);
+        return;
+    }
+    if (!hc_counters_) {
+        hc_counters_ = mtl::Ref<MTL::Buffer>(
+            ctx_.device()->newBuffer(kMaxDecodeTokens * 4, MTL::ResourceStorageModeShared));
+        std::memset(hc_counters_->contents(), 0, kMaxDecodeTokens * 4);
+    }
+    MTL::Buffer* mixes = scratch("hc_mixes", uint64_t(kMaxDecodeTokens) * 24 * 4);
+    constexpr uint32_t kRowGroups = 6; // 4 of the 24 mixing rows each
+    const HcLaggedArgs a{E, cfg_.rms_eps, E, kRowGroups, kRowGroups + (E + 255) / 256};
+    enc->setComputePipelineState(pso("hc_lagged_norm"));
+    enc->setBuffer(R, 0, 0);
+    enc->setBuffer(fn.buf, fn.off, 1);
+    enc->setBuffer(pc_prev, 0, 2);
+    enc->setBuffer(mixes, 0, 3);
+    enc->setBuffer(x, 0, 4);
+    enc->setBuffer(norm_w.buf, norm_w.off, 5);
+    enc->setBuffer(xn, 0, 6);
+    enc->setBuffer(hc_counters_.get(), 0, 7);
+    enc->setBytes(&a, sizeof(a), 8);
+    enc->dispatchThreadgroups(MTL::Size(a.groups, T, 1), MTL::Size(256, 1, 1));
+    after(enc, "hc_lagged_norm");
+    const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, T};
+    enc->setComputePipelineState(pso("hc_mix"));
+    enc->setBuffer(mixes, 0, 0);
+    enc->setBuffer(scale.buf, scale.off, 1);
+    enc->setBuffer(base.buf, base.off, 2);
+    enc->setBuffer(pc, 0, 3);
+    enc->setBytes(&ha, sizeof(ha), 4);
+    enc->dispatchThreads(MTL::Size(T, 1, 1), MTL::Size(T, 1, 1));
+    after(enc, "hc_mix");
 }
 
 // T tokens' attention at positions pos0..: each token's window rows plus the compressed rows its KV source keeps
@@ -901,8 +951,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
             const uint32_t T = std::min(chunk, (compress_only ? s : G) - c0);
             const uint64_t r_off = uint64_t(c0) * hd * 4, pc_off = uint64_t(c0) * 24 * 4;
             part(enc, "attn hc and norm");
-            hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, r_off, pc_off);
-            norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
+            hc_lagged_norm(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, r_off, pc_off,
+                           L.attn_norm, xn, decode);
             attention(enc, L, il, xn, att, T, pos_ + c0, c0, nullptr, false, compress_only);
             if (!compress_only) {
                 part(enc, "attn hc post");
@@ -933,8 +983,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
             continue;
         }
         part(enc, "ffn hc and norm");
-        hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, Gs, s_r, s_pc);
-        norm(enc, xg, &L.ffn_norm, xn_g, Gs, E, E, cfg_.rms_eps);
+        hc_lagged_norm(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, Gs, s_r, s_pc,
+                       L.ffn_norm, xn_g, decode);
         if (G == 1)
             probe(enc, "ffn_in", int(il), xn_g, E);
         if (decode) {

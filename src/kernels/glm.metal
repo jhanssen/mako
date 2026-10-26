@@ -454,6 +454,117 @@ kernel void hc_step_norm(device const float* x_post [[buffer(0)]], device const 
         atomic_store_explicit(counters + tok, 0u, memory_order_relaxed);
 }
 
+// A block's lagged pre-chain but hc_mix, for a few tokens in one dispatch, giving what rms_norm (no weight) of the
+// flat stream, the F32 mixing GEMV (fn [24][4 * n_embd]), hc_collapse with the previous block's pre and rms_norm
+// (weight w) give, bit for bit. Grid (groups, tokens), 256 threads. Groups below row_groups each norm the stream
+// themselves and compute 4 mixing rows (two teams of 4 simdgroups, 2 rows each, summed as the F32 GEMV with 4
+// simdgroups sums); the others collapse 256 elements each with pc_prev, and the token's last of those to finish
+// (device fence + counter, zero before and after) norms x into xn. hc_mix stays its own dispatch: inlined here it
+// rounds differently.
+struct HcLaggedArgs {
+    uint n_embd;
+    float rms_eps;
+    uint wn;   // xn's weight length (0: none)
+    uint row_groups;
+    uint groups;
+};
+
+kernel void hc_lagged_norm(device const float* R [[buffer(0)]], device const float* fn [[buffer(1)]],
+                           device const float* pc_prev [[buffer(2)]], device float* mixes [[buffer(3)]],
+                           device float* x [[buffer(4)]], device const float* w [[buffer(5)]],
+                           device float* xn [[buffer(6)]], device atomic_uint* counters [[buffer(7)]],
+                           constant HcLaggedArgs& a [[buffer(8)]],
+                           uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    threadgroup float red[2][2][32];
+    threadgroup uint last[1];
+    const uint g = tg2.x, tok = tg2.y, hd = 4 * a.n_embd;
+    R += uint64_t(tok) * hd;
+    if (g < a.row_groups) {
+        device const float4* R4 = reinterpret_cast<device const float4*>(R);
+        const uint n4 = hd / 4;
+        float s = 0.0f;
+        for (uint i = tid; i < n4; i += TG) {
+            const float4 v = R4[i];
+            s += dot(v, v);
+        }
+        const float inv = rsqrt(tg_sum(s, scratch, tid) / float(hd) + a.rms_eps);
+        constexpr short NW = 32, NB = 32, NF = 16, NF4 = NF / 4, NSG = 4, NR0 = 2;
+        const short team = sgitg / NSG, sg = sgitg % NSG;
+        const int r0 = (int(g) * 2 + team) * NR0, nb = int(hd) / NB;
+        device const float4* ax4[NR0];
+        for (short row = 0; row < NR0; ++row)
+            ax4[row] = reinterpret_cast<device const float4*>(fn + uint64_t(r0 + row) * hd);
+        float sumf[NR0] = {0.f};
+        const short ix = tiisg / (NW / NF), il = tiisg % (NW / NF);
+        const int ib0 = sg * NF + ix;
+        float4 yl4[NF4];
+        device const float4* yb4 = R4 + (ib0 * NB + il * NF) / 4;
+        for (int ib = ib0; ib < nb; ib += NSG * NF) {
+            for (short i = 0; i < NF4; ++i)
+                yl4[i] = yb4[i] * inv;
+            for (short row = 0; row < NR0; row++) {
+                device const float4* xb4 = ax4[row] + (ib * NB + il * NF) / 4;
+                float sumq = 0.f;
+                for (short i = 0; i < NF4; ++i)
+                    sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                sumf[row] += sumq;
+            }
+            yb4 += NSG * NF * NW / 4;
+        }
+        for (short row = 0; row < NR0; ++row) {
+            if (sg == 0)
+                red[team][row][tiisg] = 0.0f;
+            sumf[row] = simd_sum(sumf[row]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0; ++row)
+            if (tiisg == 0)
+                red[team][row][sg] = sumf[row];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0; ++row) {
+            const float tot = simd_sum(red[team][row][tiisg]);
+            if (tiisg == 0 && sg == 0)
+                mixes[tok * 24 + r0 + row] = tot;
+        }
+        return;
+    }
+    const uint e = (g - a.row_groups) * TG + tid;
+    if (e < a.n_embd) {
+        device const float* pre = pc_prev + tok * 24;
+        float acc = 0.0f;
+        for (uint h = 0; h < 4; ++h)
+            acc += R[h * a.n_embd + e] * pre[h];
+        x[uint64_t(tok) * a.n_embd + e] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        last[0] =
+            atomic_fetch_add_explicit(counters + tok, 1u, memory_order_relaxed) + 1 == a.groups - a.row_groups ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!last[0])
+        return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    device const float4* x4 = reinterpret_cast<device const float4*>(x + uint64_t(tok) * a.n_embd);
+    device float4* xn4 = reinterpret_cast<device float4*>(xn + uint64_t(tok) * a.n_embd);
+    device const float4* w4 = reinterpret_cast<device const float4*>(w);
+    const uint n4 = a.n_embd / 4;
+    float s = 0.0f;
+    for (uint i = tid; i < n4; i += TG) {
+        const float4 v = x4[i];
+        s += dot(v, v);
+    }
+    const float inv = rsqrt(tg_sum(s, scratch, tid) / float(a.n_embd) + a.rms_eps);
+    for (uint i = tid; i < n4; i += TG)
+        xn4[i] = x4[i] * inv * (a.wn ? w4[i] : float4(1.0f));
+    if (tid == 0)
+        atomic_store_explicit(counters + tok, 0u, memory_order_relaxed);
+}
+
 // Mean of the 4 streams; grid (n_embd, tokens).
 kernel void hc_mean(device const float* R [[buffer(0)]], device float* x [[buffer(1)]],
                     constant HcArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])

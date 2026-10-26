@@ -149,6 +149,12 @@ private:
     void hc_lagged(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
                    MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, MTL::Buffer* pc_prev, uint32_t T,
                    uint64_t r_off, uint64_t pc_off);
+    // hc_lagged and then xn = rms_norm(x) * norm_w; with `fused` (a decode block: no offsets, no observer) in two
+    // dispatches (hc_lagged_norm, then hc_mix) giving the same bits.
+    void hc_lagged_norm(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale,
+                        const DevTensor& base, MTL::Buffer* R, MTL::Buffer* x, MTL::Buffer* pc, MTL::Buffer* pc_prev,
+                        uint32_t T, uint64_t r_off, uint64_t pc_off, const DevTensor& norm_w, MTL::Buffer* xn,
+                        bool fused);
     // T rows (stride heads * head_dim) at positions pos0, pos0 + step, ...
     void rope(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint64_t x_off, bool compressed, uint32_t head_dim,
               uint32_t heads, uint32_t pos0, uint32_t T, uint32_t step = 1, bool inverse = false);
