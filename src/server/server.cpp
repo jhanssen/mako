@@ -48,6 +48,7 @@ struct Server::Impl {
     const text::Tokenizer& tok;
     const chat::Template& tmpl;
     ServerOptions opts;
+    ThinkingOptions thinking;
     gen::Session session;
     std::mutex gen_mutex; // one generation at a time
     std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
@@ -55,8 +56,9 @@ struct Server::Impl {
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
 
     Impl(gen::Model& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
-        : engine(e), tok(t), tmpl(tm), opts(std::move(o)), session(e)
+        : engine(e), tok(t), tmpl(tm), opts(std::move(o)), thinking(thinking_support(tm)), session(e)
     {
+        thinking.default_effort = opts.reasoning_effort;
     }
 
     using ErrorBody = std::function<std::string(const std::string&, const char*)>;
@@ -185,7 +187,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
 void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& res)
 {
     try {
-        const auto cr = parse_messages_request(req.body, opts.sampling, true);
+        const auto cr = parse_messages_request(req.body, opts.sampling, true, thinking);
         const auto rendered = tmpl.render(cr.context);
         res.set_content(count_tokens_body(uint32_t(tok.encode(rendered.text, rendered.input).size())),
                         "application/json");
@@ -277,7 +279,7 @@ Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Templ
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count();
         im.serve(
-            req, res, [&] { return parse_chat_request(req.body, im.opts.sampling); },
+            req, res, [&] { return parse_chat_request(req.body, im.opts.sampling, im.thinking); },
             [](const std::string& m, const char* t) { return error_body(m, t); }, "chatcmpl-",
             [&](const ChatRequest& cr, const std::string& id) {
                 return openai_protocol(id, created, im.opts.model_id, cr.include_usage);
@@ -288,7 +290,7 @@ Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Templ
     const auto messages = [this](const httplib::Request& req, httplib::Response& res) {
         auto& im = *impl_;
         im.serve(
-            req, res, [&] { return parse_messages_request(req.body, im.opts.sampling); },
+            req, res, [&] { return parse_messages_request(req.body, im.opts.sampling, false, im.thinking); },
             [](const std::string& m, const char* t) {
                 const std::string_view type(t);
                 return anthropic_error(m, type == "server_busy" ? "overloaded_error"

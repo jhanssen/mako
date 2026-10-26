@@ -76,7 +76,8 @@ struct TemplateContext {
     std::vector<TMessage> messages;
     std::optional<std::vector<ToolDef>> tools;
     bool add_generation_prompt = true;
-    std::optional<std::string> reasoning_effort;
+    std::optional<Effort> reasoning_effort;
+    std::optional<bool> enable_thinking;
 };
 
 // Responses.
@@ -152,7 +153,8 @@ const char* stop_reason(End e)
 
 } // namespace
 
-ChatRequest parse_messages_request(std::string_view body, const gen::SamplingParams& sampling, bool count_only)
+ChatRequest parse_messages_request(std::string_view body, const gen::SamplingParams& sampling, bool count_only,
+                                   const ThinkingOptions& thinking)
 {
     Body b{};
     if (auto ec = glz::read<glz::opts{.error_on_unknown_keys = false}>(b, body))
@@ -267,17 +269,18 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
         r.tools = "[]";
     }
 
-    // Thinking: shown only when enabled; the template reasons at low, high or maximum effort.
+    // Thinking: shown only when enabled.
     r.show_reasoning = b.thinking && b.thinking->type == "enabled";
+    std::optional<Effort> effort = Effort("none");
     if (r.show_reasoning) {
         const int64_t budget = b.thinking->budget_tokens.value_or(16384);
-        if (budget <= 4096)
-            ctx.reasoning_effort = "low";
-        else if (budget <= 16384)
-            ctx.reasoning_effort = "high";
-    } else {
-        ctx.reasoning_effort = "low";
+        effort = budget <= 4096 ? std::optional<Effort>("low")
+                 : budget <= 16384 ? std::optional<Effort>("high")
+                                   : std::nullopt;
     }
+    auto c = choose_thinking(effort, thinking);
+    ctx.reasoning_effort = std::move(c.reasoning_effort);
+    ctx.enable_thinking = c.enable_thinking;
     r.context = json::write(ctx);
 
     auto& s = r.gen.sampling;

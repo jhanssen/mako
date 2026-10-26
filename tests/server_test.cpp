@@ -149,6 +149,55 @@ int deepseek(const mako::text::Tokenizer& tok, const mako::chat::Template& tmpl)
     } catch (const std::exception& e) {
         check(false, std::format("translation threw: {}", e.what()));
     }
+    // Thinking controls: the template takes numbers and medium and can skip the reasoning.
+    {
+        using mako::server::BadRequest;
+        auto t = mako::server::thinking_support(tmpl);
+        check(t.can_disable && t.numeric && t.medium, "template thinking support found by rendering");
+        const auto chat = [&](const std::string& extra) {
+            return tmpl
+                .render(mako::server::parse_chat_request(
+                            std::format(R"({{"messages":[{{"role":"user","content":"hi"}}]{}}})", extra), {}, t)
+                            .context)
+                .text;
+        };
+        const auto msgs = [&](const std::string& extra) {
+            return tmpl
+                .render(mako::server::parse_messages_request(
+                            std::format(R"({{"max_tokens":10,"messages":[{{"role":"user","content":"hi"}}]{}}})",
+                                        extra),
+                            {}, false, t)
+                            .context)
+                .text;
+        };
+        const auto no_thinking = [](const std::string& text) {
+            return text.ends_with("<｜Assistant｜></think>") && !text.contains("Reasoning Effort");
+        };
+        check(chat("").contains("Reasoning Effort: 75") && chat("").ends_with("<think>"), "no effort: the default");
+        check(no_thinking(chat(R"(,"reasoning_effort":"none")")) && no_thinking(chat(R"(,"reasoning_effort":0)")),
+              "effort none or 0 skips the reasoning");
+        check(chat(R"(,"reasoning_effort":"medium")").contains("Reasoning Effort: 62"), "medium is its own level");
+        check(chat(R"(,"reasoning_effort":20)").contains("Reasoning Effort: 20"), "numeric effort");
+        check(chat(R"(,"reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":true})")
+                  .contains("Reasoning Effort: 75"),
+              "thinking keys in chat_template_kwargs replace the effort");
+        bool threw = false;
+        try {
+            chat(R"(,"reasoning_effort":101)");
+        } catch (const BadRequest&) {
+            threw = true;
+        }
+        check(threw, "effort above 100 rejected");
+        check(no_thinking(msgs("")) && no_thinking(msgs(R"(,"thinking":{"type":"disabled"})")),
+              "Anthropic: no thinking requested, none rendered");
+        check(msgs(R"(,"thinking":{"type":"enabled","budget_tokens":2000})").contains("Reasoning Effort: 50"),
+              "Anthropic: a small budget is low");
+        t.default_effort = mako::server::Effort(int64_t(30));
+        check(chat("").contains("Reasoning Effort: 30") &&
+                  msgs(R"(,"thinking":{"type":"enabled","budget_tokens":32000})").contains("Reasoning Effort: 30"),
+              "the server's default effort for requests naming none");
+        check(chat(R"(,"reasoning_effort":"high")").contains("Reasoning Effort: 75"), "a request's effort wins");
+    }
     std::println("{} failures", failures);
     return failures ? 1 : 0;
 }
@@ -437,6 +486,30 @@ int main(int argc, char** argv)
           "a stop string's start held back is released at the end");
     const auto [cut, cut_s] = parse(*tok, "unfinished reasoning", "[]");
     check(cut.reasoning == "unfinished reasoning" && cut.content.empty(), "reasoning cut off");
+
+    // Thinking controls: this template knows low and high only and always reasons.
+    {
+        using mako::server::BadRequest;
+        auto t = mako::server::thinking_support(tmpl);
+        check(!t.can_disable && !t.numeric && !t.medium, "GLM template thinking support");
+        const auto effort = [&](const std::string& e) {
+            return tmpl
+                .render(mako::server::parse_chat_request(
+                            std::format(R"({{"messages":[{{"role":"user","content":"hi"}}],"reasoning_effort":{}}})", e),
+                            {}, t)
+                            .context)
+                .text;
+        };
+        check(effort(R"("none")").contains("Reasoning Effort: Low"), "GLM: none asks for low");
+        check(effort(R"("medium")").contains("Reasoning Effort: High"), "GLM: medium becomes high");
+        bool threw = false;
+        try {
+            effort("40");
+        } catch (const BadRequest&) {
+            threw = true;
+        }
+        check(threw, "GLM: numeric effort rejected");
+    }
 
     std::println("{} failures", failures);
     return failures ? 1 : 0;

@@ -68,7 +68,7 @@ int main(int argc, char** argv)
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
                              "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
-                             "[--api-key KEY | --api-key-file FILE]");
+                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -164,6 +164,8 @@ int main(int argc, char** argv)
             so.max_waiting = uint32_t(std::stoul(v));
         else if (a == "--dump-requests")
             so.dump_dir = v;
+        else if (a == "--reasoning-effort")
+            so.reasoning_effort = mako::server::parse_effort(v);
         else if (a == "--api-key")
             add_keys(v, ',');
         else if (a == "--api-key-file") {
@@ -219,6 +221,19 @@ int main(int argc, char** argv)
     } catch (const std::exception& e) {
         mako::log::error("{}", e.what());
         return 1;
+    }
+    {
+        auto t = mako::server::thinking_support(*tmpl);
+        mako::log::info("chat template: reasoning {}; reasoning_effort by name{}{}",
+                        t.can_disable ? "can be skipped" : "always on", t.medium ? " (medium included)" : "",
+                        t.numeric ? " or 1..100" : "");
+        t.default_effort = so.reasoning_effort;
+        try {
+            mako::server::choose_thinking(std::nullopt, t);
+        } catch (const std::exception& e) {
+            mako::log::error("--reasoning-effort: {}", e.what());
+            return 2;
+        }
     }
     if (auto t = meta.get_float("general.sampling.temp"))
         so.sampling.temperature = float(*t);

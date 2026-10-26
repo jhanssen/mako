@@ -4,9 +4,11 @@
 #include "gen/sampler.hpp"
 #include "gen/model.hpp"
 #include "gen/session.hpp"
+#include "server/openai.hpp"
 #include "text/tokenizer.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,6 +27,7 @@ struct ServerOptions {
     // (a Host header other than a loopback name or address, or an Origin other than a loopback one: HTTP 403), so a
     // site the user visits cannot reach the server through the browser.
     std::vector<std::string> api_keys;
+    std::optional<Effort> reasoning_effort; // requests that name none (unset: the template's default)
 };
 
 // Whether a request's credentials (the Authorization or x-api-key header value) carry one of `keys`; each compared in

@@ -26,18 +26,37 @@ reverse proxy with TLS) rather than exposing the port. Not meant for the open in
 ## OpenAI
 
 - `POST /v1/chat/completions` (streaming, tool calls, `reasoning_content`), `GET /v1/models`, `GET /health`.
-- `developer` messages count as `system`; `reasoning_effort` medium maps to the template's high.
-- `chat_template_kwargs` adds template variables (GLM: `clear_thinking` drops earlier turns' reasoning).
+- `developer` messages count as `system`; `reasoning_effort` as in [Thinking](#thinking).
+- `chat_template_kwargs` adds template variables (GLM: `clear_thinking` drops earlier turns' reasoning); thinking keys
+  there (`reasoning_effort`, `enable_thinking`, `thinking`, `thinking_mode`) replace the request's effort.
 - `tool_choice` `required` or a named function forces a call.
 - Not supported (HTTP 400): `n` > 1, `logprobs`, structured `response_format`.
 
 ## Anthropic
 
 - `POST /v1/messages` (text, thinking, tool_use / tool_result, streaming, `tool_choice`) and
-  `POST /v1/messages/count_tokens`; the `thinking` budget picks low, high or maximum effort.
+  `POST /v1/messages/count_tokens`; thinking as in [Thinking](#thinking).
 - Image and document blocks and server tools are rejected.
 - Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, any `ANTHROPIC_API_KEY` (its first request is a ~11K-token
   prompt).
+
+## Thinking
+
+At startup the server renders the chat template to see what it does with the thinking controls and logs it
+(`chat template: reasoning can be skipped; reasoning_effort by name (medium included) or 1..100` for DeepSeek-V4.1;
+GLM-5.3's template knows low and high and always reasons).
+
+| Request | DeepSeek-V4.1 (effort shown) | GLM-5.3 |
+| --- | --- | --- |
+| no effort | `--reasoning-effort`, else the template's default (75) | `--reasoning-effort`, else Max |
+| `reasoning_effort` `none`, `minimal`, `0` | no reasoning (`</think>` in the prompt) | low |
+| `low`, `medium`, `high`, `max` | 50, 62, 75, 100 | Low, High (medium), High, Max |
+| a number 1..100 | that number | HTTP 400 |
+| Anthropic `thinking` disabled or absent | no reasoning | low (hidden) |
+| Anthropic `thinking` enabled, `budget_tokens` <= 4096 / <= 16384 / more | low / high / as no effort | the same |
+
+`--reasoning-effort none|low|medium|high|max|N` sets the effort for requests that name none; a value the template
+cannot take stops the server at startup. The effort is what the model was trained to follow, not a token limit.
 
 ## Behaviour
 

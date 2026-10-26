@@ -11,7 +11,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
+
+namespace mako::chat {
+class Template;
+}
 
 namespace mako::server {
 
@@ -33,8 +38,33 @@ struct ChatRequest {
     bool reasoning_first = true; // the rendered prompt opened the reasoning (ends in <think>)
 };
 
+// A reasoning effort: a level name, or a number for templates that take one (1..100; 0 as "none").
+using Effort = std::variant<std::string, int64_t>;
+// Parses "none", a level name or a whole number.
+Effort parse_effort(std::string_view text);
+
+// What the chat template does with the thinking controls (thinking_support() finds out by rendering), and the
+// server's effort for requests that name none (unset: the template's default).
+struct ThinkingOptions {
+    bool can_disable = false; // enable_thinking: false renders a prompt that skips the reasoning
+    bool numeric = false;     // reasoning_effort takes a number
+    bool medium = false;      // reasoning_effort "medium" is a level of its own
+    std::optional<Effort> default_effort;
+};
+ThinkingOptions thinking_support(const chat::Template& tmpl);
+
+// The template variables for an effort (unset: the default's): "none" (or "minimal", 0) ends the reasoning before it
+// starts where the template can, else asks for "low"; "medium" becomes "high" where the template has no medium; a
+// number needs a template that takes one. Throws BadRequest.
+struct ThinkingChoice {
+    std::optional<Effort> reasoning_effort;
+    std::optional<bool> enable_thinking;
+};
+ThinkingChoice choose_thinking(const std::optional<Effort>& effort, const ThinkingOptions& t);
+
 // Throws BadRequest. `sampling` holds the model's defaults for the fields the request leaves out.
-ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams& sampling);
+ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams& sampling,
+                               const ThinkingOptions& thinking = {});
 
 struct ToolCall {
     std::string id, name, arguments; // arguments: a JSON object's text

@@ -1,9 +1,11 @@
 #include "server/openai.hpp"
 
+#include "chat/template.hpp"
 #include "server/json.hpp"
 #include "server/protocol.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <format>
 #include <random>
 #include <variant>
@@ -36,7 +38,7 @@ struct ChatBody {
     std::optional<std::string> model;
     std::vector<MessageIn> messages;
     std::optional<glz::raw_json> tools, tool_choice, response_format, chat_template_kwargs;
-    std::optional<std::string> reasoning_effort;
+    std::optional<Effort> reasoning_effort;
     std::optional<double> temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty, repetition_penalty;
     std::optional<double> max_tokens, max_completion_tokens, n;
     std::optional<int64_t> seed;
@@ -48,7 +50,8 @@ struct TemplateContext {
     std::vector<MessageIn> messages;
     std::optional<glz::raw_json> tools;
     bool add_generation_prompt = true;
-    std::optional<std::string> reasoning_effort;
+    std::optional<Effort> reasoning_effort;
+    std::optional<bool> enable_thinking;
 };
 
 struct FunctionOut {
@@ -165,7 +168,70 @@ void parse_arguments(glz::raw_json& args)
 
 } // namespace
 
-ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams& sampling)
+Effort parse_effort(std::string_view text)
+{
+    int64_t n = 0;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), n);
+    if (ec == std::errc() && end == text.data() + text.size())
+        return n;
+    return std::string(text);
+}
+
+ThinkingOptions thinking_support(const chat::Template& tmpl)
+{
+    const auto render = [&](std::string_view extra) -> std::optional<std::string> {
+        try {
+            return tmpl
+                .render(std::format(R"({{"messages":[{{"role":"user","content":"x"}}],"add_generation_prompt":true{}}})",
+                                    extra))
+                .text;
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    };
+    // An effort counts when it renders other than an unknown one does (or the template rejects unknown ones).
+    const auto unknown = render(R"(,"reasoning_effort":"no-such-level")");
+    const auto honours = [&](std::string_view extra) {
+        const auto r = render(extra);
+        return r && (!unknown || *r != *unknown);
+    };
+    ThinkingOptions t;
+    const auto plain = render(""), off = render(R"(,"enable_thinking":false)");
+    t.can_disable = plain && off && *plain != *off;
+    t.numeric = honours(R"(,"reasoning_effort":25)");
+    t.medium = honours(R"(,"reasoning_effort":"medium")");
+    return t;
+}
+
+ThinkingChoice choose_thinking(const std::optional<Effort>& effort, const ThinkingOptions& t)
+{
+    const std::optional<Effort>& e = effort ? effort : t.default_effort;
+    if (!e)
+        return {};
+    const auto none = [&]() -> ThinkingChoice {
+        if (t.can_disable)
+            return {.enable_thinking = false};
+        return {.reasoning_effort = Effort("low")};
+    };
+    if (const auto* n = std::get_if<int64_t>(&*e)) {
+        if (*n == 0)
+            return none();
+        if (*n < 1 || *n > 100)
+            throw BadRequest(std::format("reasoning_effort {} is outside 0..100", *n));
+        if (!t.numeric)
+            throw BadRequest("this model's chat template takes reasoning_effort as a level name (low, high), not a number");
+        return {.reasoning_effort = *e};
+    }
+    const auto& name = std::get<std::string>(*e);
+    if (name == "none" || name == "minimal")
+        return none();
+    if (name == "medium" && !t.medium)
+        return {.reasoning_effort = Effort("high")};
+    return {.reasoning_effort = *e};
+}
+
+ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams& sampling,
+                               const ThinkingOptions& thinking)
 {
     ChatBody b{};
     if (auto ec = glz::read<glz::opts{.error_on_unknown_keys = false}>(b, body))
@@ -240,22 +306,24 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
     }
     if (use_tools)
         ctx.tools = std::move(b.tools);
-    if (b.reasoning_effort) {
-        // The template knows low and high and reasons at its maximum otherwise.
-        auto& e = *b.reasoning_effort;
-        if (e == "medium")
-            e = "high";
-        else if (e == "minimal" || e == "none")
-            e = "low";
-        ctx.reasoning_effort = std::move(e);
+    // Thinking keys in chat_template_kwargs replace the request's effort.
+    glz::generic kwargs;
+    const bool has_kwargs = b.chat_template_kwargs && trim(b.chat_template_kwargs->str) != "null";
+    if (has_kwargs && (glz::read_json(kwargs, trim(b.chat_template_kwargs->str)) || !kwargs.is_object()))
+        throw BadRequest("chat_template_kwargs must be an object");
+    bool own_thinking = true;
+    for (const char* k : {"reasoning_effort", "enable_thinking", "thinking", "thinking_mode"})
+        own_thinking &= !(has_kwargs && kwargs.contains(k));
+    if (own_thinking) {
+        auto c = choose_thinking(b.reasoning_effort, thinking);
+        ctx.reasoning_effort = std::move(c.reasoning_effort);
+        ctx.enable_thinking = c.enable_thinking;
     }
     r.context = to_json(ctx);
-    if (b.chat_template_kwargs && trim(b.chat_template_kwargs->str) != "null") {
+    if (has_kwargs) {
         // Extra template variables, spliced in as sent (the template's own keys stay the server's).
         const std::string_view kw = trim(b.chat_template_kwargs->str);
-        glz::generic g;
-        if (glz::read_json(g, kw) || !g.is_object())
-            throw BadRequest("chat_template_kwargs must be an object");
+        const auto& g = kwargs;
         for (const char* own : {"messages", "tools", "add_generation_prompt"})
             if (g.contains(own))
                 throw BadRequest(std::format("chat_template_kwargs may not set {}", own));
