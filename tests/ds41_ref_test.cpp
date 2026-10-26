@@ -13,6 +13,7 @@
 #include "gen/session.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -185,6 +186,7 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     mako::dsv41::Options opts;
     opts.max_ctx = mode == "long" ? 25600 : 4096;
+    opts.prefill_exact_tail = mode == "long" ? 1024 : 4096; // the checked positions (all of a short prompt)
     if (mode == "q6k")
         opts.dense_quant = mako::gguf::Type::Q6_K;
     if (mode == "dspark")
@@ -243,11 +245,20 @@ int main(int argc, char** argv)
         }
         const uint32_t from = uint32_t(ids.size() - ref.positions);
         // Measured when set (full-vocabulary KL): prefill 0.0102 / 96.9%, steps 0.0093 / 97.3%.
-        Parity p{ref, from};
-        engine.set_logits_sink([&](uint32_t pos, const float* lg) { p.add(pos, lg, V); });
-        engine.prefill(ids);
-        engine.set_logits_sink({});
-        p.check_limits(std::format("prefill of {} tokens vs reference at {}..", ids.size(), from), 0.0130, 0.955);
+        for (const bool skip : {true, false}) {
+            engine.reset();
+            engine.set_prefill_skip(skip);
+            Parity p{ref, from};
+            engine.set_logits_sink([&](uint32_t pos, const float* lg) { p.add(pos, lg, V); });
+            const auto t0 = std::chrono::steady_clock::now();
+            engine.prefill(ids);
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            engine.set_logits_sink({});
+            p.check_limits(std::format("prefill of {} tokens ({}, {:.1f} s) vs reference at {}..", ids.size(),
+                                       skip ? "early rows skip layers" : "every row", s, from),
+                           0.0130, 0.955);
+        }
+        engine.set_prefill_skip(true);
         engine.reset();
         engine.prefill(std::span<const int32_t>(ids).first(from));
         Parity q{ref, from};

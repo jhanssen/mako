@@ -13,7 +13,7 @@
 namespace mako::dsv41 {
 
 // The Engram tables: per Engram layer and position, (max_ngram - 1) * heads hashed n-gram rows of head_dim values,
-// MXFP8 on disk (blocks of an E8M0 scale and 32 E4M3 codes).
+// MXFP8 (blocks of an E8M0 scale and 32 E4M3 codes) or Q6_K on disk.
 class Engram {
 public:
     // The GGUF holding a model's Engram tables when they are not in the model's own files: a .gguf with them in
@@ -45,6 +45,7 @@ public:
     // The same rows' bytes as stored (row_bytes() each; zeros for -1, which decode to zeros).
     void read_raw(std::span<const int64_t> rows, uint8_t* out, gguf::ReadPool& pool) const;
     uint32_t row_bytes() const { return row_bytes_; }
+    gguf::Type type() const { return type_; }
 
 private:
     struct Table {
@@ -55,6 +56,7 @@ private:
     std::vector<int32_t> token_map_;
     std::vector<int64_t> mult_, primes_, offsets_;
     int64_t pad_ = 0;
+    gguf::Type type_ = gguf::Type::MXFP8;
     uint32_t ngram_ = 0, cols_ = 0, dim_ = 0, row_bytes_ = 0;
 };
 

@@ -4,7 +4,7 @@
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
-//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [-n N]
+//          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [--prefill-skip 0|1] [-n N]
 // --tail N: the ids but the last N through prefill(), then the last N timed through prefill() and, from the same
 // checkpoint, as decode steps of up to 8 tokens; the misses and expert reads of each.
 // --ref-from N: the reference's first position is N (a tail of a long prompt's logits). --steps-from N: the first N ids
@@ -119,6 +119,8 @@ int main(int argc, char** argv)
             opts.prefetch_k = uint32_t(std::stoul(v));
         else if (a == "--prefetch-ahead")
             opts.prefetch_ahead = uint32_t(std::stoul(v));
+        else if (a == "--prefill-skip")
+            opts.prefill_skip = v != "0";
         else if (a == "--miss-penalty")
             opts.miss_penalty = std::stof(v);
         else if (a == "--dense-quant") {
@@ -185,6 +187,9 @@ int main(int argc, char** argv)
     }
     mako::mtl::Context ctx;
     const auto t0 = std::chrono::steady_clock::now();
+    // Every position from --ref-from on is compared (and scored), so the prefill computes those exactly.
+    if (ids.size() > ref_from)
+        opts.prefill_exact_tail = std::max<uint32_t>(opts.prefill_exact_tail, uint32_t(ids.size() - ref_from));
     mako::dsv41::Engine engine(*m, *cfg, opts, ctx);
     engine.set_part_timing(part_timing);
     std::println(stderr, "loaded in {:.1f} s: arena {:.1f} GB, {}-{} slots a layer, profile {}",

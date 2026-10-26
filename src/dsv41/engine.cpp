@@ -82,7 +82,7 @@ struct EngramArgs {
     float eps;
 };
 struct EngramDecodeArgs {
-    uint32_t dim, tokens, layers, cols;
+    uint32_t dim, tokens, layers, cols, q6k;
 };
 
 constexpr uint32_t kFp8 = 0, kFp4E4m3 = 1, kFp4Pow2 = 2; // ds_round kinds
@@ -185,6 +185,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     for (int32_t s : cfg_.kv_source_layers)
         kv_sources_.push_back(s);
     std::ranges::sort(kv_sources_);
+    skip_from_ = kv_sources_.empty() ? cfg_.n_layer : uint32_t(kv_sources_.back());
     const auto& eg_layers = cfg_.engram.layers;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         auto L = std::make_unique<Layer>();
@@ -446,9 +447,9 @@ void Engine::hc_lagged(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, co
 
 // T tokens' attention at positions pos0..: each token's window rows plus the compressed rows its KV source keeps
 // (all of them up to indexer_top_k, else the indexer's selection), a sink per head, then the grouped output
-// projection.
+// projection. compress_only: only a KV source's compressed rows and index keys.
 void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
-                       uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring, bool block)
+                       uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring, bool block, bool compress_only)
 {
     MTL::Buffer* ringb = ring ? ring : ring_[il].get();
     const uint32_t H = cfg_.n_head, D = cfg_.head_dim, QR = cfg_.q_lora_rank, W = cfg_.sliding_window;
@@ -461,21 +462,23 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     MTL::Buffer* kv = scratch("ds_kv", uint64_t(T) * D * 4);
     MTL::Buffer* kvn = scratch("ds_kvn", uint64_t(T) * D * 4);
     MTL::Buffer* kvc = scratch("ds_kvc", uint64_t(T) * D * 4);
-    part(enc, "attn q kv");
-    if (T == 1 && !block)
-        probe(enc, "imx_attn", int(il), xn, cfg_.n_embd);
-    proj(enc, L.q_a, xn, 0, qr, 0, T);
-    norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
-    if (T == 1 && !block)
-        probe(enc, "imx_qr", int(il), qrn, QR);
-    proj(enc, L.q_b, qrn, 0, q, 0, T);
-    proj(enc, L.kv, xn, 0, kv, 0, T);
-    norm(enc, kv, &L.kv_norm, kvn, T, D, D, cfg_.rms_eps);
-    rope(enc, q, 0, comp, D, H, pos0, T);
-    rope(enc, kvn, 0, comp, D, 1, pos0, T);
-    round(enc, kvn, 0, kvc, 0, T * D, kFp8);
-    if (T == 1)
-        probe(enc, "attn_q", int(il), q, HD);
+    if (!compress_only) {
+        part(enc, "attn q kv");
+        if (T == 1 && !block)
+            probe(enc, "imx_attn", int(il), xn, cfg_.n_embd);
+        proj(enc, L.q_a, xn, 0, qr, 0, T);
+        norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+        if (T == 1 && !block)
+            probe(enc, "imx_qr", int(il), qrn, QR);
+        proj(enc, L.q_b, qrn, 0, q, 0, T);
+        proj(enc, L.kv, xn, 0, kv, 0, T);
+        norm(enc, kv, &L.kv_norm, kvn, T, D, D, cfg_.rms_eps);
+        rope(enc, q, 0, comp, D, H, pos0, T);
+        rope(enc, kvn, 0, comp, D, 1, pos0, T);
+        round(enc, kvn, 0, kvc, 0, T * D, kFp8);
+        if (T == 1)
+            probe(enc, "attn_q", int(il), q, HD);
+    }
 
     // A KV source's compressor: a new compressed row (and index key) per completed group of `ratio` tokens.
     if (L.kv_src) {
@@ -515,6 +518,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             round(enc, latn, 0, ckv_[src].get(), uint64_t(row0) * D * 2, n_emit * D, kFp4E4m3, true);
         }
     }
+    if (compress_only)
+        return;
 
     // The indexer (index sources) for the tokens with more visible compressed rows than it keeps.
     MTL::Buffer* sel = scratch("ds_sel", uint64_t(opts_.prefill_group) * top * 4);
@@ -713,7 +718,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                                                   std::min<uint32_t>(opts_.prefill_group, uint32_t(tokens.size()))));
     for (size_t g0 = 0; g0 < tokens.size(); g0 += opts_.prefill_group) {
         const size_t n = std::min<size_t>(opts_.prefill_group, tokens.size() - g0);
-        run(tokens.subspan(g0, n), bool(logits_sink_));
+        run(tokens.subspan(g0, n), bool(logits_sink_), opts_.prefill_skip ? pos_ + uint32_t(tokens.size() - g0) : 0);
         total.ensure_ms += last_step_.ensure_ms;
         for (size_t l = 0; l < total.layers.size() && l < last_step_.layers.size(); ++l) {
             total.layers[l].attn_ms += last_step_.layers[l].attn_ms;
@@ -742,7 +747,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
     return logits_;
 }
 
-void Engine::run(std::span<const int32_t> tokens, bool all_logits)
+void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prompt_end)
 {
     const uint32_t G = uint32_t(tokens.size());
     if (G == 0 || G > opts_.prefill_group)
@@ -755,6 +760,20 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     apply_pressure();
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, chunk = std::min(opts_.prefill_chunk, G);
     const bool decode = G <= kMaxDecodeTokens; // MoE with GPU routing and served misses, no expert GEMMs
+    // Options::prefill_skip: the first row of these tokens layer il computes. Layer il's rows need the window of
+    // its own KV rows before them, so each layer down from the last starts a window (less one) earlier.
+    const uint32_t W = cfg_.sliding_window, exact = std::max(W, opts_.prefill_exact_tail);
+    auto first_row = [&](uint32_t il) -> uint32_t {
+        if (!prompt_end || decode || il < skip_from_)
+            return 0;
+        const uint64_t need = exact + uint64_t(cfg_.n_layer - il) * (W - 1);
+        const uint64_t from = prompt_end > need ? prompt_end - need : 0;
+        return uint32_t(std::clamp<uint64_t>(from > pos_ ? from - pos_ : 0, 0, G));
+    };
+    // Rows from exact_from on are exact (the logits sink gets only those): all unless the last layer, which starts
+    // latest, skips some.
+    const uint64_t exact_pos = prompt_end && !decode && prompt_end > exact + (W - 1) ? prompt_end - exact : 0;
+    const uint32_t exact_from = uint32_t(std::min<uint64_t>(G, exact_pos > pos_ ? exact_pos - pos_ : 0));
     step_start_ = Clock::now();
     encoding_ = true;
     const ExpertArena::Stats before = arena_->stats();
@@ -827,7 +846,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         }
         committed.clear();
     };
-    const EngramDecodeArgs eda{eg_dim, G, eg_layers, eg_cols};
+    const EngramDecodeArgs eda{eg_dim, G, eg_layers, eg_cols, engram_->type() == gguf::Type::Q6_K};
     dispatch(enc, "ds_engram_decode", {eg_raw, eg}, &eda, sizeof(eda), MTL::Size(eg_dim, eg_rows, 1),
              MTL::Size(256, 1, 1));
     const HcArgs ha{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, G};
@@ -860,18 +879,24 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             enc->dispatchThreadgroups(MTL::Size(4, G, 1), MTL::Size(256, 1, 1));
             after(enc, "ds_engram_gate");
         }
-        for (uint32_t c0 = 0; c0 < G; c0 += chunk) {
-            const uint32_t T = std::min(chunk, G - c0);
+        // Rows before s: none, or at the last KV source its compressed rows and index keys only.
+        const uint32_t s = first_row(il);
+        for (uint32_t c0 = il == skip_from_ ? 0 : s; c0 < G;) {
+            const bool compress_only = c0 < s;
+            const uint32_t T = std::min(chunk, (compress_only ? s : G) - c0);
             const uint64_t r_off = uint64_t(c0) * hd * 4, pc_off = uint64_t(c0) * 24 * 4;
             part(enc, "attn hc and norm");
             hc_lagged(enc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, R, x, pcs[cur], prev, T, r_off, pc_off);
             norm(enc, x, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
-            attention(enc, L, il, xn, att, T, pos_ + c0, c0);
-            part(enc, "attn hc post");
-            ablate(enc, il, ablate_attn_, att, 0, T);
-            if (G == 1)
-                probe(enc, "attn_out", int(il), att, E);
-            hc_post(enc, att, R, R2, pcs[cur], T, r_off, 0, pc_off);
+            attention(enc, L, il, xn, att, T, pos_ + c0, c0, nullptr, false, compress_only);
+            if (!compress_only) {
+                part(enc, "attn hc post");
+                ablate(enc, il, ablate_attn_, att, 0, T);
+                if (G == 1)
+                    probe(enc, "attn_out", int(il), att, E);
+                hc_post(enc, att, R, R2, pcs[cur], T, r_off, 0, pc_off);
+            }
+            c0 += T;
         }
         std::swap(R, R2);
         prev = pcs[cur];
@@ -881,9 +906,18 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             enc = encoder(cb, il, 1);
         }
 
+        // Rows s.. only (s is 0 in decode); xg, xn_g and ffo hold them from row 0.
+        const uint32_t Gs = G - s;
+        const uint64_t s_r = uint64_t(s) * hd * 4, s_pc = uint64_t(s) * 24 * 4;
+        if (Gs == 0) {
+            std::swap(R, R2);
+            prev = pcs[cur];
+            cur ^= 1;
+            continue;
+        }
         part(enc, "ffn hc and norm");
-        hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, G, 0, 0);
-        norm(enc, xg, &L.ffn_norm, xn_g, G, E, E, cfg_.rms_eps);
+        hc_lagged(enc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, R, xg, pcs[cur], prev, Gs, s_r, s_pc);
+        norm(enc, xg, &L.ffn_norm, xn_g, Gs, E, E, cfg_.rms_eps);
         if (G == 1)
             probe(enc, "ffn_in", int(il), xn_g, E);
         if (decode) {
@@ -898,16 +932,16 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
                 opts_.prefetch_k, opts_.prefetch_ahead);
         } else {
             // The shared expert in chunks (its intermediates are wide), then the routed experts added in.
-            for (uint32_t c0 = 0; c0 < G; c0 += chunk)
+            for (uint32_t c0 = 0; c0 < Gs; c0 += chunk)
                 ffn_dense(enc, L.moe.sh_gate, L.moe.sh_up, L.moe.sh_down, xn_g, ffo, L.moe.clamp_sh,
-                          std::min(chunk, G - c0), uint64_t(c0) * E * 4, uint64_t(c0) * E * 4);
-            ablate(enc, il, ablate_shexp_, ffo, 0, G);
-            moe_prefill(cb, enc, L.moe, il, xn_g, ffo, G, committed);
+                          std::min(chunk, Gs - c0), uint64_t(c0) * E * 4, uint64_t(c0) * E * 4);
+            ablate(enc, il, ablate_shexp_, ffo, 0, Gs);
+            moe_prefill(cb, enc, L.moe, il, xn_g, ffo, Gs, committed);
         }
         part(enc, "ffn hc post");
         if (G == 1)
             probe(enc, "ffn_out", int(il), ffo, E);
-        hc_post(enc, ffo, R, R2, pcs[cur], G);
+        hc_post(enc, ffo, R, R2, pcs[cur], Gs, s_r, 0, s_pc);
         std::swap(R, R2);
         prev = pcs[cur];
         cur ^= 1;
@@ -941,7 +975,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     MTL::Buffer* xl = scratch("ds_xl", uint64_t(nl) * E * 4);
     MTL::Buffer* xnl = scratch("ds_xnl", uint64_t(nl) * E * 4);
     MTL::Buffer* lg = scratch("ds_logits", uint64_t(nl) * cfg_.n_vocab * 4);
-    for (uint32_t l0 = all_logits ? 0 : G - 1; l0 < G; l0 += nl) {
+    for (uint32_t l0 = all_logits ? std::min(exact_from, G - 1) : G - 1; l0 < G; l0 += nl) {
         const uint32_t n = std::min(nl, G - l0);
         const HcArgs h1{E, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, n};
         enc->setComputePipelineState(pso("hc_collapse"));
@@ -964,7 +998,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
                 std::memcpy(logits_all_.data() + uint64_t(l0) * cfg_.n_vocab, lgp, uint64_t(n) * cfg_.n_vocab * 4);
             if (logits_sink_)
                 for (uint32_t i = 0; i < n; ++i)
-                    logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
+                    if (l0 + i >= exact_from)
+                        logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);
         }
         if (l0 + n == G) {
             std::memcpy(logits_.data(), lgp + uint64_t(n - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);

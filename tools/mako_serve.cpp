@@ -2,7 +2,7 @@
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--stage-gb N] [--no-spec]
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
-//              [--prefetch-ahead D] [--imatrix FILE]
+//              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1]
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
 // per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
@@ -15,6 +15,8 @@
 // cached); --dense-quant re-quantizes the dense Q8_0 weights at load (--imatrix: activation statistics from
 // ds_run --imatrix-out weighting its rounding). --prefetch K (default 4; 0: off) reads the top K experts that layer
 // l + D's router (--prefetch-ahead, default 2) predicts from layer l's input ahead (results unchanged).
+// --prefill-skip 0 runs every prompt row through every layer (default 1: a long prompt's earlier rows skip the layers
+// after the last KV source, which only the last few thousand rows need; results unchanged).
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
@@ -57,7 +59,7 @@ int main(int argc, char** argv)
         std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
-                             "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE]");
+                             "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -73,6 +75,7 @@ int main(int argc, char** argv)
     std::string ablate, engram, dspark, imatrix;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
+    bool prefill_skip = true;
     std::optional<mako::gguf::Type> dense_quant;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -109,6 +112,8 @@ int main(int argc, char** argv)
             miss_penalty = std::stof(v);
         else if (a == "--prefetch")
             prefetch_k = uint32_t(std::stoul(v));
+        else if (a == "--prefill-skip")
+            prefill_skip = std::string_view(v) != "0";
         else if (a == "--imatrix")
             imatrix = v;
         else if (a == "--prefetch-ahead")
@@ -203,6 +208,7 @@ int main(int argc, char** argv)
                 opts.dspark = dspark;
             opts.miss_penalty = miss_penalty;
             opts.prefetch_k = prefetch_k;
+            opts.prefill_skip = prefill_skip;
             opts.prefetch_ahead = prefetch_ahead;
             opts.dense_imatrix = imatrix;
             opts.dense_quant = dense_quant;

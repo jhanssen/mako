@@ -1,5 +1,7 @@
 #include "dsv41/engram.hpp"
 
+#include "quant/dequant.hpp"
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -71,14 +73,18 @@ std::expected<Engram, std::string> Engram::open(const Config& cfg, const gguf::M
     e.offsets_ = c.offsets;
     if (e.dim_ % 32 || e.ngram_ < 2 || e.ngram_ > 8)
         return std::unexpected(std::format("engram: head_dim {} / max_ngram {} unsupported", e.dim_, e.ngram_));
-    e.row_bytes_ = e.dim_ / 32 * 33;
     const auto pad = c.pad_token;
     e.pad_ = pad >= 0 && size_t(pad) < c.token_map.size() ? c.token_map[size_t(pad)] : pad;
 
     auto table = [&](const gguf::ModelFiles::Ref& r, uint64_t first, uint64_t rows) -> std::expected<Table, std::string> {
         const auto& t = *r.tensor;
-        if (t.type != gguf::Type::MXFP8 || t.dims.size() != 2 || t.dims[0] != e.dim_)
-            return std::unexpected(std::format("engram: {} is not MXFP8 [{} x rows]", t.name, e.dim_));
+        const bool q6 = t.type == gguf::Type::Q6_K && e.dim_ % 256 == 0;
+        if ((t.type != gguf::Type::MXFP8 && !q6) || t.dims.size() != 2 || t.dims[0] != e.dim_)
+            return std::unexpected(std::format("engram: {} is not MXFP8 or Q6_K [{} x rows]", t.name, e.dim_));
+        if (!e.tables_.empty() && t.type != e.type_)
+            return std::unexpected("engram: the tables mix formats");
+        e.type_ = t.type;
+        e.row_bytes_ = uint32_t(uint64_t(e.dim_) / gguf::traits(t.type).block_elems * gguf::traits(t.type).block_bytes);
         if (first + rows > t.dims[1])
             return std::unexpected(std::format("engram: {} has {} rows, the tables need {}", t.name, t.dims[1],
                                                first + rows));
@@ -185,6 +191,10 @@ void Engram::read(std::span<const int64_t> rows, float* out, gguf::ReadPool& poo
             }
             const auto& tb = tables_[(i % per_pos) / cols_];
             gguf::read_exact(tb.fd, raw.data(), row_bytes_, tb.offset + uint64_t(rows[i]) * row_bytes_);
+            if (type_ == gguf::Type::Q6_K) {
+                quant::dequant_row(type_, reinterpret_cast<const std::byte*>(raw.data()), dst, dim_);
+                continue;
+            }
             for (uint32_t b = 0; b < dim_ / 32; ++b) {
                 const uint8_t* blk = raw.data() + b * 33;
                 for (uint32_t j = 0; j < 32; ++j)

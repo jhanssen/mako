@@ -41,6 +41,11 @@ struct Options {
     // reads the missing ones ahead (0: off). Results are unchanged.
     uint32_t prefetch_k = 4;
     uint32_t prefetch_ahead = 2;
+    // Prefill: from the last KV source layer on, a long prompt's earlier rows only add that layer's compressed rows
+    // and index keys; the later layers run only the rows the last prefill_exact_tail positions (at least a window,
+    // 0: a window) and the window rings depend on. The logits sink gets only those positions.
+    bool prefill_skip = true;
+    uint32_t prefill_exact_tail = 0;
 };
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from
@@ -81,6 +86,8 @@ public:
     // expert's output (shexp_out), each before it is added in.
     static constexpr std::array<std::string_view, 2> kAblationSites{"attn_out", "shexp_out"};
     void set_ablation(std::optional<mtl::Ablation> ablation);
+    // Options::prefill_skip.
+    void set_prefill_skip(bool on) { opts_.prefill_skip = on; }
     // Options::miss_penalty.
     void set_miss_penalty(float penalty)
     {
@@ -120,13 +127,15 @@ private:
 
     // G tokens at positions pos_..: every layer (attention in chunks of prefill_chunk), then the logits of the last
     // (of all, to the sink, when all_logits).
-    void run(std::span<const int32_t> tokens, bool all_logits);
+    // prompt_end: the position after the prefill's last token, for Options::prefill_skip (0: every row).
+    void run(std::span<const int32_t> tokens, bool all_logits, uint32_t prompt_end = 0);
     // Attention of T tokens at positions pos0.. (rows of xn into rows of att); g0: their first row in the group's
     // selection rows.
     // `ring`: the window's ring (null: layer il's); `block`: the tokens are a draft block (all see each other and the
     // ring's positions before pos0; their rows do not go into the ring).
     void attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
-                   uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring = nullptr, bool block = false);
+                   uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring = nullptr, bool block = false,
+                   bool compress_only = false);
     void load_drafter(const std::string& dir);
     void load_importance(const std::string& path);
     // The drafter's MoE of block b on T rows of xn into ffo (its experts all resident).
@@ -163,6 +172,7 @@ private:
     // pending (k, g) of a group's first token.
     std::vector<mtl::Ref<MTL::Buffer>> ckv_, ik_, comp_state_;
     std::vector<int32_t> kv_sources_;
+    uint32_t skip_from_ = 0; // the last KV source layer (Options::prefill_skip)
     uint32_t pos_ = 0;
     std::vector<float> logits_;
     std::vector<float> logits_all_; // verify(): a row per token

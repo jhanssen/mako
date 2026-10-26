@@ -547,11 +547,12 @@ kernel void ds_topk(device const float* vall [[buffer(0)]], device int* idsall [
 
 struct EngramDecodeArgs {
     uint dim, tokens, layers, cols;
+    uint q6k; // Q6_K rows instead of MXFP8
 };
 
-// Engram rows from their MXFP8 bytes (per 32 values an E8M0 scale byte, then 32 E4M3 codes) to float. Raw rows are
-// [token][layer][column]; y rows [layer][token][column] of dim values (each layer's rows contiguous). Grid (dim,
-// rows).
+// Engram rows from their bytes to float: MXFP8 (per 32 values an E8M0 scale byte, then 32 E4M3 codes) or Q6_K (per
+// 256: ql[128], qh[64], int8 scales[16] per 16 values, half d). Raw rows are [token][layer][column]; y rows
+// [layer][token][column] of dim values (each layer's rows contiguous). Grid (dim, rows).
 kernel void ds_engram_decode(device const uchar* raw [[buffer(0)]], device float* y [[buffer(1)]],
                              constant EngramDecodeArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
@@ -560,6 +561,16 @@ kernel void ds_engram_decode(device const uchar* raw [[buffer(0)]], device float
         return;
     const uint t = r / (a.layers * a.cols), l = (r / a.cols) % a.layers, c = r % a.cols;
     const uint out = (l * a.tokens + t) * a.cols + c;
+    if (a.q6k) {
+        device const uchar* blk = raw + uint64_t(r) * (dim / 256 * 210) + (i / 256) * 210;
+        const uint j = i % 256, n = j / 128, qt = (j % 128) / 32, l32 = j % 32;
+        const uchar ql = blk[64 * n + (qt & 1) * 32 + l32], qh = blk[128 + 32 * n + l32];
+        const int q = int(((qt < 2 ? ql & 0xF : ql >> 4)) | (((qh >> (2 * qt)) & 3) << 4)) - 32;
+        const float d = float(*reinterpret_cast<device const half*>(blk + 208));
+        const char sc = reinterpret_cast<device const char*>(blk + 192)[8 * n + 2 * qt + l32 / 16];
+        y[uint64_t(out) * dim + i] = d * float(sc) * float(q);
+        return;
+    }
     device const uchar* blk = raw + uint64_t(r) * (dim / 32 * 33) + (i / 32) * 33;
     const uchar code = blk[1 + i % 32];
     const int e = (code >> 3) & 15, m = code & 7;
