@@ -931,7 +931,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     }
     // Logits of the last position, or of every one (in chunks) for the sink.
     cur_layer_ = cfg_.n_layer;
-    if (all_logits)
+    if (all_logits && verifying_) // verify() returns them; a prefill hands them to the sink
         logits_all_.resize(uint64_t(G) * cfg_.n_vocab);
     if (timing()) {
         enc->endEncoding();
@@ -960,7 +960,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         drain();
         const auto* lgp = static_cast<const float*>(lg->contents());
         if (all_logits) {
-            std::memcpy(logits_all_.data() + uint64_t(l0) * cfg_.n_vocab, lgp, uint64_t(n) * cfg_.n_vocab * 4);
+            if (verifying_)
+                std::memcpy(logits_all_.data() + uint64_t(l0) * cfg_.n_vocab, lgp, uint64_t(n) * cfg_.n_vocab * 4);
             if (logits_sink_)
                 for (uint32_t i = 0; i < n; ++i)
                     logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);

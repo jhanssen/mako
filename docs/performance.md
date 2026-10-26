@@ -214,6 +214,22 @@ it alone runs at 2.3-2.4 GB/s (`io_bench batch`). Split between the internal SSD
 slowest: ~5% off miss time, not built. A drive at ~6-7 GB/s (PCIe 4.0 over Thunderbolt 5) would move the best split
 to ~35-40%: to measure with `io_bench pair` when one is available.
 
+Accuracy at long context against the reference (a 24K-token prompt of mako's sources; `ds_run --ref-from`,
+`--steps-from`; perplexity of the prompt's own next tokens, mako / reference):
+
+| Positions | Candidate stage | Top-1 | KL mean | Perplexity |
+| --- | --- | ---: | ---: | ---: |
+| 14,848-15,871 (prefill) | off | 98.1% | 0.0064 | 1.2919 / 1.2956 |
+| 23,552-24,575 (prefill) | on | 96.9% | 0.0102 | 1.5320 / 1.5351 |
+| 23,552-24,575 (decode, after a 23,552-token prefill) | on | 97.3% | 0.0093 | 1.5440 / 1.5351 |
+
+With the candidate stage (layer 20 keeping 2048 blocks of 8 for the later index layers) KL rises ~1.6x, perplexity
+does not: its block choice is a hard cut that small numeric differences move; the selection logic matches the
+reference's (max-pooled block scores, newest block always kept). Perplexity on 1300 tokens (prose / code), the
+defaults then miss penalty 0.05, 0.1, 0.2, Q6_K + statistics, penalty 0.1 + ablation: 1.871 / 2.903, then 1.863 /
+2.893, 1.860 / 2.900, 1.863 / 2.906, 1.868 / 2.919, 1.851 / 2.887 (the reference: 1.877 on the prose). The speed
+options' extra KL against the reference does not show up as worse prediction of the text.
+
 Kernel fusion in decode (2026-10-25). Fusing DeepSeek's hyper-connection step (stream norm, the 20480x24 F32
 projection, mix, lagged collapse, the sublayer's RMS norm and the previous sublayer's expand: six dispatches into
 GLM's two-kernel hc step with a lagged mode and a fused norm) gave 23.6 -> 24.0 tok/s (~0.6 ms a step), but KL against
