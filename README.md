@@ -4,8 +4,9 @@ An inference engine for very large mixture-of-experts models on Apple Silicon Ma
 **GLM-5.3-Flash** and **DeepSeek-V4.1-Flash-1017** through an OpenAI- and Anthropic-compatible API. Weights that don't
 fit in memory stream from the SSD into a unified-memory expert cache.
 
-Early, but usable: on a 128 GB M5 Max, DeepSeek-V4.1 decodes at ~25 tokens/s (~19 at 16-32K tokens of context) and
-prefills ~500-800 tokens/s. Tuned for M5, meant for M3 and later: on a 16 GB M4 the tests that fit pass and GLM-5.3
+Early, but usable: on a 128 GB M5 Max, DeepSeek-V4.1 (Maya-S) decodes at ~25 tokens/s (~19 at 16-32K tokens of context)
+and prefills ~500-800 tokens/s. ISTA's smaller IQ2_XS build with cache-aware routing (`--miss-penalty 0.1`) decodes at
+~34 tokens/s with the same perplexity as Maya-S on our prose and code texts (measurements in `docs/performance.md`). Tuned for M5, meant for M3 and later: on a 16 GB M4 the tests that fit pass and GLM-5.3
 decodes the same tokens as on the M5 (with `--arena-gb 3`, below the memory it is meant for); DeepSeek-V4.1 has run
 only on the M5 Max, and M3 is untested.
 
@@ -22,6 +23,9 @@ only on the M5 Max, and M3 is untested.
 - **DeepSeek-V4.1-Flash-1017**: `Maya-S/` from
   [peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)
   (6 files, the model and its Engram tables), and optionally `dspark/` (the drafter for speculative decoding).
+  Or, smaller and faster: the four `IQ2_XS` files and `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` from
+  [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
+  in one folder (mako opens the Engram file from there).
 
 ## Build
 
@@ -37,6 +41,14 @@ The first configure downloads pinned dependencies.
 ```sh
 ./build/tools/mako_calibrate <first .gguf of the model>    # once per model: which experts start in memory
 ./build/tools/mako_serve <first .gguf of the model> --port 8080 --ctx 65536
+```
+
+For example, DeepSeek-V4.1 with ISTA's IQ2_XS build and cache-aware routing (the ~34 tokens/s setup above):
+
+```sh
+./build/tools/mako_calibrate ~/models/ista/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf
+./build/tools/mako_serve ~/models/ista/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf \
+    --miss-penalty 0.1 --port 8080 --ctx 65536
 ```
 
 Then point a client at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic; Claude Code with

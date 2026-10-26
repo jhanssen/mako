@@ -58,4 +58,6 @@ x -= scale (x . v) v per direction, the vectors' norms carrying the strength, `-
 
 - GLM-5.3: any GGUF with the standard `glm5-next` tensor names. The Maya repository's other quants (Maya-S24, Maya-M,
   Maya-L) use expert formats mako has kernels for but have not been run; the tests use Maya-S-v2.
-- DeepSeek-V4.1: Maya-XS (IQ1_S experts) is not supported yet.
+- DeepSeek-V4.1: ISTA's GSQ-RCO builds (IQ2_XS, IQ2_XXS, IQ1_M) with their IQ4_NL Engram file; IQ2_XS and IQ2_XXS are
+  measured in `performance.md`, IQ1_M has not been run. Maya-XS (IQ1_S experts) uses formats mako has kernels for but
+  has not been run.

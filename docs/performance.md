@@ -261,6 +261,32 @@ reference. Not pursued.
 Short GEMV benchmarks at low GPU clocks read ~2x slow (a first measurement blamed the Q4_K kernel; warmed up it
 runs at 464-542 GB/s).
 
+## DeepSeek-V4.1-Flash-1017: other model files (2026-10-25)
+
+ISTA's GSQ-RCO builds against Maya-S on the 128 GB M5 Max (each with its routing profile). Decode: 128 tokens after a
+300-token prose prompt. Perplexity: 1300-token prose and code texts, token by token (the reference engine, on Maya-S:
+1.877 on the prose).
+
+| Build | Size (backbone) | Experts in memory | Decode | Prose | Code |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Maya-S | 178 GB | ~55% | 24.2 tok/s | 1.871 | 2.884 |
+| Maya-S, `--miss-penalty 0.1` | | | 28.3 tok/s | 1.860 | 2.905 |
+| ISTA IQ2_XXS | 138 GB | ~73% | 33.1 tok/s | 1.935 | 3.025 |
+| ISTA IQ2_XS | 155 GB | ~66% | 31.4 tok/s | 1.873 | 2.903 |
+| ISTA IQ2_XS, `--miss-penalty 0.1` | | | 34.0 tok/s | 1.875 | 2.901 |
+
+IQ2_XS with the penalty decodes 20% faster than Maya-S with it at the same perplexity; the penalty halves its misses
+(9.5 -> 4.8 a step) at no measurable cost. ISTA's Engram tables (IQ4_NL) and Maya-S's (Q6_K) give the same results
+with either backbone. Against the reference's logits (Maya-S's weights, so a measure of difference, not of quality):
+IQ2_XS top-1 92.5% / KL 0.068, IQ2_XXS 91% / 0.103. Two texts; the differences in perplexity are within ~1% except
+IQ2_XXS's.
+
+mako's own IQ1_S / IQ1_M decode kernels (IQ1_M is in a third of IQ2_XXS's expert layers) are 6-13% faster per expert
+dispatch than the per-format ones, but decode is unchanged within noise: they were ~1.5% of a step, and those formats
+are arithmetic-bound. Q5_K (ISTA's dense weights) already runs at 430-540 GB/s against Q8_0's 450-570, so a kernel of
+mako's own would gain ~1 ms a step at most; not written. The per-kernel timing mode serializes the GPU and inflated
+both estimates beforehand; isolated benchmarks (`gemv_bench`) are the better guide.
+
 ## Apple10 (M5) versus Apple9 (M3/M4)
 
 No code path checks the GPU family; the Apple10 hardware is reached through the same Metal 4 calls that run on Apple9.
