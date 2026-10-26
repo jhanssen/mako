@@ -598,6 +598,25 @@ std::vector<MTL::Buffer*> ExpertArena::tail_buffers() const
     return v;
 }
 
+bool ExpertArena::all_resident(uint32_t layer) const
+{
+    if (slots_[layer] < n_expert_)
+        return false;
+    const auto* table = static_cast<const int32_t*>(table_buf_->contents()) + uint64_t(layer) * n_expert_;
+    return std::all_of(table, table + n_expert_, [](int32_t s) { return s >= 0; });
+}
+
+void ExpertArena::note_resident(uint32_t layer, std::span<const uint32_t> counts, uint32_t calls)
+{
+    const double decay = std::exp2(-double(calls) / 256);
+    for (size_t e = 0; e < counts.size() && e < usage_[layer].size(); ++e) {
+        score_[layer][e] = score_[layer][e] * decay + counts[e];
+        usage_[layer][e] += counts[e];
+        stats_.hits += counts[e];
+    }
+    clock_ += calls;
+}
+
 bool ExpertArena::lent() const
 {
     return std::ranges::any_of(tails_, [](const Tail& t) { return t.bytes && !t.mem; });

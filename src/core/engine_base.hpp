@@ -148,8 +148,11 @@ protected:
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
     MTL::ComputePipelineState* pso(const std::string& fn);
 
+    // batch > 1: that many matrices from w on, each its own y block of t rows; x_shared: all read the same x.
     void gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
-              uint64_t y_off, uint32_t batch = 1, uint32_t t = 1);
+              uint64_t y_off, uint32_t batch = 1, uint32_t t = 1, bool x_shared = false);
+    // b's rows follow a's in memory, same type and shape: one batched GEMV can run both.
+    static bool adjacent(const DevTensor& a, const DevTensor& b);
     void proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
               uint64_t y_off, uint32_t T, uint32_t ldy = 0);
     void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
@@ -235,10 +238,11 @@ protected:
     // section's encoder) are timed as `name`, within the current section.
     void part(MTL::ComputeCommandEncoder*& enc, std::string_view name);
     // MAKO_REPEAT=<label substring>:<n> encodes matching GEMVs, norms and helper dispatches n times, so the extra
-    // step time measures their cost in place (they all recompute their output from their inputs).
+    // step time measures their cost in place (they all recompute their output from their inputs). Repeats read
+    // weights the cache may still hold; n = 0 leaves them out instead (the output is then meaningless).
     int repeats(std::string_view label) const
     {
-        return repeat_n_ > 1 && label.find(repeat_label_) != std::string_view::npos ? repeat_n_ : 1;
+        return repeat_n_ != 1 && label.find(repeat_label_) != std::string_view::npos ? repeat_n_ : 1;
     }
 
     const gguf::ModelFiles& model_;
@@ -279,6 +283,12 @@ protected:
         uint32_t ahead; // nonzero: arena row layer + ahead's likely misses are in scratch "mpred" (read them ahead)
     };
     std::vector<PendingMoe> pending_moe_; // not yet served
+    // Layers whose experts are all resident skip that round trip: moe_route counts their selections into
+    // resident_counts_ ([arena row][n_expert]), which finish() passes on to the arena.
+    mtl::Ref<MTL::Buffer> resident_counts_;
+    std::vector<uint32_t> resident_seen_;  // the counts already passed on
+    std::vector<uint32_t> resident_calls_; // per arena row, steps since then
+    void note_resident();
     std::unique_ptr<Stager> stager_;
     uint64_t stage_bytes_ = 3ull << 30;
 

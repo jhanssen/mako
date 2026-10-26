@@ -630,7 +630,7 @@ kernel void moe_combine(device const float* x [[buffer(0)]], device const float*
 struct RouteArgs {
     uint n_expert, n_used, norm;
     float scale;
-    uint lookup; // look the selection up in slots (one token)
+    uint lookup; // 1: look the selection up in slots (one token); 2: also count it in `counts`
     uint score;  // 0: sigmoid, 1: sqrt(softplus)
     float miss_penalty; // > 0: subtracted from the selection score (not the weight) of an expert slots lacks
 };
@@ -654,7 +654,8 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
                       device int* sel [[buffer(2)]], device float* w [[buffer(3)]], device float* biased [[buffer(4)]],
                       constant RouteArgs& a [[buffer(5)]], device const int* slots [[buffer(6)]],
                       device int* hit_ids [[buffer(7)]], device int* miss_rank [[buffer(8)]],
-                      device uint* indirect [[buffer(9)]], uint lane [[thread_position_in_threadgroup]],
+                      device uint* indirect [[buffer(9)]], device atomic_uint* counts [[buffer(10)]],
+                      uint lane [[thread_position_in_threadgroup]],
                       uint t [[threadgroup_position_in_grid]])
 {
     constexpr uint K = 16;
@@ -711,6 +712,8 @@ kernel void moe_route(device const float* logits [[buffer(0)]], device const flo
             hit_ids[lane] = max(s, 0);
             miss_rank[lane] = miss ? int(rank) : -1;
         }
+        if (a.lookup == 2 && used)
+            atomic_fetch_add_explicit(&counts[mine], 1u, memory_order_relaxed);
         const uint misses = simd_sum(miss);
         if (lane < 3)
             indirect[lane * 3 + 2] = misses;

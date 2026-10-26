@@ -204,11 +204,11 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             L->conv_k = upload(p + "ssm_conv1d_k.weight");
             L->conv_v = upload(p + "ssm_conv1d_v.weight");
             L->f_a = upload(p + "ssm_f_a.weight");
+            L->g_a = upload(p + "ssm_g_a.weight"); // next to f_a: one GEMV runs both
             L->f_b = upload(p + "ssm_f_b.weight");
             L->beta = upload(p + "ssm_beta.weight");
             L->ssm_a = upload(p + "ssm_a");
             L->dt_b = upload(p + "ssm_dt.bias");
-            L->g_a = upload(p + "ssm_g_a.weight");
             L->g_b = upload(p + "ssm_g_b.weight");
             L->o_norm = upload(p + "ssm_norm.weight");
             kda_state_.emplace_back(ctx_.device()->newBuffer(uint64_t(cfg_.n_head) * D * D * 4,
@@ -365,9 +365,13 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     MTL::Buffer* qkv = scratch("qkv", uint64_t(T) * 3 * inner * 4);
     MTL::Buffer* qkvc = scratch("qkvc", uint64_t(T) * 3 * inner * 4);
     part(enc, "kda q k v");
-    proj(enc, L.wq, xn, 0, qkv, 0, T, 3 * inner);
-    proj(enc, L.wk, xn, 0, qkv, uint64_t(inner) * 4, T, 3 * inner);
-    proj(enc, L.wv, xn, 0, qkv, uint64_t(inner) * 8, T, 3 * inner);
+    if (T == 1 && adjacent(L.wq, L.wk) && adjacent(L.wk, L.wv)) {
+        gemv(enc, L.wq, xn, 0, qkv, 0, 3, 1, true);
+    } else {
+        proj(enc, L.wq, xn, 0, qkv, 0, T, 3 * inner);
+        proj(enc, L.wk, xn, 0, qkv, uint64_t(inner) * 4, T, 3 * inner);
+        proj(enc, L.wv, xn, 0, qkv, uint64_t(inner) * 8, T, 3 * inner);
+    }
     // With snap_ (a speculative step), the state after the first snap_ tokens also goes to the alternate buffers.
     const uint32_t snap = snap_ && T > snap_ ? snap_ : 0;
     part(enc, "kda conv");
@@ -389,14 +393,21 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         probe(enc, "kda_v_conv", int(il), qkvc, inner, uint64_t(inner) * 8);
     }
 
-    MTL::Buffer* fa = scratch("fa", uint64_t(T) * D * 4);
+    // f_a's rows, then g_a's (one GEMV when their weights are adjacent).
+    MTL::Buffer* fga = scratch("fga", uint64_t(T) * D * 8);
+    const uint64_t ga_off = uint64_t(T) * D * 4;
     MTL::Buffer* graw = scratch("graw", uint64_t(T) * inner * 4);
     MTL::Buffer* braw = scratch("braw", uint64_t(T) * H * 4);
     MTL::Buffer* g = scratch("g", uint64_t(T) * inner * 4);
     MTL::Buffer* beta = scratch("beta", uint64_t(T) * H * 4);
     part(enc, "kda gates");
-    proj(enc, L.f_a, xn, 0, fa, 0, T);
-    proj(enc, L.f_b, fa, 0, graw, 0, T);
+    if (T < gemm_min_tokens_ && adjacent(L.f_a, L.g_a)) {
+        gemv(enc, L.f_a, xn, 0, fga, 0, 2, T, true);
+    } else {
+        proj(enc, L.f_a, xn, 0, fga, 0, T);
+        proj(enc, L.g_a, xn, 0, fga, ga_off, T);
+    }
+    proj(enc, L.f_b, fga, 0, graw, 0, T);
     proj(enc, L.beta, xn, 0, braw, 0, T);
     const GateArgs ga{D, H, cfg_.kda_gate_lower_bound};
     enc->setComputePipelineState(pso("kda_gate"));
@@ -444,12 +455,10 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         probe(enc, "kda_scan_out", int(il), o, inner);
     }
 
-    MTL::Buffer* gab = scratch("ga", uint64_t(T) * D * 4);
     MTL::Buffer* g2 = scratch("g2", uint64_t(T) * inner * 4);
     MTL::Buffer* gated = scratch("gated", uint64_t(T) * inner * 4);
     part(enc, "kda output gate");
-    proj(enc, L.g_a, xn, 0, gab, 0, T);
-    proj(enc, L.g_b, gab, 0, g2, 0, T);
+    proj(enc, L.g_b, fga, ga_off, g2, 0, T);
     if (probes)
         probe(enc, "kda_g2", int(il), g2, inner);
     const NormArgs na{D, D, cfg_.rms_eps, 0};

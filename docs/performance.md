@@ -23,6 +23,29 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | MLA per-head GEMMs (k_b, v_b: 64 heads, each its own dispatch into one buffer) in a concurrent encoder | 5.0% -> 3.0% of prefill GPU time: in a serial encoder each waited for the one before (one wave of 256 threadgroups each, ~1500 a prefill); logits unchanged |
 | KDA q/k l2 norm: one simdgroup per 128-wide row (was a 256-thread threadgroup and a threadgroup reduction), summing in the same order | 2.7% -> 0.7% of prefill GPU time (`prefill_sweep --parts`); logits bit-identical. Summing in a different order instead moved prefill-vs-decode KL under the ablation test from 2.8e-9 to 1.5e-5 and KL against the reference by ~10%: GLM-5.3's outputs react strongly to rounding, so the tolerance checks act close to bit-exact |
 | KDA scan with each thread's 32 state columns in registers (was threadgroup memory, read and written twice per token: ~2.2 TB/s of traffic) | scan ~1.05 s -> ~0.3 s on 4096 tokens; prefill +6-8% (562 -> 609, 464 -> 493 tok/s in A/B pairs); logits unchanged against the reference |
+| MoE layers whose experts are all resident (every GLM layer on 128 GB) skip the CPU round trip and the miss pass: `moe_route` counts the selections on the GPU, passed to the arena after the step (usage, eviction scores, `--learn` unchanged) | 25.7 -> 25.1 ms/token (two A/B pairs), speculative step 32.9 -> 32.2 ms; tokens identical |
+| Batched GEMVs for same-shape matrices on one input, weights adjacent: shared-expert and dense gate/up, KDA q/k/v (one token), KDA f_a/g_a | 25.1 -> 24.9 ms/token; tokens identical |
+
+Where a short-prompt decode step goes (2026-10-26, 789-token prompt, 128 tokens, every expert resident, 25.0
+ms/token; ~9.6 GB read a token, ~17.4 ms at 553 GB/s). Each line is the step time saved by leaving those dispatches
+out (`MAKO_REPEAT=label:0`; output meaningless, timing valid; noise ~0.2 ms):
+
+| Dispatches | Per token | Saved | Rate |
+| --- | --- | --- | --- |
+| KDA q/k/v, Q6_K 4096x8192 | 102 | 5.3 ms | ~530 GB/s |
+| Routed gate/up, IQ2_XXS 4096x2048 x8 | 84 | 3.8 ms | ~384 GB/s |
+| Routed down, IQ2_S 2048x4096 x8 / IQ3_XXS x8 | 34 / 8 | 2.0 / 0.5 ms | ~364 GB/s |
+| KDA output, Q6_K 8192x4096 | 34 | 2.1 ms | ~444 GB/s |
+| Shared gate/up, Q6_K 4096x2048 | 84 | 1.5 ms | ~385 GB/s |
+| MLA output, Q6_K 16384x4096 | 11 | 1.3 ms | ~466 GB/s |
+| Output head, Q6_K 4096x154880 | 1 | 0.9 ms | ~600 GB/s |
+| Shared down, Q6_K 2048x4096 | 42 | 0.8 ms | ~362 GB/s |
+| hc_step_a + hc_step_b | 180 | 1.4 ms | |
+| moe_route, KDA scan, Q8_0 4096x128, rms_norm | | 0.7, 0.6, 0.6, 0.3 ms | |
+| swiglu, kda_gate, kda_conv, l2_norm, rms_norm_gate, MLA projections and attention | | <= 0.5 ms each | |
+
+The weights alone would take ~17.4 ms. The remaining ~7.5 ms is the GEMVs running below the bandwidth (the IQ
+expert kernels are arithmetic-bound, the smaller Q6_K GEMVs do not fill the GPU) more than the small kernels.
 
 Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
 10-19 ms (not overlapped), drafting ~2.3 ms. The big GEMVs already run at ~400 GB/s of the 553 GB/s measured (614
@@ -48,6 +71,10 @@ GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 | Sparse attention output in 64-column tiles (8 simdgroups on a 64x64 matmul2d tile) | pathologically slow: the end-to-end prefill tests took ~15 min instead of ~15 s |
 | Sparse attention without the sum pass when there is one split (output written in place) | no change (5.5% vs 5.3% of prefill GPU time) |
 | Sparse-attention groups of up to 128 tokens (was 32) | no change (sparse attention and selection 744 vs 748 ms): the kernels, not the group size, bound it |
+| Concurrent encoders for decode | without barriers (wrong output) 25.2 -> 18.4 ms/token, the most overlap could give; with a barrier before each dispatch 25.9 ms, no better than serial order. Only independent GEMVs can overlap, and batching those into one dispatch (landed) gained 0.2 ms: little per-dependency overhead is left |
+| IQ2_XXS expert GEMV rewrites (`gemv_bench 4096 2048 64 iq2_xxs 8`, 411 GB/s): grid as float and sign masks xor'ed into x; int8 signed weights built from the grid by byte masks; 2-16 rows per simdgroup, 1-16 simdgroups | 251, 389 GB/s; 310-420 GB/s. The kernel is not the limit: the same kernel reaches 467 / 497 / 515 GB/s at 16 / 32 / 64 experts a dispatch (Q8_0 ~580 at any size), so a 17 MB dispatch loses ~9 us to ramp-up and tail |
+| Routing, shared expert and routed experts of a resident MoE layer in one concurrent encoder (barriers only where data flows) | 24.9 -> 24.9 ms/token: overlapping independent GEMVs does not recover that ramp-up and tail |
+| `MAKO_REPEAT=label:2` for in-place costs of weights under ~50 MB | the repeat reads weights the cache still holds: Q6_K 4096x8192 came out at ~880 GB/s. `label:0` (leave out) instead |
 | Per-kernel telemetry to find slow kernels | timestamps around each dispatch inflate small kernels several-fold (one "slow" shared-expert GEMV was 93 us measured, 13 us real); repeat-in-place costs (`MAKO_REPEAT`) replaced it |
 
 ### Open

@@ -72,7 +72,7 @@ EngineBase::EngineBase(const gguf::ModelFiles& model, mtl::Context& ctx, Telemet
         if (colon == std::string_view::npos)
             throw std::runtime_error("MAKO_REPEAT wants <label substring>:<n>");
         repeat_label_ = spec.substr(0, colon);
-        repeat_n_ = std::max(1, std::atoi(r + colon + 1));
+        repeat_n_ = std::max(0, std::atoi(r + colon + 1));
     }
     gemv_ = std::make_unique<mtl::Gemv>(ctx_);
     gemm_ = std::make_unique<mtl::Gemm>(ctx_);
@@ -584,7 +584,7 @@ MTL::Buffer* EngineBase::scratch(const std::string& name, uint64_t bytes)
 
 MTL::ComputePipelineState* EngineBase::pso(const std::string& fn)
 {
-    if (repeat_n_ > 1)
+    if (repeat_n_ != 1)
         last_pso_ = fn;
     auto it = psos_.find(fn);
     if (it == psos_.end())
@@ -592,8 +592,15 @@ MTL::ComputePipelineState* EngineBase::pso(const std::string& fn)
     return it->second.get();
 }
 
+bool EngineBase::adjacent(const DevTensor& a, const DevTensor& b)
+{
+    if (a.buf != b.buf || a.type != b.type || a.dims != b.dims || a.dims.size() != 2)
+        return false;
+    return b.off == a.off + mtl::Gemv::row_bytes(a.type, uint32_t(a.dims[0])) * a.dims[1];
+}
+
 void EngineBase::gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off,
-                      MTL::Buffer* y, uint64_t y_off, uint32_t batch, uint32_t t)
+                      MTL::Buffer* y, uint64_t y_off, uint32_t batch, uint32_t t, bool x_shared)
 {
     mtl::Gemv::Args a;
     a.type = w.type;
@@ -601,7 +608,8 @@ void EngineBase::gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL:
     a.n = uint32_t(w.dims[1]);
     a.t = t;
     a.batch = batch;
-    const bool labelled = tel_ == Telemetry::kernels || repeat_n_ > 1;
+    a.x_shared = x_shared;
+    const bool labelled = tel_ == Telemetry::kernels || repeat_n_ != 1;
     const std::string label = labelled ? std::format("gemv {} {}x{}", gguf::traits(a.type).name, a.k, a.n) : "";
     for (int r = repeats(label); r > 0; --r)
         gemv_->encode(enc, a, w.buf, w.off, x, x_off, y, y_off);
@@ -761,13 +769,24 @@ void EngineBase::ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& ga
                            uint64_t x_off, uint64_t out_off)
 {
     const uint32_t nff = uint32_t(gate.dims[1]);
-    MTL::Buffer* g = scratch("ffg", uint64_t(T) * nff * 4);
-    MTL::Buffer* u = scratch("ffu", uint64_t(T) * nff * 4);
-    MTL::Buffer* m = scratch("ffm", uint64_t(T) * nff * 4);
-    proj(enc, gate, xn, x_off, g, 0, T);
-    proj(enc, up, xn, x_off, u, 0, T);
+    const uint64_t rows = uint64_t(T) * nff * 4;
+    MTL::Buffer* gu = scratch("ffgu", 2 * rows); // gate rows, then up rows
+    MTL::Buffer* m = scratch("ffm", rows);
+    if (T < gemm_min_tokens_ && adjacent(gate, up)) {
+        gemv(enc, gate, xn, x_off, gu, 0, 2, T, true);
+    } else {
+        proj(enc, gate, xn, x_off, gu, 0, T);
+        proj(enc, up, xn, x_off, gu, rows, T);
+    }
     const SwigluArgs sa{T * nff, limit > 1e-6f ? limit : 0.0f};
-    dispatch(enc, "swiglu", {g, u, m}, &sa, sizeof(sa), MTL::Size(T * nff, 1, 1), MTL::Size(256, 1, 1));
+    enc->setComputePipelineState(pso("swiglu"));
+    enc->setBuffer(gu, 0, 0);
+    enc->setBuffer(gu, rows, 1);
+    enc->setBuffer(m, 0, 2);
+    enc->setBytes(&sa, sizeof(sa), 3);
+    for (int r = repeats("swiglu"); r > 0; --r)
+        enc->dispatchThreads(MTL::Size(T * nff, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "swiglu");
     if (T == 1)
         probe(enc, "imx_ffm", int(cur_layer_), m, nff);
     proj(enc, down, m, 0, out, out_off, T);
@@ -864,6 +883,26 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
     pending_moe_.erase(pending_moe_.begin(), pending_moe_.begin() + ptrdiff_t(served));
 }
 
+void EngineBase::note_resident()
+{
+    if (!resident_counts_)
+        return;
+    const auto* counts = static_cast<const uint32_t*>(resident_counts_->contents());
+    const uint32_t ne = dims_.n_expert;
+    std::vector<uint32_t> d(ne);
+    for (uint32_t r = 0; r < resident_calls_.size(); ++r) {
+        if (!resident_calls_[r])
+            continue;
+        for (uint32_t e = 0; e < ne; ++e) {
+            const uint64_t i = uint64_t(r) * ne + e;
+            d[e] = counts[i] - resident_seen_[i];
+            resident_seen_[i] = counts[i];
+        }
+        arena_->note_resident(r, d, resident_calls_[r]);
+        resident_calls_[r] = 0;
+    }
+}
+
 void EngineBase::finish(MTL::CommandBuffer* cb)
 {
     auto t0 = Clock::now();
@@ -874,6 +913,7 @@ void EngineBase::finish(MTL::CommandBuffer* cb)
     cb->commit();
     serve_moe(cb);
     cb->waitUntilCompleted();
+    note_resident();
     stats_.gpu_wait_ms += ms_since(t0);
     stats_.gpu_exec_ms += (cb->GPUEndTime() - cb->GPUStartTime()) * 1e3;
     if (cb->status() != MTL::CommandBufferStatusCompleted)
@@ -958,10 +998,22 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
             ind[t * 9 + part * 3 + 1] = uint32_t(g.height);
         }
 
+    // Every expert resident: nothing for the CPU to read, so the GPU goes on without waiting for it.
+    const bool resident = !route_override_ && !probe_ && arena_->all_resident(il);
+    if (resident) {
+        if (!resident_counts_) {
+            const uint64_t n = uint64_t(arena_rows) * dims_.n_expert;
+            resident_counts_ = mtl::Ref<MTL::Buffer>(ctx_.device()->newBuffer(n * 4, MTL::ResourceStorageModeShared));
+            std::memset(resident_counts_->contents(), 0, n * 4);
+            resident_seen_.assign(n, 0);
+            resident_calls_.assign(arena_rows, 0);
+        }
+        ++resident_calls_[il];
+    }
     part(enc, "moe router");
     gemv(enc, mw.router, xn, 0, rlog, 0, 1, T);
-    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 1, uint32_t(routing_.score),
-                       routing_.miss_penalty};
+    const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, resident ? 2u : 1u,
+                       uint32_t(routing_.score), routing_.miss_penalty};
     enc->setComputePipelineState(pso("moe_route"));
     enc->setBuffer(rlog, 0, 0);
     enc->setBuffer(mw.bias.buf, mw.bias.off, 1);
@@ -973,11 +1025,14 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     enc->setBuffer(hit_ids, 0, 7);
     enc->setBuffer(miss_rank, 0, 8);
     enc->setBuffer(indirect, ind_off, 9);
+    if (resident)
+        enc->setBuffer(resident_counts_.get(), uint64_t(il) * dims_.n_expert * 4, 10);
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(32, 1, 1));
     after(enc, "moe_route");
     // The prediction costs a router GEMV: skipped while reads ahead are not paying off (ExpertArena decides).
-    const bool predict = next && predict_k && T == 1 && il + ahead < arena_rows && arena_->prefetch_worthwhile();
+    const bool predict =
+        !resident && next && predict_k && T == 1 && il + ahead < arena_rows && arena_->prefetch_worthwhile();
     if (predict) {
         MTL::Buffer* rnext = scratch("rlog_next", uint64_t(dims_.n_expert) * 4);
         gemv(enc, next->router, xn, 0, rnext, 0, 1, 1);
@@ -991,11 +1046,13 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
         enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(32, 1, 1));
         after(enc, "moe_predict");
     }
-    enc->endEncoding();
-    const uint64_t v = ++event_value_;
-    cb->encodeSignalEvent(routed_.get(), v);
-    pending_moe_.push_back({il, v, T, predict ? ahead : 0u});
-    enc = encoder(cb, tl, il < dims_.n_layer ? 2 : -1);
+    const uint64_t v = resident ? 0 : ++event_value_;
+    if (!resident) {
+        enc->endEncoding();
+        cb->encodeSignalEvent(routed_.get(), v);
+        pending_moe_.push_back({il, v, T, predict ? ahead : 0u});
+        enc = encoder(cb, tl, il < dims_.n_layer ? 2 : -1);
+    }
     part(enc, "moe shared expert");
     // The CPU starts on the misses as soon as the route is known; the shared expert runs meanwhile.
     ffn_dense(enc, mw.sh_gate, mw.sh_up, mw.sh_down, xn, sho, mw.clamp_sh, T);
@@ -1008,7 +1065,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
                    uint64_t in_off, MTL::Buffer* out, uint64_t out_off, uint64_t ind_at) {
         const ExpertArena::Region& r = arena_->region(il, part);
         const mtl::Gemv::Args a = part_args(part, tokens);
-        const bool labelled = tel_ == Telemetry::kernels || repeat_n_ > 1;
+        const bool labelled = tel_ == Telemetry::kernels || repeat_n_ != 1;
         const std::string label = labelled ? std::format("expert {} {}x{} {}", gguf::traits(a.type).name, a.k, a.n,
                                                          miss ? "miss" : "hit")
                                            : "";
@@ -1030,19 +1087,22 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     run(1, T, false, hit_ids, 0, xn, 0, h[1], 0, 0);
     dispatch(enc, "swiglu", {h[0], h[1], h[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1), MTL::Size(256, 1, 1));
     run(2, T, false, hit_ids, 0, h[2], 0, h[3], 0, 0);
-    enc->endEncoding();
-    cb->encodeWait(ready_.get(), v);
-    enc = encoder(cb, tl, il < dims_.n_layer ? 3 : -1);
-    part(enc, "moe miss experts");
     const auto m = bufs("m");
-    const uint64_t rows = uint64_t(k) * nff * 4;
-    for (uint32_t t = 0; t < T; ++t) {
-        run(0, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[0], t * rows, ind_off + t * 36);
-        run(1, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[1], t * rows, ind_off + t * 36);
+    if (!resident) {
+        enc->endEncoding();
+        cb->encodeWait(ready_.get(), v);
+        enc = encoder(cb, tl, il < dims_.n_layer ? 3 : -1);
+        part(enc, "moe miss experts");
+        const uint64_t rows = uint64_t(k) * nff * 4;
+        for (uint32_t t = 0; t < T; ++t) {
+            run(0, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[0], t * rows, ind_off + t * 36);
+            run(1, 1, true, miss_ids, t * 64, xn, uint64_t(t) * E * 4, m[1], t * rows, ind_off + t * 36);
+        }
+        dispatch(enc, "swiglu", {m[0], m[1], m[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1),
+                 MTL::Size(256, 1, 1));
+        for (uint32_t t = 0; t < T; ++t)
+            run(2, 1, true, miss_ids, t * 64, m[2], t * rows, m[3], uint64_t(t) * k * E * 4, ind_off + t * 36);
     }
-    dispatch(enc, "swiglu", {m[0], m[1], m[2]}, &sa, sizeof(sa), MTL::Size(T * k * nff, 1, 1), MTL::Size(256, 1, 1));
-    for (uint32_t t = 0; t < T; ++t)
-        run(2, 1, true, miss_ids, t * 64, m[2], t * rows, m[3], uint64_t(t) * k * E * 4, ind_off + t * 36);
     const CombineArgs ca{E, k};
     part(enc, "moe combine");
     dispatch(enc, "moe_combine_split", {h[3], m[3], miss_rank, ew, sho, ffo}, &ca, sizeof(ca), MTL::Size(E, T, 1),

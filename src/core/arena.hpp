@@ -94,6 +94,8 @@ public:
     ExpertArena& operator=(const ExpertArena&) = delete;
 
     uint32_t slots(uint32_t layer) const { return slots_[layer]; }
+    // Every expert of the layer resident: none can miss until something is evicted or lent.
+    bool all_resident(uint32_t layer) const;
     uint64_t bytes() const { return bytes_; }
     const Part& part(uint32_t layer, int p) const { return layers_[layer][p]; }
     const Region& region(uint32_t layer, int p) const { return regions_[layer][p]; }
@@ -127,6 +129,9 @@ public:
     void touch(uint32_t layer, std::span<const int> experts);
     // A prefill group's routing of a layer for usage() (the profile): users[e] tokens selected expert e.
     void note_prefill(uint32_t layer, std::span<const uint32_t> users);
+    // What `calls` ensure() calls of a layer whose experts were all resident would have recorded (usage, eviction
+    // scores, hits); counts[e]: selections of expert e among them.
+    void note_resident(uint32_t layer, std::span<const uint32_t> counts, uint32_t calls);
     void unpin(uint32_t layer);
     void unpin(uint32_t layer, std::span<const int32_t> slots);
 
