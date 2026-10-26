@@ -2,6 +2,7 @@
 
 #include "gguf/keys.hpp"
 
+#include <cstring>
 #include <format>
 
 namespace mako::dsv41 {
@@ -11,6 +12,26 @@ namespace {
 std::vector<int32_t> narrow(const std::vector<int64_t>& v)
 {
     return {v.begin(), v.end()};
+}
+
+// An integer tensor (I32 or I64) of the model's files as int64 values; empty when absent.
+std::vector<int64_t> int_tensor(const gguf::ModelFiles& m, const std::string& name)
+{
+    const auto ref = m.find(name);
+    if (!ref || (ref.tensor->type != gguf::Type::I32 && ref.tensor->type != gguf::Type::I64))
+        return {};
+    const auto data = ref.file->data(*ref.tensor);
+    std::vector<int64_t> out(ref.tensor->elements());
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (ref.tensor->type == gguf::Type::I32) {
+            int32_t v;
+            std::memcpy(&v, data.data() + i * 4, 4);
+            out[i] = v;
+        } else {
+            std::memcpy(&out[i], data.data() + i * 8, 8);
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -57,30 +78,39 @@ std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
     c.compress_ratios = narrow(k.ints("attention.compress_ratios"));
     if (c.compress_ratios.size() < c.n_layer)
         k.missing += " attention.compress_ratios(shorter than block_count)";
-    c.kv_source_layers = narrow(k.ints("attention.kv_source_layers"));
-    c.indexer_source_layers = narrow(k.ints("attention.indexer.source_layers"));
+    // Some files name these differently (the second name of each pair).
+    c.kv_source_layers = narrow(k.ints(k.either("attention.kv_source_layers", "kv_source_layer_ids")));
+    c.indexer_source_layers = narrow(k.ints(k.either("attention.indexer.source_layers", "index_source_layer_ids")));
     c.indexer_heads = k.u32("attention.indexer.head_count");
     c.indexer_dim = k.u32("attention.indexer.key_length");
     c.indexer_top_k = k.u32("attention.indexer.top_k");
-    c.candidate_source_layer = int32_t(k.u32("attention.indexer.candidate_source_layer"));
-    c.candidate_top_k_blocks = k.u32("attention.indexer.candidate_top_k_blocks");
-    c.candidate_block_size = k.u32("attention.indexer.candidate_block_size");
+    c.candidate_source_layer =
+        int32_t(k.u32(k.either("attention.indexer.candidate_source_layer", "attention.candidate_source_layer_id")));
+    c.candidate_top_k_blocks =
+        k.u32(k.either("attention.indexer.candidate_top_k_blocks", "attention.candidate_topk_blocks"));
+    c.candidate_block_size = k.u32(k.either("attention.indexer.candidate_block_size", "attention.candidate_block_size"));
 
     c.hc = k.u32("hyper_connection.count");
     c.hc_sinkhorn_iters = k.u32("hyper_connection.sinkhorn_iterations");
     c.hc_eps = k.f32("hyper_connection.epsilon");
 
     auto& e = c.engram;
-    e.layers = narrow(k.ints("engram.layers"));
+    e.layers = narrow(k.ints(k.either("engram.layers", "engram.layer_ids")));
     e.num_embeddings = k.ints("engram.num_embeddings");
-    e.max_ngram = k.u32("engram.max_ngram_size");
-    e.heads = k.u32("engram.head_count");
-    e.head_dim = k.u32("engram.head_dim");
-    e.pad_token = int32_t(k.u32("engram.pad_token_id"));
-    e.token_map = narrow(k.ints("engram.token_map"));
-    e.multipliers = k.ints("engram.multipliers");
-    e.primes = k.ints("engram.primes");
-    e.offsets = k.ints("engram.offsets");
+    e.max_ngram = k.u32(k.either("engram.max_ngram_size", "engram_max_ngram_size"));
+    e.heads = k.u32(k.either("engram.head_count", "engram_n_heads"));
+    e.head_dim = k.u32(k.either("engram.head_dim", "engram_head_dim"));
+    e.pad_token = int32_t(k.u32(k.either("engram.pad_token_id", "engram_pad_token_id")));
+    // The hash parameters: metadata arrays, or integer tensors of the same values.
+    auto params = [&](const char* key, const char* tensor) {
+        return k.has(key) ? k.ints(key) : int_tensor(m, tensor);
+    };
+    e.token_map = narrow(params("engram.token_map", "engram_token_map.weight"));
+    e.multipliers = params("engram.multipliers", "engram_multipliers.weight");
+    e.primes = params("engram.primes", "engram_primes.weight");
+    e.offsets = params("engram.offsets", "engram_offsets.weight");
+    if (e.token_map.empty())
+        k.missing += " engram.token_map";
     const size_t nl = e.layers.size();
     if (e.multipliers.size() != nl * e.max_ngram || e.primes.size() != nl * e.columns() ||
         e.offsets.size() != nl * e.columns() || e.num_embeddings.size() != nl)

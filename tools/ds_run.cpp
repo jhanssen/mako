@@ -22,6 +22,7 @@
 // -n N: then N greedy tokens.
 #include "app/presets.hpp"
 #include "dsv41/config.hpp"
+#include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
 #include "gen/session.hpp"
 
@@ -176,7 +177,7 @@ int main(int argc, char** argv)
         std::println(stderr, "{}", m.error());
         return 1;
     }
-    if (auto r = m->add(argv[2]); !r) {
+    if (auto r = m->add(argv[2]).and_then([&] { return mako::dsv41::Engram::add_named(*m, argv[1]); }); !r) {
         std::println(stderr, "{}", r.error());
         return 1;
     }

@@ -20,6 +20,7 @@
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
+#include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -151,11 +152,10 @@ int main(int argc, char** argv)
     }
     const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
     if (deepseek) {
-        if (!engram.empty())
-            if (auto r = model->add(engram); !r) {
-                std::println(stderr, "{}", r.error());
-                return 1;
-            }
+        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1]) : model->add(engram); !r) {
+            std::println(stderr, "{}", r.error());
+            return 1;
+        }
     }
     const auto& meta = model->meta(); // (after add(), which may move the files)
     auto tok = mako::text::Tokenizer::load(meta);

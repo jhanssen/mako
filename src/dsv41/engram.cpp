@@ -38,6 +38,19 @@ const Lut& lut()
 
 } // namespace
 
+std::expected<void, std::string> Engram::add_named(gguf::ModelFiles& m, const std::string& first_shard)
+{
+    if (m.find("per_layer_token_embd.weight") || m.find("blk.1.engram_embd.weight"))
+        return {};
+    const auto name = m.meta().get_string("deepseek41.engram.file");
+    if (!name)
+        return {};
+    const auto path = (std::filesystem::path(first_shard).parent_path() / *name).string();
+    if (auto r = m.add(path); !r)
+        return std::unexpected(std::format("the Engram tables the model names ({}): {}", path, r.error()));
+    return {};
+}
+
 std::expected<Engram, std::string> Engram::open(const Config& cfg, const gguf::ModelFiles& m)
 {
     const auto& c = cfg.engram;

@@ -8,6 +8,7 @@
 // - an all-zero file and switching ablation off give the same logits as none, bit for bit;
 // - with a real file (third argument): prefill and step-by-step decode agree as closely as they do without it.
 #include "dsv41/config.hpp"
+#include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
 #include "quant/dequant.hpp"
 
@@ -78,7 +79,7 @@ int main(int argc, char** argv)
     }
     const std::string abl_path = argc > 3 ? argv[3] : "";
     auto m = mako::gguf::ModelFiles::open(argv[1]);
-    if (!m || !m->add(argv[2])) {
+    if (!m || !m->add(argv[2]) || !mako::dsv41::Engram::add_named(*m, argv[1])) {
         std::println(stderr, "cannot open the model files");
         return 1;
     }

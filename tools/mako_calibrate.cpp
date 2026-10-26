@@ -4,6 +4,7 @@
 // Without --corpus it uses the built-in corpus; without --out it writes the model's default profile. --engram: the
 // GGUF with DeepSeek-V4.1's Engram tables (default: the model's own shards).
 #include "dsv41/config.hpp"
+#include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
@@ -78,11 +79,10 @@ int main(int argc, char** argv)
     std::println("calibrating on {} tokens ({})", ids.size(), corpus_path.empty() ? "built-in corpus" : corpus_path);
     const auto t0 = std::chrono::steady_clock::now();
     if (model->meta().get_string("general.architecture").value_or("") == "deepseek41") {
-        if (!engram.empty())
-            if (auto r = model->add(engram); !r) {
-                std::println(stderr, "{}", r.error());
-                return 1;
-            }
+        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1]) : model->add(engram); !r) {
+            std::println(stderr, "{}", r.error());
+            return 1;
+        }
         auto cfg = mako::dsv41::Config::load(*model);
         if (!cfg) {
             std::println(stderr, "{}", cfg.error());

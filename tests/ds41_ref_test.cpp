@@ -9,6 +9,7 @@
 // data from a full reference dump.
 //   ds41_ref_test <model-00001.gguf> <engram.gguf> <mode> [dspark dir]
 #include "dsv41/config.hpp"
+#include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
 #include "gen/session.hpp"
 
@@ -174,7 +175,7 @@ int main(int argc, char** argv)
         return 77;
     }
     auto m = mako::gguf::ModelFiles::open(argv[1]);
-    if (!m || !m->add(argv[2])) {
+    if (!m || !m->add(argv[2]) || !mako::dsv41::Engram::add_named(*m, argv[1])) {
         std::println(stderr, "cannot open the model files");
         return 1;
     }

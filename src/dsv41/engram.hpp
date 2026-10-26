@@ -17,6 +17,9 @@ namespace mako::dsv41 {
 class Engram {
 public:
 
+    // Adds the GGUF the model's metadata names as holding its tables (deepseek41.engram.file, beside the first shard)
+    // when `m` has none of its own; an error when it names one that cannot be opened.
+    static std::expected<void, std::string> add_named(gguf::ModelFiles& m, const std::string& first_shard);
     // Finds the tables in `m` (one tensor holding every layer's table in turn, or one per layer).
     static std::expected<Engram, std::string> open(const Config& cfg, const gguf::ModelFiles& m);
 

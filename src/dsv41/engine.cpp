@@ -234,8 +234,20 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         }
         if (auto it = std::ranges::find(eg_layers, int32_t(il)); it != eg_layers.end()) {
             L->engram = int(it - eg_layers.begin());
-            L->engram_kv = upload(p + "engram_kv.weight");
-            L->engram_gate = upload(p + "engram_gate.weight");
+            // Some files keep the gate as its two norm weights (the gate is their product) and name kv "wkv".
+            L->engram_kv = upload(p + (model.find(p + "engram_kv.weight") ? "engram_kv.weight" : "engram_wkv.weight"));
+            if (model.find(p + "engram_gate.weight")) {
+                L->engram_gate = upload(p + "engram_gate.weight");
+            } else {
+                L->engram_gate = upload(p + "engram_q.weight");
+                const DevTensor k = upload(p + "engram_k.weight");
+                if (L->engram_gate.type != gguf::Type::F32 || k.type != gguf::Type::F32 || k.dims != L->engram_gate.dims)
+                    throw std::runtime_error(p + "engram_q / engram_k: expected two float tensors of one shape");
+                auto* g = reinterpret_cast<float*>(static_cast<char*>(L->engram_gate.buf->contents()) + L->engram_gate.off);
+                const auto* kf = reinterpret_cast<const float*>(static_cast<const char*>(k.buf->contents()) + k.off);
+                for (uint64_t i = 0; i < k.dims[0] * k.dims[1]; ++i)
+                    g[i] *= kf[i];
+            }
         }
         L->moe.router = upload(p + "ffn_gate_inp.weight");
         L->moe.bias = upload(p + "exp_probs_b.bias");
