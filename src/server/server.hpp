@@ -29,7 +29,7 @@ struct ServerOptions {
     std::vector<std::string> api_keys;
     std::optional<Effort> reasoning_effort; // requests that name none (unset: the template's default)
     // The most reasoning tokens for requests that name no budget (0: none). Either way, a reply capped at 1024
-    // tokens or more keeps a quarter of the cap (512 to half of it) for the answer.
+    // tokens or more keeps half of the cap for the answer.
     uint32_t reasoning_budget = 0;
 };
 

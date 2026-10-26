@@ -82,7 +82,7 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
     // The reasoning budget, cut to leave a capped reply room to answer.
     uint32_t budget = cr.reasoning_budget.value_or(opts.reasoning_budget);
     if (cr.max_tokens_given && cr.gen.max_tokens >= 1024) {
-        const uint32_t m = cr.gen.max_tokens, cap = m - std::min(std::max(512u, m / 4), m / 2);
+        const uint32_t m = cr.gen.max_tokens, cap = m / 2;
         budget = budget ? std::min(budget, cap) : cap;
     }
     std::optional<ReasoningBudget> rb;
