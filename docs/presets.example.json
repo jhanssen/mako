@@ -32,24 +32,14 @@
     "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
     "--dense-quant": "q6_k"
   },
-  "ds-prefetch": {
-    "description": "DeepSeek, experts read ahead from the router two layers ahead (story +3.5%, long code neutral)",
-    "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
-    "--prefetch": 4,
-    "--prefetch-ahead": 2
-  },
   "ds-fast-0.05": {
-    "description": "DeepSeek, cache-aware routing 0.05 + read-ahead (story 24.6 -> 27.7 tok/s; KL vs the reference +20%)",
+    "description": "DeepSeek, cache-aware routing 0.05 (story 24.6 -> 27.7 tok/s; KL vs the reference +20%)",
     "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
-    "--miss-penalty": 0.05,
-    "--prefetch": 4,
-    "--prefetch-ahead": 2
+    "--miss-penalty": 0.05
   },
   "ds-fast-0.1": {
-    "description": "DeepSeek, cache-aware routing 0.1 + read-ahead (story 24.6 -> 29.1 tok/s; KL vs the reference +58%)",
+    "description": "DeepSeek, cache-aware routing 0.1 (story 24.6 -> 29.1 tok/s; KL vs the reference +58%)",
     "model": "~/models/ds-4.1-flash-1017/Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf",
-    "--miss-penalty": 0.1,
-    "--prefetch": 4,
-    "--prefetch-ahead": 2
+    "--miss-penalty": 0.1
   }
 }

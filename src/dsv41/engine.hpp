@@ -37,10 +37,10 @@ struct Options {
     // Activation statistics (ds_run --imatrix-out) weighting dense_quant's rounding; empty: unweighted.
     std::string dense_imatrix;
     float miss_penalty = 0.0f; // core::Routing::miss_penalty
-    // Decode: each layer predicts the next layer's top prefetch_k experts from its FFN input and reads the missing
-    // ones ahead (0: off).
-    uint32_t prefetch_k = 0;
-    uint32_t prefetch_ahead = 1; // predicting the layer this many ahead
+    // Decode: each layer predicts the top prefetch_k experts of the layer prefetch_ahead later from its FFN input and
+    // reads the missing ones ahead (0: off). Results are unchanged.
+    uint32_t prefetch_k = 4;
+    uint32_t prefetch_ahead = 2;
 };
 
 // DeepSeek-V4.1: dense weights resident, routed experts in the shared expert arena, Engram rows read per token from

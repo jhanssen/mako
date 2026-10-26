@@ -257,10 +257,10 @@ int main(int argc, char** argv)
                 l.push_back(engine.step(t));
             return l;
         };
+        engine.set_prefetch(0, 2);
         const auto off = steps();
         engine.set_prefetch(4, 2);
         const auto on = steps();
-        engine.set_prefetch(0, 1);
         check(on == off, std::format("reading ahead: the same logits, bit for bit ({} experts read ahead, {} used)",
                                      engine.arena().stats().prefetched, engine.arena().stats().prefetch_used));
     }

@@ -13,8 +13,8 @@
 // cache (measured: +13% on code, -3% on prose). DeepSeek-V4.1 trade-offs (accuracy for speed, docs/performance.md):
 // --miss-penalty lowers the routing score of experts not in memory (fewer SSD reads; output then depends on what is
 // cached); --dense-quant re-quantizes the dense Q8_0 weights at load (--imatrix: activation statistics from
-// ds_run --imatrix-out weighting its rounding). --prefetch K reads the top K experts that
-// layer l + D's router (--prefetch-ahead, default 2) predicts from layer l's input ahead (results unchanged).
+// ds_run --imatrix-out weighting its rounding). --prefetch K (default 4; 0: off) reads the top K experts that layer
+// l + D's router (--prefetch-ahead, default 2) predicts from layer l's input ahead (results unchanged).
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
@@ -72,7 +72,7 @@ int main(int argc, char** argv)
     double arena_gb = -1, stage_gb = -1;
     std::string ablate, engram, dspark, imatrix;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
-    uint32_t prefetch_k = 0, prefetch_ahead = 2;
+    uint32_t prefetch_k = 4, prefetch_ahead = 2;
     std::optional<mako::gguf::Type> dense_quant;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];

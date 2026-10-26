@@ -196,8 +196,8 @@ ahead were selected (one layer in 16 still predicts, to keep measuring). Results
 | 2 ahead, top 4, with the gate | 25.6 (+3.5%) | 7.5 |
 
 One layer ahead the reads often had not finished (0.4-1.5 s of waits over 200 steps); two ahead, ~0.1 s. After a 16K
-code prompt only 21-31% of reads ahead are used: without the gate -2.7%, with it -0.3% (21.18 -> 21.11). Off by
-default.
+code prompt only 21-31% of reads ahead are used: without the gate -2.7%, with it -0.3% (21.18 -> 21.11). On by
+default (top 4, two layers ahead; `--prefetch 0` turns it off).
 
 With cache-aware routing (story, 200 tokens; the penalty changes the text, so misses are not strictly comparable):
 penalty 0.05: 27.07 tok/s, with read-ahead 27.66; penalty 0.1: 27.63, with read-ahead 29.14 (3.0 misses a step,

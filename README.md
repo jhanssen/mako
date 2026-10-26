@@ -111,7 +111,9 @@ directory. `docs/presets.example.json` has presets for both models and the DeepS
 DeepSeek-V4.1 speed/accuracy options (measured in `docs/performance.md`): `--miss-penalty F` lowers the routing
 score of experts not in memory, so fewer are read from the SSD (0.05-0.2: 9-20% faster steps, KL against the
 reference +20-80%; the output then depends on what is cached), and `--dense-quant q4_k|q5_k|q6_k` re-quantizes the
-dense Q8_0 weights at load.
+dense Q8_0 weights at load (`--imatrix FILE`: activation statistics from `ds_run --gen N --imatrix-out FILE`
+weighting its rounding). Experts that the router two layers ahead predicts are read in the background (`--prefetch K`,
+default 4; 0 turns it off); results are unchanged.
 
 For pi, a provider in `~/.pi/agent/models.json` with `"api": "openai-completions"`, `"baseUrl":
 "http://127.0.0.1:8080/v1"`, `"reasoning": true` and `"compat": {"supportsMidConvoSystemMessages": true}` (system
