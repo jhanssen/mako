@@ -34,6 +34,8 @@ struct Options {
     uint32_t max_drafts = 4;
     // Dense Q8_0 matrices re-quantized at load to this type (Q4_K, Q5_K or Q6_K); unset: as stored.
     std::optional<gguf::Type> dense_quant;
+    // Activation statistics (ds_run --imatrix-out) weighting dense_quant's rounding; empty: unweighted.
+    std::string dense_imatrix;
     float miss_penalty = 0.0f; // core::Routing::miss_penalty
     // Decode: each layer predicts the next layer's top prefetch_k experts from its FFN input and reads the missing
     // ones ahead (0: off).
@@ -120,6 +122,7 @@ private:
     void attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
                    uint32_t T, uint32_t pos0, uint32_t g0, MTL::Buffer* ring = nullptr, bool block = false);
     void load_drafter(const std::string& dir);
+    void load_importance(const std::string& path);
     // The drafter's MoE of block b on T rows of xn into ffo (its experts all resident).
     void draft_moe(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t b, MTL::Buffer* xn, MTL::Buffer* ffo,
                    uint32_t T);

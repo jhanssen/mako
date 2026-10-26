@@ -465,12 +465,12 @@ EngineBase::DevTensor EngineBase::upload(const std::string& name)
         throw std::runtime_error("missing tensor " + name);
     const gguf::Tensor& t = *ref.tensor;
     if (dense_quant_ && t.type == gguf::Type::Q8_0 && t.dims[0] % 256 == 0)
-        return upload_requant(ref.file->fd(), t, *dense_quant_);
+        return upload_requant(ref.file->fd(), t, *dense_quant_, name);
     return upload_raw(ref.file->fd(), t.offset, t.bytes, t.type, t.dims, name);
 }
 
 // Q8_0 rows dequantized and quantized again to `to`, on all cores.
-EngineBase::DevTensor EngineBase::upload_requant(int fd, const gguf::Tensor& t, gguf::Type to)
+EngineBase::DevTensor EngineBase::upload_requant(int fd, const gguf::Tensor& t, gguf::Type to, const std::string& name)
 {
     const uint64_t k = t.dims[0], src_rb = mtl::Gemv::row_bytes(t.type, uint32_t(k));
     const uint64_t dst_rb = mtl::Gemv::row_bytes(to, uint32_t(k)), rows = t.bytes / src_rb;
@@ -478,6 +478,15 @@ EngineBase::DevTensor EngineBase::upload_requant(int fd, const gguf::Tensor& t, 
     gguf::read_exact(fd, raw.data(), t.bytes, t.offset);
     DevTensor d = reserve(rows * dst_rb, to, t.dims);
     auto* dst = static_cast<std::byte*>(d.buf->contents()) + d.off;
+    const float* imp = nullptr;
+    uint64_t rows_per_group = rows;
+    if (const auto it = importance_.find(name); it != importance_.end()) {
+        const uint64_t groups = it->second.size() / k;
+        if (groups && it->second.size() % k == 0 && rows % groups == 0) {
+            imp = it->second.data();
+            rows_per_group = rows / groups;
+        }
+    }
     const uint32_t threads = std::max(1u, std::thread::hardware_concurrency());
     std::vector<std::jthread> pool;
     for (uint32_t w = 0; w < threads; ++w)
@@ -485,7 +494,7 @@ EngineBase::DevTensor EngineBase::upload_requant(int fd, const gguf::Tensor& t, 
             std::vector<float> row(k);
             for (uint64_t r = w; r < rows; r += threads) {
                 quant::dequant_row(t.type, raw.data() + r * src_rb, row.data(), k);
-                quant::quantize_row(to, row.data(), dst + r * dst_rb, k);
+                quant::quantize_row(to, row.data(), dst + r * dst_rb, k, imp ? imp + (r / rows_per_group) * k : nullptr);
             }
         });
     pool.clear();
@@ -759,6 +768,8 @@ void EngineBase::ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& ga
     proj(enc, up, xn, x_off, u, 0, T);
     const SwigluArgs sa{T * nff, limit > 1e-6f ? limit : 0.0f};
     dispatch(enc, "swiglu", {g, u, m}, &sa, sizeof(sa), MTL::Size(T * nff, 1, 1), MTL::Size(256, 1, 1));
+    if (T == 1)
+        probe(enc, "imx_ffm", int(cur_layer_), m, nff);
     proj(enc, down, m, 0, out, out_off, T);
 }
 

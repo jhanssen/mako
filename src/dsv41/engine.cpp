@@ -148,6 +148,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     : EngineBase(model, ctx, opts.telemetry), cfg_(cfg), opts_(opts)
 {
     dense_quant_ = opts_.dense_quant;
+    if (!opts_.dense_imatrix.empty())
+        load_importance(opts_.dense_imatrix);
     const auto t_load = Clock::now();
     if (cfg_.head_dim != 512 || cfg_.n_head != 64 || cfg_.n_rot != 64 || cfg_.hc != 4 || cfg_.n_head * cfg_.head_dim != cfg_.o_groups * 4096 ||
         cfg_.indexer_dim != 128 || cfg_.n_expert_used > 16)
@@ -460,8 +462,12 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     MTL::Buffer* kvn = scratch("ds_kvn", uint64_t(T) * D * 4);
     MTL::Buffer* kvc = scratch("ds_kvc", uint64_t(T) * D * 4);
     part(enc, "attn q kv");
+    if (T == 1 && !block)
+        probe(enc, "imx_attn", int(il), xn, cfg_.n_embd);
     proj(enc, L.q_a, xn, 0, qr, 0, T);
     norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+    if (T == 1 && !block)
+        probe(enc, "imx_qr", int(il), qrn, QR);
     proj(enc, L.q_b, qrn, 0, q, 0, T);
     proj(enc, L.kv, xn, 0, kv, 0, T);
     norm(enc, kv, &L.kv_norm, kvn, T, D, D, cfg_.rms_eps);
@@ -622,6 +628,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     part(enc, "attn output");
     rope(enc, o, 0, comp, D, H, pos0, T, 1, true);
     round(enc, o, 0, o, 0, T * HD, kFp8);
+    if (T == 1 && !block)
+        probe(enc, "imx_o", int(il), o, HD);
     // Grouped output projection: group g's heads (rows g * gw of each token) through its o_lora_rank rows.
     const uint32_t G = cfg_.o_groups, R = cfg_.o_lora_rank, gw = HD / G;
     MTL::Buffer* low = scratch("ds_low", uint64_t(T) * G * R * 4);
@@ -639,6 +647,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     }
     if (T == 1)
         probe(enc, "attn_low", int(il), low, uint64_t(G) * R);
+    if (T == 1 && !block)
+        probe(enc, "imx_low", int(il), low, uint64_t(G) * R);
     proj(enc, L.out_b, low, 0, att, 0, T);
 }
 
@@ -942,6 +952,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         enc->dispatchThreads(MTL::Size(E, n, 1), MTL::Size(256, 1, 1));
         after(enc, "hc_collapse");
         norm(enc, xl, &output_norm_, xnl, n, E, E, cfg_.rms_eps);
+        if (G == 1)
+            probe(enc, "imx_out", int(cfg_.n_layer), xnl, E);
         proj(enc, output_, xnl, 0, lg, 0, n);
         enc->endEncoding();
         finish(cb);
@@ -978,6 +990,49 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     last_step_.read_bytes = after_stats.read_bytes - before.read_bytes;
     if (timing())
         resolve_layer_times(cpu0, gpu0);
+}
+
+// Activation statistics (ds_run --imatrix-out: MAKOIMX1, then per entry name, layer, n, n mean squares) mapped onto
+// the dense matrices that read each input.
+void Engine::load_importance(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    char magic[8] = {};
+    uint32_t entries = 0;
+    if (!in.read(magic, 8) || std::string_view(magic, 8) != "MAKOIMX1" || !in.read(reinterpret_cast<char*>(&entries), 4))
+        throw std::runtime_error(path + ": not an activation statistics file");
+    std::map<std::pair<std::string, int>, std::vector<float>> stats;
+    for (uint32_t i = 0; i < entries; ++i) {
+        uint32_t len = 0, n = 0;
+        int32_t layer = 0;
+        in.read(reinterpret_cast<char*>(&len), 4);
+        std::string name(len, '\0');
+        in.read(name.data(), len);
+        in.read(reinterpret_cast<char*>(&layer), 4);
+        in.read(reinterpret_cast<char*>(&n), 4);
+        std::vector<float> v(n);
+        in.read(reinterpret_cast<char*>(v.data()), std::streamsize(n) * 4);
+        if (!in)
+            throw std::runtime_error(path + ": truncated");
+        stats[{name, layer}] = std::move(v);
+    }
+    auto map = [&](const std::string& tensor, const std::string& input, int layer) {
+        if (const auto it = stats.find({input, layer}); it != stats.end())
+            importance_[tensor] = it->second;
+    };
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+        const std::string p = std::format("blk.{}.", il);
+        for (const char* t : {"attn_q_a", "attn_kv", "attn_compressor_kv", "attn_compressor_gate"})
+            map(p + t + ".weight", "imx_attn", int(il));
+        map(p + "attn_q_b.weight", "imx_qr", int(il));
+        map(p + "indexer.attn_q_b.weight", "imx_qr", int(il));
+        map(p + "attn_output_a.weight", "imx_o", int(il));
+        map(p + "attn_output_b.weight", "imx_low", int(il));
+        map(p + "ffn_gate_shexp.weight", "imx_ffn", int(il));
+        map(p + "ffn_up_shexp.weight", "imx_ffn", int(il));
+        map(p + "ffn_down_shexp.weight", "imx_ffm", int(il));
+    }
+    map("output.weight", "imx_out", int(cfg_.n_layer));
 }
 
 // dspark.json: [name, dtype, offset, bytes, shape (outermost first)] per tensor of dspark.bin.

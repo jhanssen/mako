@@ -124,6 +124,22 @@ Dense re-quantization at load (`ds_run --dense-quant`, 1300 positions against th
 | Q5_K | 96.8% | 0.00964 | 43.5 ms |
 | Q4_K | 96.9% | 0.01609 | 38.6 ms |
 
+Better dense re-quantization: after the 6-bit (Q4_K) or int8 (Q6_K) scale codes are rounded, the neighbouring codes
+are tried with the weighted error of the final rounding; and activation statistics (`ds_run --gen N --imatrix-out F`:
+the mean square of each input channel of every dense matrix's input, then `--imatrix F`) weight the columns.
+1300 positions against the reference (Q8_0 as stored: 98.2%, KL 0.00572):
+
+| Dense | Top-1 | KL mean |
+| --- | ---: | ---: |
+| Q6_K, first quantizer | 97.5% | 0.00755 |
+| Q6_K, neighbour search | 98.2% | 0.00677 |
+| Q6_K, + statistics (500 generated tokens of README and code) | 97.6% | 0.00660 |
+| Q4_K, first quantizer | 96.3% | 0.01636 |
+| Q4_K, neighbour search | 96.5% | 0.01575 |
+| Q4_K, + statistics | 96.6% | 0.01455 |
+
+Q4_K stays at 2.5x the stored weights' KL; Q6_K costs about as much as cache-aware routing at 0.05.
+
 Cache-aware routing (`--miss-penalty F`: subtracted from a non-resident expert's selection score, its weight
 unchanged), 1300 positions against the reference:
 

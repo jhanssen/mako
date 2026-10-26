@@ -5,6 +5,8 @@
 //          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [-n N]
+// --imatrix-out FILE (with --gen N): the mean square of each input channel of the dense matrices' inputs over the
+// generated steps, for --imatrix (activation-weighted rounding in --dense-quant).
 // --route-study N: N greedy tokens without drafts, then how well each expert-miss predictor would have done: layer
 // l+1's router on layer l's FFN input (one and two layers ahead), the previous token's experts, and the experts the
 // same input token used earlier (misses caught, and reads of experts neither resident nor selected wasted).
@@ -73,6 +75,7 @@ int main(int argc, char** argv)
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0, study_n = 0;
     bool part_timing = false;
+    std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
     for (int i = 3; i + 1 < argc; i += 2) {
@@ -128,6 +131,10 @@ int main(int argc, char** argv)
             opts.dspark = v;
         else if (a == "--gen")
             session_n = uint32_t(std::stoul(v));
+        else if (a == "--imatrix-out")
+            imatrix_out = v;
+        else if (a == "--imatrix")
+            opts.dense_imatrix = v;
         else if (a == "--route-study")
             study_n = uint32_t(std::stoul(v));
         else if (a == "--spec")
@@ -364,6 +371,18 @@ int main(int argc, char** argv)
                          misses > 0 ? 100.0 * sc.caught / misses : 0.0, sc.caught / n_steps, sc.wasted / n_steps);
         return 0;
     }
+    // name -> layer -> (sum of squares per channel, steps)
+    std::map<std::string, std::map<int, std::pair<std::vector<double>, uint64_t>>> imx;
+    if (!imatrix_out.empty())
+        engine.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
+            if (!name.starts_with("imx_") && name != "ffn_in")
+                return;
+            auto& [sum, count] = imx[name == "ffn_in" ? "imx_ffn" : name][layer];
+            sum.resize(n);
+            for (size_t i = 0; i < n; ++i)
+                sum[i] += double(data[i]) * data[i];
+            ++count;
+        });
     if (session_n > 0) {
         mako::gen::Session session(engine);
         mako::gen::GenerateParams gp;
@@ -385,6 +404,29 @@ int main(int argc, char** argv)
                      ss.verifies ? double(ss.verify_misses) / ss.verifies : 0.0,
                      ss.verifies ? ss.verify_read_ms / ss.verifies : 0.0, ss.steps, ss.steps ? ss.step_ms / ss.steps : 0.0,
                      ss.steps ? double(ss.step_misses) / ss.steps : 0.0, ss.steps ? ss.step_read_ms / ss.steps : 0.0);
+        if (!imatrix_out.empty()) {
+            engine.set_probe({});
+            std::ofstream out(imatrix_out, std::ios::binary);
+            out.write("MAKOIMX1", 8);
+            uint32_t entries = 0;
+            for (const auto& [name, layers] : imx)
+                entries += uint32_t(layers.size());
+            out.write(reinterpret_cast<const char*>(&entries), 4);
+            for (const auto& [name, layers] : imx)
+                for (const auto& [layer, rec] : layers) {
+                    const uint32_t len = uint32_t(name.size()), n = uint32_t(rec.first.size());
+                    const int32_t l = layer;
+                    out.write(reinterpret_cast<const char*>(&len), 4);
+                    out.write(name.data(), len);
+                    out.write(reinterpret_cast<const char*>(&l), 4);
+                    out.write(reinterpret_cast<const char*>(&n), 4);
+                    for (double v : rec.first) {
+                        const float m = float(v / double(rec.second));
+                        out.write(reinterpret_cast<const char*>(&m), 4);
+                    }
+                }
+            std::println("wrote {} activation statistics to {}", entries, imatrix_out);
+        }
         if (const auto& as = engine.arena().stats(); as.prefetched)
             std::println("read ahead {} experts, {} selected before eviction ({:.0f}%), waited {:.0f} ms for reads in flight",
                          as.prefetched, as.prefetch_used, 100.0 * double(as.prefetch_used) / double(as.prefetched),
