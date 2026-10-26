@@ -1,6 +1,6 @@
 // DeepSeek-V4.1's Engram rows against the reference hasher (tests/data/ds41_engram_expected.txt: "t layer rows..." per
-// position and layer, then "V t layer values..." for the first column's decoded row of the first positions), and
-// hashing in chunks with the carried history against hashing in one go.
+// position and layer, then "V t layer values..." for the first column's decoded row of the first positions, from the
+// Q6_K tables), and hashing in chunks with the carried history against hashing in one go.
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 

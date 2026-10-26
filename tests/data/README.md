@@ -3,8 +3,10 @@
 The model-backed tests compare mako against reference implementations running the same GGUF files. The files here
 hold the inputs and the reference's outputs; the reference itself is not needed to run the tests, only to regenerate
 them. All of it was made with the Maya-S quants (see the README): GLM-5.3-Flash `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS`
-and DeepSeek-V4.1-Flash-1017 `DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS`, plus DeepSeek's Engram tables from the
-`UD-Q8_K_XL` build (shard 8 of 9). Other quants of the same models will not stay within the logit limits.
+and DeepSeek-V4.1-Flash-1017 `DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS`. The DeepSeek reference engine read the
+Engram tables in MXFP8 (the `UD-Q8_K_XL` build's shard 8 of 9); the current Maya-S set carries them in Q6_K in its
+last two shards (its model shards are byte for byte the ones the references were made with), and the tests run with
+those. Other quants of the same models will not stay within the logit limits.
 
 ## Reference logits (`*_ref.bin`)
 
@@ -69,4 +71,6 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
 The hashed table rows of a token sequence ("t layer rows..." per position and Engram layer, then "V t layer
 values..." for the first column's decoded row of the first positions), from project-maya's Python n-gram hasher
 (`tools/ds4/engram_hash.py` there), given the hash parameters (primes, multipliers, token map, offsets) read from the
-Engram GGUF's `deepseek41.engram.*` keys. `tools/engram_rows` prints mako's side for comparison.
+Engram GGUF's `deepseek41.engram.*` keys. The decoded values are from the Maya-S set's Q6_K tables, by
+`tools/gen_engram_values.py` (an independent decode of the raw bytes). `tools/engram_rows` prints mako's side for
+comparison.

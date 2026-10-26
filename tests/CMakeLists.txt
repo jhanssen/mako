@@ -37,11 +37,17 @@ add_test(NAME tokenizer COMMAND tokenizer_test "${MAKO_MODEL}" ${CMAKE_CURRENT_S
 add_test(NAME tokenizer_ds41 COMMAND tokenizer_test "${MAKO_DS41_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_tokenizer_cases.bin
                                      ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_tokenizer_expected.txt)
 add_test(NAME template_ds41 COMMAND template_cases_test "${MAKO_DS41_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_template)
+# The Engram tables: MAKO_DS41_ENGRAM, else the model's own shards.
+if(MAKO_DS41_ENGRAM)
+    set(DS41_ENGRAM "${MAKO_DS41_ENGRAM}")
+else()
+    set(DS41_ENGRAM "${MAKO_DS41_MODEL}")
+endif()
 # DeepSeek-V4.1 engine checks (ablation sites and invariants; MAKO_DS41_ABLATION adds a real file's prefill check).
-add_test(NAME dsv41 COMMAND dsv41_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_ENGRAM}" ${MAKO_DS41_ABLATION})
+add_test(NAME dsv41 COMMAND dsv41_test "${MAKO_DS41_MODEL}" "${DS41_ENGRAM}" ${MAKO_DS41_ABLATION})
 set_tests_properties(dsv41 PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
 # Engram hashing and row decoding (expected rows from the reference hasher, values decoded independently).
-add_test(NAME engram_ds41 COMMAND engram_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_ENGRAM}"
+add_test(NAME engram_ds41 COMMAND engram_test "${MAKO_DS41_MODEL}" "${DS41_ENGRAM}"
                                   ${CMAKE_CURRENT_SOURCE_DIR}/data/ds41_engram_expected.txt)
 add_test(NAME gemv COMMAND gemv_test "${MAKO_MODEL}")
 add_test(NAME gemm COMMAND gemm_test "${MAKO_MODEL}")
@@ -86,6 +92,6 @@ add_executable(ds41_ref_test ds41_ref_test.cpp)
 target_link_libraries(ds41_ref_test PRIVATE mako_dsv41 mako_gen)
 target_compile_definitions(ds41_ref_test PRIVATE MAKO_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
 foreach(m short long penalty q6k dspark)
-    add_test(NAME ds41_${m} COMMAND ds41_ref_test "${MAKO_DS41_MODEL}" "${MAKO_DS41_ENGRAM}" ${m} "${MAKO_DS41_DSPARK}")
+    add_test(NAME ds41_${m} COMMAND ds41_ref_test "${MAKO_DS41_MODEL}" "${DS41_ENGRAM}" ${m} "${MAKO_DS41_DSPARK}")
     set_tests_properties(ds41_${m} PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
 endforeach()

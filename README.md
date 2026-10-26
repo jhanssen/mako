@@ -21,15 +21,14 @@ The expert cache takes what is available at startup within a margin (a quarter o
 
 ### DeepSeek-V4.1
 
-The current Maya-S set carries its Engram tables (Q6_K) in its last two shards. Older layouts keep them in a GGUF
-of their own (MXFP8); `mako_serve` and `mako_calibrate` then find it in an `Engram` folder next to the model's
-folder (or inside it), or take `--engram FILE`. `ds_run` and the tests take the file as an argument (one of the
-model's own shards for the current set).
+The Maya-S set carries its Engram tables (Q6_K) in its last two shards. `--engram FILE` (`mako_serve`,
+`mako_calibrate`) uses the tables of another GGUF instead (Q6_K or MXFP8). `ds_run`'s second argument names the
+Engram GGUF; the model's first shard again uses its own.
 
 ```sh
 build/tools/mako_calibrate <DeepSeek shard 1>                    # routing profile (once): which experts start resident
 build/tools/mako_serve <DeepSeek shard 1> --ctx 65536 --port 8080
-build/tools/ds_run <DeepSeek shard 1> <engram.gguf> --ids 0,671,6102 -n 32   # token ids in, greedy tokens out
+build/tools/ds_run <DeepSeek shard 1> <DeepSeek shard 1> --ids 0,671,6102 -n 32   # token ids in, greedy tokens out
 ```
 
 `--ablate FILE` takes DeepSeek's sites `attn_out` (a layer's attention output) and `shexp_out` (its shared expert's
@@ -137,8 +136,9 @@ only the tests that need no GPU work.
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<model-00001-of-0000N.gguf>   # or MAKO_MODEL in the environment at configure
 ctest --test-dir build --output-on-failure                     # -L kernels | tokenizer | sampler | server | e2e
-# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> and MAKO_DS41_ENGRAM=<its Engram GGUF> (at configure) add the DeepSeek
-# tokenizer, template, Engram, GEMM and server tests
+# MAKO_DS41_MODEL=<DeepSeek-V4.1 shard 1> (at configure) adds the DeepSeek tokenizer, template, Engram, GEMM,
+# server and reference tests; MAKO_DS41_ENGRAM=<GGUF> runs them with other Engram tables, MAKO_DS41_DSPARK=<dir>
+# adds the drafter's
 ```
 
 Every test but `sampler` needs the model and reports as skipped without it. The `e2e` tests (about a minute) check
