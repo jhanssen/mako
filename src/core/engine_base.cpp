@@ -1219,7 +1219,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
     const auto h = bufs("h");
     // The resident experts' gate and up and the shared gate/up in one dispatch, both swiglus in one, the resident
     // down and the shared down in one (3 dispatches instead of 8), while the CPU reads the misses.
-    if (!probe_ && adjacent(mw.sh_gate, mw.sh_up)) { // probes read the shared expert's intermediate
+    if (!probe_) { // probes read the shared expert's intermediate
         const uint32_t nff_sh = uint32_t(mw.sh_gate.dims[1]);
         const uint64_t sh_rows = uint64_t(T) * nff_sh * 4;
         MTL::Buffer* gu = scratch("ffgu", 2 * sh_rows);
@@ -1237,8 +1237,9 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
             j.tail = {r.tail, r.tail_off, r.split};
             return j;
         };
-        const std::array<mtl::Gemv::Job, 3> up_jobs{routed_job(0, xn, h[0]), routed_job(1, xn, h[1]),
-                                                     gemv_job(mw.sh_gate, xn, 0, gu, 0, 2, T, true)};
+        const std::array<mtl::Gemv::Job, 4> up_jobs{routed_job(0, xn, h[0]), routed_job(1, xn, h[1]),
+                                                     gemv_job(mw.sh_gate, xn, 0, gu, 0, 1, T, false),
+                                                     gemv_job(mw.sh_up, xn, 0, gu, sh_rows, 1, T, false)};
         const std::array<mtl::Gemv::Job, 2> down_jobs{routed_job(2, h[2], h[3]),
                                                        gemv_job(mw.sh_down, m, 0, sho, 0, 1, T, false)};
         if (gemv_jobs_ok(up_jobs) && gemv_jobs_ok(down_jobs)) {
