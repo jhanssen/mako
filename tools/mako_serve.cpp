@@ -190,6 +190,8 @@ int main(int argc, char** argv)
         std::println(stderr, "--host {} serves beyond this machine: give an --api-key or --api-key-file", so.host);
         return 2;
     }
+    const auto t_start = std::chrono::steady_clock::now();
+    std::println(stderr, "reading {}", argv[1]);
     auto model = mako::gguf::ModelFiles::open(argv[1]);
     if (!model) {
         std::println(stderr, "{}", model.error());
@@ -228,8 +230,14 @@ int main(int argc, char** argv)
         so.model_id = std::string(meta.get_string("general.basename").value_or(
             std::filesystem::path(argv[1]).stem().string()));
 
+    {
+        uint64_t bytes = 0;
+        for (const auto& f : model->files())
+            bytes += f.size();
+        std::println(stderr, "{} files, {:.1f} GB; loading the resident weights and setting up the expert cache",
+                     model->files().size(), bytes / 1e9);
+    }
     mako::mtl::Context ctx;
-    const auto t0 = std::chrono::steady_clock::now();
     std::unique_ptr<mako::glm::Engine> glm_engine;
     std::unique_ptr<mako::dsv41::Engine> ds_engine;
     mako::gen::Model* model_if = nullptr;
@@ -301,9 +309,9 @@ int main(int argc, char** argv)
             experts += usage[l].size();
         }
     const double resident = experts ? 100.0 * double(slots) / double(experts) : 100.0;
-    std::println(stderr, "loaded in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
+    std::println(stderr, "ready in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
                          "temperature {}, top_p {}",
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), max_ctx,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(), max_ctx,
                  base->arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
     if (resident < expected_resident)
         std::println(stderr, "warning: little memory was free for the expert cache (a process that just exited may "
