@@ -12,9 +12,9 @@ DeepSeek-V4.1-Flash-1017 through an OpenAI- and Anthropic-compatible API. Built 
 
 ## Install
 
-Files downloaded with a browser are quarantined, and macOS stops these unsigned programs until that is cleared: the
-shell prints only `killed`. Clear it once for the whole folder (Safari unpacks the archive itself; otherwise
-`tar xzf @NAME@.tar.gz` first):
+Files downloaded with a browser are quarantined, and macOS stops these unsigned programs until that is cleared: a
+dialog says "mako_serve" Not Opened (Apple could not verify it) with Move to Trash and Done; click Done, and the shell
+then prints `killed`. Clear it once for the whole folder (Safari unpacks the archive itself; otherwise `tar xzf @NAME@.tar.gz` first):
 
 ```sh
 xattr -dr com.apple.quarantine @NAME@
