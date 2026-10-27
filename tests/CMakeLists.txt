@@ -93,6 +93,10 @@ add_test(NAME gemv_own COMMAND gemv_own_test)
 add_executable(gemv_rows_test gemv_rows_test.cpp)
 target_link_libraries(gemv_rows_test PRIVATE mako_mtl)
 add_test(NAME gemv_rows COMMAND gemv_rows_test)
+add_executable(hc_test hc_test.cpp)
+target_link_libraries(hc_test PRIVATE mako_mtl)
+add_test(NAME hc COMMAND hc_test)
+set_tests_properties(hc PROPERTIES LABELS kernels)
 
 # DeepSeek-V4.1 against the reference engine's logits (tests/data/ds41_*): short prose, a 24K-token prompt's tail, the
 # miss penalty, dense Q6_K, and the drafter (MAKO_DS41_DSPARK).
