@@ -1,0 +1,82 @@
+# Nightly build: when main has moved since the last one (or on demand), builds a release, runs the tests that need
+# neither a GPU nor a model, packages it (dist/package.sh) and replaces the `nightly` pre-release with it. Each
+# night's archives are also kept as a workflow artifact for 90 days.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # the tags, for the last nightly's commit
+
+      - name: Changed since the last nightly
+        id: changed
+        run: |
+          last=$(git rev-parse -q --verify 'refs/tags/nightly^{commit}' || true)
+          head=$(git rev-parse HEAD)
+          if [ "$last" = "$head" ] && [ "${{ github.event_name }}" = schedule ]; then
+            echo "main is still at the last nightly's commit ${head}"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "name=mako-nightly-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)-macos-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Tools
+        if: steps.changed.outputs.build == 'true'
+        run: |
+          brew install cmake ninja
+          xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+          xcodebuild -version
+          cmake --version
+
+      - name: Build
+        if: steps.changed.outputs.build == 'true'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-g
+          cmake --build build
+
+      - name: Test
+        if: steps.changed.outputs.build == 'true'
+        run: ctest --test-dir build -L cpu --output-on-failure
+
+      - name: Package
+        if: steps.changed.outputs.build == 'true'
+        run: dist/package.sh build out "${{ steps.changed.outputs.name }}"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.changed.outputs.build == 'true'
+        with:
+          name: ${{ steps.changed.outputs.name }}
+          path: |
+            out/*.tar.gz
+            out/*.sha256
+          retention-days: 90
+
+      - name: Release
+        if: steps.changed.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.changed.outputs.name }}
+        run: |
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly --prerelease --target "$(git rev-parse HEAD)" \
+            --title "Nightly $(date -u +%Y-%m-%d) ($(git rev-parse --short=7 HEAD))" \
+            --notes "Built from $(git rev-parse HEAD) on main. Unsigned: after downloading with a browser, run \`xattr -dr com.apple.quarantine ${NAME}\` once (see README.md in the archive)." \
+            "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256" "out/${NAME}-dSYM.tar.gz"

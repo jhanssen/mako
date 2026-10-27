@@ -60,6 +60,9 @@ run only on the M5 Max; on an M1 Ultra only the tests that need no model have ru
 
 ## Build
 
+Prebuilt: the [nightly](https://github.com/jhanssen/mako/releases/tag/nightly) release (`mako_serve` and
+`mako_calibrate`, rebuilt each night `main` has changed; unsigned, see the README.md inside). To build:
+
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
