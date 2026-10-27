@@ -30,6 +30,7 @@ target_include_directories(metal_cpp SYSTEM INTERFACE ${metal_cpp_SOURCE_DIR})
 target_link_libraries(metal_cpp INTERFACE
     "-framework Foundation" "-framework Metal" "-framework QuartzCore")
 
+include(cmake/llama_cpp_sources.cmake)
 include(cmake/gemv_kernels.cmake)
 include(cmake/jinja.cmake)
 include(cmake/server_deps.cmake)

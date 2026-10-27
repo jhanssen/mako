@@ -17,8 +17,7 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
 ### GLM-5.3 (`parity_ref.bin`, `long_ref.bin`)
 
 - Prompts: `parity_ids.txt` (512 tokens), `long_ids.txt` (2391 tokens, past the dense-attention window).
-- Reference: llama.cpp at commit `9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e` (the same commit the GEMV kernels are
-  pinned to), CPU backend, through `tools/ref_dump` (built when CMake gets `-DMAKO_REF_SRC=<llama.cpp checkout>
+- Reference: llama.cpp at commit `9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e` (release b11845), CPU backend, through `tools/ref_dump` (built when CMake gets `-DMAKO_REF_SRC=<llama.cpp checkout>
   -DMAKO_REF_BUILD=<its build directory>`):
 
   ```sh
