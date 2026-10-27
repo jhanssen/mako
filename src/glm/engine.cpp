@@ -1113,6 +1113,50 @@ void Engine::restore(const Checkpoint& cp)
     }
 }
 
+std::vector<std::pair<MTL::Buffer*, uint64_t>> Engine::positional(uint32_t pos) const
+{
+    if (pos > opts_.max_ctx)
+        throw std::runtime_error("position past the context size");
+    const uint64_t Di = cfg_.indexer_dim, pools = pos / cfg_.indexer_kpool;
+    std::vector<std::pair<MTL::Buffer*, uint64_t>> out;
+    for (size_t il = 0; il < kv_cache_.size(); ++il)
+        if (kv_cache_[il]) {
+            out.emplace_back(kv_cache_[il].get(), uint64_t(pos) * cfg_.kv_lora_rank * 2);
+            out.emplace_back(idx_cache_[il].get(), uint64_t(pos) * 2 * Di * 4);
+            out.emplace_back(idx_pooled_[il].get(), pools * Di * 4);
+        }
+    return out;
+}
+
+std::vector<std::byte> Engine::save_positions(uint32_t pos) const
+{
+    const auto parts = positional(pos);
+    uint64_t n = 0;
+    for (const auto& [b, bytes] : parts)
+        n += bytes;
+    std::vector<std::byte> out(n);
+    std::byte* p = out.data();
+    for (const auto& [b, bytes] : parts) {
+        std::memcpy(p, b->contents(), bytes);
+        p += bytes;
+    }
+    return out;
+}
+
+void Engine::load_positions(uint32_t pos, std::span<const std::byte> data)
+{
+    const auto parts = positional(pos);
+    uint64_t off = 0;
+    for (const auto& [b, bytes] : parts) {
+        if (off + bytes > data.size())
+            throw std::runtime_error("positions from another engine");
+        std::memcpy(b->contents(), data.data() + off, bytes);
+        off += bytes;
+    }
+    if (off != data.size())
+        throw std::runtime_error("positions from another engine");
+}
+
 // The next-token block over the last step's hidden rows row0.. (positions last_pos0_ + row0..), each followed by
 // next[i]; returns the guess after the last.
 int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)

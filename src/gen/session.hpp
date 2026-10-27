@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -59,10 +60,25 @@ public:
     // Forgets the context and the checkpoints.
     void clear();
 
+    // The prompt's leading tokens this session can keep: its whole context when the prompt continues it, else the
+    // latest checkpoint within the part they share (0: none).
+    size_t usable_prefix(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const;
+    // Takes the context out of the engine (another session is about to use it) and puts it back; generate() needs
+    // it in. Parking a session the engine no longer holds forgets its context.
+    void park();
+    void unpark();
+    bool parked() const { return parked_.has_value(); }
+    // Memory the session holds outside the engine: its parked context and its checkpoints.
+    uint64_t bytes() const;
+
 private:
     struct Saved {
         Model::Checkpoint cp;
         uint64_t used = 0;
+    };
+    struct Parked {
+        Model::Checkpoint cp;
+        std::vector<std::byte> positions;
     };
     GenerateResult run(std::span<const int32_t> prompt, const GenerateParams& p,
                        const std::function<bool(int32_t)>& on_token);
@@ -78,6 +94,7 @@ private:
     std::vector<int32_t> ctx_;
     std::vector<GenerateParams::PromptRows> keys_; // the input-row spans within ctx_ (their rows are not kept)
     std::vector<Saved> saved_;
+    std::optional<Parked> parked_;
     uint64_t clock_ = 0;
     int32_t mtp_next_ = -1; // the token the next-token block's cache assumes after ctx_.back(); -1: none
 };

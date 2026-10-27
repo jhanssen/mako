@@ -81,6 +81,9 @@ public:
     void restore(const Checkpoint& cp) override;
     uint32_t checkpoint_slots() const override { return opts_.checkpoints; }
     uint64_t checkpoint_bytes() const;
+    // The compressed KV rows and index keys before pos (one per completed group of each source's ratio).
+    std::vector<std::byte> save_positions(uint32_t pos) const override;
+    void load_positions(uint32_t pos, std::span<const std::byte> data) override;
     const core::StepStats& last_prefill() const { return last_prefill_; }
 
     // Abliteration sites: a layer's attention output (attn_out, after the output projection) and its shared
@@ -163,6 +166,8 @@ private:
                uint32_t n, uint32_t kind, bool out_half = false);
     void ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* x, uint64_t off, uint32_t rows);
     uint64_t prefill_scratch(uint32_t chunk, uint32_t group) const;
+    // The positional caches and the bytes of each that hold positions before pos.
+    std::vector<std::pair<MTL::Buffer*, uint64_t>> positional(uint32_t pos) const;
 
     Config cfg_;
     Options opts_;

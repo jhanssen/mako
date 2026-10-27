@@ -354,6 +354,48 @@ uint64_t Engine::checkpoint_bytes() const
     return n;
 }
 
+std::vector<std::pair<MTL::Buffer*, uint64_t>> Engine::positional(uint32_t pos) const
+{
+    if (pos > opts_.max_ctx)
+        throw std::runtime_error("position past the context size");
+    std::vector<std::pair<MTL::Buffer*, uint64_t>> out;
+    for (size_t i = 0; i < kv_sources_.size(); ++i) {
+        const uint64_t rows = pos / uint32_t(cfg_.compress_ratios[kv_sources_[i]]);
+        out.emplace_back(ckv_[i].get(), rows * cfg_.head_dim * 2);
+        out.emplace_back(ik_[i].get(), rows * cfg_.indexer_dim * 4);
+    }
+    return out;
+}
+
+std::vector<std::byte> Engine::save_positions(uint32_t pos) const
+{
+    const auto parts = positional(pos);
+    uint64_t n = 0;
+    for (const auto& [b, bytes] : parts)
+        n += bytes;
+    std::vector<std::byte> out(n);
+    std::byte* p = out.data();
+    for (const auto& [b, bytes] : parts) {
+        std::memcpy(p, b->contents(), bytes);
+        p += bytes;
+    }
+    return out;
+}
+
+void Engine::load_positions(uint32_t pos, std::span<const std::byte> data)
+{
+    const auto parts = positional(pos);
+    uint64_t off = 0;
+    for (const auto& [b, bytes] : parts) {
+        if (off + bytes > data.size())
+            throw std::runtime_error("positions from another engine");
+        std::memcpy(b->contents(), data.data() + off, bytes);
+        off += bytes;
+    }
+    if (off != data.size())
+        throw std::runtime_error("positions from another engine");
+}
+
 Engine::Checkpoint Engine::checkpoint()
 {
     Checkpoint cp;

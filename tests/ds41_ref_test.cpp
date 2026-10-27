@@ -5,12 +5,15 @@
 //   penalty  the miss penalty at 0.1: KL bounded and fewer misses than without
 //   q6k      dense weights re-quantized to Q6_K: KL bounded
 //   dspark   with the drafter (a directory; skipped without one): greedy output with drafts equals it without
+//   pool     two conversations on one engine (with the drafter when given): one's second turn after the other ran
+//            gives its tokens and logits without the other in between, bit for bit
 // and `import <logits.f32> <out.bin> [positions]` (rows of n_vocab floats, the last `positions` of them) to write the
 // data from a full reference dump.
 //   ds41_ref_test <model-00001.gguf> <engram.gguf> <mode> [dspark dir]
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
+#include "gen/pool.hpp"
 #include "gen/session.hpp"
 
 #include <algorithm>
@@ -191,7 +194,7 @@ int main(int argc, char** argv)
     opts.prefill_exact_tail = mode == "long" ? 1024 : 4096; // the checked positions (all of a short prompt)
     if (mode == "q6k")
         opts.dense_quant = mako::gguf::Type::Q6_K;
-    if (mode == "dspark")
+    if (mode == "dspark" || (mode == "pool" && !dspark.empty() && fs::exists(fs::path(dspark) / "dspark.json")))
         opts.dspark = dspark;
     mako::dsv41::Engine engine(*m, *cfg, opts, ctx);
     const size_t V = cfg->n_vocab;
@@ -284,6 +287,46 @@ int main(int argc, char** argv)
               std::format("greedy tokens with drafts equal those without ({} tokens)", plain.tokens.size()));
         check(drafted.drafts > 0 && drafted.accepted * 4 >= drafted.drafts,
               std::format("drafts kept: {} of {}", drafted.accepted, drafted.drafts));
+    } else if (mode == "pool") {
+        const auto long_ids = read_ids(kData / "ds41_long_ids.txt"), short_ids = read_ids(kData / "ds41_short_ids.txt");
+        const std::vector<int32_t> a(long_ids.begin(), long_ids.begin() + 3000), b(short_ids.begin(), short_ids.begin() + 600);
+        mako::gen::GenerateParams gp;
+        gp.sampling.temperature = 0;
+        gp.max_tokens = 48;
+        uint64_t hash = 0;
+        gp.forced = [&](const float* l) {
+            const auto* p = reinterpret_cast<const unsigned char*>(l);
+            for (size_t i = 0; i < V * 4; ++i)
+                hash = (hash ^ p[i]) * 1099511628211ull;
+            return -1;
+        };
+        auto second = [&](const std::vector<int32_t>& out) {
+            std::vector<int32_t> p = a;
+            p.insert(p.end(), out.begin(), out.end());
+            p.insert(p.end(), short_ids.begin() + 600, short_ids.begin() + 640);
+            return p;
+        };
+        engine.reset();
+        mako::gen::Session alone(engine);
+        const auto r1 = alone.generate(a, gp);
+        const auto a2 = second(r1.tokens);
+        hash = 1469598103934665603ull;
+        const auto r2 = alone.generate(a2, gp);
+        const uint64_t want = hash;
+
+        mako::gen::SessionPool pool(engine, 64ull << 30);
+        const auto pa = pool.acquire(a, {});
+        const auto p1 = pa.session->generate(a, gp);
+        pool.acquire(b, {}).session->generate(b, gp);
+        const auto pa2 = pool.acquire(a2, {});
+        hash = 1469598103934665603ull;
+        const auto p2 = pa2.session->generate(a2, gp);
+        check(!pa2.fresh && pa2.index == pa.index && p1.tokens == r1.tokens,
+              std::format("A's second turn goes back to A's session ({} -> {})", pa.index, pa2.index));
+        check(p2.reused_tokens == r2.reused_tokens && p2.tokens == r2.tokens && hash == want,
+              std::format("A after B{}: {} tokens reused (alone {}), tokens {}, logits {}",
+                          engine.has_drafter() ? " (drafter on)" : "", p2.reused_tokens, r2.reused_tokens,
+                          p2.tokens == r2.tokens ? "the same" : "differ", hash == want ? "bit for bit" : "differ"));
     } else {
         std::println(stderr, "unknown mode {}", mode);
         return 2;

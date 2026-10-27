@@ -18,6 +18,7 @@
 // Exit 77: the model is missing (skipped).
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "gen/pool.hpp"
 #include "gen/session.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
@@ -585,6 +586,63 @@ int main(int argc, char** argv)
                               seeded, unseeded));
         }
         session.clear();
+    }
+
+    if (want("pool")) {
+        // Two conversations on one engine: A's second turn after B ran (A parked, then put back) gives the tokens
+        // and logits of A's turns without B in between, bit for bit, keeping all of A's context.
+        std::println("pool");
+        const auto corpus = parse_ids(read_file(kData / "long_ids.txt"));
+        const std::vector<int32_t> a(corpus.begin(), corpus.begin() + 2100), b(corpus.begin() + 2100, corpus.end());
+        mako::gen::GenerateParams gp;
+        gp.sampling.temperature = 0;
+        gp.max_tokens = 32;
+        gp.speculative = engine.has_mtp();
+        uint64_t hash = 1469598103934665603ull;
+        gp.forced = [&](const float* l) {
+            const auto* p = reinterpret_cast<const unsigned char*>(l);
+            for (size_t i = 0; i < size_t(cfg->n_vocab) * 4; ++i)
+                hash = (hash ^ p[i]) * 1099511628211ull;
+            return -1;
+        };
+        auto second = [&](const std::vector<int32_t>& first_out) {
+            std::vector<int32_t> p = a;
+            p.insert(p.end(), first_out.begin(), first_out.end());
+            p.insert(p.end(), {13, 785, 6722, 315, 279});
+            return p;
+        };
+        // Without B.
+        engine.reset();
+        mako::gen::Session alone(engine);
+        const auto r1 = alone.generate(a, gp);
+        const auto a2 = second(r1.tokens);
+        hash = 1469598103934665603ull;
+        const auto r2 = alone.generate(a2, gp);
+        const uint64_t want_hash = hash;
+
+        mako::gen::SessionPool pool(engine, 64ull << 30);
+        const auto pa = pool.acquire(a, {});
+        const auto p1 = pa.session->generate(a, gp);
+        const auto pb = pool.acquire(b, {});
+        pb.session->generate(b, gp);
+        const auto pa2 = pool.acquire(a2, {});
+        hash = 1469598103934665603ull;
+        const auto p2 = pa2.session->generate(a2, gp);
+        check(pa.fresh && pb.fresh && !pa2.fresh && pa2.index == pa.index && p1.tokens == r1.tokens,
+              std::format("A and B get their own sessions; A's second turn goes back to A's ({} -> {})", pa.index, pa2.index));
+        check(p2.reused_tokens == r2.reused_tokens && p2.tokens == r2.tokens && hash == want_hash,
+              std::format("A after B: {} tokens reused (alone {}), tokens {}, logits {}", p2.reused_tokens,
+                          r2.reused_tokens, p2.tokens == r2.tokens ? "the same" : "differ",
+                          hash == want_hash ? "bit for bit" : "differ"));
+
+        // A budget of nothing: B's turn gives A's context up.
+        mako::gen::SessionPool tight(engine, 0);
+        tight.acquire(a, {}).session->generate(a, gp);
+        const auto tb = tight.acquire(b, {});
+        const auto ta = tight.acquire(a2, {});
+        check(tb.evicted == 1 && ta.fresh, std::format("a zero budget evicts the parked session ({} evicted, A {})",
+                                                      tb.evicted, ta.fresh ? "fresh" : "kept"));
+        gp.forced = {};
     }
 
     if (want("ablate")) {

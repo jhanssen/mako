@@ -47,7 +47,7 @@ add_library(mako_app STATIC app/presets.cpp)
 target_include_directories(mako_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_app PRIVATE glaze_headers)
 
-add_library(mako_gen STATIC gen/sampler.cpp gen/session.cpp)
+add_library(mako_gen STATIC gen/pool.cpp gen/sampler.cpp gen/session.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_library(mako_core STATIC core/arena.cpp core/engine_base.cpp core/profile.cpp core/stager.cpp core/telemetry.cpp)

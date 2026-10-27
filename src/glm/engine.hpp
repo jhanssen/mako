@@ -79,6 +79,9 @@ public:
     // next-token block's input).
     Checkpoint checkpoint() override;
     void restore(const Checkpoint& cp) override;
+    // The MLA layers' latent rows, indexer keys and complete pools before pos (the next-token block's included).
+    std::vector<std::byte> save_positions(uint32_t pos) const override;
+    void load_positions(uint32_t pos, std::span<const std::byte> data) override;
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     // `cancelled` is polled between groups of tokens (Options::prefill_group): true stops there, with the tokens so
     // far in the context (position() tells how many) and the logits after the last of them.
@@ -142,6 +145,8 @@ private:
     void mtp_fill(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* h, uint64_t h_off, MTL::Buffer* e, uint64_t e_off,
                   uint32_t T, uint32_t pos0);
     uint64_t prefill_scratch(uint32_t chunk, uint32_t group) const;
+    // The positional caches and the bytes of each that hold positions before pos.
+    std::vector<std::pair<MTL::Buffer*, uint64_t>> positional(uint32_t pos) const;
 
     Config cfg_;
     Options opts_;

@@ -51,6 +51,10 @@ public:
     };
     virtual Checkpoint checkpoint() = 0;
     virtual void restore(const Checkpoint& cp) = 0;
+    // The positional caches' contents for positions before pos (what a checkpoint leaves out) and back: with a
+    // checkpoint taken at pos, they carry a context out of the engine and, after restore(), into it again.
+    virtual std::vector<std::byte> save_positions(uint32_t pos) const = 0;
+    virtual void load_positions(uint32_t pos, std::span<const std::byte> data) = 0;
     // Checkpoints the engine's memory budget reserved room for.
     virtual uint32_t checkpoint_slots() const = 0;
 

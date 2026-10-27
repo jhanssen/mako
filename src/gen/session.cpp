@@ -34,11 +34,77 @@ void Session::cut_keys(size_t n)
 
 void Session::clear()
 {
-    e_.reset();
+    if (parked_)
+        parked_.reset(); // the engine holds another session's context
+    else
+        e_.reset();
     ctx_.clear();
     keys_.clear();
     saved_.clear();
     mtp_next_ = -1;
+}
+
+namespace {
+
+uint64_t key_in(std::span<const GenerateParams::PromptRows> rows, size_t i)
+{
+    for (const auto& r : rows)
+        if (i >= r.rows.pos && i - r.rows.pos < r.rows.count)
+            return r.key;
+    return 0;
+}
+
+} // namespace
+
+size_t Session::usable_prefix(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const
+{
+    if (prompt.empty())
+        return 0;
+    const size_t limit = std::min(prompt.size() - 1, ctx_.size());
+    size_t common = 0;
+    while (common < limit && ctx_[common] == prompt[common] && key_at(common) == key_in(rows, common))
+        ++common;
+    if (common == ctx_.size())
+        return common;
+    size_t best = 0;
+    for (const Saved& sv : saved_)
+        if (sv.cp.pos <= common)
+            best = std::max<size_t>(best, sv.cp.pos);
+    return best;
+}
+
+void Session::park()
+{
+    if (parked_)
+        return;
+    if (e_.position() != ctx_.size() || ctx_.empty()) {
+        ctx_.clear();
+        keys_.clear();
+        saved_.clear();
+        mtp_next_ = -1;
+        return;
+    }
+    Parked p{e_.checkpoint(), e_.save_positions(uint32_t(ctx_.size()))};
+    parked_ = std::move(p);
+}
+
+void Session::unpark()
+{
+    if (!parked_) {
+        clear();
+        return;
+    }
+    e_.restore(parked_->cp);
+    e_.load_positions(parked_->cp.pos, parked_->positions);
+    parked_.reset();
+}
+
+uint64_t Session::bytes() const
+{
+    uint64_t n = parked_ ? parked_->cp.bytes() + parked_->positions.size() : 0;
+    for (const Saved& sv : saved_)
+        n += sv.cp.bytes();
+    return n;
 }
 
 // Back to the best state that holds at most ctx_[0, keep): the current one, a checkpoint, or the start.
@@ -92,18 +158,15 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
 {
     if (prompt.empty())
         throw std::invalid_argument("empty prompt");
+    if (parked_)
+        throw std::logic_error("generate() on a parked session");
     if (prompt.size() > e_.max_context())
         throw std::invalid_argument("prompt longer than the context");
     GenerateResult res;
     res.prompt_tokens = uint32_t(prompt.size());
 
     // The prompt's input-row spans, the keys its positions are compared by.
-    const auto prompt_key = [&](size_t i) -> uint64_t {
-        for (const auto& r : p.input_rows)
-            if (i >= r.rows.pos && i - r.rows.pos < r.rows.count)
-                return r.key;
-        return 0;
-    };
+    const auto prompt_key = [&](size_t i) { return key_in(p.input_rows, i); };
     const auto keep_keys = [&](size_t n) {
         keys_ = p.input_rows;
         cut_keys(n);
