@@ -5,8 +5,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace mako::gen {
@@ -86,17 +88,18 @@ public:
     void park();
     void unpark();
     bool parked() const { return parked_.has_value(); }
-    // Memory the session holds outside the engine: its parked context and its checkpoints.
-    uint64_t bytes() const;
+    // Memory the session holds outside the engine: its parked context and its checkpoints (forks share theirs);
+    // with `seen`, checkpoints already in it are not counted again.
+    uint64_t bytes(std::unordered_set<const void*>* seen = nullptr) const;
 
 private:
     struct Saved {
-        Model::Checkpoint cp;
+        std::shared_ptr<const Model::Checkpoint> cp;
         uint64_t used = 0;
         bool fork = false; // at the fork point: kept while parked, never the one evicted
     };
     struct Parked {
-        Model::Checkpoint cp;
+        std::shared_ptr<const Model::Checkpoint> cp;
         std::vector<std::byte> positions;
     };
     GenerateResult run(std::span<const int32_t> prompt, const GenerateParams& p,

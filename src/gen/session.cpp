@@ -71,9 +71,9 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
     }
     size_t best = 0, latest = 0;
     for (const Saved& sv : saved_) {
-        latest = std::max<size_t>(latest, sv.cp.pos);
-        if (sv.cp.pos <= common)
-            best = std::max<size_t>(best, sv.cp.pos);
+        latest = std::max<size_t>(latest, sv.cp->pos);
+        if (sv.cp->pos <= common)
+            best = std::max<size_t>(best, sv.cp->pos);
     }
     (best == latest ? m.keep : m.fork) = best;
     return m;
@@ -81,13 +81,13 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
 
 void Session::fork(const Session& src, size_t pos)
 {
-    const auto it = std::ranges::find_if(src.saved_, [&](const Saved& s) { return s.cp.pos == pos; });
+    const auto it = std::ranges::find_if(src.saved_, [&](const Saved& s) { return s.cp->pos == pos; });
     if (it == src.saved_.end() || pos > src.ctx_.size())
         throw std::logic_error("fork from a position without a checkpoint");
     ctx_.assign(src.ctx_.begin(), src.ctx_.begin() + pos);
     keys_ = src.keys_;
     cut_keys(pos);
-    saved_ = {{it->cp, ++clock_, it->fork}};
+    saved_ = {{it->cp, ++clock_, it->fork}}; // shared with src
     parked_ = Parked{it->cp, e_.save_positions(uint32_t(pos))};
     mtp_next_ = -1;
 }
@@ -103,14 +103,14 @@ void Session::park()
         mtp_next_ = -1;
         return;
     }
-    Parked p{e_.checkpoint(), e_.save_positions(uint32_t(ctx_.size()))};
+    Parked p{std::make_shared<const Model::Checkpoint>(e_.checkpoint()), e_.save_positions(uint32_t(ctx_.size()))};
     parked_ = std::move(p);
     // The newest checkpoint stays (another try at the last prompt) and the fork point's; the parked state continues
     // the context.
     size_t newest = 0;
     for (const Saved& sv : saved_)
-        newest = std::max<size_t>(newest, sv.cp.pos);
-    std::erase_if(saved_, [&](const Saved& s) { return s.cp.pos != newest && !s.fork; });
+        newest = std::max<size_t>(newest, sv.cp->pos);
+    std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos != newest && !s.fork; });
 }
 
 void Session::unpark()
@@ -119,16 +119,19 @@ void Session::unpark()
         clear();
         return;
     }
-    e_.restore(parked_->cp);
-    e_.load_positions(parked_->cp.pos, parked_->positions);
+    e_.restore(*parked_->cp);
+    e_.load_positions(parked_->cp->pos, parked_->positions);
     parked_.reset();
 }
 
-uint64_t Session::bytes() const
+uint64_t Session::bytes(std::unordered_set<const void*>* seen) const
 {
-    uint64_t n = parked_ ? parked_->cp.bytes() + parked_->positions.size() : 0;
+    const auto once = [&](const std::shared_ptr<const Model::Checkpoint>& cp) {
+        return !seen || seen->insert(cp.get()).second ? cp->bytes() : 0;
+    };
+    uint64_t n = parked_ ? once(parked_->cp) + parked_->positions.size() : 0;
     for (const Saved& sv : saved_)
-        n += sv.cp.bytes();
+        n += once(sv.cp);
     return n;
 }
 
@@ -142,10 +145,10 @@ void Session::rewind(size_t keep)
         return;
     Saved* best = nullptr;
     for (Saved& s : saved_)
-        if (s.cp.pos <= keep && (!best || s.cp.pos > best->cp.pos))
+        if (s.cp->pos <= keep && (!best || s.cp->pos > best->cp->pos))
             best = &s;
     if (best) {
-        e_.restore(best->cp);
+        e_.restore(*best->cp);
         best->used = ++clock_;
     } else {
         e_.reset();
@@ -153,7 +156,7 @@ void Session::rewind(size_t keep)
     ctx_.resize(e_.position());
     cut_keys(ctx_.size());
     // Checkpoints past the divergence would describe tokens that are about to be overwritten.
-    std::erase_if(saved_, [&](const Saved& s) { return s.cp.pos > keep; });
+    std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos > keep; });
     mtp_next_ = -1;
 }
 
@@ -161,7 +164,7 @@ void Session::save_checkpoint(bool fork)
 {
     if (max_checkpoints_ == 0)
         return;
-    if (const auto it = std::ranges::find_if(saved_, [&](const Saved& s) { return s.cp.pos == ctx_.size(); });
+    if (const auto it = std::ranges::find_if(saved_, [&](const Saved& s) { return s.cp->pos == ctx_.size(); });
         it != saved_.end()) {
         it->fork |= fork;
         return;
@@ -174,7 +177,7 @@ void Session::save_checkpoint(bool fork)
         if (victim != saved_.end())
             saved_.erase(victim);
     }
-    saved_.push_back({e_.checkpoint(), ++clock_, fork});
+    saved_.push_back({std::make_shared<const Model::Checkpoint>(e_.checkpoint()), ++clock_, fork});
 }
 
 GenerateResult Session::generate(std::span<const int32_t> prompt, const GenerateParams& p,

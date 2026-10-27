@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace mako::gen {

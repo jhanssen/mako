@@ -109,8 +109,8 @@ A cut in the middle of a calculation can leave the answer wrong.
   expert fits, 1-8 GB; GLM-5.3 on 128 GB gets ~2.9 GB at the default 131072-token context and ~5.5 GB at 32768, every
   expert still resident), `--conversations` their number (default 16); the least recently used is given up first. A
   conversation keeps a checkpoint where its first user turn starts (after the system prompt and tools); a new
-  conversation that starts the same way begins from a copy of it and reads only the rest, the other conversation left
-  as it is (the same tokens and logits as reading it all, bit for bit).
+  conversation that starts the same way begins from a copy of it and reads only the rest (sharing that checkpoint),
+  the other conversation left as it is (the same tokens and logits as reading it all, bit for bit).
 - Requests take turns: one generates at a time, and while others wait it gives the engine up every `--slice-ms`
   (default 1000) at a decode step or between pieces of its prompt (cut at multiples of the engine's prefill group,
   4096 tokens for GLM-5.3 and 8192 for DeepSeek-V4.1, so a long read yields every few seconds), then queues again.

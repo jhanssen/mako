@@ -12,9 +12,10 @@ SessionPool::SessionPool(Model& model, uint64_t budget_bytes, size_t max_session
 uint64_t SessionPool::parked_bytes() const
 {
     uint64_t n = 0;
+    std::unordered_set<const void*> seen;
     for (const Slot& s : slots_)
         if (s.session.get() != live_)
-            n += s.session->bytes();
+            n += s.session->bytes(&seen);
     return n;
 }
 
