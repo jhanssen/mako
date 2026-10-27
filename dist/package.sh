@@ -1,18 +1,19 @@
 #!/bin/sh
 # Packages a build for release: bin/ (mako_serve, mako_calibrate; stripped and ad-hoc signed again), README.md,
-# LICENSE, THIRD_PARTY_LICENSES.txt and examples/presets.json in <out dir>/<name>/, then <name>.tar.gz with its
-# .sha256 and the programs' debug symbols in <name>-dSYM.tar.gz.
-#   dist/package.sh <build dir> <out dir> <name>
+# LICENSE, THIRD_PARTY_LICENSES.txt and examples/presets.json in <out dir>/<name>/, then <archive>.tar.gz (default
+# <name>) with its .sha256 and the programs' debug symbols in <archive>-dSYM.tar.gz.
+#   dist/package.sh <build dir> <out dir> <name> [<archive>]
 set -eu
 
-if [ $# -ne 3 ]; then
-    echo "usage: dist/package.sh <build dir> <out dir> <name>" >&2
+if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+    echo "usage: dist/package.sh <build dir> <out dir> <name> [<archive>]" >&2
     exit 2
 fi
 build=$(cd "$1" && pwd)
 mkdir -p "$2"
 out=$(cd "$2" && pwd)
 name=$3
+archive=${4:-$3}
 src=$(cd "$(dirname "$0")/.." && pwd)
 commit=$(git -C "$src" rev-parse --short=12 HEAD)
 
@@ -27,7 +28,7 @@ for tool in mako_serve mako_calibrate; do
     codesign --force --sign - "$pkg/bin/$tool" # stripping invalidates the linker's ad-hoc signature
 done
 
-sed -e "s/@NAME@/$name/g" -e "s/@COMMIT@/$commit/g" "$src/dist/README.md" > "$pkg/README.md"
+sed -e "s/@NAME@/$name/g" -e "s/@ARCHIVE@/$archive/g" -e "s/@COMMIT@/$commit/g" "$src/dist/README.md" > "$pkg/README.md"
 cp "$src/LICENSE" "$pkg/LICENSE"
 cp "$src/docs/presets.example.json" "$pkg/examples/presets.json"
 
@@ -54,7 +55,7 @@ metal_cpp=$(version CMakeLists.txt 's/.*metal-cpp_\([0-9.]*\)\.zip.*/\1/p')
 grep -q '^==== llama.cpp b[0-9]' "$pkg/THIRD_PARTY_LICENSES.txt" || { echo "no llama.cpp version" >&2; exit 1; }
 
 cd "$out"
-tar czf "$name.tar.gz" "$name"
-shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-tar czf "$name-dSYM.tar.gz" "$name-dSYM"
-echo "$out/$name.tar.gz"
+tar czf "$archive.tar.gz" "$name"
+shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+tar czf "$archive-dSYM.tar.gz" "$name-dSYM"
+echo "$out/$archive.tar.gz"

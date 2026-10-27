@@ -1,6 +1,8 @@
 # Nightly build: when main has moved since the last one (or on demand), builds a release, runs the tests that need
-# neither a GPU nor a model, packages it (dist/package.sh) and replaces the `nightly` pre-release with it. Each
-# night's archives are also kept as a workflow artifact for 90 days.
+# neither a GPU nor a model, packages it (dist/package.sh) and replaces the `nightly` pre-release with it. The files
+# keep their names (mako-nightly-macos-arm64.tar.gz, .sha256, -dSYM.tar.gz), so their download URLs always give the
+# latest; the folder inside names the date and commit. Each night's archives are also kept as a workflow artifact for
+# 90 days.
 name: nightly
 
 on:
@@ -58,7 +60,7 @@ jobs:
 
       - name: Package
         if: steps.changed.outputs.build == 'true'
-        run: dist/package.sh build out "${{ steps.changed.outputs.name }}"
+        run: dist/package.sh build out "${{ steps.changed.outputs.name }}" mako-nightly-macos-arm64
 
       - uses: actions/upload-artifact@v4
         if: steps.changed.outputs.build == 'true'
@@ -78,5 +80,6 @@ jobs:
           gh release delete nightly --cleanup-tag --yes || true
           gh release create nightly --prerelease --target "$(git rev-parse HEAD)" \
             --title "Nightly $(date -u +%Y-%m-%d) ($(git rev-parse --short=7 HEAD))" \
-            --notes "Built from $(git rev-parse HEAD) on main. Unsigned: after downloading with a browser, run \`xattr -dr com.apple.quarantine ${NAME}\` once (see README.md in the archive)." \
-            "out/${NAME}.tar.gz" "out/${NAME}.tar.gz.sha256" "out/${NAME}-dSYM.tar.gz"
+            --notes "Built from $(git rev-parse HEAD) on main; the archive unpacks to ${NAME}/. Unsigned: after downloading with a browser, run \`xattr -dr com.apple.quarantine ${NAME}\` once (see README.md in the archive)." \
+            out/mako-nightly-macos-arm64.tar.gz out/mako-nightly-macos-arm64.tar.gz.sha256 \
+            out/mako-nightly-macos-arm64-dSYM.tar.gz
