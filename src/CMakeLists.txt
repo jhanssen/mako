@@ -29,7 +29,8 @@ add_custom_target(mako_metallib DEPENDS ${MAKO_METALLIB})
 add_custom_target(mako_version
     COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/generated/mako_version.hpp
             -P ${PROJECT_SOURCE_DIR}/cmake/version.cmake
-    BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp)
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp
+    COMMENT "Checking the commit")
 
 add_library(mako_chat STATIC chat/template.cpp)
 target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
