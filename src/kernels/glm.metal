@@ -325,10 +325,11 @@ kernel void hc_step_b(device const float* part [[buffer(0)]], device const float
 // hc_step_a and hc_step_b in one dispatch (grid (parts, tokens) as A), then the rms norm of x: the last threadgroup
 // to finish a token's part (a device-scope fence, then a counter) does B for that token and writes
 // xn = rms_norm(x) * w (w of n_embd; none when wn is 0), summing as rms_norm does. counters: one per token, zero
-// before the dispatch and left zero after.
+// before the dispatch and left zero after. part and out, which the last threadgroup reads, are coherent(device):
+// device memory is otherwise coherent only within a threadgroup (MSL 4.8).
 kernel void hc_step_norm(device const float* x_post [[buffer(0)]], device const float* R [[buffer(1)]],
-                         device float* pc [[buffer(2)]], device float* out [[buffer(3)]],
-                         device const float* fn [[buffer(4)]], device float* part [[buffer(5)]],
+                         device float* pc [[buffer(2)]], coherent(device) device float* out [[buffer(3)]],
+                         device const float* fn [[buffer(4)]], coherent(device) device float* part [[buffer(5)]],
                          constant HcStepArgs& a [[buffer(6)]], device const float* scale [[buffer(7)]],
                          device const float* base [[buffer(8)]], device float* x [[buffer(9)]],
                          device const float* w [[buffer(10)]], device float* xn [[buffer(11)]],
@@ -382,16 +383,20 @@ kernel void hc_step_norm(device const float* x_post [[buffer(0)]], device const 
         }
     }
     // The token's last threadgroup goes on; every other one has written its part and read pc by now.
+    // The barrier orders the threadgroup's writes before thread 0's fence, which releases them with the counter; the
+    // last threadgroup's thread 0 acquires the others' before the second barrier passes them on.
     threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         last[0] = atomic_fetch_add_explicit(counters + tok, 1u, memory_order_relaxed) + 1 == a.parts ? 1u : 0u;
+        if (last[0])
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (!last[0])
         return;
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    device const float* Rn = a.expand ? out : R;
+    coherent(device) device const float* Rn =
+        a.expand ? out : reinterpret_cast<coherent(device) device const float*>(R);
     for (uint i = tid; i < a.parts * 25; i += HC_TG)
         parts[i] = part[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -459,8 +464,8 @@ kernel void hc_step_norm(device const float* x_post [[buffer(0)]], device const 
 // (weight w) give, bit for bit. Grid (groups, tokens), 256 threads. Groups below row_groups each norm the stream
 // themselves and compute 4 mixing rows (two teams of 4 simdgroups, 2 rows each, summed as the F32 GEMV with 4
 // simdgroups sums); the others collapse 256 elements each with pc_prev, and the token's last of those to finish
-// (device fence + counter, zero before and after) norms x into xn. hc_mix stays its own dispatch: inlined here it
-// rounds differently.
+// (device fence + counter, zero before and after) norms x into xn; x is coherent(device) for that (MSL 4.8). hc_mix
+// stays its own dispatch: inlined here it rounds differently.
 struct HcLaggedArgs {
     uint n_embd;
     float rms_eps;
@@ -471,7 +476,7 @@ struct HcLaggedArgs {
 
 kernel void hc_lagged_norm(device const float* R [[buffer(0)]], device const float* fn [[buffer(1)]],
                            device const float* pc_prev [[buffer(2)]], device float* mixes [[buffer(3)]],
-                           device float* x [[buffer(4)]], device const float* w [[buffer(5)]],
+                           coherent(device) device float* x [[buffer(4)]], device const float* w [[buffer(5)]],
                            device float* xn [[buffer(6)]], device atomic_uint* counters [[buffer(7)]],
                            constant HcLaggedArgs& a [[buffer(8)]],
                            uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -539,17 +544,20 @@ kernel void hc_lagged_norm(device const float* R [[buffer(0)]], device const flo
             acc += R[h * a.n_embd + e] * pre[h];
         x[uint64_t(tok) * a.n_embd + e] = acc;
     }
+    // Released and acquired as in hc_step_norm.
     threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         last[0] =
             atomic_fetch_add_explicit(counters + tok, 1u, memory_order_relaxed) + 1 == a.groups - a.row_groups ? 1u : 0u;
+        if (last[0])
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (!last[0])
         return;
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    device const float4* x4 = reinterpret_cast<device const float4*>(x + uint64_t(tok) * a.n_embd);
+    coherent(device) device const float4* x4 =
+        reinterpret_cast<coherent(device) device const float4*>(x + uint64_t(tok) * a.n_embd);
     device float4* xn4 = reinterpret_cast<device float4*>(xn + uint64_t(tok) * a.n_embd);
     device const float4* w4 = reinterpret_cast<device const float4*>(w);
     const uint n4 = a.n_embd / 4;
