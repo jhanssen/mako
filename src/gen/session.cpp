@@ -202,7 +202,31 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     const auto run_to = [&](size_t end) {
         if (end <= ctx_.size())
             return true;
-        e_.prefill(prompt.subspan(ctx_.size(), end - ctx_.size()), p.cancelled);
+        // Pieces end at multiples of prefill_piece more than 8 tokens from either end (shorter runs take the decode
+        // path, which rounds differently).
+        constexpr size_t kMin = 8;
+        const size_t piece = p.prefill_piece;
+        size_t at = ctx_.size();
+        while (true) {
+            size_t to = end;
+            if (piece) {
+                const size_t cut = (at + kMin) / piece * piece + piece;
+                if (cut + kMin < end)
+                    to = cut;
+            }
+            e_.prefill(prompt.subspan(at, to - at), p.cancelled);
+            if (e_.position() != to || to == end)
+                break;
+            at = to;
+            ctx_.assign(prompt.begin(), prompt.begin() + at);
+            keep_keys(at);
+            if (e_.has_mtp())
+                e_.mtp_seed(prompt[at]);
+            if (p.cancelled && p.cancelled())
+                break;
+            if (p.yield)
+                p.yield();
+        }
         const size_t read = e_.position();
         ctx_.assign(prompt.begin(), prompt.begin() + read);
         keep_keys(read);
@@ -276,6 +300,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         // Each round: drafts after `token`, then token and the drafts in one verify; drafts are kept up to the first
         // the sampler rejects (it then gives the token in its place), and after the last kept the trunk's next.
         while (p.max_tokens > 0 && emit(token)) {
+            if (p.yield)
+                p.yield();
             std::vector<int32_t> drafts = e_.draft(token);
             const uint32_t room = std::min<uint32_t>(e_.max_context() - e_.position(),
                                                      p.max_tokens - uint32_t(res.tokens.size()) + 1);
@@ -322,6 +348,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     int32_t draft = spec ? e_.mtp_draft(token) : -1;
     mtp_next_ = spec ? token : -1;
     while (p.max_tokens > 0 && emit(token)) {
+        if (p.yield)
+            p.yield();
         if (draft >= 0 && e_.position() + 2 <= e_.max_context()) {
             // Verify [token, draft] in one two-token step.
             const std::vector<float>& two = e_.step2(token, draft);

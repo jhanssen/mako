@@ -58,15 +58,13 @@ struct Server::Impl {
     ServerOptions opts;
     ThinkingOptions thinking;
     gen::SessionPool pool;
-    std::string conv_note; // the last generation's conversation, for its log line; under gen_mutex
-    std::mutex gen_mutex; // one generation at a time
     std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
     httplib::Server http;
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
 
     Impl(gen::Model& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
         : engine(e), tok(t), tmpl(tm), opts(std::move(o)), thinking(thinking_support(tm)),
-          pool(e, opts.park_bytes, opts.max_conversations)
+          pool(e, opts.park_bytes, opts.max_conversations, std::chrono::milliseconds(opts.slice_ms))
     {
         thinking.default_effort = opts.reasoning_effort;
     }
@@ -87,14 +85,16 @@ struct Server::Impl {
     // not yet encoded). Throws BadRequest without a projector.
     std::vector<int32_t> expand(ChatRequest& cr, std::vector<int32_t> prompt, Images& images) const;
     // Encodes the images (or takes them from the cache) and points the request's input rows at them; the outputs
-    // are kept alive in `held`. Under gen_mutex.
+    // are kept alive in `held`. In the request's turn.
     void encode_images(Images& images, ChatRequest& cr,
                        std::vector<std::shared_ptr<const vision::Encoder::Output>>& held);
     std::list<std::pair<uint64_t, std::shared_ptr<const vision::Encoder::Output>>> image_cache; // recent first
-    // Runs the request on the session; on_delta gets each increment (false: the client went away).
-    gen::GenerateResult generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
-                                 const std::function<bool(const Delta&)>& on_delta, bool& stopped,
-                                 Images* images = nullptr);
+    // Runs the request in its turns, on its conversation; on_delta gets each increment (false: the client went away),
+    // `begin` runs when its first turn comes (false: give up). False when it gave up before generating; `conv`
+    // describes its conversation for the log.
+    bool generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
+                  const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
+                  const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv);
 };
 
 std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> prompt, Images& images) const
@@ -156,13 +156,12 @@ void Server::Impl::encode_images(Images& images, ChatRequest& cr,
     cr.gen.input_rows = images.rows;
 }
 
-gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
-                                           const std::function<bool(const Delta&)>& on_delta, bool& stopped,
-                                           Images* images)
+bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
+                            const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
+                            const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv)
 {
     std::vector<std::shared_ptr<const vision::Encoder::Output>> held;
-    if (images && !images->prepared.empty())
-        encode_images(*images, cr, held);
+    cr.gen.prefill_piece = opts.prefill_piece;
     cr.gen.stop_tokens = {tok.eos(), tok.eot(), tok.find("<|observation|>")};
     const uint32_t room = engine.max_context() - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
@@ -185,11 +184,17 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
             return parser.forced();
         };
     bool client_gone = false;
-    const auto pick = pool.acquire(prompt, cr.gen.input_rows);
-    conv_note = std::format("conversation {}{}, {} kept ({:.2f} of {:.1f} GB parked){}", pick.index,
-                            pick.fresh ? " (new)" : "", pool.size(), pool.parked_bytes() / 1e9, pool.budget() / 1e9,
-                            pick.evicted ? std::format(", {} given up", pick.evicted) : "");
-    auto r = pick.session->generate(prompt, cr.gen, [&](int32_t token) {
+    gen::SessionPool::Pick pick;
+    const auto start = [&](gen::GenerateParams& p) {
+        if (begin && !begin())
+            return false;
+        if (images && !images->prepared.empty()) {
+            encode_images(*images, cr, held);
+            p.input_rows = cr.gen.input_rows;
+        }
+        return true;
+    };
+    const bool ran = pool.generate(prompt, cr.gen, [&](int32_t token) {
         Delta d;
         if (rb)
             rb->push(token, parser.in_reasoning());
@@ -200,7 +205,13 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
         }
         stopped = !more;
         return more;
-    });
+    }, r, pick, start);
+    if (!ran)
+        return false;
+    conv = std::format("conversation {}{}{}, {} kept ({:.2f} of {:.1f} GB parked){}", pick.index,
+                       pick.fresh ? " (new)" : "", pick.switches ? std::format(", {} turns ({:.0f} ms switching)", pick.switches + 1, pick.switch_ms) : "",
+                       pick.conversations, pick.parked / 1e9, pool.budget() / 1e9,
+                       pick.evicted ? std::format(", {} given up", pick.evicted) : "");
     Delta d;
     parser.finish(d);
     if (!d.empty() && !client_gone)
@@ -208,7 +219,7 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
     if (rb && rb->how())
         log::info("reasoning {} after {} tokens (budget {})", rb->how() == 1 ? "closed early" : "cut", rb->thought(),
                   budget);
-    return r;
+    return true;
 }
 
 void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, const std::function<ChatRequest()>& parse,
@@ -249,17 +260,18 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
     const std::string id = std::format("{}{}", id_prefix, ++next_id);
     std::shared_ptr<Protocol> proto = make(cr, id);
     if (!cr.stream) {
-        std::lock_guard lock(gen_mutex);
         const auto closed = req.is_connection_closed;
-        if (closed())
-            return; // gave up while waiting
         try {
             OutputParser parser(tok, cr.tools, cr.stop, cr.reasoning_first);
             bool stopped = false;
             cr.gen.cancelled = closed;
-            const auto r = generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped, images.get());
+            gen::GenerateResult r;
+            std::string conv;
+            if (!generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped, images.get(),
+                          [&] { return !closed(); }, r, conv))
+                return; // gave up while waiting
             const End e = end_of(r, parser, stopped);
-            log_result(id, r, end_name(e), conv_note);
+            log_result(id, r, end_name(e), conv);
             res.set_content(proto->whole(e, parser, r), "application/json");
         } catch (const std::exception& e) {
             fail(500, e.what(), "server_error");
@@ -273,16 +285,17 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
     res.set_chunked_content_provider("text/event-stream", [this, shared, proto, prompt = std::move(prompt), id, slot,
                                                            images](size_t, httplib::DataSink& sink) {
         const auto write = [&](const std::string& s) { return s.empty() || sink.write(s.data(), s.size()); };
-        std::lock_guard lock(gen_mutex);
-        if (shared->gen.cancelled() || !write(proto->begin(uint32_t(prompt.size()))))
-            return false; // gave up while waiting
         try {
             OutputParser parser(tok, shared->tools, shared->stop, shared->reasoning_first);
             bool stopped = false;
-            const auto r = generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); },
-                                    stopped, images.get());
+            gen::GenerateResult r;
+            std::string conv;
+            const auto begin = [&] { return !shared->gen.cancelled() && write(proto->begin(uint32_t(prompt.size()))); };
+            if (!generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); }, stopped,
+                          images.get(), begin, r, conv))
+                return false; // gave up while waiting
             const End e = end_of(r, parser, stopped);
-            log_result(id, r, end_name(e), conv_note);
+            log_result(id, r, end_name(e), conv);
             if (e == End::cancelled)
                 return false;
             write(proto->end(e, parser, r));

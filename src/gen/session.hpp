@@ -30,6 +30,12 @@ struct GenerateParams {
     // Asked before each token is chosen (after the previous one reached on_token), with that position's logits
     // (n_vocab): a token >= 0 is taken instead of sampling, and a draft is kept only if it matches. -1: sample.
     std::function<int32_t(const float* logits)> forced;
+    // Called between prefill pieces and between decode steps, where the engine may be given to another session and
+    // back (gen::Scheduler); the engine must hold this session's context again when it returns.
+    std::function<void()> yield;
+    // The prompt is read in pieces cut at multiples of this position (0: one piece), none of 8 tokens or fewer, so
+    // where it is cut depends only on the prompt and the context held, not on when others run.
+    uint32_t prefill_piece = 0;
 };
 
 enum class Finish { stop_token, max_tokens, context_full, cancelled };

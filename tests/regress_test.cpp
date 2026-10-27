@@ -25,6 +25,9 @@
 #include "text/tokenizer.hpp"
 
 #include <algorithm>
+#include <tuple>
+#include <thread>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -589,60 +592,101 @@ int main(int argc, char** argv)
     }
 
     if (want("pool")) {
-        // Two conversations on one engine: A's second turn after B ran (A parked, then put back) gives the tokens
-        // and logits of A's turns without B in between, bit for bit, keeping all of A's context.
+        // Two conversations on two threads taking turns on one engine, switching at every step and prefill piece
+        // (slice 0): each request gives the tokens and logits it gives with its conversation alone, bit for bit, and
+        // a second turn keeps all of its conversation's context.
         std::println("pool");
         const auto corpus = parse_ids(read_file(kData / "long_ids.txt"));
         const std::vector<int32_t> a(corpus.begin(), corpus.begin() + 2100), b(corpus.begin() + 2100, corpus.end());
-        mako::gen::GenerateParams gp;
-        gp.sampling.temperature = 0;
-        gp.max_tokens = 32;
-        gp.speculative = engine.has_mtp();
-        uint64_t hash = 1469598103934665603ull;
-        gp.forced = [&](const float* l) {
-            const auto* p = reinterpret_cast<const unsigned char*>(l);
-            for (size_t i = 0; i < size_t(cfg->n_vocab) * 4; ++i)
-                hash = (hash ^ p[i]) * 1099511628211ull;
-            return -1;
+        struct Turn {
+            std::vector<int32_t> tokens;
+            uint64_t hash = 0;
+            uint32_t reused = 0;
+            size_t conv = 0;
+            uint32_t switches = 0;
         };
-        auto second = [&](const std::vector<int32_t>& first_out) {
-            std::vector<int32_t> p = a;
-            p.insert(p.end(), first_out.begin(), first_out.end());
+        auto params = [&](uint64_t& hash) {
+            mako::gen::GenerateParams gp;
+            gp.sampling.temperature = 0;
+            gp.max_tokens = 32;
+            gp.speculative = engine.has_mtp();
+            gp.prefill_piece = 512;
+            gp.forced = [&hash, nv = cfg->n_vocab](const float* l) {
+                const auto* p = reinterpret_cast<const unsigned char*>(l);
+                for (size_t i = 0; i < size_t(nv) * 4; ++i)
+                    hash = (hash ^ p[i]) * 1099511628211ull;
+                return -1;
+            };
+            return gp;
+        };
+        auto second = [](std::vector<int32_t> p, const std::vector<int32_t>& out) {
+            p.insert(p.end(), out.begin(), out.end());
             p.insert(p.end(), {13, 785, 6722, 315, 279});
             return p;
         };
-        // Without B.
-        engine.reset();
-        mako::gen::Session alone(engine);
-        const auto r1 = alone.generate(a, gp);
-        const auto a2 = second(r1.tokens);
-        hash = 1469598103934665603ull;
-        const auto r2 = alone.generate(a2, gp);
-        const uint64_t want_hash = hash;
+        // A conversation's two turns, alone or through a pool.
+        auto converse = [&](const std::vector<int32_t>& first, auto&& run) {
+            std::array<Turn, 2> t;
+            t[0] = run(first);
+            t[1] = run(second(first, t[0].tokens));
+            return t;
+        };
+        auto alone = [&](const std::vector<int32_t>& first) {
+            engine.reset();
+            mako::gen::Session session(engine);
+            return converse(first, [&](const std::vector<int32_t>& prompt) {
+                Turn t;
+                t.hash = 1469598103934665603ull;
+                const auto r = session.generate(prompt, params(t.hash));
+                t.tokens = r.tokens;
+                t.reused = r.reused_tokens;
+                return t;
+            });
+        };
+        const auto want_a = alone(a), want_b = alone(b);
 
-        mako::gen::SessionPool pool(engine, 64ull << 30);
-        const auto pa = pool.acquire(a, {});
-        const auto p1 = pa.session->generate(a, gp);
-        const auto pb = pool.acquire(b, {});
-        pb.session->generate(b, gp);
-        const auto pa2 = pool.acquire(a2, {});
-        hash = 1469598103934665603ull;
-        const auto p2 = pa2.session->generate(a2, gp);
-        check(pa.fresh && pb.fresh && !pa2.fresh && pa2.index == pa.index && p1.tokens == r1.tokens,
-              std::format("A and B get their own sessions; A's second turn goes back to A's ({} -> {})", pa.index, pa2.index));
-        check(p2.reused_tokens == r2.reused_tokens && p2.tokens == r2.tokens && hash == want_hash,
-              std::format("A after B: {} tokens reused (alone {}), tokens {}, logits {}", p2.reused_tokens,
-                          r2.reused_tokens, p2.tokens == r2.tokens ? "the same" : "differ",
-                          hash == want_hash ? "bit for bit" : "differ"));
+        mako::gen::SessionPool pool(engine, 64ull << 30, 16, std::chrono::milliseconds(0));
+        auto pooled = [&](const std::vector<int32_t>& first) {
+            return converse(first, [&](const std::vector<int32_t>& prompt) {
+                Turn t;
+                t.hash = 1469598103934665603ull;
+                mako::gen::GenerateResult r;
+                mako::gen::SessionPool::Pick pick;
+                pool.generate(prompt, params(t.hash), {}, r, pick);
+                t.tokens = r.tokens;
+                t.reused = r.reused_tokens;
+                t.conv = pick.index;
+                t.switches = pick.switches;
+                return t;
+            });
+        };
+        std::array<Turn, 2> got_a, got_b;
+        {
+            std::jthread ta([&] { got_a = pooled(a); });
+            std::jthread tb([&] { got_b = pooled(b); });
+        }
+        for (const auto& [name, got, want] : {std::tuple{"A", &got_a, &want_a}, std::tuple{"B", &got_b, &want_b}})
+            for (int i = 0; i < 2; ++i)
+                check((*got)[i].tokens == (*want)[i].tokens && (*got)[i].hash == (*want)[i].hash &&
+                          (*got)[i].reused == (*want)[i].reused,
+                      std::format("{} turn {}: tokens {}, logits {}, {} reused (alone {}), {} switches", name, i + 1,
+                                  (*got)[i].tokens == (*want)[i].tokens ? "the same" : "differ",
+                                  (*got)[i].hash == (*want)[i].hash ? "bit for bit" : "differ", (*got)[i].reused,
+                                  (*want)[i].reused, (*got)[i].switches));
+        check(got_a[0].conv == got_a[1].conv && got_b[0].conv == got_b[1].conv && got_a[0].conv != got_b[0].conv &&
+                  got_a[0].switches + got_a[1].switches + got_b[0].switches + got_b[1].switches > 0,
+              "each conversation keeps its session, and the two took turns");
 
         // A budget of nothing: B's turn gives A's context up.
         mako::gen::SessionPool tight(engine, 0);
-        tight.acquire(a, {}).session->generate(a, gp);
-        const auto tb = tight.acquire(b, {});
-        const auto ta = tight.acquire(a2, {});
-        check(tb.evicted == 1 && ta.fresh, std::format("a zero budget evicts the parked session ({} evicted, A {})",
-                                                      tb.evicted, ta.fresh ? "fresh" : "kept"));
-        gp.forced = {};
+        uint64_t h = 0;
+        mako::gen::GenerateResult r;
+        mako::gen::SessionPool::Pick pa, pb, pa2;
+        tight.generate(a, params(h), {}, r, pa);
+        tight.generate(b, params(h), {}, r, pb);
+        tight.generate(second(a, {}), params(h), {}, r, pa2);
+        check(pb.evicted == 1 && pa2.fresh, std::format("a zero budget evicts the parked session ({} evicted, A {})",
+                                                       pb.evicted, pa2.fresh ? "fresh" : "kept"));
     }
 
     if (want("ablate")) {

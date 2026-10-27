@@ -4,7 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N]
+//              [--park-gb N] [--conversations N] [--slice-ms N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -26,7 +26,9 @@
 // most N prompt rows (default: the model's limit, 1024 for DeepSeek-V4.1, 8000 for GLM-5.3). Each conversation keeps
 // its context between requests: up to --conversations (default 16) besides the one generating are parked in memory,
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
-// expert cache beyond that), the least recently used given up first.
+// expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
+// one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
+// engine's prefill group) and queues again.
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "core/log.hpp"
@@ -76,7 +78,7 @@ int main(int argc, char** argv)
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
                              "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
                              "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N] "
-                             "[--park-gb N] [--conversations N]");
+                             "[--park-gb N] [--conversations N] [--slice-ms N]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -140,6 +142,8 @@ int main(int argc, char** argv)
             park_gb = std::stod(v);
         else if (a == "--conversations")
             so.max_conversations = uint32_t(std::stoul(v));
+        else if (a == "--slice-ms")
+            so.slice_ms = uint32_t(std::stoul(v));
         else if (a == "--stage-gb")
             stage_gb = std::stod(v);
         else if (a == "--engram")
@@ -331,6 +335,7 @@ int main(int argc, char** argv)
             opts.dense_imatrix = imatrix;
             opts.dense_quant = dense_quant;
             ds_engine = std::make_unique<mako::dsv41::Engine>(*model, *cfg, opts, ctx);
+            so.prefill_piece = opts.prefill_group;
             model_if = ds_engine.get();
             base = ds_engine.get();
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
@@ -351,6 +356,7 @@ int main(int argc, char** argv)
             opts.stage_gb = stage_gb;
             opts.mtp = so.speculative;
             glm_engine = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
+            so.prefill_piece = opts.prefill_group;
             model_if = glm_engine.get();
             base = glm_engine.get();
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;

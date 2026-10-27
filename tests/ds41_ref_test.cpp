@@ -5,8 +5,8 @@
 //   penalty  the miss penalty at 0.1: KL bounded and fewer misses than without
 //   q6k      dense weights re-quantized to Q6_K: KL bounded
 //   dspark   with the drafter (a directory; skipped without one): greedy output with drafts equals it without
-//   pool     two conversations on one engine (with the drafter when given): one's second turn after the other ran
-//            gives its tokens and logits without the other in between, bit for bit
+//   pool     two conversations on two threads taking turns on one engine at every step (with the drafter when
+//            given): each request's tokens and logits as with its conversation alone, bit for bit
 // and `import <logits.f32> <out.bin> [positions]` (rows of n_vocab floats, the last `positions` of them) to write the
 // data from a full reference dump.
 //   ds41_ref_test <model-00001.gguf> <engram.gguf> <mode> [dspark dir]
@@ -17,6 +17,9 @@
 #include "gen/session.hpp"
 
 #include <algorithm>
+#include <tuple>
+#include <thread>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -290,43 +293,81 @@ int main(int argc, char** argv)
     } else if (mode == "pool") {
         const auto long_ids = read_ids(kData / "ds41_long_ids.txt"), short_ids = read_ids(kData / "ds41_short_ids.txt");
         const std::vector<int32_t> a(long_ids.begin(), long_ids.begin() + 3000), b(short_ids.begin(), short_ids.begin() + 600);
-        mako::gen::GenerateParams gp;
-        gp.sampling.temperature = 0;
-        gp.max_tokens = 48;
-        uint64_t hash = 0;
-        gp.forced = [&](const float* l) {
-            const auto* p = reinterpret_cast<const unsigned char*>(l);
-            for (size_t i = 0; i < V * 4; ++i)
-                hash = (hash ^ p[i]) * 1099511628211ull;
-            return -1;
+        struct Turn {
+            std::vector<int32_t> tokens;
+            uint64_t hash = 0;
+            uint32_t reused = 0, switches = 0;
+            size_t conv = 0;
         };
-        auto second = [&](const std::vector<int32_t>& out) {
-            std::vector<int32_t> p = a;
+        auto params = [&](uint64_t& hash) {
+            mako::gen::GenerateParams gp;
+            gp.sampling.temperature = 0;
+            gp.max_tokens = 48;
+            gp.prefill_piece = 1024;
+            gp.forced = [&hash, V](const float* l) {
+                const auto* p = reinterpret_cast<const unsigned char*>(l);
+                for (size_t i = 0; i < V * 4; ++i)
+                    hash = (hash ^ p[i]) * 1099511628211ull;
+                return -1;
+            };
+            return gp;
+        };
+        auto second = [&](std::vector<int32_t> p, const std::vector<int32_t>& out) {
             p.insert(p.end(), out.begin(), out.end());
             p.insert(p.end(), short_ids.begin() + 600, short_ids.begin() + 640);
             return p;
         };
-        engine.reset();
-        mako::gen::Session alone(engine);
-        const auto r1 = alone.generate(a, gp);
-        const auto a2 = second(r1.tokens);
-        hash = 1469598103934665603ull;
-        const auto r2 = alone.generate(a2, gp);
-        const uint64_t want = hash;
-
-        mako::gen::SessionPool pool(engine, 64ull << 30);
-        const auto pa = pool.acquire(a, {});
-        const auto p1 = pa.session->generate(a, gp);
-        pool.acquire(b, {}).session->generate(b, gp);
-        const auto pa2 = pool.acquire(a2, {});
-        hash = 1469598103934665603ull;
-        const auto p2 = pa2.session->generate(a2, gp);
-        check(!pa2.fresh && pa2.index == pa.index && p1.tokens == r1.tokens,
-              std::format("A's second turn goes back to A's session ({} -> {})", pa.index, pa2.index));
-        check(p2.reused_tokens == r2.reused_tokens && p2.tokens == r2.tokens && hash == want,
-              std::format("A after B{}: {} tokens reused (alone {}), tokens {}, logits {}",
-                          engine.has_drafter() ? " (drafter on)" : "", p2.reused_tokens, r2.reused_tokens,
-                          p2.tokens == r2.tokens ? "the same" : "differ", hash == want ? "bit for bit" : "differ"));
+        auto converse = [&](const std::vector<int32_t>& first, auto&& run) {
+            std::array<Turn, 2> t;
+            t[0] = run(first);
+            t[1] = run(second(first, t[0].tokens));
+            return t;
+        };
+        auto alone = [&](const std::vector<int32_t>& first) {
+            engine.reset();
+            mako::gen::Session session(engine);
+            return converse(first, [&](const std::vector<int32_t>& prompt) {
+                Turn t;
+                t.hash = 1469598103934665603ull;
+                const auto r = session.generate(prompt, params(t.hash));
+                t.tokens = r.tokens;
+                t.reused = r.reused_tokens;
+                return t;
+            });
+        };
+        const auto want_a = alone(a), want_b = alone(b);
+        mako::gen::SessionPool pool(engine, 64ull << 30, 16, std::chrono::milliseconds(0));
+        auto pooled = [&](const std::vector<int32_t>& first) {
+            return converse(first, [&](const std::vector<int32_t>& prompt) {
+                Turn t;
+                t.hash = 1469598103934665603ull;
+                mako::gen::GenerateResult r;
+                mako::gen::SessionPool::Pick pick;
+                pool.generate(prompt, params(t.hash), {}, r, pick);
+                t.tokens = r.tokens;
+                t.reused = r.reused_tokens;
+                t.switches = pick.switches;
+                t.conv = pick.index;
+                return t;
+            });
+        };
+        std::array<Turn, 2> got_a, got_b;
+        {
+            std::jthread ta([&] { got_a = pooled(a); });
+            std::jthread tb([&] { got_b = pooled(b); });
+        }
+        for (const auto& [name, got, want] : {std::tuple{"A", &got_a, &want_a}, std::tuple{"B", &got_b, &want_b}})
+            for (int i = 0; i < 2; ++i)
+                check((*got)[i].tokens == (*want)[i].tokens && (*got)[i].hash == (*want)[i].hash &&
+                          (*got)[i].reused == (*want)[i].reused,
+                      std::format("{} turn {}{}: tokens {}, logits {}, {} reused (alone {}), {} switches", name, i + 1,
+                                  engine.has_drafter() ? " (drafter on)" : "",
+                                  (*got)[i].tokens == (*want)[i].tokens ? "the same" : "differ",
+                                  (*got)[i].hash == (*want)[i].hash ? "bit for bit" : "differ", (*got)[i].reused,
+                                  (*want)[i].reused, (*got)[i].switches));
+        check(got_a[0].conv == got_a[1].conv && got_b[0].conv == got_b[1].conv && got_a[0].conv != got_b[0].conv &&
+                  got_a[0].switches + got_a[1].switches + got_b[0].switches + got_b[1].switches > 0,
+              "each conversation keeps its session, and the two took turns");
     } else {
         std::println(stderr, "unknown mode {}", mode);
         return 2;

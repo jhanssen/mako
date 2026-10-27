@@ -27,6 +27,10 @@ struct ServerOptions {
     // most of its prompt; the others are parked within park_bytes, the least recently used given up first.
     uint64_t park_bytes = 1ull << 30;
     uint32_t max_conversations = 16;
+    // While other requests wait, the one generating gives the engine up every slice_ms and queues again. Prompts are
+    // read in pieces cut at multiples of prefill_piece (0: whole), where turns can change.
+    uint32_t slice_ms = 1000;
+    uint32_t prefill_piece = 0;
     std::string dump_dir;     // non-empty: each generation request's body is written there (client debugging)
     // Non-empty: every request but /health needs one of them, as "Authorization: Bearer <key>" (OpenAI clients) or
     // "x-api-key: <key>" (Anthropic clients); others get HTTP 401. Empty: requests from web pages are refused instead
@@ -52,8 +56,8 @@ bool host_allowed(const std::string& host);
 bool origin_allowed(const std::string& origin);
 
 // OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health.
-// Generation runs one request at a time; a request waits for the one before it, up to max_waiting of them. Each
-// conversation keeps its context between requests (see ServerOptions::park_bytes).
+// Requests take turns generating (see ServerOptions::slice_ms), up to max_waiting waiting; each conversation keeps
+// its context between requests (see ServerOptions::park_bytes).
 class Server {
 public:
     Server(gen::Model& model, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);

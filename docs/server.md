@@ -98,7 +98,7 @@ A cut in the middle of a calculation can leave the answer wrong.
 ## Behaviour
 
 - Prompts use the GGUF's chat template, sampling defaults its `general.sampling.*` metadata.
-- Up to `--max-waiting` requests (default 4) wait behind the one generating; more get HTTP 503 with `Retry-After`; a
+- Up to `--max-waiting` requests (default 4) wait besides the one generating; more get HTTP 503 with `Retry-After`; a
   waiting request whose client left is dropped.
 - Each conversation keeps its context between requests, so several clients (two pi sessions, an agent and its
   subagents) can take turns without one re-reading the other's prompt. A request continues the conversation that
@@ -107,9 +107,15 @@ A cut in the middle of a calculation can leave the answer wrong.
   of recurrent state per copy (the parked state and the latest checkpoint), DeepSeek-V4.1 far less. `--park-gb`
   bounds them (default: what the expert cache leaves when every expert fits, 1-8 GB; GLM-5.3 on 128 GB gets ~5-8 GB
   without losing resident experts), `--conversations` their number (default 16); the least recently used is given up
-  first. Generation still runs one request at a time. A new conversation reads its whole prompt, even when it shares
-  a system prompt with another. The log line of each request names its conversation. A conversation taken out and
-  put back gives the same tokens and logits as one never interrupted (tests `e2e_pool`, `ds41_pool`).
+  first. A new conversation reads its whole prompt, even when it shares a system prompt with another.
+- Requests take turns: one generates at a time, and while others wait it gives the engine up every `--slice-ms`
+  (default 1000) at a decode step or between pieces of its prompt (cut at multiples of the engine's prefill group,
+  4096 tokens for GLM-5.3 and 8192 for DeepSeek-V4.1, so a long read yields every few seconds), then queues again.
+  A second request starts within about a slice instead of after the first one's whole reply; a switch takes ~9 ms
+  (GLM-5.3, short contexts). Interleaving changes no result: each request gives the tokens and logits it gives alone,
+  bit for bit (tests `e2e_pool`, `ds41_pool`: two threads switching at every step), except with `--miss-penalty`,
+  whose routing depends on which experts the other conversations left in memory. The log line of each request names
+  its conversation and its turns.
 - `--learn` adds the session's routing counts to the model's profile at shutdown (SIGINT / SIGTERM), so the experts
   that start in memory follow use.
 - `--dump-requests DIR` saves each request body, for debugging a client.
