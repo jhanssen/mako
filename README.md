@@ -51,6 +51,11 @@ only on the M5 Max, and M3 is untested.
   `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` from
   [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
   in one folder (mako opens the Engram file from there). The `dspark/` drafter has not been tried with it yet.
+- **Vision** (optional, `mako_serve --mmproj FILE`, docs/vision.md): GLM-5.3's `mmproj-BF16.gguf` from
+  [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF); DeepSeek-V4.1's
+  `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` from
+  [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+  (it serves both DeepSeek builds above).
 
 ## Build
 

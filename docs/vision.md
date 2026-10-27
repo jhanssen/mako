@@ -4,8 +4,8 @@ Images as prompt input for both models, from a projector file (an "mmproj" GGUF)
 
 | Model | mmproj | Projector type |
 | --- | --- | --- |
-| DeepSeek-V4.1-Flash-1017 | `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` (972 MB) | `deepseek41v`; the published file says `deepseek4v` (mako takes it as V4.1 without V4's padding vector; the reference needs `tools/gguf_retag.py <in> <out> clip.projector_type deepseek41v`) |
-| GLM-5.3-Flash | `mmproj-BF16.gguf` (1.16 GB) | `glm5v` |
+| DeepSeek-V4.1-Flash-1017 | `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` (972 MB) from `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` | `deepseek41v`; the published file says `deepseek4v` (mako takes it as V4.1 without V4's padding vector; the reference needs `tools/gguf_retag.py <in> <out> clip.projector_type deepseek41v`) |
+| GLM-5.3-Flash | `mmproj-BF16.gguf` (1.16 GB) from `unsloth/GLM-5.3-Flash-GGUF` | `glm5v` |
 
 The reference is the llama.cpp checkout `ref_vision` links (`tools/ref_dump`), on its CPU backend.
 
