@@ -29,7 +29,8 @@
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
 // engine's prefill group) and queues again.
-#include "app/presets.hpp"
+#include "app/cli.hpp"
+#include "app/dense_quant.hpp"
 #include "chat/template.hpp"
 #include "core/log.hpp"
 #include "dsv41/config.hpp"
@@ -62,31 +63,6 @@
 
 int main(int argc, char** argv)
 {
-    mako::app::Args expanded = [&] {
-        try {
-            return mako::app::Args(argc, argv);
-        } catch (const std::exception& e) {
-            std::println(stderr, "{}", e.what());
-            std::exit(2);
-        }
-    }();
-    argc = expanded.argc();
-    argv = expanded.argv();
-    if (argc < 2) {
-        std::println(stderr, "usage: mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] "
-                             "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
-                             "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
-                             "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
-                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N] "
-                             "[--park-gb N] [--conversations N] [--slice-ms N]");
-        return 2;
-    }
-    // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
-    sigset_t stop_signals;
-    sigemptyset(&stop_signals);
-    sigaddset(&stop_signals, SIGINT);
-    sigaddset(&stop_signals, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
     bool learn = false;
     mako::server::ServerOptions so;
     // Keys separated by `sep`, surrounding whitespace dropped; false when none.
@@ -113,105 +89,71 @@ int main(int argc, char** argv)
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
     bool prefill_skip = true;
     std::optional<mako::gguf::Type> dense_quant;
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--no-spec") {
-            so.speculative = false;
-            continue;
-        }
-        if (a == "--learn") {
-            learn = true;
-            continue;
-        }
-        if (i + 1 >= argc) {
-            std::println(stderr, "option {} needs a value", a);
-            return 2;
-        }
-        const char* v = argv[++i];
-        if (a == "--host")
-            so.host = v;
-        else if (a == "--port")
-            so.port = std::stoi(v);
-        else if (a == "--ctx")
-            max_ctx = uint32_t(std::stoul(v));
-        else if (a == "--model-id")
-            so.model_id = v;
-        else if (a == "--arena-gb")
-            arena_gb = std::stod(v);
-        else if (a == "--park-gb")
-            park_gb = std::stod(v);
-        else if (a == "--conversations")
-            so.max_conversations = uint32_t(std::stoul(v));
-        else if (a == "--slice-ms")
-            so.slice_ms = uint32_t(std::stoul(v));
-        else if (a == "--stage-gb")
-            stage_gb = std::stod(v);
-        else if (a == "--engram")
-            engram = v;
-        else if (a == "--dspark")
-            dspark = v;
-        else if (a == "--miss-penalty")
-            miss_penalty = std::stof(v);
-        else if (a == "--prefetch")
-            prefetch_k = uint32_t(std::stoul(v));
-        else if (a == "--prefill-skip")
-            prefill_skip = std::string_view(v) != "0";
-        else if (a == "--imatrix")
-            imatrix = v;
-        else if (a == "--prefetch-ahead")
-            prefetch_ahead = uint32_t(std::stoul(v));
-        else if (a == "--dense-quant") {
-            const std::string q = v;
-            if (q == "q4_k")
-                dense_quant = mako::gguf::Type::Q4_K;
-            else if (q == "q5_k")
-                dense_quant = mako::gguf::Type::Q5_K;
-            else if (q == "q6_k")
-                dense_quant = mako::gguf::Type::Q6_K;
-            else {
-                std::println(stderr, "--dense-quant takes q4_k, q5_k or q6_k");
-                return 2;
-            }
-        }
-        else if (a == "--ablate")
-            ablate = v;
-        else if (a == "--ablate-scale")
-            ablate_scale = std::stof(v);
-        else if (a == "--max-waiting")
-            so.max_waiting = uint32_t(std::stoul(v));
-        else if (a == "--dump-requests")
-            so.dump_dir = v;
-        else if (a == "--reasoning-effort")
-            so.reasoning_effort = mako::server::parse_effort(v);
-        else if (a == "--reasoning-budget")
-            so.reasoning_budget = uint32_t(std::stoul(v));
-        else if (a == "--mmproj")
-            mmproj_path = v;
-        else if (a == "--image-max-tokens") {
-            image_max_tokens = uint32_t(std::stoul(v));
-            if (image_max_tokens < 16) {
-                std::println(stderr, "--image-max-tokens takes 16 or more");
-                return 2;
-            }
-        }
-        else if (a == "--api-key")
-            add_keys(v, ',');
-        else if (a == "--api-key-file") {
-            std::ifstream in(v);
-            std::stringstream text;
-            text << in.rdbuf();
-            if (!in || !add_keys(text.str(), '\n')) {
-                std::println(stderr, "cannot read an API key from {}", v);
-                return 2;
-            }
-        }
-        else {
-            std::println(stderr, "unknown option {}", a);
-            return 2;
-        }
-    }
-    if (const char* env = std::getenv("MAKO_API_KEY"); env && so.api_keys.empty())
-        add_keys(env, ',');
+    const auto args =
+        mako::app::Cli("mako_serve", "<model.gguf>", 1, 1)
+            .option("--host", "H", "address to listen on (default 127.0.0.1; others need an API key)", so.host)
+            .option("--port", "N", "port to listen on", so.port)
+            .option("--ctx", "N", "the context length in tokens", max_ctx)
+            .option("--model-id", "NAME", "the model name the API reports", so.model_id)
+            .option("--api-key", "KEY[,KEY...]", "keys requests must carry (Bearer or x-api-key)",
+                    [&](const std::string& v) { add_keys(v, ','); })
+            .secret()
+            .option("--api-key-file", "FILE", "keys requests must carry, one a line",
+                    [&](const std::string& v) {
+                        std::ifstream in(v);
+                        std::stringstream text;
+                        text << in.rdbuf();
+                        if (!in || !add_keys(text.str(), '\n'))
+                            throw std::invalid_argument("names no readable key file");
+                    })
+            .shared_env("--api-key")
+            .option("--arena-gb", "N", "the expert cache's size in GB (default: what memory allows)", arena_gb)
+            .option("--stage-gb", "N", "the ring prompts' missing experts are read ahead into (0: off)", stage_gb)
+            .option("--park-gb", "N", "memory for parked conversations (default: what the expert cache leaves)",
+                    park_gb)
+            .option("--conversations", "N", "conversations kept parked besides the one generating (default 16)",
+                    so.max_conversations)
+            .option("--slice-ms", "N", "how long a request generates before waiting ones get a turn (default 1000)",
+                    so.slice_ms)
+            .option("--max-waiting", "N", "requests that may wait before new ones are refused", so.max_waiting)
+            .flag("--spec", "speculative decoding (GLM-5.3's MTP block, DeepSeek-V4.1 with --dspark; default on)",
+                  so.speculative)
+            .option("--dspark", "DIR", "DeepSeek-V4.1's drafter (dspark.json and dspark.bin)", dspark)
+            .option("--engram", "FILE", "DeepSeek-V4.1: the Engram tables of another GGUF (default: the model's own)",
+                    engram)
+            .option("--miss-penalty", "F", "DeepSeek-V4.1: lower routing scores of experts not in memory (0.05-0.2)",
+                    miss_penalty)
+            .option("--dense-quant", "q4_k|q5_k|q6_k", "re-quantize the dense Q8_0 weights at load",
+                    [&](const std::string& v) { dense_quant = mako::app::parse_dense_quant(v); })
+            .option("--imatrix", "FILE", "activation statistics (ds_run --imatrix-out) weighting --dense-quant",
+                    imatrix)
+            .option("--prefetch", "K", "read ahead the K experts a later layer's router predicts (default 4; 0: off)",
+                    prefetch_k)
+            .option("--prefetch-ahead", "D", "how many layers ahead --prefetch predicts (default 2)", prefetch_ahead)
+            .option("--prefill-skip", "0|1", "a long prompt's earlier rows skip the layers only later rows need",
+                    prefill_skip)
+            .option("--reasoning-effort", "none|low|medium|high|max|N", "the default reasoning effort",
+                    [&](const std::string& v) { so.reasoning_effort = mako::server::parse_effort(v); })
+            .option("--reasoning-budget", "N", "the default reasoning budget in tokens", so.reasoning_budget)
+            .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
+            .option("--image-max-tokens", "N", "scale larger images down to at most N prompt rows (16 or more)",
+                    [&](const std::string& v) {
+                        image_max_tokens = mako::app::Cli::parse<uint32_t>(v);
+                        if (image_max_tokens < 16)
+                            throw std::invalid_argument("takes 16 or more");
+                    })
+            .option("--ablate", "FILE", "remove per-layer directions (an ablation file)", ablate)
+            .option("--ablate-scale", "S", "multiply the ablation's strength", ablate_scale)
+            .flag("--learn", "add the session's routing counts to the model's profile on exit", learn)
+            .option("--dump-requests", "DIR", "write each request and response to DIR", so.dump_dir)
+            .parse(argc, argv);
+    const char* model_path = args[0].c_str();
+    // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
     for (const auto& k : so.api_keys)
         if (k.size() < 16)
             mako::log::warn("an API key of {} characters is easy to guess (16 or more; e.g. openssl rand -hex 24)",
@@ -221,15 +163,15 @@ int main(int argc, char** argv)
         return 2;
     }
     const auto t_start = std::chrono::steady_clock::now();
-    mako::log::info("reading {}", argv[1]);
-    auto model = mako::gguf::ModelFiles::open(argv[1]);
+    mako::log::info("reading {}", model_path);
+    auto model = mako::gguf::ModelFiles::open(model_path);
     if (!model) {
         mako::log::error("{}", model.error());
         return 1;
     }
     const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
     if (deepseek) {
-        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1])
+        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, model_path)
                                     : mako::dsv41::Engram::add_files(*model, engram);
             !r) {
             mako::log::error("{}", r.error());
@@ -271,7 +213,7 @@ int main(int argc, char** argv)
         so.sampling.top_k = uint32_t(*k);
     if (so.model_id.empty())
         so.model_id = std::string(meta.get_string("general.basename").value_or(
-            std::filesystem::path(argv[1]).stem().string()));
+            std::filesystem::path(model_path).stem().string()));
 
     {
         uint64_t bytes = 0;

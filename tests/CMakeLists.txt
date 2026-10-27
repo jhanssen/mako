@@ -91,6 +91,11 @@ target_link_libraries(presets_test PRIVATE mako_app)
 add_test(NAME presets COMMAND presets_test ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(presets PROPERTIES LABELS cpu)
 
+add_executable(cli_test cli_test.cpp)
+target_link_libraries(cli_test PRIVATE mako_app)
+add_test(NAME cli COMMAND cli_test ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(cli PROPERTIES LABELS cpu)
+
 add_executable(engram_decode_test engram_decode_test.cpp)
 target_link_libraries(engram_decode_test PRIVATE mako_mtl mako_gguf)
 add_test(NAME engram_decode COMMAND engram_decode_test)

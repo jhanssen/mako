@@ -3,6 +3,7 @@
 //   mako_calibrate <model.gguf> [--corpus FILE] [--out FILE] [--arena-gb N] [--engram FILE]
 // Without --corpus it uses the built-in corpus; without --out it writes the model's default profile. --engram: the
 // GGUF with DeepSeek-V4.1's Engram tables (default: the model's own shards).
+#include "app/cli.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
@@ -29,31 +30,17 @@ constexpr char kCorpus[] = {
 int main(int argc, char** argv)
 {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (argc < 2) {
-        std::println(stderr, "usage: mako_calibrate <model.gguf> [--corpus FILE] [--out FILE] [--arena-gb N] [--engram FILE]");
-        return 2;
-    }
     std::string corpus_path, out, engram;
     double arena_gb = -1;
-    for (int i = 2; i < argc; i += 2) {
-        const std::string a = argv[i];
-        if (i + 1 >= argc) {
-            std::println(stderr, "option {} needs a value", a);
-            return 2;
-        }
-        if (a == "--corpus")
-            corpus_path = argv[i + 1];
-        else if (a == "--out")
-            out = argv[i + 1];
-        else if (a == "--arena-gb")
-            arena_gb = std::stod(argv[i + 1]);
-        else if (a == "--engram")
-            engram = argv[i + 1];
-        else {
-            std::println(stderr, "unknown option {}", a);
-            return 2;
-        }
-    }
+    const auto args =
+        mako::app::Cli("mako_calibrate", "<model.gguf>", 1, 1)
+            .option("--corpus", "FILE", "the calibration text (default: the built-in one)", corpus_path)
+            .option("--out", "FILE", "the profile to write (default: the model's, read by later runs)", out)
+            .option("--arena-gb", "N", "the expert cache's size in GB (default: what memory allows)", arena_gb)
+            .option("--engram", "FILE", "DeepSeek-V4.1: the Engram tables of another GGUF (default: the model's own)",
+                    engram)
+            .parse(argc, argv);
+    const char* model_path = args[0].c_str();
     std::string text = kCorpus;
     if (!corpus_path.empty()) {
         std::ifstream in(corpus_path, std::ios::binary);
@@ -64,7 +51,7 @@ int main(int argc, char** argv)
         text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     }
 
-    auto model = mako::gguf::ModelFiles::open(argv[1]);
+    auto model = mako::gguf::ModelFiles::open(model_path);
     if (!model) {
         std::println(stderr, "{}", model.error());
         return 1;
@@ -79,7 +66,7 @@ int main(int argc, char** argv)
     std::println("calibrating on {} tokens ({})", ids.size(), corpus_path.empty() ? "built-in corpus" : corpus_path);
     const auto t0 = std::chrono::steady_clock::now();
     if (model->meta().get_string("general.architecture").value_or("") == "deepseek41") {
-        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, argv[1])
+        if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, model_path)
                                     : mako::dsv41::Engram::add_files(*model, engram);
             !r) {
             std::println(stderr, "{}", r.error());

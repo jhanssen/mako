@@ -9,7 +9,7 @@
 // (greedy and speculative unless --temp / --no-spec) and summarizes its steps. --prompt-file takes the text from F
 // (all of it, up to --base tokens) instead of the sources. --turns N simulates an agent: an answer of 150 tokens after the
 // base context, then N turns that each read 1000 new tokens and answer 150 (misses per step in each answer's halves).
-#include "app/presets.hpp"
+#include "app/cli.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gen/session.hpp"
@@ -149,21 +149,6 @@ int run_turns(mako::glm::Engine& engine, const std::vector<int32_t>& ids, uint32
 
 int main(int argc, char** argv)
 {
-    mako::app::Args expanded = [&] {
-        try {
-            return mako::app::Args(argc, argv);
-        } catch (const std::exception& e) {
-            std::println(stderr, "{}", e.what());
-            std::exit(2);
-        }
-    }();
-    argc = expanded.argc();
-    argv = expanded.argv();
-    if (argc < 2) {
-        std::println(stderr, "usage: prefill_sweep <model.gguf> [--base N] [--sizes a,b,...] [--repeats N] [--layers] "
-                             "[--steps N] [--prefill-group N] [--parts]");
-        return 2;
-    }
     uint32_t base = 15000, repeats = 2, step_max = 0, decode = 0, turns = 0;
     std::string prompt_file;
     float temp = 0.0f;
@@ -171,55 +156,37 @@ int main(int argc, char** argv)
     std::vector<uint32_t> sizes{16, 64, 256, 512, 1024, 2048, 4096};
     mako::glm::Options opts;
     opts.telemetry = mako::core::Telemetry::summary;
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--layers") {
-            opts.telemetry = mako::core::Telemetry::layers;
-            continue;
-        }
-        if (a == "--parts") {
-            opts.telemetry = mako::core::Telemetry::layers;
-            parts = true;
-            continue;
-        }
-        if (a == "--no-spec") {
-            spec = false;
-            continue;
-        }
-        if (i + 1 >= argc) {
-            std::println(stderr, "option {} needs a value", a);
-            return 2;
-        }
-        const std::string v = argv[++i];
-        if (a == "--base")
-            base = uint32_t(std::stoul(v));
-        else if (a == "--repeats")
-            repeats = uint32_t(std::stoul(v));
-        else if (a == "--steps")
-            step_max = uint32_t(std::stoul(v));
-        else if (a == "--decode")
-            decode = uint32_t(std::stoul(v));
-        else if (a == "--turns")
-            turns = uint32_t(std::stoul(v));
-        else if (a == "--prompt-file")
-            prompt_file = v;
-        else if (a == "--temp")
-            temp = std::stof(v);
-        else if (a == "--prefill-group")
-            opts.prefill_group = uint32_t(std::stoul(v));
-        else if (a == "--stage-gb")
-            opts.stage_gb = std::stod(v);
-        else if (a == "--sizes") {
-            sizes.clear();
-            std::stringstream ss(v);
-            for (std::string x; std::getline(ss, x, ',');)
-                sizes.push_back(uint32_t(std::stoul(x)));
-        } else {
-            std::println(stderr, "unknown option {}", a);
-            return 2;
-        }
-    }
-    auto model = mako::gguf::ModelFiles::open(argv[1]);
+    const auto args =
+        mako::app::Cli("prefill_sweep", "<model.gguf>", 1, 1)
+            .option("--base", "N", "the base context in tokens (default 15000)", base)
+            .option("--sizes", "a,b,...", "the read sizes in tokens",
+                    [&](const std::string& v) {
+                        sizes.clear();
+                        std::stringstream ss(v);
+                        for (std::string x; std::getline(ss, x, ',');)
+                            sizes.push_back(mako::app::Cli::parse<uint32_t>(x));
+                    })
+            .option("--repeats", "N", "runs of each size (default 2)", repeats)
+            .option("--steps", "N", "also time sizes up to N as decode steps", step_max)
+            .option("--decode", "N", "instead generate N tokens after the base context and summarize the steps", decode)
+            .option("--turns", "N", "simulate an agent: N turns reading 1000 tokens and answering 150", turns)
+            .option("--prompt-file", "F", "the text (default: this repository's sources)", prompt_file)
+            .option("--temp", "T", "sampling temperature for --decode (default 0: greedy)", temp)
+            .flag("--spec", "speculative decoding in --decode (default on)", spec)
+            .option("--prefill-group", "N", "prompt rows that read the missing experts once", opts.prefill_group)
+            .option("--stage-gb", "N", "the ring prompts' missing experts are read ahead into (0: off)", opts.stage_gb)
+            .flag("--layers", "per-layer GPU timestamps",
+                  [&](bool b) {
+                      opts.telemetry = b ? mako::core::Telemetry::layers : mako::core::Telemetry::summary;
+                  })
+            .flag("--parts", "also time named parts of the layers",
+                  [&](bool b) {
+                      parts = b;
+                      if (b)
+                          opts.telemetry = mako::core::Telemetry::layers;
+                  })
+            .parse(argc, argv);
+    auto model = mako::gguf::ModelFiles::open(args[0]);
     if (!model) {
         std::println(stderr, "{}", model.error());
         return 1;

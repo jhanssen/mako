@@ -2,8 +2,8 @@
 // reference's (float32 [positions][vocab]).
 //
 //   ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref logits.f32] [--logits-out FILE] [--arena-gb N]
-//          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
-//          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--spec 0|1] [--max-drafts N]
+//          [--stage-gb N] [--max-ctx N] [--ablate FILE] [--indexer-top-k N] [--prefill 1] [--chunk N] [--group N] [--telemetry layers|parts|kernels] [--profile F]
+//          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--no-spec] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [--prefill-skip 0|1] [-n N]
 // --tail N: the ids but the last N through prefill(), then the last N timed through prefill() and, from the same
 // checkpoint, as decode steps of up to 8 tokens; the misses and expert reads of each.
@@ -14,13 +14,14 @@
 // --route-study N: N greedy tokens without drafts, then how well each expert-miss predictor would have done: layer
 // l+1's router on layer l's FFN input (one and two layers ahead), the previous token's experts, and the experts the
 // same input token used earlier (misses caught, and reads of experts neither resident nor selected wasted).
-// --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one and
-// --spec is not 0), with the tokens, speed and drafts kept.
+// --gen N: N greedy tokens through a generation session after the ids (with the drafter when --dspark gives one,
+// unless --no-spec), with the tokens, speed and drafts kept.
 // --split S --width W: prefills the first S ids, then runs the rest W at a time (as a speculative verify step whose
 // drafts were all right would) and reports the time and expert misses per step and per token.
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
-#include "app/presets.hpp"
+#include "app/cli.hpp"
+#include "app/dense_quant.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
@@ -58,21 +59,6 @@ std::vector<float> log_softmax(const float* x, size_t n)
 
 int main(int argc, char** argv)
 {
-    mako::app::Args expanded = [&] {
-        try {
-            return mako::app::Args(argc, argv);
-        } catch (const std::exception& e) {
-            std::println(stderr, "{}", e.what());
-            std::exit(2);
-        }
-    }();
-    argc = expanded.argc();
-    argv = expanded.argv();
-    if (argc < 4) {
-        std::println(stderr, "usage: ds_run <model-00001.gguf> <engram.gguf> --ids I,J,... [--ref F] [--logits-out F] "
-                             "[--arena-gb N] [--max-ctx N] [--ablate F] [-n N]");
-        return 2;
-    }
     std::vector<int32_t> ids;
     std::string ref, out, ablate, save_profile;
     mako::dsv41::Options opts;
@@ -84,101 +70,66 @@ int main(int argc, char** argv)
     std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
-    for (int i = 3; i + 1 < argc; i += 2) {
-        const std::string a = argv[i], v = argv[i + 1];
-        if (a == "--ids") {
-            std::stringstream ss(v);
-            for (std::string s; std::getline(ss, s, ',');)
-                ids.push_back(std::stoi(s));
-        } else if (a == "--ref")
-            ref = v;
-        else if (a == "--logits-out")
-            out = v;
-        else if (a == "--arena-gb")
-            opts.arena_gb = std::stod(v);
-        else if (a == "--stage-gb")
-            opts.stage_gb = std::stod(v);
-        else if (a == "--max-ctx")
-            opts.max_ctx = uint32_t(std::stoul(v));
-        else if (a == "--prefill")
-            use_prefill = v != "0";
-        else if (a == "--chunk")
-            opts.prefill_chunk = uint32_t(std::stoul(v));
-        else if (a == "--group")
-            opts.prefill_group = uint32_t(std::stoul(v));
-        else if (a == "--telemetry") {
-            opts.telemetry = v == "summary" ? mako::core::Telemetry::summary
-                             : v == "kernels" ? mako::core::Telemetry::kernels
-                                              : mako::core::Telemetry::layers;
-            part_timing = v == "parts";
-        }
-        else if (a == "--save-profile")
-            save_profile = v;
-        else if (a == "--profile")
-            opts.expert_counts = v;
-        else if (a == "--prefetch")
-            opts.prefetch_k = uint32_t(std::stoul(v));
-        else if (a == "--prefetch-ahead")
-            opts.prefetch_ahead = uint32_t(std::stoul(v));
-        else if (a == "--prefill-skip")
-            opts.prefill_skip = v != "0";
-        else if (a == "--miss-penalty")
-            opts.miss_penalty = std::stof(v);
-        else if (a == "--dense-quant") {
-            if (v == "q4_k")
-                opts.dense_quant = mako::gguf::Type::Q4_K;
-            else if (v == "q5_k")
-                opts.dense_quant = mako::gguf::Type::Q5_K;
-            else if (v == "q6_k")
-                opts.dense_quant = mako::gguf::Type::Q6_K;
-            else {
-                std::println(stderr, "--dense-quant takes q4_k, q5_k or q6_k");
-                return 2;
-            }
-        } else if (a == "--dspark")
-            opts.dspark = v;
-        else if (a == "--gen")
-            session_n = uint32_t(std::stoul(v));
-        else if (a == "--tail")
-            tail = std::stoul(v);
-        else if (a == "--ref-from")
-            ref_from = std::stoul(v);
-        else if (a == "--steps-from")
-            steps_from = std::stoul(v);
-        else if (a == "--imatrix-out")
-            imatrix_out = v;
-        else if (a == "--imatrix")
-            opts.dense_imatrix = v;
-        else if (a == "--route-study")
-            study_n = uint32_t(std::stoul(v));
-        else if (a == "--spec")
-            spec = v != "0";
-        else if (a == "--max-drafts")
-            opts.max_drafts = uint32_t(std::stoul(v));
-        else if (a == "--draft-conf")
-            opts.draft_conf = std::stof(v);
-        else if (a == "--split")
-            split = uint32_t(std::stoul(v));
-        else if (a == "--width")
-            width = uint32_t(std::stoul(v));
-        else if (a == "--top-k")
-            opts.indexer_top_k = uint32_t(std::stoul(v));
-        else if (a == "--ablate")
-            ablate = v;
-        else if (a == "-n")
-            gen = std::stoi(v);
-        else {
-            std::println(stderr, "unknown option {}", a);
-            return 2;
-        }
-    }
-    auto m = mako::gguf::ModelFiles::open(argv[1]);
+    const auto args =
+        mako::app::Cli("ds_run", "<model-00001.gguf> <engram.gguf>", 2, 2)
+            .option("--ids", "I,J,...", "the prompt's token ids",
+                    [&](const std::string& v) {
+                        std::stringstream ss(v);
+                        for (std::string x; std::getline(ss, x, ',');)
+                            ids.push_back(mako::app::Cli::parse<int32_t>(x));
+                    })
+            .option("-n", "N", "then N greedy tokens", gen)
+            .option("--gen", "N", "N greedy tokens through a generation session after the ids", session_n)
+            .flag("--spec", "speculative decoding in --gen (with --dspark; default on)", spec)
+            .option("--dspark", "DIR", "the drafter (dspark.json and dspark.bin)", opts.dspark)
+            .option("--max-drafts", "N", "drafts a step at most", opts.max_drafts)
+            .option("--draft-conf", "F", "the confidence a draft needs", opts.draft_conf)
+            .option("--ref", "FILE", "compare the logits against a reference", ref)
+            .option("--ref-from", "N", "the reference's first position (a long prompt's tail)", ref_from)
+            .option("--steps-from", "N", "the first N ids through prefill, the rest one step each", steps_from)
+            .option("--tail", "N", "time the last N ids through prefill and as decode steps", tail)
+            .option("--logits-out", "FILE", "write the logits", out)
+            .option("--arena-gb", "N", "the expert cache's size in GB (default: what memory allows)", opts.arena_gb)
+            .option("--stage-gb", "N", "the ring prompts' missing experts are read ahead into (0: off)", opts.stage_gb)
+            .option("--max-ctx", "N", "the context length in tokens", opts.max_ctx)
+            .option("--prefill", "0|1", "the ids through prefill instead of one step each", use_prefill)
+            .option("--chunk", "N", "prompt rows a prefill step", opts.prefill_chunk)
+            .option("--group", "N", "prompt rows that read the missing experts once", opts.prefill_group)
+            .option("--prefill-skip", "0|1", "a long prompt's earlier rows skip the layers only later rows need",
+                    opts.prefill_skip)
+            .option("--telemetry", "summary|layers|parts|kernels", "telemetry",
+                    [&](const std::string& v) {
+                        if (v != "summary" && v != "layers" && v != "parts" && v != "kernels")
+                            throw std::invalid_argument("takes summary, layers, parts or kernels");
+                        opts.telemetry = v == "summary"   ? mako::core::Telemetry::summary
+                                         : v == "kernels" ? mako::core::Telemetry::kernels
+                                                          : mako::core::Telemetry::layers;
+                        part_timing = v == "parts";
+                    })
+            .option("--profile", "FILE", "the routing profile to start from", opts.expert_counts)
+            .option("--save-profile", "FILE|default", "write the run's routing profile", save_profile)
+            .option("--prefetch", "K", "read ahead the K experts a later layer's router predicts (0: off)",
+                    opts.prefetch_k)
+            .option("--prefetch-ahead", "D", "how many layers ahead --prefetch predicts", opts.prefetch_ahead)
+            .option("--miss-penalty", "F", "lower routing scores of experts not in memory", opts.miss_penalty)
+            .option("--dense-quant", "q4_k|q5_k|q6_k", "re-quantize the dense Q8_0 weights at load",
+                    [&](const std::string& v) { opts.dense_quant = mako::app::parse_dense_quant(v); })
+            .option("--imatrix", "FILE", "activation statistics weighting --dense-quant", opts.dense_imatrix)
+            .option("--imatrix-out", "FILE", "activation statistics over --gen, for --imatrix", imatrix_out)
+            .option("--indexer-top-k", "K", "the attention indexer's top-k", opts.indexer_top_k)
+            .option("--route-study", "N", "N greedy tokens, then how well miss predictors would have done", study_n)
+            .option("--split", "S", "prefill the first S ids, then the rest --width at a time", split)
+            .option("--width", "W", "ids a step after --split", width)
+            .option("--ablate", "FILE", "remove per-layer directions (an ablation file)", ablate)
+            .parse(argc, argv);
+    const char* model_path = args[0].c_str();
+    auto m = mako::gguf::ModelFiles::open(model_path);
     if (!m) {
         std::println(stderr, "{}", m.error());
         return 1;
     }
-    if (auto r = mako::dsv41::Engram::add_files(*m, argv[2]).and_then([&] {
-            return mako::dsv41::Engram::add_named(*m, argv[1]);
+    if (auto r = mako::dsv41::Engram::add_files(*m, args[1]).and_then([&] {
+            return mako::dsv41::Engram::add_named(*m, model_path);
         });
         !r) {
         std::println(stderr, "{}", r.error());

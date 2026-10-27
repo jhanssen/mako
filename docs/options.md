@@ -5,11 +5,22 @@
 The expert cache takes what is available at startup within a margin (a quarter of RAM from 96 GB up, 40% below).
 `--arena-gb N` fixes its size; `--stage-gb N` limits the ring a prompt's missing experts are read ahead into.
 
-## Presets
+## Presets and the environment
 
-`--preset NAME` (`mako_serve`, `mako_run`, `ds_run`, `prefill_sweep`) applies a named set of options from
-`~/Library/Application Support/mako/presets.json` (`--presets FILE` for another file); `presets.example.json` here
-has examples for both models.
+The tools (`mako_serve`, `mako_calibrate`, `mako_run`, `ds_run`, `prefill_sweep`) take their options from, lowest
+precedence first, environment variables, presets and the command line. `--help` lists each tool's options with their
+variables.
+
+- Each long option has a variable: `--arena-gb 40` is `MAKO_ARENA_GB=40`, `--miss-penalty 0.1`
+  `MAKO_MISS_PENALTY=0.1`. A flag's variable takes `1` / `0` (or `true`, `yes`, `on` / `false`, `no`, `off`); every flag
+  has a `--no-` form (`--spec`, `--no-spec`). Short options (`-n`) have none, and empty variables are ignored.
+- An option the command line gives, or a preset it names, ignores its variable. For options that add up
+  (`--api-key`, `--api-key-file`) the command line's replace the environment's.
+- Options taken from the environment are listed on stderr at startup (secrets without their value).
+
+`--preset NAME` applies a named set of options from `~/Library/Application Support/mako/presets.json` (`--presets
+FILE` for another file; `MAKO_PRESET` and `MAKO_PRESETS` when the command line names none); `presets.example.json`
+here has examples for both models.
 
 - Each `"--flag": value` entry becomes that option (`true`: the flag alone, `false`: left out), inserted where
   `--preset` stands, so later options override it and presets stack.
@@ -17,6 +28,7 @@ has examples for both models.
 
 ```sh
 ./build/tools/mako_serve --preset ds-route-0.1 --port 8091
+MAKO_ARENA_GB=40 ./build/tools/mako_serve ~/models/glm/model-00001-of-00003.gguf
 ```
 
 ## DeepSeek-V4.1 speed and accuracy

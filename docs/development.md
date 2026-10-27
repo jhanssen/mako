@@ -25,13 +25,14 @@ the state taken before an earlier prompt's last token), samples, drafts and stop
 
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<GLM-5.3 .gguf> -DMAKO_DS41_MODEL=<DeepSeek .gguf>   # or the same environment variables
-ctest --test-dir build --output-on-failure                                           # -L kernels | tokenizer | sampler | server | e2e
+ctest --test-dir build --output-on-failure                                           # -L cpu | kernels | tokenizer | sampler | server | e2e
 ```
 
 `MAKO_DS41_DSPARK=<dir>` adds the drafter's test, `MAKO_DS41_ENGRAM=<GGUF>` runs DeepSeek's with other Engram tables.
 
-- No model needed: the kernel checks on random data (`quant`, `gemv_own`, `gemm_synthetic`, `engram_decode`),
-  `sampler`, `presets`. The others report as skipped without their model.
+- No model needed (`ctest -L cpu` for those without a GPU too, as CI runs): the kernel checks on random data
+  (`quant`, `gemv_own`, `gemv_rows`, `gemm_synthetic`, `engram_decode`, `hc`), `sampler`, `presets`, `cli`,
+  `template`, `vision_prep`. The others report as skipped without their model.
 - GLM-5.3's `e2e` tests (about a minute): greedy decode tokens, prefill against token-by-token decode, logits against
   stored reference top-k, speculative steps, generation and prefix reuse through `Session`, a prompt past the
   dense-attention window.
@@ -57,7 +58,7 @@ For GLM-5.3: runs the tests and a fixed benchmark (prefill of 512 and 4096 new t
 | --- | --- |
 | `src/gguf` | GGUF reader, multi-file models |
 | `src/quant` | CPU dequantization and the dense re-quantizers |
-| `src/app` | command-line presets |
+| `src/app` | command-line options: the environment, presets |
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
 | `src/core` | what the engines share: GPU runtime base, expert arena, routing profiles, telemetry |

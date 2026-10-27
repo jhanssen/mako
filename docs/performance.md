@@ -188,7 +188,7 @@ the sections below take it to ~25 by default.
 
 ### Where a decode step goes (2026-10-25, short story prompt, Q8_0 dense, 94.4 GB expert cache)
 
-`ds_run --gen 200 --spec 0 --telemetry layers|parts|kernels`. A step is ~41 ms, GPU-bound (inputs and encoding <1 ms):
+`ds_run --gen 200 --no-spec --telemetry layers|parts|kernels`. A step is ~41 ms, GPU-bound (inputs and encoding <1 ms):
 
 | | ms/step | Note |
 | --- | ---: | --- |

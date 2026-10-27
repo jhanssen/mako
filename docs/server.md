@@ -11,7 +11,7 @@ One request runs at a time on one session, so a conversation's next turn reuses 
 The server listens on 127.0.0.1 unless `--host` says otherwise.
 
 - **API keys**: `--api-key KEY[,KEY...]`, `--api-key-file FILE` (a key per line; keeps keys out of the shell history
-  and the process list) or `MAKO_API_KEY` (when neither is given). Every request but `/health` then needs one of them:
+  and the process list), or `MAKO_API_KEY` / `MAKO_API_KEY_FILE` (when neither option is given). Every request but `/health` then needs one of them:
   `Authorization: Bearer KEY` (OpenAI clients' API key setting) or `x-api-key: KEY` (Anthropic clients, Claude Code's
   `ANTHROPIC_API_KEY`); others get HTTP 401. Several keys let one client's key be withdrawn. Keys under 16 characters
   get a warning (`openssl rand -hex 24` makes a good one). Another `--host` requires a key.

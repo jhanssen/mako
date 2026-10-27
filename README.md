@@ -87,12 +87,13 @@ Then point a client at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:
 from other machines, see [Server](docs/server.md#access) (API key, encrypted transport).
 
 Named option sets go in `~/Library/Application Support/mako/presets.json` (`--preset NAME`; examples in
-`docs/presets.example.json`).
+`docs/presets.example.json`), and every option can come from the environment (`--arena-gb 40` is `MAKO_ARENA_GB=40`;
+the command line wins). `--help` lists a tool's options.
 
 ## More
 
 - [Server](docs/server.md): API coverage, queueing, clients
-- [Options](docs/options.md): memory, presets, DeepSeek speed/accuracy trade-offs, drafters, ablation
+- [Options](docs/options.md): memory, presets and the environment, DeepSeek speed/accuracy trade-offs, drafters, ablation
 - [Development](docs/development.md): other tools, tests, self-check, source layout
 - [Architecture](docs/architecture.md), [performance work](docs/performance.md),
   [DeepSeek design](docs/dsv41-design.md), [test data](tests/data/README.md)

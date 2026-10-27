@@ -17,7 +17,8 @@
 // --ablate removes per-layer directions (an ablation file, mtl::Ablation; sites ffn_out and stream) from the
 // FFN output and residual streams (Engine::set_ablation); --ablate-scale multiplies their strength.
 // --spec or a sampling option generates through a Session (speculatively with --spec; sampled with --temp > 0).
-#include "app/presets.hpp"
+#include "app/cli.hpp"
+#include "app/dense_quant.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gen/session.hpp"
@@ -107,125 +108,69 @@ void dump(const std::filesystem::path& file, const float* data, size_t n)
 
 int main(int argc, char** argv)
 {
-    mako::app::Args expanded = [&] {
-        try {
-            return mako::app::Args(argc, argv);
-        } catch (const std::exception& e) {
-            std::println(stderr, "{}", e.what());
-            std::exit(2);
-        }
-    }();
-    argc = expanded.argc();
-    argv = expanded.argv();
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (argc < 3) {
-        std::println(stderr, "usage: mako_run <model.gguf> <id,id,...> [-n N] [--ctx N] [--top K]");
-        return 2;
-    }
     int n_gen = 8, top = 5;
     std::string ref_dir, dump_dir, force_dir, route_dir, save_counts, stats_out, logits_dir;
-    bool mtp_stats = false, spec = false, use_session = false;
+    bool mtp_stats = false, spec = false, sampling = false;
     bool learn = false;
     mako::glm::Options opts;
     mako::gen::GenerateParams gp;
     std::string ablate;
     float ablate_scale = 1.0f;
     gp.sampling.temperature = 0;
-    for (int i = 3; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--learn") {
-            learn = true;
-            continue;
-        }
-        if (a == "--mtp-stats") {
-            mtp_stats = true;
-            continue;
-        }
-        if (a == "--spec") {
-            spec = use_session = true;
-            continue;
-        }
-        if (i + 1 >= argc) {
-            std::println(stderr, "option {} needs a value", a);
-            return 2;
-        }
-        const char* v = argv[++i];
-        if (a == "-n")
-            n_gen = std::stoi(v);
-        else if (a == "--ctx")
-            opts.max_ctx = uint32_t(std::stoul(v));
-        else if (a == "--dense-quant") {
-            const std::string_view q(v);
-            if (q != "q4_k" && q != "q5_k" && q != "q6_k") {
-                std::println(stderr, "--dense-quant takes q4_k, q5_k or q6_k");
-                return 1;
-            }
-            opts.dense_quant = q == "q4_k" ? mako::gguf::Type::Q4_K : q == "q5_k" ? mako::gguf::Type::Q5_K : mako::gguf::Type::Q6_K;
-        }
-        else if (a == "--top")
-            top = std::stoi(v);
-        else if (a == "--indexer-top-k")
-            opts.indexer_top_k = uint32_t(std::stoul(v));
-        else if (a == "--ref")
-            ref_dir = v;
-        else if (a == "--expert-counts")
-            opts.expert_counts = v;
-        else if (a == "--save-counts")
-            save_counts = v;
-        else if (a == "--prefill-chunk")
-            opts.prefill_chunk = uint32_t(std::stoul(v));
-        else if (a == "--prefill-group")
-            opts.prefill_group = uint32_t(std::stoul(v));
-        else if (a == "--simulate-ram")
-            opts.simulate_ram_gb = std::stod(v);
-        else if (a == "--arena-gb")
-            opts.arena_gb = std::stod(v);
-        else if (a == "--stage-gb")
-            opts.stage_gb = std::stod(v);
-        else if (a == "--ablate")
-            ablate = v;
-        else if (a == "--ablate-scale")
-            ablate_scale = std::stof(v);
-        else if (a == "--dump")
-            dump_dir = v;
-        else if (a == "--logits-out")
-            logits_dir = v;
-        else if (a == "--force")
-            force_dir = v;
-        else if (a == "--force-route")
-            route_dir = v;
-        else if (a == "--stats") {
-            const auto t = mako::core::parse_telemetry(v);
-            if (!t) {
-                std::println(stderr, "--stats takes summary, steps, layers or kernels");
-                return 2;
-            }
-            opts.telemetry = *t;
-        } else if (a == "--stats-out")
-            stats_out = v;
-        else if (a == "--temp" || a == "--top-k" || a == "--top-p" || a == "--min-p" || a == "--seed") {
-            use_session = true;
-            if (a == "--temp")
-                gp.sampling.temperature = std::stof(v);
-            else if (a == "--top-k")
-                gp.sampling.top_k = uint32_t(std::stoul(v));
-            else if (a == "--top-p")
-                gp.sampling.top_p = std::stof(v);
-            else if (a == "--min-p")
-                gp.sampling.min_p = std::stof(v);
-            else
-                gp.seed = std::stoull(v);
-        }
-        else {
-            std::println(stderr, "unknown option {}", a);
-            return 2;
-        }
-    }
+    // Sampling options run the generation through a session, as --spec does.
+    auto sample = [&](auto& to) {
+        return [&to, &sampling](const std::string& v) {
+            to = mako::app::Cli::parse<std::remove_reference_t<decltype(to)>>(v);
+            sampling = true;
+        };
+    };
+    const auto args =
+        mako::app::Cli("mako_run", "<model.gguf> <id,id,...|@text>", 2, 2)
+            .option("-n", "N", "tokens to generate (default 8)", n_gen)
+            .option("--top", "K", "top logits to print (default 5)", top)
+            .option("--ctx", "N", "the context length in tokens", opts.max_ctx)
+            .flag("--spec", "speculative decoding with the MTP block (default off)", spec)
+            .option("--temp", "T", "sampling temperature (default 0: greedy)", sample(gp.sampling.temperature))
+            .option("--top-k", "K", "sampling top-k", sample(gp.sampling.top_k))
+            .option("--top-p", "P", "sampling top-p", sample(gp.sampling.top_p))
+            .option("--min-p", "P", "sampling min-p", sample(gp.sampling.min_p))
+            .option("--seed", "N", "sampling seed", sample(gp.seed))
+            .option("--arena-gb", "N", "the expert cache's size in GB (default: what memory allows)", opts.arena_gb)
+            .option("--stage-gb", "N", "the ring prompts' missing experts are read ahead into (0: off)", opts.stage_gb)
+            .option("--simulate-ram", "GB", "size the expert cache as on a machine with this much memory",
+                    opts.simulate_ram_gb)
+            .option("--dense-quant", "q4_k|q5_k|q6_k", "re-quantize the dense Q8_0 weights at load",
+                    [&](const std::string& v) { opts.dense_quant = mako::app::parse_dense_quant(v); })
+            .option("--indexer-top-k", "K", "the attention indexer's top-k", opts.indexer_top_k)
+            .option("--prefill-chunk", "N", "prompt rows a prefill step", opts.prefill_chunk)
+            .option("--prefill-group", "N", "prompt rows that read the missing experts once", opts.prefill_group)
+            .option("--expert-counts", "FILE", "the routing profile to start from", opts.expert_counts)
+            .option("--save-counts", "FILE", "write the run's routing counts", save_counts)
+            .flag("--learn", "add the run's routing counts to the model's profile", learn)
+            .option("--ref", "DIR", "compare against a reference dump", ref_dir)
+            .option("--dump", "DIR", "dump intermediate values", dump_dir)
+            .option("--logits-out", "DIR", "write the logits", logits_dir)
+            .option("--force", "DIR", "force the reference's tokens", force_dir)
+            .option("--force-route", "DIR", "force the reference's routing", route_dir)
+            .flag("--mtp-stats", "measure the MTP block's draft acceptance", mtp_stats)
+            .option("--stats", "summary|steps|layers|kernels", "telemetry",
+                    [&](const std::string& v) {
+                        const auto t = mako::core::parse_telemetry(v);
+                        if (!t)
+                            throw std::invalid_argument("takes summary, steps, layers or kernels");
+                        opts.telemetry = *t;
+                    })
+            .option("--stats-out", "FILE", "write the telemetry", stats_out)
+            .option("--ablate", "FILE", "remove per-layer directions (an ablation file)", ablate)
+            .option("--ablate-scale", "S", "multiply the ablation's strength", ablate_scale)
+            .parse(argc, argv);
+    const bool use_session = spec || sampling;
     if (!dump_dir.empty())
         std::filesystem::create_directories(dump_dir);
     if (!logits_dir.empty())
         std::filesystem::create_directories(logits_dir);
-    auto model = mako::gguf::ModelFiles::open(argv[1]);
+    auto model = mako::gguf::ModelFiles::open(args[0]);
     if (!model) {
         std::println(stderr, "{}", model.error());
         return 1;
@@ -235,7 +180,7 @@ int main(int argc, char** argv)
         std::println(stderr, "{}", tok.error());
         return 1;
     }
-    const std::string input = argv[2];
+    const std::string input = args[1];
     auto ids = input.starts_with('@') ? tok->encode(std::string_view(input).substr(1), true) : parse_ids(input);
     if (ids.empty()) {
         std::println(stderr, "no input tokens");
