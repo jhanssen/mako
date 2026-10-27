@@ -53,6 +53,22 @@ again does not encode it again, and its prompt prefix is reused only up to an im
 rows (encoding and prefill grow with the rows, GLM's encoder faster than linearly: its 3200x2400 at the default
 8000 takes ~18 s, at 2048 ~4 s).
 
+Context an image takes (rows; GLM keeps the image's own resolution up to its limit, DeepSeek scales it into its
+block):
+
+| Image | GLM-5.3 | DeepSeek-V4.1 |
+| --- | ---: | ---: |
+| 3200x2400 | ~7900 (at most 8000) | ~1000 |
+| 2000x2000 | ~5200 | ~1000 |
+| 1920x1080 | ~2700 | ~1000 |
+| 1024x1024 | 1369 | 652 |
+| 512x512 | ~350 | ~200 |
+
+The log gives each new image's rows (`image 1036x1036: 1369 rows in 572 ms`) and each request's prompt
+(`prompt 1395 tokens (1380 reused)`). A new image costs its encoding (~0.3 s at 1024x1024, ~3 s for GLM at
+2000x2000) plus the prefill of its rows (GLM ~570 rows/s; DeepSeek ~100/s on a short prompt, its missing experts
+read from the SSD); later turns reuse it.
+
 ## Thinking
 
 At startup the server renders the chat template to see what it does with the thinking controls and logs it
@@ -93,3 +109,6 @@ A cut in the middle of a calculation can leave the answer wrong.
 pi: a provider in `~/.pi/agent/models.json` with `"api": "openai-completions"`, `"baseUrl":
 "http://127.0.0.1:8080/v1"`, `"reasoning": true` and `"compat": {"supportsMidConvoSystemMessages": true}` (a changed
 system prompt is then appended instead of rewriting the prompt's start, which would re-read the whole context).
+With `--mmproj`, `"input": ["text", "image"]` on the model lets pi send images (attachments and `read` results),
+resized to at most 2000x2000 JPEG; `"inputLimits": {"images": {"resize": {"maxWidth": 1344, "maxHeight": 1344}}}`
+keeps a GLM image to ~2300 rows.
