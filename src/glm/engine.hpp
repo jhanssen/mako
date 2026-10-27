@@ -82,6 +82,7 @@ public:
     // Runs tokens at the next positions, as many steps would, faster; returns the logits after the last.
     // `cancelled` is polled between groups of tokens (Options::prefill_group): true stops there, with the tokens so
     // far in the context (position() tells how many) and the logits after the last of them.
+    void set_input_rows(std::span<const gen::InputRows> rows) override { input_rows_.assign(rows.begin(), rows.end()); }
     const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {}) override;
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
     using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;

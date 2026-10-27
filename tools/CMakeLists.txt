@@ -37,3 +37,6 @@ target_link_libraries(ds_run PRIVATE mako_dsv41 mako_gen mako_app)
 
 add_executable(vision_run vision_run.cpp)
 target_link_libraries(vision_run PRIVATE mako_vision mako_mtl)
+
+add_executable(vision_chat vision_chat.cpp)
+target_link_libraries(vision_chat PRIVATE mako_vision mako_glm mako_dsv41 mako_text mako_chat mako_gen)

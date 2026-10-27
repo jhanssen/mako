@@ -68,8 +68,9 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
   same rows in the reference's CPU-vs-GPU comparison as in mako's (layer 23: 4.34 vs 4.37 on row 1934). No
   automated encoder test yet (the reference rows are large); `vision_run --probe` and `ref_vision` with
   `REF_VISION_DUMP` compare stage by stage.
-- Text: GLM logits after an image prompt against the reference (it runs GLM on the CPU); answers about known
-  images for both.
+- Text: answers about a known image (the Sonoma wallpaper) are right for both models, through `vision_chat` and the
+  server (colours, no text in it, the shapes). Not done yet: GLM logits after an image prompt against the reference
+  (which can run GLM on the CPU).
 
 ## Milestones
 
@@ -78,5 +79,9 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
 2. Encoder on Metal for both projector types, compared stage by stage. Done: `src/vision/encoder`,
    `src/kernels/vision.metal` (attention as per-head score GEMMs, a masked softmax and value GEMMs, in query
    chunks); 1024x1024: 0.66 s (DeepSeek), 0.55 s (GLM) on an M5 Max.
-3. Prefill with image rows, Session keys, Engram masking; `mako_run`/`ds_run` take an image.
-4. Server API.
+3. Prefill with image rows, Session keys, Engram masking. Done: `gen::Model::set_input_rows`, the engines' token
+   rows (`EngineBase::embed`), `GenerateParams::input_rows` (keys; a checkpoint at the end of the prompt's last
+   image, so another question about it reuses the prefix: 1380 of 1396 tokens with GLM, its prefill 2.4 -> 0.19 s),
+   `vision::expand_images`, `tools/vision_chat`.
+4. Server API. Done: `--mmproj`, OpenAI `image_url` (data: URLs) and Anthropic `image` blocks (user messages and
+   tool results), the last 8 encoded images cached (docs/server.md).

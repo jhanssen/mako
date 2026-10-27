@@ -896,15 +896,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     scratch("R", rows * hd * 4);
     scratch("R2", rows * hd * 4);
 
-    {
-        const gguf::Tensor& t = *token_embd_.tensor;
-        const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
-        std::vector<std::byte> row(rb);
-        for (uint32_t i = 0; i < T; ++i) {
-            gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[i]) * rb);
-            quant::dequant_row(t.type, row.data(), static_cast<float*>(x->contents()) + uint64_t(i) * E, E);
-        }
-    }
+    embed(token_embd_, tokens.first(T), pos_, static_cast<float*>(x->contents()));
 
     if (probe_)
         probe_("inp_embd", -1, static_cast<const float*>(x->contents()), E);
@@ -1273,25 +1265,12 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
         MTL::Buffer* att = scratch("p_att", uint64_t(std::min(chunk, G)) * E * 4);
         MTL::Buffer* pc = scratch("p_pc", uint64_t(std::min(chunk, G)) * 24 * 4);
 
-        {
-            const gguf::Tensor& t = *token_embd_.tensor;
-            const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
-            std::vector<std::byte> row(rb);
-            for (uint32_t i = 0; i < G; ++i) {
-                gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i]) * rb);
-                quant::dequant_row(t.type, row.data(), static_cast<float*>(xg_in->contents()) + uint64_t(i) * E, E);
-            }
-            // The next-token block's inputs: each position's following prompt token (written before any of the
-            // group's GPU work, which reads them).
-            if (has_mtp())
-                for (uint32_t i = 0; i < G && g0 + i + 1 < tokens.size(); ++i) {
-                    gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[g0 + i + 1]) * rb);
-                    quant::dequant_row(t.type, row.data(),
-                                       static_cast<float*>(scratch("mf_e", uint64_t(group) * E * 4)->contents()) +
-                                           uint64_t(i) * E,
-                                       E);
-                }
-        }
+        embed(token_embd_, tokens.subspan(g0, G), pos_ + uint32_t(g0), static_cast<float*>(xg_in->contents()));
+        // The next-token block's inputs: each position's following prompt token (written before any of the group's
+        // GPU work, which reads them).
+        if (has_mtp() && g0 + 1 < tokens.size())
+            embed(token_embd_, tokens.subspan(g0 + 1, std::min<size_t>(G, tokens.size() - g0 - 1)),
+                  pos_ + uint32_t(g0) + 1, static_cast<float*>(scratch("mf_e", uint64_t(group) * E * 4)->contents()));
 
         begin_staging(G);
         struct StagingEnd {

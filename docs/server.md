@@ -40,6 +40,17 @@ reverse proxy with TLS) rather than exposing the port. Not meant for the open in
 - Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, any `ANTHROPIC_API_KEY` (its first request is a ~11K-token
   prompt).
 
+## Images
+
+`--mmproj FILE` loads the model's vision projector (docs/vision.md): DeepSeek-V4.1's
+`mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf`, GLM-5.3's `mmproj-BF16.gguf`; ~1 GB, loaded before the expert cache is
+sized. Images come as OpenAI `image_url` parts with a `data:` URL (base64) or Anthropic `image` blocks with base64
+data (in user messages and in `tool_result` content); URLs are not fetched. PNG, JPEG and the other formats ImageIO
+reads. Each image becomes its rows in the prompt (652 for a 1024x1024 image with DeepSeek, 1369 with GLM; DeepSeek
+at most 1024, GLM at most 8000); the last 8 encoded images are kept, so a conversation that sends the same image
+again does not encode it again, and its prompt prefix is reused only up to an image that differs. Without
+`--mmproj` a request with an image gets HTTP 400.
+
 ## Thinking
 
 At startup the server renders the chat template to see what it does with the thinking controls and logs it

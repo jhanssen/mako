@@ -15,10 +15,28 @@ double ms_since(std::chrono::steady_clock::time_point t)
 
 } // namespace
 
+uint64_t Session::key_at(size_t i) const
+{
+    for (const auto& k : keys_)
+        if (i >= k.rows.pos && i - k.rows.pos < k.rows.count)
+            return k.key;
+    return 0;
+}
+
+void Session::cut_keys(size_t n)
+{
+    std::erase_if(keys_, [&](const auto& k) { return k.rows.pos >= n; });
+    for (auto& k : keys_) {
+        k.rows.count = uint32_t(std::min<size_t>(k.rows.count, n - k.rows.pos));
+        k.rows.rows = nullptr;
+    }
+}
+
 void Session::clear()
 {
     e_.reset();
     ctx_.clear();
+    keys_.clear();
     saved_.clear();
     mtp_next_ = -1;
 }
@@ -42,6 +60,7 @@ void Session::rewind(size_t keep)
         e_.reset();
     }
     ctx_.resize(e_.position());
+    cut_keys(ctx_.size());
     // Checkpoints past the divergence would describe tokens that are about to be overwritten.
     std::erase_if(saved_, [&](const Saved& s) { return s.cp.pos > keep; });
     mtp_next_ = -1;
@@ -78,38 +97,79 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     GenerateResult res;
     res.prompt_tokens = uint32_t(prompt.size());
 
+    // The prompt's input-row spans, the keys its positions are compared by.
+    const auto prompt_key = [&](size_t i) -> uint64_t {
+        for (const auto& r : p.input_rows)
+            if (i >= r.rows.pos && i - r.rows.pos < r.rows.count)
+                return r.key;
+        return 0;
+    };
+    const auto keep_keys = [&](size_t n) {
+        keys_ = p.input_rows;
+        cut_keys(n);
+    };
     // At least the prompt's last token runs, for its logits.
     const size_t limit = prompt.size() - 1;
     size_t common = 0;
-    while (common < std::min(limit, ctx_.size()) && ctx_[common] == prompt[common])
+    while (common < std::min(limit, ctx_.size()) && ctx_[common] == prompt[common] &&
+           key_at(common) == prompt_key(common))
         ++common;
     rewind(common);
     res.reused_tokens = uint32_t(ctx_.size());
+    // The engine reads the rows only while the prompt runs.
+    std::vector<InputRows> rows;
+    for (const auto& r : p.input_rows)
+        rows.push_back(r.rows);
+    e_.set_input_rows(rows);
+    struct Unset {
+        Model& e;
+        ~Unset() { e.set_input_rows({}); }
+    } unset{e_};
 
     const auto t_prefill = std::chrono::steady_clock::now();
     const auto rest = prompt.subspan(ctx_.size());
     if (!ctx_.empty() && mtp_next_ != rest[0])
         e_.mtp_seed(rest[0]);
-    // The checkpoint is taken before the prompt's last token, so that the same prompt again (reuse stops short of
-    // its end) or one continuing differently right after it restores it.
-    if (rest.size() > 1) {
-        e_.prefill(rest.first(rest.size() - 1), p.cancelled);
-        if (const size_t read = e_.position(); read < prompt.size() - 1) {
-            // The next-token block's cache already holds the last position read with the prompt's next token.
-            ctx_.assign(prompt.begin(), prompt.begin() + read);
-            mtp_next_ = e_.has_mtp() ? prompt[read] : -1;
-            res.finish = Finish::cancelled;
-            res.prefill_ms = ms_since(t_prefill);
-            return res;
+    // Runs the prompt up to `end` (exclusive) and records it; false when cancelled there (the result says so).
+    const auto run_to = [&](size_t end) {
+        if (end <= ctx_.size())
+            return true;
+        e_.prefill(prompt.subspan(ctx_.size(), end - ctx_.size()), p.cancelled);
+        const size_t read = e_.position();
+        ctx_.assign(prompt.begin(), prompt.begin() + read);
+        keep_keys(read);
+        if (read == end) {
+            // The next-token block learns the token after the part (within it, prefill gave it each next token).
+            if (e_.has_mtp())
+                e_.mtp_seed(prompt[read]);
+            return true;
         }
-        if (e_.has_mtp())
-            e_.mtp_seed(prompt.back());
+        // The next-token block's cache already holds the last position read with the prompt's next token.
+        mtp_next_ = e_.has_mtp() ? prompt[read] : -1;
+        res.finish = Finish::cancelled;
+        res.prefill_ms = ms_since(t_prefill);
+        return false;
+    };
+    // A checkpoint at the end of the last image, for other questions about it, and one before the prompt's last
+    // token, so that the same prompt again (reuse stops short of its end) or one continuing differently right after
+    // it restores it.
+    size_t image_end = 0;
+    for (const auto& r : p.input_rows)
+        image_end = std::max<size_t>(image_end, r.rows.pos + r.rows.count);
+    if (image_end > ctx_.size() && image_end < prompt.size() - 1) {
+        if (!run_to(image_end))
+            return res;
+        save_checkpoint();
     }
+    if (!run_to(prompt.size() - 1))
+        return res;
     ctx_.assign(prompt.begin(), prompt.end() - 1);
+    keep_keys(prompt.size());
     if (!ctx_.empty())
         save_checkpoint();
     const std::vector<float>& lp = e_.step(prompt.back());
     ctx_.push_back(prompt.back());
+    e_.set_input_rows({});
     res.prefill_ms = ms_since(t_prefill);
 
     const auto t_decode = std::chrono::steady_clock::now();

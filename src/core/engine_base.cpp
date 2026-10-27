@@ -1025,6 +1025,33 @@ void EngineBase::submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& en
     enc = encoder(cb, cur_layer_, -1);
 }
 
+bool EngineBase::input_at(uint32_t pos) const
+{
+    return std::ranges::any_of(input_rows_, [&](const gen::InputRows& r) { return pos >= r.pos && pos - r.pos < r.count; });
+}
+
+void EngineBase::embed(const gguf::ModelFiles::Ref& token_embd, std::span<const int32_t> tokens, uint32_t pos0,
+                       float* dst) const
+{
+    const gguf::Tensor& t = *token_embd.tensor;
+    const uint32_t E = dims_.n_embd;
+    const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
+    std::vector<std::byte> row(rb);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        float* out = dst + i * E;
+        const uint32_t pos = pos0 + uint32_t(i);
+        const auto r = std::ranges::find_if(input_rows_, [&](const gen::InputRows& r) {
+            return pos >= r.pos && pos - r.pos < r.count;
+        });
+        if (r != input_rows_.end()) {
+            std::memcpy(out, r->rows + uint64_t(pos - r->pos) * E, uint64_t(E) * 4);
+            continue;
+        }
+        gguf::read_exact(token_embd.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[i]) * rb);
+        quant::dequant_row(t.type, row.data(), out, E);
+    }
+}
+
 void EngineBase::probe(MTL::ComputeCommandEncoder*& enc, const std::string& name, int layer, MTL::Buffer* buf,
                        size_t n, uint64_t off)
 {

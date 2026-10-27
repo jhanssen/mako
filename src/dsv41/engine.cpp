@@ -852,9 +852,14 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
     MTL::Buffer* eg = scratch("ds_eg", eg_rows * eg_dim * 4);
     {
         std::vector<int64_t> rows(eg_rows);
-        engram_->hash(tokens, engram_history_, rows);
+        // Positions taking input rows (an image) have no Engram rows, and n-grams reaching back to them are cut there.
+        std::vector<int32_t> hashed(tokens.begin(), tokens.end());
+        for (uint32_t i = 0; i < hashed.size(); ++i)
+            if (input_at(pos_ + i))
+                hashed[i] = -1;
+        engram_->hash(hashed, engram_history_, rows);
         engram_->read_raw(rows, static_cast<uint8_t*>(eg_raw->contents()), *engram_pool_);
-        engram_history_ = engram_->advance(engram_history_, tokens);
+        engram_history_ = engram_->advance(engram_history_, hashed);
     }
 
     MTL::Buffer* xg = scratch("ds_xg", uint64_t(G) * E * 4);
@@ -873,13 +878,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
         std::fill_n(p0, uint64_t(G) * 24, 0.0f);
         for (uint32_t t = 0; t < G; ++t)
             p0[t * 24] = 1.0f; // the first sublayer's input is stream 0
-        const gguf::Tensor& t = *token_embd_.tensor;
-        const uint64_t rb = gguf::traits(t.type).block_bytes * (t.dims[0] / gguf::traits(t.type).block_elems);
-        std::vector<std::byte> row(rb);
-        for (uint32_t i = 0; i < G; ++i) {
-            gguf::read_exact(token_embd_.file->fd(), row.data(), rb, t.offset + uint64_t(tokens[i]) * rb);
-            quant::dequant_row(t.type, row.data(), static_cast<float*>(xg->contents()) + uint64_t(i) * E, E);
-        }
+        embed(token_embd_, tokens.first(G), pos_, static_cast<float*>(xg->contents()));
     }
 
     const double prep_ms = ms_since(step_start_);

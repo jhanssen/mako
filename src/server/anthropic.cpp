@@ -15,11 +15,16 @@ struct Block {
     std::string type;
     std::optional<std::string> text, thinking, signature, id, name, tool_use_id;
     std::optional<glz::raw_json> input, content; // tool_use input; tool_result content (text or text blocks)
+    std::optional<glz::raw_json> source;         // image: {type: base64, media_type, data} or {type: url, url}
     std::optional<bool> is_error;
 };
 struct MessageIn {
     std::string role;
     glz::raw_json content{"\"\""}; // text or blocks
+};
+struct ImageSource {
+    std::string type;
+    std::optional<std::string> data, url;
 };
 struct ToolIn {
     std::optional<std::string> type, description;
@@ -113,6 +118,44 @@ namespace {
 using namespace wire_anthropic;
 using json::trim;
 
+// An image block's file bytes.
+std::string image_bytes(const Block& b)
+{
+    if (!b.source)
+        throw BadRequest("an image block needs a source");
+    ImageSource s;
+    if (glz::read<glz::opts{.error_on_unknown_keys = false}>(s, trim(b.source->str)))
+        throw BadRequest("an image source must be an object");
+    if (s.type == "base64" && s.data)
+        return base64_decode(*s.data);
+    if (s.type == "url" && s.url)
+        return image_from_url(*s.url);
+    throw BadRequest("image sources are base64 data or data: URLs");
+}
+
+// Template content for blocks with images among them: an array of text and image parts in order, the images'
+// bytes appended to `images`.
+std::string parts_with_images(std::span<const Block> blocks, std::vector<std::string>& images)
+{
+    std::string out = "[";
+    for (const Block& b : blocks) {
+        if (b.type == "text" && b.text) {
+            out += std::format(R"({}{{"type":"text","text":{}}})", out.size() > 1 ? "," : "", json::quoted(*b.text));
+        } else if (b.type == "image") {
+            images.push_back(image_bytes(b));
+            out += std::format(R"({}{{"type":"image"}})", out.size() > 1 ? "," : "");
+        } else if (b.type == "document") {
+            throw BadRequest("document blocks are not supported");
+        }
+    }
+    return out + "]";
+}
+
+bool has_image(std::span<const Block> blocks)
+{
+    return std::ranges::any_of(blocks, [](const Block& b) { return b.type == "image"; });
+}
+
 // The text of a string or of an array of text blocks.
 std::string text_of(std::string_view raw, const char* what)
 {
@@ -165,6 +208,7 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
         throw BadRequest("max_tokens is required");
 
     TemplateContext ctx;
+    std::vector<std::string> images;
     if (b.system) {
         if (std::string s = text_of(b.system->str, "system"); !s.empty())
             ctx.messages.push_back({.role = "system", .content = {json::quoted(s)}});
@@ -188,23 +232,40 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
         if (m.role == "user") {
             // Tool results become tool messages (after the call), the text a user message after them.
             std::string text;
+            std::vector<Block> parts; // the user's own blocks, when they hold images
+            const bool user_images = has_image(blocks);
             for (const auto& bl : blocks) {
                 if (bl.type == "tool_result") {
                     if (!bl.tool_use_id)
                         throw BadRequest("tool_result needs tool_use_id");
-                    std::string out = bl.content ? text_of(bl.content->str, "tool_result content") : "";
-                    if (bl.is_error.value_or(false))
-                        out = "Error: " + out;
-                    ctx.messages.push_back({.role = "tool", .content = {json::quoted(out)}, .tool_call_id = *bl.tool_use_id});
+                    const std::string_view inner_raw = bl.content ? trim(bl.content->str) : std::string_view();
+                    std::vector<Block> inner;
+                    std::string content;
+                    if (!inner_raw.empty() && inner_raw.front() == '[' &&
+                        !glz::read<glz::opts{.error_on_unknown_keys = false}>(inner, inner_raw) && has_image(inner)) {
+                        if (bl.is_error.value_or(false))
+                            inner.insert(inner.begin(), Block{.type = "text", .text = "Error:"});
+                        content = parts_with_images(inner, images);
+                    } else {
+                        std::string out = bl.content ? text_of(bl.content->str, "tool_result content") : "";
+                        if (bl.is_error.value_or(false))
+                            out = "Error: " + out;
+                        content = json::quoted(out);
+                    }
+                    ctx.messages.push_back({.role = "tool", .content = {content}, .tool_call_id = *bl.tool_use_id});
+                } else if (user_images && (bl.type == "text" || bl.type == "image")) {
+                    parts.push_back(bl);
                 } else if (bl.type == "text" && bl.text) {
                     if (!text.empty())
                         text += "\n";
                     text += *bl.text;
-                } else if (bl.type == "image" || bl.type == "document") {
-                    throw BadRequest(std::format("{} blocks are not supported", bl.type));
+                } else if (bl.type == "document") {
+                    throw BadRequest("document blocks are not supported");
                 }
             }
-            if (!text.empty() || std::ranges::none_of(blocks, [](const Block& x) { return x.type == "tool_result"; }))
+            if (user_images)
+                ctx.messages.push_back({.role = "user", .content = {parts_with_images(parts, images)}});
+            else if (!text.empty() || std::ranges::none_of(blocks, [](const Block& x) { return x.type == "tool_result"; }))
                 ctx.messages.push_back({.role = "user", .content = {json::quoted(text)}});
         } else {
             TMessage a{.role = "assistant"};
@@ -233,6 +294,7 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
     }
 
     ChatRequest r;
+    r.images = std::move(images);
     bool use_tools = b.tools && !b.tools->empty();
     if (b.tool_choice) {
         const auto& c = *b.tool_choice;

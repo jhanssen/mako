@@ -19,6 +19,13 @@ struct GenerateParams {
     // Polled while the prompt is read (between groups of tokens): true stops (Finish::cancelled, no tokens), keeping
     // the part read so far in the context.
     std::function<bool()> cancelled;
+    // Prompt positions whose embeddings come from rows (images), each span with a key for its content: a prefix the
+    // context holds is reused only where its keys match too. The rows must outlive generate().
+    struct PromptRows {
+        InputRows rows;
+        uint64_t key = 0;
+    };
+    std::vector<PromptRows> input_rows;
     // Asked before each token is chosen (after the previous one reached on_token), with that position's logits
     // (n_vocab): a token >= 0 is taken instead of sampling, and a draft is kept only if it matches. -1: sample.
     std::function<int32_t(const float* logits)> forced;
@@ -61,10 +68,15 @@ private:
                        const std::function<bool(int32_t)>& on_token);
     void rewind(size_t keep);
     void save_checkpoint();
+    // The key of ctx_[i]: its span's in keys_, else 0.
+    uint64_t key_at(size_t i) const;
+    // Keys only of positions before n.
+    void cut_keys(size_t n);
 
     Model& e_;
     size_t max_checkpoints_;
     std::vector<int32_t> ctx_;
+    std::vector<GenerateParams::PromptRows> keys_; // the input-row spans within ctx_ (their rows are not kept)
     std::vector<Saved> saved_;
     uint64_t clock_ = 0;
     int32_t mtp_next_ = -1; // the token the next-token block's cache assumes after ctx_.back(); -1: none

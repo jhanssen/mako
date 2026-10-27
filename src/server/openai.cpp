@@ -169,6 +169,83 @@ void parse_arguments(glz::raw_json& args)
 
 } // namespace
 
+std::string base64_decode(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size() / 4 * 3);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char c : s) {
+        int v;
+        if (c >= 'A' && c <= 'Z')
+            v = c - 'A';
+        else if (c >= 'a' && c <= 'z')
+            v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9')
+            v = c - '0' + 52;
+        else if (c == '+' || c == '-')
+            v = 62;
+        else if (c == '/' || c == '_')
+            v = 63;
+        else if (c == '=' || is_space(c))
+            continue;
+        else
+            throw BadRequest("image data is not valid base64");
+        acc = (acc << 6) | uint32_t(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(char((acc >> bits) & 0xff));
+        }
+    }
+    return out;
+}
+
+std::string image_from_url(std::string_view url)
+{
+    url = trim(url);
+    if (!url.starts_with("data:"))
+        throw BadRequest("image URLs are not fetched: send the image as a data: URL (base64)");
+    const size_t comma = url.find(',');
+    if (comma == std::string_view::npos || url.substr(0, comma).find(";base64") == std::string_view::npos)
+        throw BadRequest("an image data: URL must be base64 encoded");
+    return base64_decode(url.substr(comma + 1));
+}
+
+// Image parts of a message's content (an array): their bytes appended to `images` and each part replaced by
+// {"type": "image"}, which the template renders as the placeholder. Content without image parts is unchanged.
+void take_images(glz::raw_json& content, std::vector<std::string>& images)
+{
+    const std::string_view raw = trim(content.str);
+    if (raw.empty() || raw.front() != '[' || raw.find("image") == std::string_view::npos)
+        return;
+    glz::generic parts;
+    if (glz::read_json(parts, raw) || !parts.is_array())
+        throw BadRequest("message content must be text or an array of parts");
+    bool any = false;
+    for (auto& part : parts.get_array()) {
+        if (!part.is_object() || !part.contains("type") || !part["type"].is_string())
+            continue;
+        const std::string type = part["type"].get_string();
+        if (type != "image_url" && type != "image")
+            continue;
+        if (type == "image_url") {
+            const auto& u = part.contains("image_url") ? part["image_url"] : glz::generic{};
+            const auto* url = u.is_string() ? &u : u.is_object() && u.contains("url") ? &u["url"] : nullptr;
+            if (!url || !url->is_string())
+                throw BadRequest("an image_url part needs a url");
+            images.push_back(image_from_url(url->get_string()));
+        } else {
+            throw BadRequest("image parts are sent as image_url parts");
+        }
+        part = glz::generic{};
+        part["type"] = "image";
+        any = true;
+    }
+    if (any)
+        content.str = glz::write_json(parts).value_or("[]");
+}
+
 Effort parse_effort(std::string_view text)
 {
     int64_t n = 0;
@@ -240,6 +317,7 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
     if (b.messages.empty())
         throw BadRequest("messages must be a non-empty array");
 
+    std::vector<std::string> r_images;
     TemplateContext ctx;
     for (auto& m : b.messages) {
         if (m.role == "developer")
@@ -248,6 +326,7 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
             throw BadRequest(std::format("unsupported role '{}'", m.role));
         if (!m.content || trim(m.content->str) == "null")
             m.content = glz::raw_json{"\"\""};
+        take_images(*m.content, r_images);
         if (!m.reasoning_content && m.reasoning)
             m.reasoning_content = std::move(m.reasoning);
         m.reasoning.reset();
@@ -264,6 +343,7 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
     ctx.messages = std::move(b.messages);
 
     ChatRequest r;
+    r.images = std::move(r_images);
     bool use_tools = b.tools.has_value();
     if (use_tools) {
         const std::string_view t = trim(b.tools->str);

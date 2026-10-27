@@ -29,6 +29,8 @@ public:
         std::vector<float> embd;
     };
     Output encode(const Prepared& img);
+    // The rows encode() gives for an image prepared for this projector.
+    static uint32_t rows_for(const Mmproj& mm, const Prepared& img);
 
     // Called with each stage's output once the encode completes (patch_bias, layer_out-N, vit_out, merged,
     // projected), as fp32 rows.

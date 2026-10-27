@@ -38,7 +38,14 @@ struct ChatRequest {
     bool reasoning_first = true; // the rendered prompt opened the reasoning (ends in <think>)
     std::optional<uint32_t> reasoning_budget; // the request's (0: none); unset: the server's
     bool max_tokens_given = false;            // the client capped the reply
+    // The images of image parts, as file bytes, in the order the template renders their placeholders.
+    std::vector<std::string> images;
 };
+
+// The bytes of an image sent as a data: URL (base64); throws BadRequest for anything else (images are not fetched).
+std::string image_from_url(std::string_view url);
+// Throws BadRequest on characters outside the base64 alphabet.
+std::string base64_decode(std::string_view s);
 
 // A reasoning effort: a level name, or a number for templates that take one (1..100; 0 as "none").
 using Effort = std::variant<std::string, int64_t>;

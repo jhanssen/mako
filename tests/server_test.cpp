@@ -89,6 +89,44 @@ std::pair<Parsed, Parsed> parse(const mako::text::Tokenizer& tok, const std::str
 // DeepSeek-V4.1's markup: reasoning only when the prompt opened it, DSML tool calls.
 // ReasoningBudget with synthetic logits: nothing forced before the last stretch; there, </think> only when it is among
 // the three likeliest; at the budget the closing sentence and </think>, in order.
+// Image parts: OpenAI data: URLs and Anthropic base64 blocks (user messages and tool results) leave their bytes in
+// ChatRequest::images, in rendering order, and an image part in the template content.
+void image_checks()
+{
+    using mako::server::BadRequest;
+    check(mako::server::base64_decode("aGVsbG8gd29ybGQ=") == "hello world" &&
+              mako::server::base64_decode("aGVs\nbG8") == "hello",
+          "base64 decoding");
+    check(mako::server::image_from_url("data:image/png;base64,QUJD") == "ABC", "data: URL");
+    bool threw = false;
+    try {
+        mako::server::image_from_url("https://example.com/a.png");
+    } catch (const BadRequest&) {
+        threw = true;
+    }
+    check(threw, "image URLs are not fetched");
+    const auto oa = mako::server::parse_chat_request(
+        R"({"messages":[{"role":"user","content":[{"type":"text","text":"what is it"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]},
+        {"role":"assistant","content":"a cat"},
+        {"role":"user","content":[{"type":"image_url","image_url":"data:image/jpeg;base64,REVG"}]}]})",
+        {});
+    check(oa.images == std::vector<std::string>{"ABC", "DEF"}, "OpenAI image parts, in order");
+    check(!oa.context.contains("base64") && oa.context.contains(R"("type":"image")"),
+          "OpenAI image parts become image parts without their data");
+    const auto an = mako::server::parse_messages_request(
+        R"({"max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"look"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.png"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a.png"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"REVG"}}]},
+        {"type":"text","text":"and this?"}]}]})",
+        {});
+    check(an.images == std::vector<std::string>{"ABC", "DEF"}, "Anthropic image blocks (user, tool result), in order");
+    check(!an.context.contains("QUJD") && an.context.contains(R"("type":"image")"),
+          "Anthropic image blocks become image parts without their data");
+}
+
 void budget_checks(const mako::text::Tokenizer& tok)
 {
     const int32_t end = tok.find("</think>"), filler = tok.encode("a", false).front();
@@ -534,6 +572,7 @@ int main(int argc, char** argv)
     check(cut.reasoning == "unfinished reasoning" && cut.content.empty(), "reasoning cut off");
 
     budget_checks(*tok);
+    image_checks();
     // Thinking controls: this template knows low and high only and always reasons.
     {
         using mako::server::BadRequest;

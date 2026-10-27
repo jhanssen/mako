@@ -214,6 +214,15 @@ void Encoder::sync(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, st
     enc = cb->computeCommandEncoder();
 }
 
+uint32_t Encoder::rows_for(const Mmproj& mm, const Prepared& img)
+{
+    const uint32_t p = mm.prep.patch, m = mm.prep.merge, px = img.width / p, py = img.height / p;
+    if (mm.prep.kind == Projector::glm5v)
+        return (px / 2) * (py / 2);
+    const uint32_t cx = (px + m - 1) / m, cy = (py + m - 1) / m;
+    return cy * (cx + 1) + 2;
+}
+
 Encoder::Output Encoder::encode(const Prepared& img)
 {
     const bool glm = mm_.prep.kind == Projector::glm5v;

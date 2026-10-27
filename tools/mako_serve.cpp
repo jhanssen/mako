@@ -3,6 +3,7 @@
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
+//              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -19,7 +20,8 @@
 // ds_run --imatrix-out weighting its rounding). --prefetch K (default 4; 0: off) reads the top K experts that layer
 // l + D's router (--prefetch-ahead, default 2) predicts from layer l's input ahead (results unchanged).
 // --prefill-skip 0 runs every prompt row through every layer (default 1: a long prompt's earlier rows skip the layers
-// after the last KV source, which only the last few thousand rows need; results unchanged).
+// after the last KV source, which only the last few thousand rows need; results unchanged). --mmproj: the model's
+// vision projector, for images in requests (docs/vision.md).
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "core/log.hpp"
@@ -68,7 +70,7 @@ int main(int argc, char** argv)
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
                              "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
-                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N]");
+                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -97,7 +99,7 @@ int main(int argc, char** argv)
     };
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1;
-    std::string ablate, engram, dspark, imatrix;
+    std::string ablate, engram, dspark, imatrix, mmproj_path;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
     bool prefill_skip = true;
@@ -168,6 +170,8 @@ int main(int argc, char** argv)
             so.reasoning_effort = mako::server::parse_effort(v);
         else if (a == "--reasoning-budget")
             so.reasoning_budget = uint32_t(std::stoul(v));
+        else if (a == "--mmproj")
+            mmproj_path = v;
         else if (a == "--api-key")
             add_keys(v, ',');
         else if (a == "--api-key-file") {
@@ -255,6 +259,30 @@ int main(int argc, char** argv)
                         model->files().size(), bytes / 1e9);
     }
     mako::mtl::Context ctx;
+    // The vision projector goes first: its weights then count against what the expert cache may take.
+    std::optional<mako::vision::Mmproj> mmproj;
+    std::unique_ptr<mako::vision::Encoder> vision;
+    if (!mmproj_path.empty()) {
+        auto m = mako::vision::open_mmproj(mmproj_path);
+        if (!m) {
+            mako::log::error("{}", m.error());
+            return 1;
+        }
+        if ((m->prep.kind == mako::vision::Projector::deepseek41v) != deepseek) {
+            mako::log::error("{} is a projector for the other model", mmproj_path);
+            return 1;
+        }
+        mmproj.emplace(std::move(*m));
+        try {
+            vision = std::make_unique<mako::vision::Encoder>(ctx, *mmproj);
+        } catch (const std::exception& e) {
+            mako::log::error("{}", e.what());
+            return 1;
+        }
+        so.mmproj = &*mmproj;
+        so.vision = vision.get();
+        mako::log::info("vision projector {}: {} blocks, rows of {}", mmproj_path, mmproj->n_layer, mmproj->out_embd);
+    }
     std::unique_ptr<mako::glm::Engine> glm_engine;
     std::unique_ptr<mako::dsv41::Engine> ds_engine;
     mako::gen::Model* model_if = nullptr;
@@ -307,6 +335,10 @@ int main(int argc, char** argv)
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
             sites = mako::glm::Engine::kAblationSites;
             set_ablation = [&](mako::mtl::Ablation a) { glm_engine->set_ablation(std::move(a)); };
+        }
+        if (mmproj && mmproj->out_embd != n_embd) {
+            mako::log::error("the projector's rows are {} wide; the model's embeddings {}", mmproj->out_embd, n_embd);
+            return 1;
         }
         if (!ablate.empty()) {
             auto a = mako::mtl::Ablation::load(ablate, ctx, n_embd, n_layer, sites);

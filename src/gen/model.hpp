@@ -9,10 +9,25 @@
 
 namespace mako::gen {
 
+// Rows that stand in for tokens' embeddings (an image's encoder output): sequence position pos + i takes
+// rows[i * width, (i + 1) * width), width the model's embedding width.
+struct InputRows {
+    uint32_t pos = 0, count = 0;
+    const float* rows = nullptr;
+};
+
 // What a Session needs of an engine: tokens in, logits out, and the state to keep or go back to.
 class Model {
 public:
     virtual ~Model() = default;
+
+    // Positions that take these rows instead of their tokens' embeddings in the prefills and steps that follow,
+    // until replaced (empty: none). The rows must outlive their use. Engines without such input throw.
+    virtual void set_input_rows(std::span<const InputRows> rows)
+    {
+        if (!rows.empty())
+            throw std::runtime_error("this engine takes no input rows");
+    }
 
     // Runs one token at the next position and returns its logits.
     virtual const std::vector<float>& step(int32_t token) = 0;

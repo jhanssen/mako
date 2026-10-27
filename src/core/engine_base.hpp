@@ -4,6 +4,7 @@
 #include "core/profile.hpp"
 #include "core/stager.hpp"
 #include "core/telemetry.hpp"
+#include "gen/model.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemm.hpp"
@@ -239,6 +240,11 @@ protected:
     // Commits what cb holds, so the GPU starts on it while the rest of the step is encoded into a new command
     // buffer (finish() accounts for both). Not while a MoE layer waits for the CPU: finish() serves those.
     void commit_ahead(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
+    // dst[i] = the embedding of tokens[i] at sequence position pos0 + i (E floats each): its input row when one
+    // stands there, else its row of token_embd.
+    void embed(const gguf::ModelFiles::Ref& token_embd, std::span<const int32_t> tokens, uint32_t pos0, float* dst) const;
+    // Whether an input row stands at position pos.
+    bool input_at(uint32_t pos) const;
     void probe(MTL::ComputeCommandEncoder*& enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
                uint64_t off = 0);
     void deliver_probes();
@@ -301,6 +307,7 @@ protected:
         uint32_t ahead; // nonzero: arena row layer + ahead's likely misses are in scratch "mpred" (read them ahead)
     };
     std::vector<PendingMoe> pending_moe_; // not yet served
+    std::vector<gen::InputRows> input_rows_; // gen::Model::set_input_rows
     // Layers whose experts are all resident skip that round trip: moe_route counts their selections into
     // resident_counts_ ([arena row][n_expert]), which finish() passes on to the arena.
     mtl::Ref<MTL::Buffer> resident_counts_;

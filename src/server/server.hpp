@@ -6,6 +6,8 @@
 #include "gen/session.hpp"
 #include "server/openai.hpp"
 #include "text/tokenizer.hpp"
+#include "vision/encoder.hpp"
+#include "vision/mmproj.hpp"
 
 #include <memory>
 #include <optional>
@@ -31,6 +33,9 @@ struct ServerOptions {
     // The most reasoning tokens for requests that name no budget (0: none). Either way, a reply capped at 1024
     // tokens or more keeps half of the cap for the answer.
     uint32_t reasoning_budget = 0;
+    // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
+    const vision::Mmproj* mmproj = nullptr;
+    vision::Encoder* vision = nullptr;
 };
 
 // Whether a request's credentials (the Authorization or x-api-key header value) carry one of `keys`; each compared in
