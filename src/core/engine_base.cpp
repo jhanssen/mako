@@ -910,7 +910,8 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
         if (overridden)
             for (int d = 0; d < 3; ++d)
                 ind[d * 3 + 2] = k;
-        ready_->setSignaledValue(v);
+        // Before the event: the reads ahead evict from row il + predicted's slot table, which the GPU must not be
+        // routing yet (ExpertArena::prefetch).
         if (predicted) { // arena row il + predicted
             const auto* pred = static_cast<const int32_t*>(scratch("mpred", uint64_t(arena_rows) * 64)->contents()) +
                                uint64_t(il) * 16;
@@ -920,6 +921,7 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
             if (!ahead.empty())
                 arena_->prefetch(il + predicted, ahead);
         }
+        ready_->setSignaledValue(v);
     }
     pending_moe_.erase(pending_moe_.begin(), pending_moe_.begin() + ptrdiff_t(served));
 }

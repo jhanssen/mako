@@ -392,14 +392,16 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     std::vector<char> taken(pinned_[layer]);
     if (pf_thread_.joinable()) {
         std::unique_lock lock(pf_m_);
-        // A selected expert still being read ahead: wait for it (it is then resident).
+        // A selected expert still being read ahead: wait for it; then every completed read ahead becomes resident
+        // (before the event that lets the GPU route the layers after this one).
         for (int e : experts)
             for (uint32_t s = 0; s < n_slots; ++s)
-                if (owner[s] == e && loading_[layer][s]) {
+                if (owner[s] == e && loading_[layer][s] == 1) {
                     const auto t0 = Clock::now();
-                    pf_cv_.wait(lock, [&] { return !loading_[layer][s]; });
+                    pf_cv_.wait(lock, [&] { return loading_[layer][s] != 1; });
                     stats_.prefetch_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 }
+        publish_prefetched();
         for (uint32_t s = 0; s < n_slots; ++s) {
             if (loading_[layer][s])
                 taken[s] = 1;
@@ -565,9 +567,8 @@ void ExpertArena::prefetch_loop(std::stop_token st)
         });
         {
             std::lock_guard lock(pf_m_);
-            auto* table = static_cast<int32_t*>(table_buf_->contents()) + uint64_t(job.layer) * n_expert_;
-            table[job.expert] = job.slot;
-            loading_[job.layer][job.slot] = 0;
+            loading_[job.layer][job.slot] = 2;
+            pf_done_.push_back(job);
             --pf_active_;
         }
         pf_cv_.notify_all();
@@ -587,6 +588,17 @@ void ExpertArena::prefetch_wait()
         return;
     std::unique_lock lock(pf_m_);
     pf_cv_.wait(lock, [&] { return pf_active_ == 0; });
+    publish_prefetched();
+}
+
+void ExpertArena::publish_prefetched()
+{
+    auto* table = static_cast<int32_t*>(table_buf_->contents());
+    for (const PrefetchJob& job : pf_done_) {
+        table[uint64_t(job.layer) * n_expert_ + job.expert] = job.slot;
+        loading_[job.layer][job.slot] = 0;
+    }
+    pf_done_.clear();
 }
 
 std::vector<MTL::Buffer*> ExpertArena::tail_buffers() const

@@ -136,10 +136,15 @@ public:
     void unpin(uint32_t layer, std::span<const int32_t> slots);
 
     // Starts reading these experts of a layer in the background into the least scored slots (none selected or
-    // pinned, none being read); each becomes resident in the slot table when its read completes. An ensure() that
-    // selects one still in flight waits for it. Experts already resident or in flight are skipped.
+    // pinned, none being read); each becomes resident in the slot table once its read completes and the next
+    // ensure() or prefetch_wait() publishes it. An ensure() that selects one still in flight waits for it. Experts
+    // already resident or in flight are skipped. The GPU reads the slot table and the experts' weights while a command
+    // buffer runs, and CPU writes to shared memory must be complete before the GPU reads them (Apple's MTLStorageMode
+    // .shared), so the table changes only when the GPU cannot be routing the layers changed: here (the evictions;
+    // called before the event the GPU waits on to go past a layer before `layer`), in ensure() (called before the
+    // event for its layer) and in prefetch_wait() (the GPU idle).
     void prefetch(uint32_t layer, std::span<const int> experts);
-    // Waits until no read ahead is in flight.
+    // Waits until no read ahead is in flight, and publishes them.
     void prefetch_wait();
     // Whether reads ahead have been paying off lately (a decayed share of them selected before eviction of at least
     // 30%); while not, only one call in eight goes ahead, to keep measuring.
@@ -180,16 +185,19 @@ private:
     std::unique_ptr<gguf::ReadPool> readers_;
 
     // Reads ahead: jobs (layer, expert, slot) done in order by one thread with its own readers. loading_ marks
-    // slots being read (owner already set, table entry not yet); guarded by pf_m_, as are the jobs.
+    // slots being read (1) or read and not yet published (2), the owner already set and the table entry not yet; the
+    // read ones wait in pf_done_ for publish_prefetched() (pf_m_ held). All guarded by pf_m_, as are the jobs.
     struct PrefetchJob {
         uint32_t layer;
         int expert;
         int32_t slot;
     };
     void prefetch_loop(std::stop_token st);
+    void publish_prefetched();
     std::mutex pf_m_;
     std::condition_variable_any pf_cv_;
     std::deque<PrefetchJob> pf_jobs_;
+    std::vector<PrefetchJob> pf_done_;
     std::vector<std::vector<char>> loading_;           // [layer][slot]
     std::vector<std::vector<char>> prefetched_slot_;   // [layer][slot]: read ahead, not selected since
     size_t pf_active_ = 0;
