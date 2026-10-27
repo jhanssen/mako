@@ -56,8 +56,18 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
   16-bit, RGBA) against the reference's hashes, for both projector types. JPEG decoders differ: on a photo ~10% of
   the samples differ, by 0.13 levels on average (99th percentile 2 levels, at most 35, at edges).
 - Encoder: not bit-exact (the reference accumulates the patch embedding in fp16, rounds activations to bf16 before
-  each linear and runs attention with fp16 K and V); per-row cosine and relative error against `vit_out` and the
-  final rows, by stage.
+  each linear and runs attention with fp16 K and V). Its two backends disagree with each other, so each is the
+  yardstick for the other. 1024x1024 image, per-row cosine (mean / worst) and mean relative error of the final rows:
+
+  | | reference CPU vs GPU | mako vs reference GPU | mako vs reference CPU |
+  | --- | --- | --- | --- |
+  | DeepSeek-V4.1 (652 rows) | 0.99971 / 0.985, 1.8% | 0.99999 / 0.998, 0.4% | 0.99970 / 0.980, 1.7% |
+  | GLM-5.3 (1369 rows) | 0.990 / 0.50, 10% | 0.997 / 0.81, 4.5% | 0.989 / 0.49, 11% |
+
+  GLM's ViT amplifies rounding on a few tokens: per layer the worst row's relative error roughly doubles, on the
+  same rows in the reference's CPU-vs-GPU comparison as in mako's (layer 23: 4.34 vs 4.37 on row 1934). No
+  automated encoder test yet (the reference rows are large); `vision_run --probe` and `ref_vision` with
+  `REF_VISION_DUMP` compare stage by stage.
 - Text: GLM logits after an image prompt against the reference (it runs GLM on the CPU); answers about known
   images for both.
 
@@ -65,6 +75,8 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
 
 1. mmproj loader, size plan, resize and normalise; `ref_vision` dumps named intermediates; preprocessing exact.
    Done: `src/vision/{image,mmproj,preprocess}`, `tools/vision_run --prep-out`.
-2. Encoder on Metal for both projector types, compared stage by stage.
+2. Encoder on Metal for both projector types, compared stage by stage. Done: `src/vision/encoder`,
+   `src/kernels/vision.metal` (attention as per-head score GEMMs, a masked softmax and value GEMMs, in query
+   chunks); 1024x1024: 0.66 s (DeepSeek), 0.55 s (GLM) on an M5 Max.
 3. Prefill with image rows, Session keys, Engram masking; `mako_run`/`ds_run` take an image.
 4. Server API.

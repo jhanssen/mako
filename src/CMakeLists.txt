@@ -8,7 +8,7 @@ target_include_directories(mako_gguf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set(MAKO_METALLIB ${CMAKE_BINARY_DIR}/mako.metallib)
 set(MAKO_METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/glm.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/dsv41.metal
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemv.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm.metal)
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vision.metal)
 set(_airs)
 foreach(src ${MAKO_METAL_SOURCES})
     get_filename_component(stem ${src} NAME_WE)
@@ -63,9 +63,9 @@ set_source_files_properties(mtl/embedded.cpp PROPERTIES
     OBJECT_DEPENDS "${MAKO_METALLIB};${GEMV_METALLIB}")
 add_dependencies(mako_mtl mako_metallib gemv_metallib)
 
-add_library(mako_vision STATIC vision/image.cpp vision/mmproj.cpp vision/preprocess.cpp)
+add_library(mako_vision STATIC vision/encoder.cpp vision/image.cpp vision/mmproj.cpp vision/preprocess.cpp)
 target_include_directories(mako_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mako_vision PUBLIC mako_gguf PRIVATE "-framework ImageIO" "-framework CoreGraphics"
+target_link_libraries(mako_vision PUBLIC mako_gguf mako_mtl PRIVATE "-framework ImageIO" "-framework CoreGraphics"
                       "-framework CoreFoundation")
 
 add_library(mako_text STATIC text/stream.cpp text/tokenizer.cpp)
