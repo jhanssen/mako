@@ -28,7 +28,9 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
 
   `ref_dump` runs the ids one at a time (or `REF_BATCH=N` at a time, logits only, much faster for long prompts) and
   writes `logits.<pos>.f32` per position; `--import-ref` keeps the top 64 of each. (Which of the two modes made the
-  committed files was not recorded.)
+  committed files was not recorded.) The reference checkout has since moved to `7aca0d2ea8d92b56911233b822db01f9fbb1ae50`
+  (2026-10-26, for DeepSeek-V4.1 vision); one token at a time it gives the first 32 positions of `parity_ref.bin`
+  bit for bit.
 
 ### DeepSeek-V4.1 (`ds41_short_ref.bin`, `ds41_long_ref.bin`)
 

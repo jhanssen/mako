@@ -10,8 +10,12 @@
 
 `mako_run` samples with `--temp T` (`--top-k`, `--top-p`, `--min-p`, `--seed`). `ds_run` also compares logits with a
 reference dump (`--ref`), measures decode widths and collects an imatrix (`--imatrix-out`). Others: `prefill_sweep`
-(prefill timing), `gguf_dump`, `tokenize`, `render_template`, `engram_rows`, `logit_compare`, and `ref_dump` when
-CMake is given a reference checkout (`MAKO_REF_SRC`, `MAKO_REF_BUILD`).
+(prefill timing), `gguf_dump`, `tokenize`, `render_template`, `engram_rows`, `logit_compare`, and `ref_dump` and
+`ref_vision` (an image's embeddings through the reference's vision encoder and projector) when CMake is given a
+reference checkout (`MAKO_REF_SRC`, `MAKO_REF_BUILD`; `ref_vision` needs its `mtmd` library built). The DeepSeek-V4.1
+projector published as `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` declares the V4 projector type, `deepseek4v`;
+the reference loads it as `deepseek41v`, the V4.1 type, once that one string in its metadata is changed
+(`tools/gguf_retag.py <in> <out> clip.projector_type deepseek41v`).
 
 Programs generate through `gen::Session` (`src/gen/session.hpp`), for either model: it takes the whole prompt each
 time, keeps the longest prefix the engine already holds (continuing the current state, or restoring a checkpoint of

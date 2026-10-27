@@ -5,3 +5,11 @@ target_include_directories(ref_dump PRIVATE ${MAKO_REF_SRC}/include ${MAKO_REF_S
 target_link_directories(ref_dump PRIVATE ${MAKO_REF_BUILD}/bin)
 target_link_libraries(ref_dump PRIVATE llama ggml ggml-base)
 set_target_properties(ref_dump PROPERTIES BUILD_RPATH ${MAKO_REF_BUILD}/bin)
+
+# Image embeddings through the reference's multimodal library.
+add_executable(ref_vision ref_vision.cpp)
+target_include_directories(ref_vision PRIVATE ${MAKO_REF_SRC}/include ${MAKO_REF_SRC}/ggml/include
+                                              ${MAKO_REF_SRC}/tools/mtmd)
+target_link_directories(ref_vision PRIVATE ${MAKO_REF_BUILD}/bin)
+target_link_libraries(ref_vision PRIVATE mtmd llama ggml ggml-base)
+set_target_properties(ref_vision PROPERTIES BUILD_RPATH ${MAKO_REF_BUILD}/bin)
