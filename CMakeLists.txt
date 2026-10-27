@@ -17,6 +17,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
+# Warnings fail the build (C++ and Metal); cmake --compile-no-warning-error turns that off for one configure.
+set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
 include(FetchContent)
 FetchContent_Declare(metal_cpp
