@@ -4,6 +4,7 @@
 #include "server/openai.hpp"
 #include "server/protocol.hpp"
 #include "core/log.hpp"
+#include "gen/pool.hpp"
 #include "vision/image.hpp"
 #include "vision/prompt.hpp"
 
@@ -37,15 +38,15 @@ const char* end_name(End e)
     return "?";
 }
 
-void log_result(const std::string& id, const gen::GenerateResult& r, const char* finish)
+void log_result(const std::string& id, const gen::GenerateResult& r, const char* finish, const std::string& conv)
 {
     const auto rate = [](size_t n, double ms) { return ms > 0 ? n / ms * 1e3 : 0.0; };
     const size_t read = r.prompt_tokens - r.reused_tokens, n = r.tokens.size();
     log::info("{}: prompt {} tokens ({} reused), prefill {} in {:.0f} ms ({:.0f} tok/s), generated {} in {:.0f} ms "
-              "({:.1f} tok/s, {:.1f} ms/token){}, {}",
+              "({:.1f} tok/s, {:.1f} ms/token){}, {}; {}",
                  id, r.prompt_tokens, r.reused_tokens, read, r.prefill_ms, rate(read, r.prefill_ms), n, r.decode_ms,
                  rate(n, r.decode_ms), r.decode_ms / double(std::max<size_t>(n, 1)),
-                 r.drafts ? std::format(", {:.0f}% of drafts kept", 100.0 * r.accepted / r.drafts) : "", finish);
+                 r.drafts ? std::format(", {:.0f}% of drafts kept", 100.0 * r.accepted / r.drafts) : "", finish, conv);
 }
 
 } // namespace
@@ -56,14 +57,16 @@ struct Server::Impl {
     const chat::Template& tmpl;
     ServerOptions opts;
     ThinkingOptions thinking;
-    gen::Session session;
+    gen::SessionPool pool;
+    std::string conv_note; // the last generation's conversation, for its log line; under gen_mutex
     std::mutex gen_mutex; // one generation at a time
     std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
     httplib::Server http;
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
 
     Impl(gen::Model& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
-        : engine(e), tok(t), tmpl(tm), opts(std::move(o)), thinking(thinking_support(tm)), session(e)
+        : engine(e), tok(t), tmpl(tm), opts(std::move(o)), thinking(thinking_support(tm)),
+          pool(e, opts.park_bytes, opts.max_conversations)
     {
         thinking.default_effort = opts.reasoning_effort;
     }
@@ -182,7 +185,11 @@ gen::GenerateResult Server::Impl::generate(const std::vector<int32_t>& prompt, C
             return parser.forced();
         };
     bool client_gone = false;
-    auto r = session.generate(prompt, cr.gen, [&](int32_t token) {
+    const auto pick = pool.acquire(prompt, cr.gen.input_rows);
+    conv_note = std::format("conversation {}{}, {} kept ({:.2f} of {:.1f} GB parked){}", pick.index,
+                            pick.fresh ? " (new)" : "", pool.size(), pool.parked_bytes() / 1e9, pool.budget() / 1e9,
+                            pick.evicted ? std::format(", {} given up", pick.evicted) : "");
+    auto r = pick.session->generate(prompt, cr.gen, [&](int32_t token) {
         Delta d;
         if (rb)
             rb->push(token, parser.in_reasoning());
@@ -252,7 +259,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             cr.gen.cancelled = closed;
             const auto r = generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped, images.get());
             const End e = end_of(r, parser, stopped);
-            log_result(id, r, end_name(e));
+            log_result(id, r, end_name(e), conv_note);
             res.set_content(proto->whole(e, parser, r), "application/json");
         } catch (const std::exception& e) {
             fail(500, e.what(), "server_error");
@@ -275,7 +282,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             const auto r = generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); },
                                     stopped, images.get());
             const End e = end_of(r, parser, stopped);
-            log_result(id, r, end_name(e));
+            log_result(id, r, end_name(e), conv_note);
             if (e == End::cancelled)
                 return false;
             write(proto->end(e, parser, r));

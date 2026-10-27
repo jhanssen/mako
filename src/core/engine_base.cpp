@@ -196,6 +196,15 @@ void EngineBase::init_runtime(ArenaInit init)
     arena_plan_.budget = init.arena_gb >= 0
                              ? init.arena_gb * 1e9
                              : std::max(1e9, arena_budget(arena_plan_.mem) - double(init.context_bytes));
+    // Parked conversations take what the experts leave of the budget first, then from it.
+    double experts = 0;
+    for (const auto& row : init.parts)
+        for (const auto& part : row)
+            experts += double(part.bytes) * dims_.n_expert;
+    const double slack = std::max(0.0, arena_plan_.budget - experts);
+    arena_plan_.park = init.park_gb >= 0 ? init.park_gb * 1e9 : std::clamp(slack, 1e9, 8e9);
+    if (init.arena_gb < 0)
+        arena_plan_.budget = std::max(1e9, arena_plan_.budget - std::max(0.0, arena_plan_.park - slack));
     auto t_phase = Clock::now();
     routing_key_ = core::routing_key(model_, init.moe_layers);
     load_.key_ms = ms_since(t_phase);

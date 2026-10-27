@@ -29,6 +29,7 @@ struct Options {
     uint32_t indexer_top_k = 0; // nonzero: override the model's (for testing the sparse selection)
     double stage_gb = -1;       // prefill staging ring limit (0: off; < 0: automatic, EngineBase::set_staging_limit)
     double arena_gb = -1;       // expert arena size; < 0: from the memory budget
+    double park_gb = -1;        // parked conversations (gen::SessionPool); < 0: what full expert residency leaves, 1-8 GB
     uint32_t prefill_chunk = 512; // tokens prefill() runs through each layer's attention together
     uint32_t prefill_group = 4096; // tokens whose routed experts run together, each loaded once per layer
     std::string expert_counts;  // routing profile placing experts in the arena; empty: the model's default profile

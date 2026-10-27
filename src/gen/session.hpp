@@ -63,8 +63,8 @@ public:
     // The prompt's leading tokens this session can keep: its whole context when the prompt continues it, else the
     // latest checkpoint within the part they share (0: none).
     size_t usable_prefix(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const;
-    // Takes the context out of the engine (another session is about to use it) and puts it back; generate() needs
-    // it in. Parking a session the engine no longer holds forgets its context.
+    // Takes the context out of the engine (another session is about to use it), keeping the latest checkpoint only,
+    // and puts it back; generate() needs it in. Parking a session the engine no longer holds forgets its context.
     void park();
     void unpark();
     bool parked() const { return parked_.has_value(); }

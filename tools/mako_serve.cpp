@@ -4,6 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
+//              [--park-gb N] [--conversations N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -22,7 +23,10 @@
 // --prefill-skip 0 runs every prompt row through every layer (default 1: a long prompt's earlier rows skip the layers
 // after the last KV source, which only the last few thousand rows need; results unchanged). --mmproj: the model's
 // vision projector, for images in requests (docs/vision.md); --image-max-tokens scales larger images down to at
-// most N prompt rows (default: the model's limit, 1024 for DeepSeek-V4.1, 8000 for GLM-5.3).
+// most N prompt rows (default: the model's limit, 1024 for DeepSeek-V4.1, 8000 for GLM-5.3). Each conversation keeps
+// its context between requests: up to --conversations (default 16) besides the one generating are parked in memory,
+// within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
+// expert cache beyond that), the least recently used given up first.
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "core/log.hpp"
@@ -71,7 +75,8 @@ int main(int argc, char** argv)
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
                              "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
-                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]");
+                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N] "
+                             "[--park-gb N] [--conversations N]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -99,7 +104,7 @@ int main(int argc, char** argv)
         return so.api_keys.size() > before;
     };
     uint32_t max_ctx = 131072;
-    double arena_gb = -1, stage_gb = -1;
+    double arena_gb = -1, stage_gb = -1, park_gb = -1;
     std::string ablate, engram, dspark, imatrix, mmproj_path;
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
@@ -131,6 +136,10 @@ int main(int argc, char** argv)
             so.model_id = v;
         else if (a == "--arena-gb")
             arena_gb = std::stod(v);
+        else if (a == "--park-gb")
+            park_gb = std::stod(v);
+        else if (a == "--conversations")
+            so.max_conversations = uint32_t(std::stoul(v));
         else if (a == "--stage-gb")
             stage_gb = std::stod(v);
         else if (a == "--engram")
@@ -311,6 +320,7 @@ int main(int argc, char** argv)
             mako::dsv41::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
+            opts.park_gb = park_gb;
             opts.stage_gb = stage_gb;
             if (so.speculative)
                 opts.dspark = dspark;
@@ -337,6 +347,7 @@ int main(int argc, char** argv)
             mako::glm::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
+            opts.park_gb = park_gb;
             opts.stage_gb = stage_gb;
             opts.mtp = so.speculative;
             glm_engine = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
@@ -368,10 +379,12 @@ int main(int argc, char** argv)
             experts += usage[l].size();
         }
     const double resident = experts ? 100.0 * double(slots) / double(experts) : 100.0;
+    so.park_bytes = uint64_t(base->arena_plan().park);
     mako::log::info("ready in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
-                    "temperature {}, top_p {}",
+                    "{:.1f} GB for parked conversations; temperature {}, top_p {}",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(), max_ctx,
-                    base->arena().bytes() / 1e9, resident, so.sampling.temperature, so.sampling.top_p);
+                    base->arena().bytes() / 1e9, resident, so.park_bytes / 1e9, so.sampling.temperature,
+                    so.sampling.top_p);
     if (resident < expected_resident)
         mako::log::warn("little memory was free for the expert cache (a process that just exited may still be "
                         "returning its memory); decoding will read experts from the SSD often");

@@ -86,6 +86,11 @@ void Session::park()
     }
     Parked p{e_.checkpoint(), e_.save_positions(uint32_t(ctx_.size()))};
     parked_ = std::move(p);
+    // Only the newest checkpoint stays (another try at the last prompt); the parked state continues the context.
+    if (saved_.size() > 1) {
+        std::ranges::sort(saved_, {}, [](const Saved& s) { return s.cp.pos; });
+        saved_.erase(saved_.begin(), saved_.end() - 1);
+    }
 }
 
 void Session::unpark()

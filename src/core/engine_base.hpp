@@ -80,6 +80,7 @@ public:
     struct ArenaPlan {
         MemInfo mem;
         double budget = 0;
+        double park = 0;     // bytes for parked conversations (gen::SessionPool), taken from the budget
         double lendable = 0; // arena bytes prefill's scratch buffers borrow
         double warm_ms = 0;  // first GPU pass over the arena, at load
     };
@@ -138,6 +139,7 @@ protected:
         uint64_t context_bytes = 0;                 // caches and checkpoints, taken from the budget
         double lendable = 0;
         double arena_gb = -1;      // < 0: from the memory budget
+        double park_gb = -1;       // parked conversations; < 0: what full expert residency leaves, 1-8 GB
         double simulate_ram_gb = 0;
         std::string expert_counts; // profile; empty: the default one when it exists
         uint32_t draft_rows = 0;   // arena rows after the trunk (n_layer) that a profile may lack

@@ -23,6 +23,10 @@ struct ServerOptions {
     gen::SamplingParams sampling; // defaults for fields a request leaves out
     bool speculative = true;
     uint32_t max_waiting = 4; // requests waiting behind the one generating; more get HTTP 503
+    // Conversations kept besides the one generating (gen::SessionPool): a request continues the one that holds the
+    // most of its prompt; the others are parked within park_bytes, the least recently used given up first.
+    uint64_t park_bytes = 1ull << 30;
+    uint32_t max_conversations = 16;
     std::string dump_dir;     // non-empty: each generation request's body is written there (client debugging)
     // Non-empty: every request but /health needs one of them, as "Authorization: Bearer <key>" (OpenAI clients) or
     // "x-api-key: <key>" (Anthropic clients); others get HTTP 401. Empty: requests from web pages are refused instead
@@ -48,7 +52,8 @@ bool host_allowed(const std::string& host);
 bool origin_allowed(const std::string& origin);
 
 // OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health.
-// Generation runs one request at a time; a request waits for the one before it, up to max_waiting of them.
+// Generation runs one request at a time; a request waits for the one before it, up to max_waiting of them. Each
+// conversation keeps its context between requests (see ServerOptions::park_bytes).
 class Server {
 public:
     Server(gen::Model& model, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);

@@ -100,6 +100,16 @@ A cut in the middle of a calculation can leave the answer wrong.
 - Prompts use the GGUF's chat template, sampling defaults its `general.sampling.*` metadata.
 - Up to `--max-waiting` requests (default 4) wait behind the one generating; more get HTTP 503 with `Retry-After`; a
   waiting request whose client left is dropped.
+- Each conversation keeps its context between requests, so several clients (two pi sessions, an agent and its
+  subagents) can take turns without one re-reading the other's prompt. A request continues the conversation that
+  holds the most of its prompt: all of it when the prompt extends it, else up to its last checkpoint (the end of its
+  last prompt); with none, it starts a new one. The others are parked in memory: GLM-5.3 ~25 KB a token plus ~0.14 GB
+  of recurrent state per copy (the parked state and the latest checkpoint), DeepSeek-V4.1 far less. `--park-gb`
+  bounds them (default: what the expert cache leaves when every expert fits, 1-8 GB; GLM-5.3 on 128 GB gets ~5-8 GB
+  without losing resident experts), `--conversations` their number (default 16); the least recently used is given up
+  first. Generation still runs one request at a time. A new conversation reads its whole prompt, even when it shares
+  a system prompt with another. The log line of each request names its conversation. A conversation taken out and
+  put back gives the same tokens and logits as one never interrupted (tests `e2e_pool`, `ds41_pool`).
 - `--learn` adds the session's routing counts to the model's profile at shutdown (SIGINT / SIGTERM), so the experts
   that start in memory follow use.
 - `--dump-requests DIR` saves each request body, for debugging a client.

@@ -308,6 +308,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     init.context_bytes = context_bytes + uint64_t(opts_.checkpoints) * checkpoint_bytes();
     init.lendable = double(prefill_scratch(opts_.prefill_chunk, opts_.prefill_group));
     init.arena_gb = opts_.arena_gb;
+    init.park_gb = opts_.park_gb;
     init.simulate_ram_gb = opts_.simulate_ram_gb;
     init.expert_counts = opts_.expert_counts;
     init_runtime(std::move(init));

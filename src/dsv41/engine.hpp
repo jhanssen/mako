@@ -24,6 +24,7 @@ struct Options {
     uint32_t checkpoints = 4;      // checkpoints (checkpoint()) the memory budget reserves room for
     double stage_gb = -1;       // prefill staging ring limit (0: off; < 0: automatic, EngineBase::set_staging_limit)
     double arena_gb = -1;          // expert arena size; < 0: from the memory budget
+    double park_gb = -1;           // parked conversations (gen::SessionPool); < 0: what full expert residency leaves, 1-8 GB
     std::string expert_counts;     // routing profile; empty: the model's default one when it exists
     core::Telemetry telemetry = core::Telemetry::off;
     double simulate_ram_gb = 0;
