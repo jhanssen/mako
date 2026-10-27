@@ -101,13 +101,16 @@ A cut in the middle of a calculation can leave the answer wrong.
 - Up to `--max-waiting` requests (default 4) wait besides the one generating; more get HTTP 503 with `Retry-After`; a
   waiting request whose client left is dropped.
 - Each conversation keeps its context between requests, so several clients (two pi sessions, an agent and its
-  subagents) can take turns without one re-reading the other's prompt. A request continues the conversation that
-  holds the most of its prompt: all of it when the prompt extends it, else up to its last checkpoint (the end of its
-  last prompt); with none, it starts a new one. The others are parked in memory: GLM-5.3 ~25 KB a token plus ~0.14 GB
-  of recurrent state per copy (the parked state and the latest checkpoint), DeepSeek-V4.1 far less. `--park-gb`
-  bounds them (default: what the expert cache leaves when every expert fits, 1-8 GB; GLM-5.3 on 128 GB gets ~5-8 GB
-  without losing resident experts), `--conversations` their number (default 16); the least recently used is given up
-  first. A new conversation reads its whole prompt, even when it shares a system prompt with another.
+  subagents) can take turns without one re-reading the other's prompt. A request continues the conversation that holds
+  the most of its prompt: all of it when the prompt extends it, else up to its last checkpoint (the end of its last
+  prompt: another try at the last turn); with none, it starts a new one. The others are parked in memory: GLM-5.3 ~25
+  KB a token plus ~0.14 GB of recurrent state per copy (the parked state, the latest checkpoint and the one at the
+  fork point), DeepSeek-V4.1 far less. `--park-gb` bounds them (default: what the expert cache leaves when every
+  expert fits, 1-8 GB; GLM-5.3 on 128 GB gets ~2.9 GB at the default 131072-token context and ~5.5 GB at 32768, every
+  expert still resident), `--conversations` their number (default 16); the least recently used is given up first. A
+  conversation keeps a checkpoint where its first user turn starts (after the system prompt and tools); a new
+  conversation that starts the same way begins from a copy of it and reads only the rest, the other conversation left
+  as it is (the same tokens and logits as reading it all, bit for bit).
 - Requests take turns: one generates at a time, and while others wait it gives the engine up every `--slice-ms`
   (default 1000) at a decode step or between pieces of its prompt (cut at multiples of the engine's prefill group,
   4096 tokens for GLM-5.3 and 8192 for DeepSeek-V4.1, so a long read yields every few seconds), then queues again.

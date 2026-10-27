@@ -28,6 +28,8 @@ public:
         size_t index = 0;   // stable while the session lives
         size_t usable = 0;  // prompt tokens it can keep
         bool fresh = false; // no session could keep any: an empty one
+        bool forked = false; // a new session starting from another's checkpoint (usable tokens of it)
+        size_t forked_from = 0;
         uint32_t evicted = 0;
         uint32_t switches = 0; // times the request gave the engine up and took it back
         double switch_ms = 0;  // taking its context back in those
@@ -41,10 +43,10 @@ public:
     bool generate(std::span<const int32_t> prompt, GenerateParams p, const std::function<bool(int32_t)>& on_token,
                   GenerateResult& result, Pick& pick, const std::function<bool(GenerateParams&)>& start = {});
 
-    // The session for this prompt, made the engine's: the one not in use that can keep most of it (ties: the most
-    // recently used), else an empty one. The previous one is parked, and parked sessions past the budget or the
-    // count are given up, oldest first. Marks it in use until release(). The caller holds the turn (or is the only
-    // thread).
+    // The session for this prompt, made the engine's: the one not in use that can keep most of it in place (ties:
+    // the most recently used); or, when another's earlier checkpoint holds more of it, a new session forked from
+    // there; else an empty one. The previous one is parked, and parked sessions past the budget or the count are
+    // given up, oldest first. Marks it in use until release(). The caller holds the turn (or is the only thread).
     Pick acquire(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows);
     void release(const Session* s);
 

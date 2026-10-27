@@ -56,21 +56,40 @@ uint64_t key_in(std::span<const GenerateParams::PromptRows> rows, size_t i)
 
 } // namespace
 
-size_t Session::usable_prefix(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const
+Session::Match Session::match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const
 {
+    Match m;
     if (prompt.empty())
-        return 0;
+        return m;
     const size_t limit = std::min(prompt.size() - 1, ctx_.size());
     size_t common = 0;
     while (common < limit && ctx_[common] == prompt[common] && key_at(common) == key_in(rows, common))
         ++common;
-    if (common == ctx_.size())
-        return common;
-    size_t best = 0;
-    for (const Saved& sv : saved_)
+    if (common == ctx_.size()) {
+        m.keep = common;
+        return m;
+    }
+    size_t best = 0, latest = 0;
+    for (const Saved& sv : saved_) {
+        latest = std::max<size_t>(latest, sv.cp.pos);
         if (sv.cp.pos <= common)
             best = std::max<size_t>(best, sv.cp.pos);
-    return best;
+    }
+    (best == latest ? m.keep : m.fork) = best;
+    return m;
+}
+
+void Session::fork(const Session& src, size_t pos)
+{
+    const auto it = std::ranges::find_if(src.saved_, [&](const Saved& s) { return s.cp.pos == pos; });
+    if (it == src.saved_.end() || pos > src.ctx_.size())
+        throw std::logic_error("fork from a position without a checkpoint");
+    ctx_.assign(src.ctx_.begin(), src.ctx_.begin() + pos);
+    keys_ = src.keys_;
+    cut_keys(pos);
+    saved_ = {{it->cp, ++clock_, it->fork}};
+    parked_ = Parked{it->cp, e_.save_positions(uint32_t(pos))};
+    mtp_next_ = -1;
 }
 
 void Session::park()
@@ -86,11 +105,12 @@ void Session::park()
     }
     Parked p{e_.checkpoint(), e_.save_positions(uint32_t(ctx_.size()))};
     parked_ = std::move(p);
-    // Only the newest checkpoint stays (another try at the last prompt); the parked state continues the context.
-    if (saved_.size() > 1) {
-        std::ranges::sort(saved_, {}, [](const Saved& s) { return s.cp.pos; });
-        saved_.erase(saved_.begin(), saved_.end() - 1);
-    }
+    // The newest checkpoint stays (another try at the last prompt) and the fork point's; the parked state continues
+    // the context.
+    size_t newest = 0;
+    for (const Saved& sv : saved_)
+        newest = std::max<size_t>(newest, sv.cp.pos);
+    std::erase_if(saved_, [&](const Saved& s) { return s.cp.pos != newest && !s.fork; });
 }
 
 void Session::unpark()
@@ -137,13 +157,24 @@ void Session::rewind(size_t keep)
     mtp_next_ = -1;
 }
 
-void Session::save_checkpoint()
+void Session::save_checkpoint(bool fork)
 {
-    if (max_checkpoints_ == 0 || std::ranges::any_of(saved_, [&](const Saved& s) { return s.cp.pos == ctx_.size(); }))
+    if (max_checkpoints_ == 0)
         return;
-    if (saved_.size() >= max_checkpoints_)
-        saved_.erase(std::ranges::min_element(saved_, {}, &Saved::used));
-    saved_.push_back({e_.checkpoint(), ++clock_});
+    if (const auto it = std::ranges::find_if(saved_, [&](const Saved& s) { return s.cp.pos == ctx_.size(); });
+        it != saved_.end()) {
+        it->fork |= fork;
+        return;
+    }
+    if (saved_.size() >= max_checkpoints_) {
+        auto victim = saved_.end();
+        for (auto it = saved_.begin(); it != saved_.end(); ++it)
+            if (!it->fork && (victim == saved_.end() || it->used < victim->used))
+                victim = it;
+        if (victim != saved_.end())
+            saved_.erase(victim);
+    }
+    saved_.push_back({e_.checkpoint(), ++clock_, fork});
 }
 
 GenerateResult Session::generate(std::span<const int32_t> prompt, const GenerateParams& p,
@@ -242,17 +273,20 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         res.prefill_ms = ms_since(t_prefill);
         return false;
     };
-    // A checkpoint at the end of the last image, for other questions about it, and one before the prompt's last
-    // token, so that the same prompt again (reuse stops short of its end) or one continuing differently right after
-    // it restores it.
+    // A checkpoint at the fork point, for other conversations starting the same way; one at the end of the last
+    // image, for other questions about it; and one before the prompt's last token, so that the same prompt again
+    // (reuse stops short of its end) or one continuing differently right after it restores it.
     size_t image_end = 0;
     for (const auto& r : p.input_rows)
         image_end = std::max<size_t>(image_end, r.rows.pos + r.rows.count);
-    if (image_end > ctx_.size() && image_end < prompt.size() - 1) {
-        if (!run_to(image_end))
-            return res;
-        save_checkpoint();
-    }
+    std::vector<std::pair<size_t, bool>> marks{{p.fork_point, true}, {image_end, false}};
+    std::ranges::sort(marks);
+    for (const auto& [at, fork] : marks)
+        if (at > ctx_.size() && at < prompt.size() - 1) {
+            if (!run_to(at))
+                return res;
+            save_checkpoint(fork);
+        }
     if (!run_to(prompt.size() - 1))
         return res;
     ctx_.assign(prompt.begin(), prompt.end() - 1);

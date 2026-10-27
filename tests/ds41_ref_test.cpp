@@ -368,6 +368,33 @@ int main(int argc, char** argv)
         check(got_a[0].conv == got_a[1].conv && got_b[0].conv == got_b[1].conv && got_a[0].conv != got_b[0].conv &&
                   got_a[0].switches + got_a[1].switches + got_b[0].switches + got_b[1].switches > 0,
               "each conversation keeps its session, and the two took turns");
+        // A conversation sharing the first one's start forks from its checkpoint at the fork point: the tokens and
+        // logits of a fresh read.
+        {
+            const size_t shared = 2000;
+            std::vector<int32_t> fb(long_ids.begin(), long_ids.begin() + shared);
+            fb.insert(fb.end(), short_ids.begin(), short_ids.begin() + 300);
+            auto fparams = [&](uint64_t& hash) {
+                auto gp = params(hash);
+                gp.fork_point = shared;
+                return gp;
+            };
+            uint64_t want_hash = 1469598103934665603ull, h = 0;
+            engine.reset();
+            mako::gen::Session fresh_b(engine);
+            const auto want = fresh_b.generate(fb, fparams(want_hash));
+            mako::gen::SessionPool fp(engine, 64ull << 30);
+            mako::gen::GenerateResult ra, rb;
+            mako::gen::SessionPool::Pick pa, pb;
+            fp.generate(a, fparams(h), {}, ra, pa);
+            h = 1469598103934665603ull;
+            fp.generate(fb, fparams(h), {}, rb, pb);
+            check(pb.forked && pb.forked_from == pa.index && rb.reused_tokens == shared && rb.tokens == want.tokens &&
+                      h == want_hash,
+                  std::format("a conversation sharing {} tokens forks from the first ({} reused), tokens {}, logits {}",
+                              shared, rb.reused_tokens, rb.tokens == want.tokens ? "the same" : "differ",
+                              h == want_hash ? "bit for bit" : "differ"));
+        }
     } else {
         std::println(stderr, "unknown mode {}", mode);
         return 2;

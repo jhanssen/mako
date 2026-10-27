@@ -677,6 +677,42 @@ int main(int argc, char** argv)
                   got_a[0].switches + got_a[1].switches + got_b[0].switches + got_b[1].switches > 0,
               "each conversation keeps its session, and the two took turns");
 
+        // Two conversations sharing a start (a system prompt): the second forks from the first's checkpoint at the
+        // fork point, reading only what follows it, with the tokens and logits of a fresh read; the first continues.
+        {
+            const size_t shared = 1500;
+            std::vector<int32_t> fa(corpus.begin(), corpus.begin() + 1800), fb(corpus.begin(), corpus.begin() + shared);
+            fb.insert(fb.end(), corpus.begin() + 2000, corpus.begin() + 2300);
+            auto fparams = [&](uint64_t& hash) {
+                auto gp = params(hash);
+                gp.fork_point = shared;
+                return gp;
+            };
+            uint64_t want_hash = 1469598103934665603ull;
+            engine.reset();
+            mako::gen::Session fresh_b(engine);
+            const auto want = fresh_b.generate(fb, fparams(want_hash));
+            mako::gen::SessionPool fp(engine, 64ull << 30);
+            uint64_t h = 1469598103934665603ull;
+            mako::gen::GenerateResult ra, rb, ra2;
+            mako::gen::SessionPool::Pick pa, pb, pa2;
+            fp.generate(fa, fparams(h), {}, ra, pa);
+            h = 1469598103934665603ull;
+            fp.generate(fb, fparams(h), {}, rb, pb);
+            const auto fa2 = second(fa, ra.tokens);
+            uint64_t h2 = 0;
+            fp.generate(fa2, fparams(h2), {}, ra2, pa2);
+            check(pb.forked && pb.forked_from == pa.index && pb.index != pa.index && rb.reused_tokens == shared &&
+                      rb.tokens == want.tokens && h == want_hash,
+                  std::format("a conversation sharing {} tokens forks from the first ({} reused), tokens {}, logits {}",
+                              shared, rb.reused_tokens, rb.tokens == want.tokens ? "the same" : "differ",
+                              h == want_hash ? "bit for bit" : "differ"));
+            // Its context: the prompt and the reply (the last token too when a draft ran with it).
+            check(pa2.index == pa.index && !pa2.forked && ra2.reused_tokens >= fa.size() + ra.tokens.size() - 1,
+                  std::format("the first continues in place ({} tokens reused, its prompt and reply {})",
+                              ra2.reused_tokens, fa.size() + ra.tokens.size()));
+        }
+
         // A budget of nothing: B's turn gives A's context up.
         mako::gen::SessionPool tight(engine, 0);
         uint64_t h = 0;

@@ -36,6 +36,9 @@ struct GenerateParams {
     // The prompt is read in pieces cut at multiples of this position (0: one piece), none of 8 tokens or fewer, so
     // where it is cut depends only on the prompt and the context held, not on when others run.
     uint32_t prefill_piece = 0;
+    // Where the part of the prompt other conversations may share ends (the system prompt and tools; 0: none): a
+    // checkpoint kept there lets a new conversation with the same start begin from it (Session::fork).
+    size_t fork_point = 0;
 };
 
 enum class Finish { stop_token, max_tokens, context_full, cancelled };
@@ -66,11 +69,20 @@ public:
     // Forgets the context and the checkpoints.
     void clear();
 
-    // The prompt's leading tokens this session can keep: its whole context when the prompt continues it, else the
-    // latest checkpoint within the part they share (0: none).
-    size_t usable_prefix(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const;
-    // Takes the context out of the engine (another session is about to use it), keeping the latest checkpoint only,
-    // and puts it back; generate() needs it in. Parking a session the engine no longer holds forgets its context.
+    // How a prompt relates to this session's context. keep: the leading tokens it can keep in place, its whole
+    // context when the prompt continues it or its latest checkpoint when the prompt diverges after that (another try
+    // at the last turn). fork: else an earlier checkpoint within the shared part, which a new session can start
+    // from (fork()) leaving this one as it is. 0: none.
+    struct Match {
+        size_t keep = 0, fork = 0;
+    };
+    Match match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const;
+    // A parked session holding src's context up to its checkpoint at pos: the engine holds src's context (src is
+    // live) and gives the positions before pos.
+    void fork(const Session& src, size_t pos);
+    // Takes the context out of the engine (another session is about to use it), keeping the latest checkpoint and
+    // the one at the fork point only, and puts it back; generate() needs it in. Parking a session the engine no
+    // longer holds forgets its context.
     void park();
     void unpark();
     bool parked() const { return parked_.has_value(); }
@@ -81,6 +93,7 @@ private:
     struct Saved {
         Model::Checkpoint cp;
         uint64_t used = 0;
+        bool fork = false; // at the fork point: kept while parked, never the one evicted
     };
     struct Parked {
         Model::Checkpoint cp;
@@ -89,7 +102,7 @@ private:
     GenerateResult run(std::span<const int32_t> prompt, const GenerateParams& p,
                        const std::function<bool(int32_t)>& on_token);
     void rewind(size_t keep);
-    void save_checkpoint();
+    void save_checkpoint(bool fork = false);
     // The key of ctx_[i]: its span's in keys_, else 0.
     uint64_t key_at(size_t i) const;
     // Keys only of positions before n.

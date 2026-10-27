@@ -58,6 +58,7 @@ struct Server::Impl {
     ServerOptions opts;
     ThinkingOptions thinking;
     gen::SessionPool pool;
+    int32_t user_turn = -1; // the template's user-turn token: the system prompt and tools come before the first
     std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
     httplib::Server http;
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
@@ -67,6 +68,9 @@ struct Server::Impl {
           pool(e, opts.park_bytes, opts.max_conversations, std::chrono::milliseconds(opts.slice_ms))
     {
         thinking.default_effort = opts.reasoning_effort;
+        user_turn = tok.find("<|user|>");
+        if (user_turn < 0)
+            user_turn = tok.find("<｜User｜>");
     }
 
     using ErrorBody = std::function<std::string(const std::string&, const char*)>;
@@ -162,6 +166,9 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
 {
     std::vector<std::shared_ptr<const vision::Encoder::Output>> held;
     cr.gen.prefill_piece = opts.prefill_piece;
+    // Conversations with the same system prompt and tools share everything before the first user turn.
+    if (const auto it = std::ranges::find(prompt, user_turn); user_turn >= 0 && it != prompt.end())
+        cr.gen.fork_point = size_t(it - prompt.begin());
     cr.gen.stop_tokens = {tok.eos(), tok.eot(), tok.find("<|observation|>")};
     const uint32_t room = engine.max_context() - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
@@ -209,7 +216,9 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
     if (!ran)
         return false;
     conv = std::format("conversation {}{}{}, {} kept ({:.2f} of {:.1f} GB parked){}", pick.index,
-                       pick.fresh ? " (new)" : "", pick.switches ? std::format(", {} turns ({:.0f} ms switching)", pick.switches + 1, pick.switch_ms) : "",
+                       pick.fresh     ? " (new)"
+                       : pick.forked ? std::format(" (new, from {}'s first {} tokens)", pick.forked_from, pick.usable)
+                                     : "", pick.switches ? std::format(", {} turns ({:.0f} ms switching)", pick.switches + 1, pick.switch_ms) : "",
                        pick.conversations, pick.parked / 1e9, pool.budget() / 1e9,
                        pick.evicted ? std::format(", {} given up", pick.evicted) : "");
     Delta d;

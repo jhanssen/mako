@@ -48,26 +48,47 @@ SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
                                        std::span<const GenerateParams::PromptRows> rows)
 {
     Pick pick;
-    Slot* best = nullptr;
-    for (Slot& s : slots_) {
-        if (s.busy)
-            continue;
-        const size_t u = s.session->usable_prefix(prompt, rows);
-        if (u > 0 && (!best || u > pick.usable || (u == pick.usable && s.used > best->used))) {
-            best = &s;
-            pick.usable = u;
+    Session* keep = nullptr;
+    Session* fork = nullptr;
+    size_t keep_len = 0, fork_len = 0, fork_index = 0;
+    uint64_t keep_used = 0;
+    for (const Slot& s : slots_) {
+        const Session::Match m = s.session->match(prompt, rows);
+        if (!s.busy && m.keep > 0 && (m.keep > keep_len || (m.keep == keep_len && s.used > keep_used))) {
+            keep = s.session.get();
+            keep_len = m.keep;
+            keep_used = s.used;
+        }
+        // A session in use by a request waiting for its turn is parked: its checkpoints can be forked from.
+        if (m.fork > fork_len) {
+            fork = s.session.get();
+            fork_len = m.fork;
+            fork_index = s.index;
         }
     }
-    if (!best) {
-        pick.fresh = true;
+    Session* s = keep;
+    if (!keep || fork_len > keep_len) {
         slots_.push_back({std::make_unique<Session>(model_), next_index_++, 0, false});
-        best = &slots_.back();
+        s = slots_.back().session.get();
+        if (fork && fork_len > keep_len) {
+            make_live(fork);
+            s->fork(*fork, fork_len);
+            pick.forked = true;
+            pick.forked_from = fork_index;
+            pick.usable = fork_len;
+        } else {
+            pick.fresh = true;
+        }
+    } else {
+        pick.usable = keep_len;
     }
-    best->used = ++clock_;
-    best->busy = true;
-    Session* s = best->session.get();
+    for (Slot& slot : slots_)
+        if (slot.session.get() == s) {
+            slot.used = ++clock_;
+            slot.busy = true;
+            pick.index = slot.index;
+        }
     pick.session = s;
-    pick.index = best->index;
     make_live(s);
     pick.evicted = trim();
     return pick;
