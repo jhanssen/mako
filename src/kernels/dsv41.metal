@@ -262,6 +262,7 @@ kernel void ds_attn_softmax(device float* scores [[buffer(0)]], device const flo
                             uint2 tg [[threadgroup_position_in_grid]],
                             uint2 tid2 [[thread_position_in_threadgroup]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     const uint tid = tid2.x;
     threadgroup float red[8];
     const uint h = tg.x;
@@ -404,6 +405,7 @@ struct BlockArgs {
 kernel void ds_block_max(device const float* score [[buffer(0)]], device float* blk [[buffer(1)]],
                          constant BlockArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     const uint b = gid.x, n = (a.pos0 + a.t0 + gid.y + 1) / a.ratio;
     const uint nb = (n + a.block - 1) / a.block;
     if (b >= nb)
@@ -420,6 +422,7 @@ kernel void ds_block_max(device const float* score [[buffer(0)]], device float* 
 kernel void ds_block_mask(device float* score [[buffer(0)]], device const uchar* keep [[buffer(1)]],
                           constant BlockArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     const uint i = gid.x, n = (a.pos0 + a.t0 + gid.y + 1) / a.ratio;
     if ((n + a.block - 1) / a.block <= a.kblocks)
         return;
@@ -439,6 +442,7 @@ struct TopkArgs {
 // Order-preserving map of a float to uint (larger float, larger key); NaN sorts lowest.
 static uint fkey(float f)
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     if (isnan(f))
         return 0;
     const uint u = as_type<uint>(f);
@@ -686,6 +690,7 @@ kernel void ds_draft_pick(device const float* scores [[buffer(0)]], device int* 
                           constant MarkovArgs& a [[buffer(6)]], constant uint& dim [[buffer(7)]],
                           uint tid [[thread_position_in_threadgroup]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     threadgroup float best_v[32];
     threadgroup uint best_i[32];
     threadgroup float part[32];

@@ -188,6 +188,7 @@ kernel void vit_flash_attn(device const half* q [[buffer(0)]], device const half
                            constant FlashArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                            ushort tid [[thread_index_in_threadgroup]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     constexpr int B = 32, K = 128;
     threadgroup float s[B * K];
     threadgroup half p[B * K];

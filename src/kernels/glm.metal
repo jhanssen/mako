@@ -20,6 +20,7 @@ static float tg_sum(float v, threadgroup float* scratch, uint tid)
 
 static float tg_max(float v, threadgroup float* scratch, uint tid)
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     v = simd_max(v);
     if (tid % 32 == 0)
         scratch[tid / 32] = v;
@@ -103,6 +104,7 @@ kernel void hc_mix(device const float* mixes_all [[buffer(0)]], device const flo
                    device const float* base [[buffer(2)]], device float* pc [[buffer(3)]],
                    constant HcArgs& a [[buffer(4)]], uint t [[thread_position_in_grid]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     if (t >= a.tokens)
         return;
     device const float* mixes = mixes_all + t * 24;
@@ -838,6 +840,7 @@ kernel void attn_softmax(device float* scores [[buffer(0)]], constant SoftmaxArg
                          uint row [[threadgroup_position_in_grid]],
                          uint tid [[thread_position_in_threadgroup]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     threadgroup float scratch[TG / 32];
     device float* sh = scores + uint64_t(row) * a.n_kv;
     const uint vis = min(a.n_kv, a.first_kv + row / a.heads);
@@ -867,6 +870,7 @@ kernel void attn_softmax_list(device float* scores [[buffer(0)]], device const u
                               constant ListSoftmaxArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
                               uint tid [[thread_position_in_threadgroup]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     threadgroup float scratch[TG / 32];
     device float* sh = scores + uint64_t(row) * a.stride;
     const uint n = count[row / a.heads];
@@ -1001,11 +1005,14 @@ kernel void moe_predict(device const float* logits [[buffer(0)]], device const f
                         device const int* slots [[buffer(2)]], device int* out [[buffer(3)]],
                         constant PredictArgs& a [[buffer(4)]], uint lane [[thread_position_in_threadgroup]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     constexpr uint K = 16;
     float v[K];
     for (uint k = 0; k < K; ++k) {
         const uint e = lane + 32 * k;
         v[k] = e < a.n_expert ? route_score(logits[e], a.score) + bias[e] : -INFINITY;
+        if (isnan(v[k])) // ranks below every number, as in moe_route_token
+            v[k] = -FLT_MAX;
     }
     uint mine = 0xffffffffu;
     for (uint r = 0; r < a.k; ++r) {
@@ -1018,7 +1025,7 @@ kernel void moe_predict(device const float* logits [[buffer(0)]], device const f
             }
         const float m = simd_max(bv);
         const uint e = simd_min(bv == m && bv > -INFINITY ? lane + 32 * bk : 0xffffffffu);
-        if (e % 32 == lane)
+        if (e < a.n_expert && e % 32 == lane)
             v[e / 32] = -INFINITY;
         if (lane == r)
             mine = e;
@@ -1121,6 +1128,7 @@ kernel void idx_pool(device const float* cache [[buffer(0)]], device const float
                      device float* pooled [[buffer(2)]], constant PoolArgs& a [[buffer(3)]],
                      uint2 gid [[thread_position_in_grid]])
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     const uint d = gid.x, pool = a.pool + gid.y;
     if (d >= a.dim)
         return;
