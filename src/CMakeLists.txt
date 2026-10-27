@@ -63,5 +63,10 @@ set_source_files_properties(mtl/embedded.cpp PROPERTIES
     OBJECT_DEPENDS "${MAKO_METALLIB};${GEMV_METALLIB}")
 add_dependencies(mako_mtl mako_metallib gemv_metallib)
 
+add_library(mako_vision STATIC vision/image.cpp vision/mmproj.cpp vision/preprocess.cpp)
+target_include_directories(mako_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_vision PUBLIC mako_gguf PRIVATE "-framework ImageIO" "-framework CoreGraphics"
+                      "-framework CoreFoundation")
+
 add_library(mako_text STATIC text/stream.cpp text/tokenizer.cpp)
 target_link_libraries(mako_text PUBLIC mako_gguf)

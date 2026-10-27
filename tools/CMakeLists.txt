@@ -34,3 +34,6 @@ target_link_libraries(engram_rows PRIVATE mako_dsv41)
 
 add_executable(ds_run ds_run.cpp)
 target_link_libraries(ds_run PRIVATE mako_dsv41 mako_gen mako_app)
+
+add_executable(vision_run vision_run.cpp)
+target_link_libraries(vision_run PRIVATE mako_vision)

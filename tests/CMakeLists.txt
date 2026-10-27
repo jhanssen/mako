@@ -22,6 +22,9 @@ target_link_libraries(engram_test PRIVATE mako_dsv41)
 add_executable(sampler_test sampler_test.cpp)
 target_link_libraries(sampler_test PRIVATE mako_gen)
 
+add_executable(vision_prep_test vision_prep_test.cpp)
+target_link_libraries(vision_prep_test PRIVATE mako_vision)
+
 add_executable(gemm_test gemm_test.cpp)
 target_link_libraries(gemm_test PRIVATE mako_mtl)
 
@@ -60,6 +63,7 @@ foreach(c decode prefill parity spec session ablate long)
     set_tests_properties(e2e_${c} PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model)
 endforeach()
 add_test(NAME sampler COMMAND sampler_test)
+add_test(NAME vision_prep COMMAND vision_prep_test ${CMAKE_CURRENT_SOURCE_DIR}/data/vision)
 add_test(NAME server COMMAND server_test "${MAKO_MODEL}")
 add_test(NAME server_ds41 COMMAND server_test "${MAKO_DS41_MODEL}")
 add_test(NAME chat COMMAND chat_test "${MAKO_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_chat_cases.bin)
@@ -67,6 +71,7 @@ set_tests_properties(tokenizer tokenizer_ds41 template_ds41 chat PROPERTIES LABE
 set_tests_properties(engram_ds41 PROPERTIES LABELS dsv41)
 set_tests_properties(server server_ds41 PROPERTIES LABELS server)
 set_tests_properties(sampler PROPERTIES LABELS sampler)
+set_tests_properties(vision_prep PROPERTIES LABELS vision)
 set_tests_properties(gemv gemm gemm_ds41 PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
 set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds41 chat server server_ds41 gemv gemm e2e_decode e2e_prefill e2e_parity e2e_spec e2e_session e2e_ablate e2e_long PROPERTIES SKIP_RETURN_CODE 77)
 
