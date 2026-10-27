@@ -30,13 +30,14 @@ fit in memory stream from the SSD into a unified-memory expert cache.
 
 Early, but usable: on a 128 GB M5 Max, DeepSeek-V4.1 (Maya-S) decodes at ~25 tokens/s (~19 at 16-32K tokens of context)
 and prefills ~500-800 tokens/s. ISTA's smaller IQ2_XS build with cache-aware routing (`--miss-penalty 0.1`) decodes at
-~34 tokens/s with the same perplexity as Maya-S on our prose and code texts (measurements in `docs/performance.md`). Tuned for M5, meant for M3 and later: on a 16 GB M4 the tests that fit pass and GLM-5.3
-decodes the same tokens as on the M5 (with `--arena-gb 3`, below the memory it is meant for); DeepSeek-V4.1 has run
-only on the M5 Max, and M3 is untested.
+~34 tokens/s with the same perplexity as Maya-S on our prose and code texts (measurements in `docs/performance.md`). Tuned for M5 and should work on any Apple Silicon Mac
+(M1 and later), but tested thoroughly only on an M5 Max and briefly on a 16 GB M4: there the tests that fit pass and
+GLM-5.3 decodes the same tokens as on the M5 (with `--arena-gb 3`, below the memory it is meant for). DeepSeek-V4.1 has
+run only on the M5 Max; on an M1 Ultra only the tests that need no model have run.
 
 ## Requirements
 
-- Apple Silicon Mac with 64-256 GB of memory, macOS 26 or later
+- Apple Silicon Mac (M1 or later) with 64-256 GB of memory, macOS 26 or later
 - Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`)
 - CMake 4.3 or later, Ninja
 
