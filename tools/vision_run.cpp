@@ -1,8 +1,8 @@
 // Runs an image through a vision projector file.
-//   vision_run <mmproj.gguf> <image> [--prep-out FILE] [--out FILE] [--probe PREFIX]
+//   vision_run <mmproj.gguf> <image> [--prep-out FILE] [--out FILE] [--probe PREFIX] [--timing 1]
 // --prep-out: the encoder's prepared input as raw fp32, planar [3][height][width].
 // --out: the encoder's rows for the text model as raw fp32 [rows][width]; --probe: each stage's output to
-// PREFIX.<stage>.f32 (patch_bias, layer_out-N, vit_out, merged / projected).
+// PREFIX.<stage>.f32 (patch_bias, layer_out-N, vit_out, merged / projected); --timing: GPU time by stage.
 #include "mtl/context.hpp"
 #include "vision/encoder.hpp"
 #include "vision/image.hpp"
@@ -25,6 +25,7 @@ int main(int argc, char** argv)
         return 2;
     }
     std::string prep_out, out, probe;
+    bool timing = false;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--prep-out")
@@ -33,6 +34,8 @@ int main(int argc, char** argv)
             out = argv[i + 1];
         else if (a == "--probe")
             probe = argv[i + 1];
+        else if (a == "--timing")
+            timing = std::string_view(argv[i + 1]) != "0";
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
@@ -61,7 +64,7 @@ int main(int argc, char** argv)
             }
             std::fclose(f);
         }
-        if (out.empty() && probe.empty())
+        if (out.empty() && probe.empty() && !timing)
             return 0;
         mako::mtl::Context ctx;
         mako::vision::Encoder enc(ctx, *mm);
@@ -78,6 +81,16 @@ int main(int argc, char** argv)
         const auto r = enc.encode(prep);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::println("{} rows x {} ({} x {} cells) in {:.1f} ms", r.rows, enc.out_embd(), r.cells_x, r.cells_y, ms);
+        if (timing) {
+            enc.timing = true;
+            enc.stage_ms.clear();
+            enc.encode(prep);
+            double sum = 0;
+            for (const auto& [name, t] : enc.stage_ms)
+                sum += t;
+            for (const auto& [name, t] : enc.stage_ms)
+                std::println("  {:10} {:8.1f} ms GPU ({:.0f}%)", name, t, 100.0 * t / sum);
+        }
         if (!out.empty()) {
             std::FILE* f = std::fopen(out.c_str(), "wb");
             if (!f || std::fwrite(r.embd.data(), 4, r.embd.size(), f) != r.embd.size()) {

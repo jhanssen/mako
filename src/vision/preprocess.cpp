@@ -45,11 +45,11 @@ Prepared normalise(const PrepParams& p, const Rgb8& img, bool bf16)
     return out;
 }
 
-constexpr int kDeepSeekMaxTokens = 1024;
+constexpr int kDeepSeekMaxTokens = 1024; // the block limit DeepSeek-V4.1 was trained with
 constexpr uint8_t kDeepSeekPad = 127;
 
-// The canvas size for a width x height image: multiples of the patch size whose block fits kDeepSeekMaxTokens.
-void deepseek_plan(int width, int height, int p, int r, int min_pixels, int& best_w, int& best_h)
+// The canvas size for a width x height image: multiples of the patch size whose block fits max_tokens.
+void deepseek_plan(int width, int height, int p, int r, int min_pixels, int max_tokens, int& best_w, int& best_h)
 {
     const auto tokens = [&](int bh, int bw) {
         const int rows = (bh / p + r - 1) / r, cols = (bw / p + r - 1) / r;
@@ -62,31 +62,32 @@ void deepseek_plan(int width, int height, int p, int r, int min_pixels, int& bes
     }
     best_w = (width + p - 1) / p * p;
     best_h = (height + p - 1) / p * p;
-    if (tokens(best_h, best_w) <= kDeepSeekMaxTokens)
+    if (tokens(best_h, best_w) <= max_tokens)
         return;
     // The largest aspect-preserving size whose block fits.
     const double ratio = double(height) / width;
-    const double max_w = std::sqrt((kDeepSeekMaxTokens - 2) / ratio + 0.25) - 0.5, max_h = max_w * ratio;
+    const double max_w = std::sqrt((max_tokens - 2) / ratio + 0.25) - 0.5, max_h = max_w * ratio;
     const int cell = p * r;
     if (max_w < 1.0) {
-        best_h = (kDeepSeekMaxTokens - 2) / 2 * cell;
+        best_h = (max_tokens - 2) / 2 * cell;
         best_w = cell;
     } else if (max_h < 1.0) {
         best_h = cell;
-        best_w = (kDeepSeekMaxTokens - 3) * cell;
+        best_w = (max_tokens - 3) * cell;
     } else {
         const double beta = std::min(std::floor(max_w) * cell / width, std::floor(max_h) * cell / height);
         best_h = int(std::floor(height * beta / p)) * p;
         best_w = int(std::floor(width * beta / p)) * p;
     }
-    if (tokens(best_h, best_w) > kDeepSeekMaxTokens)
+    if (tokens(best_h, best_w) > max_tokens)
         throw std::runtime_error("image block over the token limit");
 }
 
 Prepared prepare_deepseek(const PrepParams& p, const Rgb8& img)
 {
     int best_w = 0, best_h = 0;
-    deepseek_plan(int(img.width), int(img.height), int(p.patch), int(p.merge), int(p.min_pixels), best_w, best_h);
+    deepseek_plan(int(img.width), int(img.height), int(p.patch), int(p.merge), int(p.min_pixels),
+                  p.max_tokens ? int(p.max_tokens) : kDeepSeekMaxTokens, best_w, best_h);
     // Fitted with the aspect kept, then centred; halves round to even.
     const auto round_even = [](double x) { return int(std::nearbyint(x)); };
     int new_w = best_w, new_h = best_h;
@@ -106,7 +107,9 @@ Prepared prepare_deepseek(const PrepParams& p, const Rgb8& img)
 Prepared prepare_glm(const PrepParams& p, const Rgb8& img)
 {
     const int64_t factor = p.patch * p.merge, height = img.height, width = img.width;
-    const int64_t min_px = int64_t(p.min_pixels), max_px = int64_t(p.max_pixels);
+    const int64_t min_px = int64_t(p.min_pixels);
+    const int64_t max_px = p.max_tokens ? std::min<int64_t>(int64_t(p.max_pixels), int64_t(p.max_tokens) * factor * factor)
+                                        : int64_t(p.max_pixels);
     if (min_px <= 0 || max_px <= 0)
         throw std::runtime_error("projector without a pixel range");
     const auto align = [factor](int64_t v) { return (v + factor - 1) / factor * factor; };

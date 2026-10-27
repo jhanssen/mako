@@ -38,6 +38,11 @@ public:
 
     uint32_t out_embd() const { return out_embd_; }
 
+    // With timing, encode() commits each stage on its own and adds its GPU time to stage_ms (patch, qkv,
+    // attention, out_ffn, merge).
+    bool timing = false;
+    std::map<std::string, double> stage_ms;
+
 private:
     // A weight on the GPU: fp16 for linears, fp32 otherwise; null when the file has no such tensor.
     using Tensor = MTL::Buffer*;

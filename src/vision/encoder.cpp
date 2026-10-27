@@ -28,8 +28,8 @@ struct QkvArgs {
     float theta;
     PatchOrder order;
 };
-struct SoftmaxArgs {
-    uint32_t n, stride;
+struct FlashArgs {
+    uint32_t n_tok, n_pad, width;
     float scale;
 };
 struct RowsArgs {
@@ -56,7 +56,6 @@ struct SwigluArgs {
 constexpr uint32_t kHead = 64; // dims a head
 constexpr float kRopeTheta = 10000.0f;
 constexpr float kProjectorNormEps = 1e-5f;    // glm5v's LayerNorm after the merger
-constexpr uint64_t kScoreBytes = 64ull << 20; // attention scores of one query chunk
 
 uint16_t to_f16(float v) { return std::bit_cast<uint16_t>(static_cast<_Float16>(v)); }
 
@@ -228,7 +227,7 @@ Encoder::Output Encoder::encode(const Prepared& img)
     const bool glm = mm_.prep.kind == Projector::glm5v;
     const uint32_t P = mm_.prep.patch, px = img.width / P, py = img.height / P, T = px * py;
     const uint32_t E = mm_.n_embd, H = mm_.n_head, FF = mm_.n_ff, OUT = out_embd_;
-    const uint32_t n_pad = (T + 31) / 32 * 32;
+    const uint32_t n_pad = (T + 127) / 128 * 128; // whole tiles of the attention kernel
     if (!T || img.width % P || img.height % P || (glm && (px % 2 || py % 2)) || img.chw.size() != 3ull * img.width * img.height)
         throw std::runtime_error("image not prepared for this projector");
     const PatchOrder order{px, glm ? 1u : 0u};
@@ -240,19 +239,17 @@ Encoder::Output Encoder::encode(const Prepared& img)
     MTL::Buffer* xn = scratch("v_xn", uint64_t(T) * E * 4);
     MTL::Buffer* xh = scratch("v_xh", uint64_t(T) * std::max(E, FF) * 2);
     MTL::Buffer* qkv = scratch("v_qkv", uint64_t(T) * 3 * E * 4);
-    MTL::Buffer* q = scratch("v_q", uint64_t(H) * T * kHead * 2);
+    MTL::Buffer* q = scratch("v_q", uint64_t(H) * n_pad * kHead * 2);
     MTL::Buffer* k = scratch("v_k", uint64_t(H) * n_pad * kHead * 2);
-    MTL::Buffer* vt = scratch("v_vt", uint64_t(H) * kHead * n_pad * 2);
-    MTL::Buffer* attn = scratch("v_attn", uint64_t(T) * E * 4);
+    MTL::Buffer* v = scratch("v_v", uint64_t(H) * n_pad * kHead * 2);
+    MTL::Buffer* attn = scratch("v_attn", uint64_t(n_pad) * E * 4);
     MTL::Buffer* tmp = scratch("v_tmp", uint64_t(T) * E * 4);
     MTL::Buffer* g = scratch("v_g", uint64_t(T) * FF * 4);
     MTL::Buffer* u = scratch("v_u", uint64_t(T) * FF * 4);
-    // Padded keys and values stay zero (the softmax leaves them out).
+    // Padding rows stay zero (the attention leaves those keys out; their queries' rows are not used).
+    std::memset(q->contents(), 0, q->length());
     std::memset(k->contents(), 0, k->length());
-    std::memset(vt->contents(), 0, vt->length());
-    const uint32_t chunk = uint32_t(std::clamp<uint64_t>(kScoreBytes / (uint64_t(n_pad) * 4), 32, T));
-    MTL::Buffer* s = scratch("v_s", uint64_t(chunk) * n_pad * 4);
-    MTL::Buffer* p = scratch("v_p", uint64_t(chunk) * n_pad * 2);
+    std::memset(v->contents(), 0, v->length());
 
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
@@ -267,6 +264,18 @@ Encoder::Output Encoder::encode(const Prepared& img)
         enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
     }
     sync(cb, enc, "patch_bias", x, uint64_t(T) * E);
+    std::string stage_name = "patch";
+    const auto stage = [&](const char* next) {
+        if (!timing)
+            return;
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        stage_ms[stage_name] += (cb->GPUEndTime() - cb->GPUStartTime()) * 1e3;
+        stage_name = next;
+        cb = ctx_.queue()->commandBuffer();
+        enc = cb->computeCommandEncoder();
+    };
     const auto rms = [&](MTL::Buffer* in, Tensor w, MTL::Buffer* out, uint32_t rows, uint32_t n) {
         const NormArgs a{n, n, mm_.eps, 0};
         enc->setComputePipelineState(pso("rms_norm"));
@@ -298,6 +307,7 @@ Encoder::Output Encoder::encode(const Prepared& img)
 
     for (uint32_t il = 0; il < layers_.size(); ++il) {
         const Layer& L = layers_[il];
+        stage("qkv");
         rms(x, L.ln1, xn, T, E);
         gemm_.to_half(enc, xn, 0, T, E, 0, xh, 0);
         linear(enc, L.qkv, E, 3 * E, T, xh, 0, qkv);
@@ -310,25 +320,22 @@ Encoder::Output Encoder::encode(const Prepared& img)
             enc->setBuffer(L.kn ? L.kn : L.qkv_b, 0, 3);
             enc->setBuffer(q, 0, 4);
             enc->setBuffer(k, 0, 5);
-            enc->setBuffer(vt, 0, 6);
+            enc->setBuffer(v, 0, 6);
             enc->setBytes(&a, sizeof(a), 7);
             enc->dispatchThreads(MTL::Size(32, uint64_t(T) * H * 3, 1), MTL::Size(32, 1, 1));
         }
-        // Per head and chunk of queries: scores, softmax, then the values.
-        for (uint32_t h = 0; h < H; ++h)
-            for (uint32_t c0 = 0; c0 < T; c0 += chunk) {
-                const uint32_t tq = std::min(chunk, T - c0);
-                gemm_.encode(enc, gguf::Type::F16, kHead, n_pad, tq, k, uint64_t(h) * n_pad * kHead * 2, q,
-                             (uint64_t(h) * T + c0) * kHead * 2, s, 0);
-                const SoftmaxArgs sa{T, n_pad, 1.0f / 8.0f};
-                enc->setComputePipelineState(pso("vit_softmax"));
-                enc->setBuffer(s, 0, 0);
-                enc->setBuffer(p, 0, 1);
-                enc->setBytes(&sa, sizeof(sa), 2);
-                enc->dispatchThreadgroups(MTL::Size(tq, 1, 1), MTL::Size(256, 1, 1));
-                gemm_.encode(enc, gguf::Type::F16, n_pad, kHead, tq, vt, uint64_t(h) * kHead * n_pad * 2, p, 0, attn,
-                             (uint64_t(c0) * E + h * kHead) * 4, E);
-            }
+        stage("attention");
+        {
+            const FlashArgs fa{T, n_pad, E, 1.0f / 8.0f};
+            enc->setComputePipelineState(pso("vit_flash_attn"));
+            enc->setBuffer(q, 0, 0);
+            enc->setBuffer(k, 0, 1);
+            enc->setBuffer(v, 0, 2);
+            enc->setBuffer(attn, 0, 3);
+            enc->setBytes(&fa, sizeof(fa), 4);
+            enc->dispatchThreadgroups(MTL::Size(n_pad / 32, H, 1), MTL::Size(32, 8, 1));
+        }
+        stage("out_ffn");
         gemm_.to_half(enc, attn, 0, T, E, 0, xh, 0);
         linear(enc, L.out, E, E, T, xh, 0, tmp);
         residual(tmp, L.out_b, T, E);
@@ -344,6 +351,7 @@ Encoder::Output Encoder::encode(const Prepared& img)
         if (probe)
             sync(cb, enc, std::format("layer_out-{}", il), x, uint64_t(T) * E);
     }
+    stage("merge");
     rms(x, post_ln_, xn, T, E);
     sync(cb, enc, "vit_out", xn, uint64_t(T) * E);
 
@@ -366,6 +374,8 @@ Encoder::Output Encoder::encode(const Prepared& img)
         cb->waitUntilCompleted();
         if (cb->status() != MTL::CommandBufferStatusCompleted)
             throw std::runtime_error("vision encoder: command buffer failed");
+        if (timing)
+            stage_ms[stage_name] += (cb->GPUEndTime() - cb->GPUStartTime()) * 1e3;
         if (probe)
             probe("projected", static_cast<const float*>(y->contents()), uint64_t(cells) * OUT);
         // [start] (row of cells, newline)* [end]
@@ -416,6 +426,8 @@ Encoder::Output Encoder::encode(const Prepared& img)
         cb->waitUntilCompleted();
         if (cb->status() != MTL::CommandBufferStatusCompleted)
             throw std::runtime_error("vision encoder: command buffer failed");
+        if (timing)
+            stage_ms[stage_name] += (cb->GPUEndTime() - cb->GPUStartTime()) * 1e3;
         out.cells_x = px / 2;
         out.cells_y = py / 2;
         out.rows = cells;

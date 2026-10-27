@@ -1,6 +1,9 @@
 // Vision encoder kernels (both projector types). Activations are fp32 rows [token][width] unless noted.
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // Patch grid order: raster, or 2x2 blocks in raster order of the block grid, each block (x, y), (x+1, y), (x, y+1),
 // (x+1, y+1).
@@ -59,8 +62,8 @@ struct QkvArgs {
 
 // One simdgroup per (token, head, part): adds the QKV bias, RMS-normalises q and k per head (with weights) when
 // asked, applies the 2D RoPE (lane k < 16 rotates dims k, k+32 by the patch row times theta^(-k/16), lanes 16..31
-// by the column times theta^(-(k-16)/16)), and writes half q [head][token][64], k [head][n_pad][64] and
-// v transposed [head][64][n_pad]. qkv rows hold q, k, v of all heads, 64 dims a head. Grid (32, n_tok * heads * 3).
+// by the column times theta^(-(k-16)/16)), and writes half q, k and v, each [head][n_pad][64]. qkv rows hold q, k,
+// v of all heads, 64 dims a head. Grid (32, n_tok * heads * 3).
 kernel void vit_qkv_rope(device const float* qkv [[buffer(0)]], device const float* bias [[buffer(1)]],
                          device const float* qn [[buffer(2)]], device const float* kn [[buffer(3)]],
                          device half* q [[buffer(4)]], device half* k [[buffer(5)]], device half* vt [[buffer(6)]],
@@ -74,9 +77,9 @@ kernel void vit_qkv_rope(device const float* qkv [[buffer(0)]], device const flo
     device const float* src = qkv + uint64_t(t) * 3 * width + off;
     float x0 = src[lane] + bias[off + lane], x1 = src[lane + 32] + bias[off + lane + 32];
     if (part == 2) {
-        device half* dst = vt + uint64_t(h) * 64 * a.n_pad;
-        dst[uint64_t(lane) * a.n_pad + t] = half(x0);
-        dst[uint64_t(lane + 32) * a.n_pad + t] = half(x1);
+        device half* dst = vt + (uint64_t(h) * a.n_pad + t) * 64;
+        dst[lane] = half(x0);
+        dst[lane + 32] = half(x1);
         return;
     }
     if (a.qk_norm) {
@@ -90,51 +93,9 @@ kernel void vit_qkv_rope(device const float* qkv [[buffer(0)]], device const flo
     const float angle = pos * pow(a.theta, -float(lane % 16) / 16.0f);
     const float c = cos(angle), s = sin(angle);
     const float r0 = x0 * c - x1 * s, r1 = x0 * s + x1 * c;
-    device half* dst = (part == 0 ? q + uint64_t(h) * a.n_tok * 64 : k + uint64_t(h) * a.n_pad * 64) + uint64_t(t) * 64;
+    device half* dst = (part == 0 ? q : k) + (uint64_t(h) * a.n_pad + t) * 64;
     dst[lane] = half(r0);
     dst[lane + 32] = half(r1);
-}
-
-struct SoftmaxArgs {
-    uint n;       // valid columns
-    uint stride;  // row stride (padded columns are written as 0)
-    float scale;
-};
-
-constant uint SM_TG = 256;
-
-// p[r][j] = softmax_j(scale * s[r][j]) over j < n, 0 for n <= j < stride; one threadgroup per row.
-kernel void vit_softmax(device const float* s [[buffer(0)]], device half* p [[buffer(1)]],
-                        constant SoftmaxArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
-                        uint tid [[thread_position_in_threadgroup]])
-{
-    threadgroup float red[SM_TG / 32];
-    device const float* sr = s + uint64_t(row) * a.stride;
-    device half* pr = p + uint64_t(row) * a.stride;
-    float m = -INFINITY;
-    for (uint j = tid; j < a.n; j += SM_TG)
-        m = max(m, sr[j] * a.scale);
-    m = simd_max(m);
-    if (tid % 32 == 0)
-        red[tid / 32] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    m = red[0];
-    for (uint i = 1; i < SM_TG / 32; ++i)
-        m = max(m, red[i]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float sum = 0.0f;
-    for (uint j = tid; j < a.n; j += SM_TG)
-        sum += exp(sr[j] * a.scale - m);
-    sum = simd_sum(sum);
-    if (tid % 32 == 0)
-        red[tid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    sum = 0.0f;
-    for (uint i = 0; i < SM_TG / 32; ++i)
-        sum += red[i];
-    const float inv = 1.0f / sum;
-    for (uint j = tid; j < a.stride; j += SM_TG)
-        pr[j] = j < a.n ? half(exp(sr[j] * a.scale - m) * inv) : half(0.0f);
 }
 
 struct RowsArgs {
@@ -209,3 +170,99 @@ kernel void vit_unfold3(device const float* x [[buffer(0)]], device half* y [[bu
     y[uint64_t(cell) * a.n_embd * 9 + i] = half(v);
 }
 
+
+struct FlashArgs {
+    uint n_tok;  // valid keys
+    uint n_pad;  // rows of q, k, v a head (a multiple of 128)
+    uint width;  // o row length (heads * 64)
+    float scale;
+};
+
+// o[q][h * 64 + d] = sum_j softmax_j(scale * q . k_j) v_j[d] over keys j < n_tok, for a block of 32 queries of head
+// h; q, k, v half [head][n_pad][64], n_pad a multiple of 128. The scores of 128 keys at a time go to threadgroup
+// memory for the running softmax (eight threads a row), the output stays in registers (rescaled when a row's
+// maximum grows) and both products run through matmul2d with float accumulation. Grid (n_pad / 32, heads), 8
+// simdgroups.
+kernel void vit_flash_attn(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                           device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
+                           constant FlashArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]])
+{
+    constexpr int B = 32, K = 128;
+    threadgroup float s[B * K];
+    threadgroup half p[B * K];
+    threadgroup float row_scale[B];
+    const uint q0 = tg.x * B, h = tg.y;
+    const uint64_t head = uint64_t(h) * a.n_pad * 64;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + head + uint64_t(q0) * 64,
+                                                                dextents<int32_t, 2>(64, B));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tk(const_cast<device half*>(k) + head,
+                                                                dextents<int32_t, 2>(64, int(a.n_pad)));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tv(const_cast<device half*>(v) + head,
+                                                                dextents<int32_t, 2>(64, int(a.n_pad)));
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> ts(s, dextents<int32_t, 2>(K, B));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(p, dextents<int32_t, 2>(K, B));
+    constexpr auto qk_desc = matmul2d_descriptor(B, K, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+    constexpr auto pv_desc =
+        matmul2d_descriptor(B, 64, K, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroups<8>> qk;
+    matmul2d<pv_desc, execution_simdgroups<8>> pv;
+    auto kt0 = tk.slice(0, 0);
+    auto sc = qk.get_destination_cooperative_tensor<decltype(tq), decltype(kt0), float>();
+    auto vt0 = tv.slice(0, 0);
+    auto acc = pv.get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    // Eight threads a row, 16 columns each; each keeps the row's running maximum and sum.
+    const uint r = tid / 8, c0 = (tid % 8) * 16;
+    float m = -INFINITY, l = 0.0f;
+    for (uint j0 = 0; j0 < a.n_tok; j0 += K) {
+        for (uint16_t i = 0; i < sc.get_capacity(); ++i)
+            if (sc.is_valid_element(i))
+                sc[i] = 0.0f;
+        auto kt = tk.slice(0, int(j0));
+        qk.run(tq, kt, sc);
+        sc.store(ts);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float x[16], mt = -INFINITY;
+        for (uint c = 0; c < 16; ++c) {
+            x[c] = j0 + c0 + c < a.n_tok ? s[r * K + c0 + c] * a.scale : -INFINITY;
+            mt = max(mt, x[c]);
+        }
+        mt = max(mt, simd_shuffle_xor(mt, 1));
+        mt = max(mt, simd_shuffle_xor(mt, 2));
+        mt = max(mt, simd_shuffle_xor(mt, 4));
+        const float mn = max(m, mt), f = exp(m - mn);
+        float sum = 0.0f;
+        for (uint c = 0; c < 16; ++c) {
+            const float e = exp(x[c] - mn);
+            p[r * K + c0 + c] = half(e);
+            sum += e;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        sum += simd_shuffle_xor(sum, 4);
+        l = l * f + sum;
+        m = mn;
+        if (tid % 8 == 0)
+            row_scale[r] = f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+            if (acc.is_valid_element(i))
+                acc[i] *= row_scale[acc.get_multidimensional_index(i)[1]];
+        auto vt = tv.slice(0, int(j0));
+        pv.run(tp, vt, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid % 8 == 0)
+        row_scale[r] = 1.0f / l;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] *= row_scale[acc.get_multidimensional_index(i)[1]];
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(o + uint64_t(q0) * a.width + h * 64,
+                                                                 dextents<int32_t, 2>(int(a.width), B));
+    auto ot = to.slice(0, 0);
+    acc.store(ot);
+}

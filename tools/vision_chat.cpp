@@ -1,6 +1,6 @@
 // One question about an image, answered greedily: the chat template with an image part, the image through the
 // projector, the answer printed (reasoning included).
-//   vision_chat <model.gguf> <mmproj.gguf> <image> <question> [-n N] [--ctx N] [--no-think 1]
+//   vision_chat <model.gguf> <mmproj.gguf> <image> <question> [-n N] [--ctx N] [--no-think 1] [--image-max-tokens N]
 #include "chat/template.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
@@ -56,6 +56,7 @@ int main(int argc, char** argv)
     }
     uint32_t n_gen = 512, max_ctx = 16384;
     bool no_think = false;
+    uint32_t image_max_tokens = 0;
     for (int i = 5; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "-n")
@@ -64,6 +65,8 @@ int main(int argc, char** argv)
             max_ctx = uint32_t(std::stoul(argv[i + 1]));
         else if (a == "--no-think")
             no_think = std::string_view(argv[i + 1]) != "0";
+        else if (a == "--image-max-tokens")
+            image_max_tokens = uint32_t(std::stoul(argv[i + 1]));
         else {
             std::println(stderr, "unknown option {}", a);
             return 2;
@@ -86,6 +89,7 @@ int main(int argc, char** argv)
         auto mm = mako::vision::open_mmproj(argv[2]);
         if (!mm)
             throw std::runtime_error(mm.error());
+        mm->prep.max_tokens = image_max_tokens;
         std::ifstream in(argv[3], std::ios::binary);
         const std::vector<char> bytes{std::istreambuf_iterator<char>(in), {}};
         const auto img = mako::vision::decode_image(std::as_bytes(std::span(bytes)));

@@ -49,7 +49,9 @@ data (in user messages and in `tool_result` content); URLs are not fetched. PNG,
 reads. Each image becomes its rows in the prompt (652 for a 1024x1024 image with DeepSeek, 1369 with GLM; DeepSeek
 at most 1024, GLM at most 8000); the last 8 encoded images are kept, so a conversation that sends the same image
 again does not encode it again, and its prompt prefix is reused only up to an image that differs. Without
-`--mmproj` a request with an image gets HTTP 400.
+`--mmproj` a request with an image gets HTTP 400. `--image-max-tokens N` scales larger images down to at most N
+rows (encoding and prefill grow with the rows, GLM's encoder faster than linearly: its 3200x2400 at the default
+8000 takes ~18 s, at 2048 ~4 s).
 
 ## Thinking
 

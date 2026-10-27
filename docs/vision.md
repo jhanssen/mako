@@ -77,8 +77,13 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
 1. mmproj loader, size plan, resize and normalise; `ref_vision` dumps named intermediates; preprocessing exact.
    Done: `src/vision/{image,mmproj,preprocess}`, `tools/vision_run --prep-out`.
 2. Encoder on Metal for both projector types, compared stage by stage. Done: `src/vision/encoder`,
-   `src/kernels/vision.metal` (attention as per-head score GEMMs, a masked softmax and value GEMMs, in query
-   chunks); 1024x1024: 0.66 s (DeepSeek), 0.55 s (GLM) on an M5 Max.
+   `src/kernels/vision.metal`. Attention, 71-95% of the encode when it ran as per-head score GEMMs + a softmax +
+   value GEMMs, is one kernel (`vit_flash_attn`: 32 queries x 128 keys a step, the running softmax in threadgroup
+   memory, the output in registers, both products through matmul2d). Encode, M5 Max: 1024x1024 GLM 0.55 -> ~0.3 s,
+   DeepSeek 0.66 -> ~0.45 s; GLM's largest (3200x2400, 7931 rows) 29 -> ~7 s (`vision_run --timing 1` gives the GPU
+   time by stage; run-to-run spread is ~20%, so compare interleaved). Agreement with the reference unchanged.
+   `--image-max-tokens N` (server, `vision_chat`) scales larger images down: GLM's 3200x2400 at 2048 takes ~4 s to
+   encode and prefill instead of ~18 s.
 3. Prefill with image rows, Session keys, Engram masking. Done: `gen::Model::set_input_rows`, the engines' token
    rows (`EngineBase::embed`), `GenerateParams::input_rows` (keys; a checkpoint at the end of the prompt's last
    image, so another question about it reuses the prefix: 1380 of 1396 tokens with GLM, its prefill 2.4 -> 0.19 s),

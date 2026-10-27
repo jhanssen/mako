@@ -3,7 +3,7 @@
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
-//              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE]
+//              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -21,7 +21,8 @@
 // l + D's router (--prefetch-ahead, default 2) predicts from layer l's input ahead (results unchanged).
 // --prefill-skip 0 runs every prompt row through every layer (default 1: a long prompt's earlier rows skip the layers
 // after the last KV source, which only the last few thousand rows need; results unchanged). --mmproj: the model's
-// vision projector, for images in requests (docs/vision.md).
+// vision projector, for images in requests (docs/vision.md); --image-max-tokens scales larger images down to at
+// most N prompt rows (default: the model's limit, 1024 for DeepSeek-V4.1, 8000 for GLM-5.3).
 #include "app/presets.hpp"
 #include "chat/template.hpp"
 #include "core/log.hpp"
@@ -70,7 +71,7 @@ int main(int argc, char** argv)
                              "[--arena-gb N] [--stage-gb N] [--no-spec] [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] "
                              "[--dump-requests DIR] [--engram FILE] [--dspark DIR] [--miss-penalty F] "
                              "[--dense-quant q4_k|q5_k|q6_k] [--prefetch K] [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] "
-                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE]");
+                             "[--api-key KEY | --api-key-file FILE] [--reasoning-effort none|low|medium|high|max|N] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]");
         return 2;
     }
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -100,6 +101,7 @@ int main(int argc, char** argv)
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1;
     std::string ablate, engram, dspark, imatrix, mmproj_path;
+    uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
     bool prefill_skip = true;
@@ -172,6 +174,13 @@ int main(int argc, char** argv)
             so.reasoning_budget = uint32_t(std::stoul(v));
         else if (a == "--mmproj")
             mmproj_path = v;
+        else if (a == "--image-max-tokens") {
+            image_max_tokens = uint32_t(std::stoul(v));
+            if (image_max_tokens < 16) {
+                std::println(stderr, "--image-max-tokens takes 16 or more");
+                return 2;
+            }
+        }
         else if (a == "--api-key")
             add_keys(v, ',');
         else if (a == "--api-key-file") {
@@ -273,6 +282,7 @@ int main(int argc, char** argv)
             return 1;
         }
         mmproj.emplace(std::move(*m));
+        mmproj->prep.max_tokens = image_max_tokens;
         try {
             vision = std::make_unique<mako::vision::Encoder>(ctx, *mmproj);
         } catch (const std::exception& e) {
