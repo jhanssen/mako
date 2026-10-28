@@ -1,13 +1,13 @@
 #!/bin/sh
 # Downloads a model mako runs from Hugging Face, at the repository revisions this version of mako was tested with,
 # and checks each file's size and SHA-256. Interrupted downloads resume; files already complete are kept.
-#   tools/mako-download.sh <model> [--vision] [--dspark] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
+#   tools/mako-download.sh <model> [--vision] [--dspark] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
 # HF_TOKEN, when set, is sent with each request.
 set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: mako-download.sh <model> [--vision] [--dspark] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
+usage: mako-download.sh <model> [--vision] [--dspark] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
 
 models:
   glm           GLM-5.3-Flash, Maya-S-v2 IQ2_XXS (96.5 GB)
@@ -17,6 +17,7 @@ models:
 
   --vision      the vision projector (1.0-1.2 GB; mako_serve --mmproj)
   --dspark      DeepSeek's DSpark drafter (8 GB, in DIR/dspark; mako_serve --dspark)
+  --ablate      the model's refusal ablation file (3-4 MB; mako_serve --ablate)
   --dir DIR     where to put the files (default ~/models/<model>)
   --no-verify   skip the SHA-256 check (sizes are still checked)
   --recheck     also check the SHA-256 of files already in DIR
@@ -30,6 +31,7 @@ repo_glm=peasantsmith/GLM-5.3-Flash-Maya-GGUF@f16ee4ba50d8fd2bb726ea1862ca6ca14b
 repo_ds=peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF@d1fc01009f21e26157acb6858c315d0365483b72
 repo_unsloth=unsloth/GLM-5.3-Flash-GGUF@a38483c8cd5df544f53d70fb281afe97369d5ab6
 repo_ista=ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@a419d74cd28d5b9f8c5e2b9077d11a609c17bc32
+repo_abl=skafte/mako-ablations@b5a4188af1eb61375ebe2caf38f14d453052419d
 
 # group repo path size sha256
 manifest() {
@@ -46,6 +48,8 @@ ds ds Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00005-of-00006.gguf 8064129
 ds ds Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00006-of-00006.gguf 80643503412 98d65ef4f36e0b193935d44c3586241ca09b1b47e90f118e85332cfdb5860263
 dspark ds dspark/dspark.bin 7967616768 42df65159f980a9189d80597e42b30012c7b10e0dd385a47051f3b2fd659bb7b
 dspark ds dspark/dspark.json 96965 639c3144bca8cfe4db59057047dca40411f0cc732796e2a9321feb98fee2295f
+glm-abl abl glm-5.3-flash/refusal-3dir.abl 4423736 d75f26455b9dd26a99eb604ad21b233485da6f181ae922c47f417208bbde33c5
+ds-abl abl deepseek-v4.1-flash-1017/refusal.abl 3276856 b8c10979b684ea4c84c3146d69bef5313cd84a21e6391f2e1b97a9fabe094994
 ds-vision ista mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf 972208096 0fdc4b7693f287e9665940cf42bd39c546ffe4f0def89c569d7d0e45d60d2df1
 ista-xs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf 5780704 0182a2a1f42d319a0dbc6e34aa82a063880c069fe3aafbbea86018f386e64e5f
 ista-xs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00006.gguf 39581533600 5c88039fa640460a9fc3465a6dfcd162a4083dd738d55e5b52e025be14555a08
@@ -64,11 +68,12 @@ EOF
 [ $# -ge 1 ] || usage
 model=$1
 shift
-vision=0 dspark=0 verify=1 recheck=0 dry=0 dir=
+vision=0 dspark=0 ablate=0 verify=1 recheck=0 dry=0 dir=
 while [ $# -gt 0 ]; do
     case $1 in
     --vision) vision=1 ;;
     --dspark) dspark=1 ;;
+    --ablate) ablate=1 ;;
     --no-verify) verify=0 ;;
     --recheck) recheck=1 ;;
     --dry-run) dry=1 ;;
@@ -79,13 +84,14 @@ while [ $# -gt 0 ]; do
 done
 
 case $model in
-glm) groups=glm vgroup=glm-vision link= ;;
-ds) groups=ds vgroup=ds-vision link= ;;
-ds-ista-xs) groups="ista-xs ista-engram" vgroup=ds-vision link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS ;;
-ds-ista-xxs) groups="ista-xxs ista-engram" vgroup=ds-vision link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS ;;
+glm) groups=glm vgroup=glm-vision agroup=glm-abl link= ;;
+ds) groups=ds vgroup=ds-vision agroup=ds-abl link= ;;
+ds-ista-xs) groups="ista-xs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS ;;
+ds-ista-xxs) groups="ista-xxs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS ;;
 *) usage ;;
 esac
 [ $vision = 1 ] && groups="$groups $vgroup"
+[ $ablate = 1 ] && groups="$groups $agroup"
 if [ $dspark = 1 ]; then
     case $model in
     glm) echo "--dspark: GLM-5.3 has no DSpark drafter (it drafts with its own MTP layer)" >&2; exit 2 ;;
@@ -109,7 +115,7 @@ dest_of() {
     esac
 }
 
-fsize() { stat -f %z "$1" 2>/dev/null || echo 0; }
+fsize() { stat -L -f %z "$1" 2>/dev/null || echo 0; }
 
 need=0 total=0
 while read -r repo path size sha; do
@@ -200,6 +206,7 @@ done
 extra=
 [ $vision = 1 ] && extra="$extra --mmproj $(dest_of "$(echo "$files" | awk '/mmproj/ { print $2 }')")"
 [ $dspark = 1 ] && extra="$extra --dspark $dir/dspark"
+[ $ablate = 1 ] && extra="$extra --ablate $(dest_of "$(echo "$files" | awk '/\.abl / { print $2 }')")"
 case $model in ds-ista-*) extra="$extra --miss-penalty 0.1" ;; esac
 
 echo

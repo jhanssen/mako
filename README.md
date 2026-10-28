@@ -43,7 +43,7 @@ run only on the M5 Max; on an M1 Ultra only the tests that need no model have ru
 
 ## Models
 
-`tools/mako-download.sh glm|ds|ds-ista-xs|ds-ista-xxs [--vision] [--dspark]` (`bin/mako-download` in the release
+`tools/mako-download.sh glm|ds|ds-ista-xs|ds-ista-xxs [--vision] [--dspark] [--ablate]` (`bin/mako-download` in the release
 archive) downloads one of the sets below with curl, at the repository revisions mako was tested with, resumes
 interrupted files, checks each file's SHA-256 and prints the commands (and a preset) to run it. Files go to
 `~/models/<model>` unless `--dir` says otherwise; `--dry-run` lists them and the space needed. Or by hand:

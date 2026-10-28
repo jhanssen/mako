@@ -62,6 +62,8 @@ x -= scale (x . v) v per direction, the vectors' norms carrying the strength, `-
 
 - Format (`MAKOABL1`, `src/mtl/ablation.hpp`): n_embd, n_layer, site names, then float32 vectors
   [layer][site][k][n_embd]. `tools/make_ablation.py` builds one from raw [layer][k][n_embd] directions.
+- Refusal directions: [skafte/mako-ablations](https://huggingface.co/skafte/mako-ablations) has one file per model
+  (`mako-download.sh <model> --ablate`); the DeepSeek file serves both Maya-S and ISTA's builds.
 - GLM-5.3 sites: `ffn_out` (a layer's FFN output) and `stream` (the hyper-connection streams), both before the FFN
   output is mixed in; the next-token block is left alone.
 - DeepSeek-V4.1 sites: `attn_out` (a layer's attention output) and `shexp_out` (its shared expert's output).
