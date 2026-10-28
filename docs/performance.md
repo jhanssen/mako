@@ -171,6 +171,7 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 | Decode: the step's command buffer committed after layer 0's attention (`commit_ahead`; the next commits stay every 4 layers), so the GPU starts while the rest is encoded | 41.4 -> 41.2 ms/step median (41.8/41.3/41.4 vs 41.5/41.2/41.2, three A/B pairs without telemetry, 9.3 misses a step in both arms; the routing wait unchanged); tokens identical. Under `--telemetry layers` no commit is made early |
 | Every decode MoE layer on the multi-GEMV path: an IQ3_S job type (`mako_iq3_s_impl`: the per-format row loop, the grid table loaded for any number of simdgroups) for the IQ3_S down experts of layers 0-3 and 36-39, and the shared gate and up as two jobs (no adjacency needed; layer 16's are not adjacent) | 40 of 40 layers merged (was 31); 41.2/41.2/41.1 -> 41.1/41.0/41.2 ms/step (three A/B pairs without telemetry, 9.2-9.3 misses a step in both arms): within the drift, not slower. Logits of 110 decode positions bit-identical, tokens identical, DS and GLM e2e tests unchanged |
 | Decode hyper-connection pre-chain in two dispatches a block instead of five (`hc_lagged_norm`: 6 threadgroups each norm the flat stream themselves and compute 4 of the 24 mixing rows as the F32 GEMV sums them, 20 collapse the streams with the previous block's pre, the last of those to finish norms x; then `hc_mix`). hc_mix inside the fused kernel rounded differently from its own dispatch (same inputs, same IR; the GPU compiler's code differs once inlined), so it stays separate | parts: attn + ffn hc and norm 0.95 + 0.94 -> 0.77 + 0.75 ms a step; 41.3/41.1/41.3 -> 40.7/40.7/41.1 ms/step (three A/B pairs without telemetry, 9.2-9.3 misses a step in both arms). Logits of 110 decode positions bit-identical, tokens identical |
+| ISTA builds on the merged decode MoE path: job types for Q5_K (their shared experts, which kept every layer off it), IQ2_XS (`mako_iq2_xs_impl`: the per-format row loop, its tables loaded for any number of simdgroups) and IQ1_S / IQ1_M (mako's own row kernels) | IQ2_XS 31.3/31.0 -> 30.6/30.5 ms/step, IQ2_XXS 32.5/32.3 -> 32.1/31.9 (alternating runs, 128 steps, 6.2-6.4 misses a step in both arms); logits of 160 decode positions bit-identical on both builds. Each job matches the per-format kernel bit for bit (`gemv_rows`, plain and indexed). perf_check IQ2_XS: decode -2.5%; its part shares moved from "shared expert" (now merged away) to "miss experts", whose dispatch now starts earlier and waits for the SSD reads |
 
 Prefill on prompts of a few thousand tokens is SSD-bound: ~6 s of expert reads once per group (overlapped with the
 ~1.8 ms/token of GPU work since staging). Decode first ran 13-21 tok/s (misses per step 15-40 with content and history);
@@ -197,11 +198,6 @@ the sections below take it to ~25 by default.
 - Decode misses (15-40 a step). Untried: experts pinned resident by their decode request rate (an EMA per route,
   the top share of each layer) beside the decayed score; another engine pins half of each layer for GLM-5.3 and has
   it off for this model, unmeasured.
-- The ISTA builds miss the merged decode MoE path: `job_type()` has no IQ2_XS, IQ1_S, IQ1_M or Q5_K, and the path
-  merges only when both the up and the down job groups are supported, so one unsupported matrix sends the layer's
-  three merged dispatches and the fused swiglu back to separate ones. On Maya-S the merged path was worth ~0.5 ms a
-  step (above); job types for IQ2_XS and Q5_K (then IQ1), and merging the up and down groups independently. Measure
-  on ISTA IQ2_XS (presets `ds-ista-xs*`).
 - Engram rows are read before the step's command buffer is made (`read_raw`, synchronous), both tables at once,
   though their consumers are layers 1 and 14. Decode's input reads are ~0.3 ms a step (telemetry), the most overlap
   can return there; prefill's are unmeasured: a group of 8192 tokens reads 393,216 rows with one `pread` each,
