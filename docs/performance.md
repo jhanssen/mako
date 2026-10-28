@@ -111,7 +111,11 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 - Expert GEMMs at few rows per expert in short prefills (512 tokens: experts ~714 ms GPU against a ~150 ms
   weight-read bound). Each expert's gate, up and down are dispatches of their own in a concurrent encoder; one
   dispatch over a job table of (expert, tile) pairs, each tile's arithmetic unchanged, would remove the dispatch
-  overhead but not the tile padding. First measure how much of the 714 ms is gaps between dispatches.
+  overhead but not the tile padding. First measure how much of the 714 ms is gaps between dispatches. The tile
+  choice has a cliff where short prefills land (512 tokens give ~14 rows an expert): IQ experts take 16-row tiles up
+  to 16 rows and 32-row ones from 17, and `bench/gemm_bench` (128 experts, GLM shapes; reported by a reviewer, not
+  rerun here) took gate + up 3.5 -> 4.8 ms and down 1.8-1.9 -> 2.4 ms from 16 to 17 rows. Tile sizes against the
+  measured rows-per-expert distribution, with logits parity (smaller tiles dequantize more often).
 - Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
   (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
   none measured:
@@ -193,6 +197,19 @@ the sections below take it to ~25 by default.
 - Decode misses (15-40 a step). Untried: experts pinned resident by their decode request rate (an EMA per route,
   the top share of each layer) beside the decayed score; another engine pins half of each layer for GLM-5.3 and has
   it off for this model, unmeasured.
+- The ISTA builds miss the merged decode MoE path: `job_type()` has no IQ2_XS, IQ1_S, IQ1_M or Q5_K, and the path
+  merges only when both the up and the down job groups are supported, so one unsupported matrix sends the layer's
+  three merged dispatches and the fused swiglu back to separate ones. On Maya-S the merged path was worth ~0.5 ms a
+  step (above); job types for IQ2_XS and Q5_K (then IQ1), and merging the up and down groups independently. Measure
+  on ISTA IQ2_XS (presets `ds-ista-xs*`).
+- Engram rows are read before the step's command buffer is made (`read_raw`, synchronous), both tables at once,
+  though their consumers are layers 1 and 14. Decode's input reads are ~0.3 ms a step (telemetry), the most overlap
+  can return there; prefill's are unmeasured: a group of 8192 tokens reads 393,216 rows with one `pread` each,
+  repeated n-grams reading the same row again. Measure prefill's Engram read time and unique-row share (prose and
+  code) before overlapping (layer 0 while layer 1's rows arrive, layer 14's later) or deduplicating.
+- Reads ahead are a FIFO done one expert at a time, and `ensure()` waits for a selected expert that is still queued
+  behind unselected predictions before it starts its other misses. Waits for reads in flight measured ~50-60 ms over
+  200 tokens (~0.3 ms a step), the bound for moving selected jobs to the front; split queued from in-flight waits first.
 - The GPU waits once per layer for all its misses. Gating each miss's gate/up on its own bytes and its down on the
   rest would overlap compute with the remaining reads, but a miss's compute is tens of us against ~1 ms of reading:
   well under 1 ms a step (estimated).
