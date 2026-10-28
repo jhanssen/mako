@@ -108,6 +108,8 @@ public:
     // The token the next one must be, else -1 (GenerateParams::forced).
     int32_t forced() const;
     bool in_reasoning() const { return mode_ == Mode::reasoning; }
+    // In the reasoning or the answer's text (not a tool call).
+    bool in_text() const { return mode_ == Mode::reasoning || mode_ == Mode::content; }
     // Returns false once a stop string ended the answer (later tokens are ignored).
     bool push(int32_t token, Delta& out);
     // End of generation: whatever is held back.

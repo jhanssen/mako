@@ -4,7 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N] [--slice-ms N]
+//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -135,6 +135,9 @@ int main(int argc, char** argv)
             .option("--reasoning-effort", "none|low|medium|high|max|N", "the default reasoning effort",
                     [&](const std::string& v) { so.reasoning_effort = mako::server::parse_effort(v); })
             .option("--reasoning-budget", "N", "the default reasoning budget in tokens", so.reasoning_budget)
+            .option("--loop-guard", "N",
+                    "end repetition loops of N tokens or more in reasoning or answers (default 256; 0: off)",
+                    so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
             .option("--image-max-tokens", "N", "scale larger images down to at most N prompt rows (16 or more)",
                     [&](const std::string& v) {

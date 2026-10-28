@@ -41,6 +41,10 @@ struct ServerOptions {
     // The most reasoning tokens for requests that name no budget (0: none). Either way, a reply capped at 1024
     // tokens or more keeps half of the cap for the answer.
     uint32_t reasoning_budget = 0;
+    // Repetition loops (gen::LoopGuard, this many tokens; 0: off) in the reasoning or the answer's text outside code
+    // blocks: one in the reasoning closes it, one in the answer ends the reply ("stop"; a whole reply is cut back to
+    // the loop's first time through).
+    uint32_t loop_guard = 256;
     // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
     const vision::Mmproj* mmproj = nullptr;
     vision::Encoder* vision = nullptr;

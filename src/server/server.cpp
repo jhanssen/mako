@@ -4,6 +4,7 @@
 #include "server/openai.hpp"
 #include "server/protocol.hpp"
 #include "core/log.hpp"
+#include "gen/loop_guard.hpp"
 #include "gen/pool.hpp"
 #include "vision/image.hpp"
 #include "vision/prompt.hpp"
@@ -97,10 +98,11 @@ struct Server::Impl {
     std::list<std::pair<uint64_t, std::shared_ptr<const vision::Encoder::Output>>> image_cache; // recent first
     // Runs the request in its turns, on its conversation; on_delta gets each increment (false: the client went away),
     // `idle` each token that adds none, `begin` runs when its first turn comes (false: give up). False when it gave
-    // up before generating; `conv` describes its conversation for the log.
+    // up before generating; `conv` describes its conversation for the log. A loop in the answer ends it: `loop_keep`
+    // is then the generated tokens up to the loop's first time through (else 0).
     bool generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                   const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
-                  const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv,
+                  const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv, size_t& loop_keep,
                   const std::function<void()>& idle = {});
 };
 
@@ -166,7 +168,7 @@ void Server::Impl::encode_images(Images& images, ChatRequest& cr,
 bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                             const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
                             const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv,
-                            const std::function<void()>& idle)
+                            size_t& loop_keep, const std::function<void()>& idle)
 {
     std::vector<std::shared_ptr<const vision::Encoder::Output>> held;
     cr.gen.prefill_piece = opts.prefill_piece;
@@ -188,8 +190,20 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
         rb.emplace(tok, budget);
     if (cr.tool_required)
         parser.require_call(cr.tool_name);
-    if (rb || cr.tool_required)
+    // The loop guard sees the reasoning and the answer's text outside code blocks; `base` is the generated tokens
+    // before what it holds.
+    std::optional<gen::LoopGuard> guard;
+    if (opts.loop_guard)
+        guard.emplace(opts.loop_guard);
+    const int32_t think_end = tok.find("</think>");
+    size_t generated = 0, base = 0;
+    bool close_reasoning = false, in_code = false;
+    std::string fence_tail; // the answer's last two characters, for a ``` split across deltas
+    loop_keep = 0;
+    if (rb || cr.tool_required || guard)
         cr.gen.forced = [&, nv = engine.n_vocab()](const float* logits) {
+            if (close_reasoning && parser.in_reasoning())
+                return think_end;
             if (rb && parser.in_reasoning())
                 return rb->forced(logits, nv);
             return parser.forced();
@@ -209,6 +223,7 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
         Delta d;
         if (rb)
             rb->push(token, parser.in_reasoning());
+        const bool reasoning = parser.in_reasoning();
         const bool more = parser.push(token, d);
         if (!d.empty() && !on_delta(d)) {
             client_gone = true;
@@ -217,7 +232,32 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
         if (d.empty() && idle)
             idle();
         stopped = !more;
-        return more;
+        ++generated;
+        if (!guard || !more)
+            return more;
+        const std::string seen = fence_tail + d.content;
+        for (size_t at = 0; (at = seen.find("```", at)) != std::string::npos; at += 3)
+            in_code = !in_code;
+        fence_tail = seen.substr(seen.size() - std::min<size_t>(seen.size(), 2));
+        if (!parser.in_text() || in_code || token == think_end) {
+            guard->reset();
+            base = generated;
+            if (token == think_end)
+                close_reasoning = false;
+            return true;
+        }
+        if (!guard->push(token))
+            return true;
+        log::info("repetition loop in the {} ({} tokens a time through, from generated token {})",
+                  reasoning ? "reasoning" : "answer", guard->period(), base + guard->start());
+        if (reasoning && think_end >= 0) {
+            close_reasoning = true;
+            guard->reset();
+            base = generated;
+            return true;
+        }
+        loop_keep = base + guard->start() + guard->period();
+        return false;
     }, r, pick, start);
     if (!ran)
         return false;
@@ -282,11 +322,21 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             cr.gen.cancelled = closed;
             gen::GenerateResult r;
             std::string conv;
+            size_t loop_keep = 0;
             if (!generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped, images.get(),
-                          [&] { return !closed(); }, r, conv))
+                          [&] { return !closed(); }, r, conv, loop_keep))
                 return; // gave up while waiting
-            const End e = end_of(r, parser, stopped);
+            const End e = loop_keep ? End::stop : end_of(r, parser, stopped);
             log_result(id, r, end_name(e), conv);
+            if (loop_keep) { // the reply up to the loop's first time through
+                OutputParser kept(tok, cr.tools, cr.stop, cr.reasoning_first);
+                Delta d;
+                for (size_t i = 0; i < loop_keep; ++i)
+                    kept.push(r.tokens[i], d);
+                kept.finish(d);
+                res.set_content(proto->whole(e, kept, r), "application/json");
+                return;
+            }
             res.set_content(proto->whole(e, parser, r), "application/json");
         } catch (const std::exception& e) {
             fail(500, e.what(), "server_error");
@@ -322,11 +372,12 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             bool stopped = false;
             gen::GenerateResult r;
             std::string conv;
+            size_t loop_keep = 0; // a stream cannot take back what it sent: it ends where the loop was found
             const auto begin = [&] { return !shared->gen.cancelled() && write(proto->begin(uint32_t(prompt.size()))); };
             if (!generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); }, stopped,
-                          images.get(), begin, r, conv, [&] { keepalive(); }))
+                          images.get(), begin, r, conv, loop_keep, [&] { keepalive(); }))
                 return false; // gave up while waiting
-            const End e = end_of(r, parser, stopped);
+            const End e = loop_keep ? End::stop : end_of(r, parser, stopped);
             log_result(id, r, end_name(e), conv);
             if (e == End::cancelled)
                 return false;

@@ -122,6 +122,14 @@ A cut in the middle of a calculation can leave the answer wrong.
 - A stream with nothing to send for 5 seconds (waiting for its turn, reading a long prompt, reasoning the client does
   not see) gets an SSE comment line (`: keepalive`), which clients skip, so clients that drop idle streams (pi's HTTP
   client after 300 s) keep the connection. A long prompt is polled between prefill groups, every ~10-20 s.
+- Repetition loops (`--loop-guard N`, default 256; 0: off): the reasoning or the answer's text (not tool calls, not
+  fenced code blocks) ending in a run that repeats at least 4 times, exactly over N tokens or more, or with 90% of its
+  tokens the same over 2N (a loop with a counter). A loop in the reasoning closes it (`</think>`) and the answer
+  follows; a loop in the answer ends the reply with "stop" rather than running on to "length" (on which pi compacts).
+  A whole reply is cut back to the loop's first time through; a stream ends where the loop was found (~N tokens of
+  it already sent). Each is logged. Over 473 reasoning and answer blocks of GLM-5.3 and DeepSeek-V4.1 pi sessions
+  (~200K tokens) it found none; over this repository's sources (~450K tokens, code not fenced) one, a block of
+  near-identical template instantiations.
 - `--learn` adds the session's routing counts to the model's profile at shutdown (SIGINT / SIGTERM), so the experts
   that start in memory follow use.
 - `--dump-requests DIR` saves each request body, for debugging a client.

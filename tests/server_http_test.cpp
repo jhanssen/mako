@@ -1,5 +1,6 @@
 // The server over HTTP with a scripted stand-in for the engine (the model file gives only the tokenizer and chat
-// template): streams carry SSE comments while a request waits for its turn or its prompt is read.
+// template): streams carry SSE comments while a request waits for its turn or its prompt is read; repetition loops
+// close the reasoning or end the answer, and are left alone in code blocks.
 //   server_http_test <model.gguf>
 #include "gguf/gguf.hpp"
 #include "server/server.hpp"
@@ -26,19 +27,27 @@ void check(bool ok, const std::string& what)
         ++failures;
 }
 
-// Generates `script` after any prompt (greedy: one-hot logits), its last token repeated past its end. A prefill takes
-// prefill_ms, polling `cancelled` every 500 ms as an engine does between groups; a step takes step_ms.
+// Generates `script` after any prompt (greedy: one-hot logits), its last token repeated past its end; once fed
+// `switch_on`, `after` instead. A prefill takes prefill_ms, polling `cancelled` every 500 ms as an engine does between
+// groups; a step takes step_ms.
 class Scripted : public mako::gen::Model {
 public:
     explicit Scripted(uint32_t n_vocab) : logits_(n_vocab, 0.0f) {}
 
-    std::vector<int32_t> script;
+    std::vector<int32_t> script, after;
+    int32_t switch_on = -1;
     std::atomic<int> prefill_ms = 0, step_ms = 0;
+    std::atomic<size_t> steps = 0; // since the last prefill
 
-    const std::vector<float>& step(int32_t) override
+    const std::vector<float>& step(int32_t token) override
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(step_ms.load()));
         ++pos_;
+        ++steps;
+        if (token == switch_on && !switched_) {
+            switched_ = true;
+            steps_ = 0;
+        }
         return next();
     }
     const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled) override
@@ -50,6 +59,8 @@ public:
         }
         pos_ += uint32_t(tokens.size());
         steps_ = 0;
+        steps = 0;
+        switched_ = false;
         return logits_;
     }
     uint32_t position() const override { return pos_; }
@@ -66,24 +77,27 @@ private:
     const std::vector<float>& next()
     {
         std::ranges::fill(logits_, 0.0f);
-        if (!script.empty())
-            logits_[size_t(script[std::min<size_t>(steps_, script.size() - 1)])] = 1.0f;
+        const auto& s = switched_ ? after : script;
+        if (!s.empty())
+            logits_[size_t(s[std::min<size_t>(steps_, s.size() - 1)])] = 1.0f;
         ++steps_;
         return logits_;
     }
     std::vector<float> logits_;
     uint32_t pos_ = 0;
     size_t steps_ = 0;
+    bool switched_ = false;
 };
 
-// A streamed chat completion's raw body.
-std::string stream(int port, const std::string& text)
+// A chat completion's raw body (streamed or whole).
+std::string chat(int port, const std::string& text, bool streamed = true)
 {
     httplib::Client cli("127.0.0.1", port);
     cli.set_read_timeout(std::chrono::seconds(60));
     std::string body;
-    const std::string req = std::format(
-        R"({{"model":"m","stream":true,"temperature":0,"messages":[{{"role":"user","content":"{}"}}]}})", text);
+    const std::string req =
+        std::format(R"({{"model":"m","stream":{},"temperature":0,"messages":[{{"role":"user","content":"{}"}}]}})",
+                    streamed, text);
     cli.Post("/v1/chat/completions", {}, req, "application/json", [&](const char* d, size_t n) {
         body.append(d, n);
         return true;
@@ -91,16 +105,35 @@ std::string stream(int port, const std::string& text)
     return body;
 }
 
-// The streamed answer: the content deltas joined.
-std::string content(const std::string& body)
+std::string stream(int port, const std::string& text)
+{
+    return chat(port, text);
+}
+
+// A field's string values joined: a streamed answer's deltas, or a whole one (plain text without escapes).
+std::string joined(const std::string& body, const std::string& field)
 {
     std::string out;
-    for (size_t at = 0; (at = body.find(R"("content":")", at)) != std::string::npos;) {
-        at += 11;
+    const std::string key = std::format(R"("{}":")", field);
+    for (size_t at = 0; (at = body.find(key, at)) != std::string::npos;) {
+        at += key.size();
         const size_t end = body.find('"', at);
         out += body.substr(at, end - at);
     }
     return out;
+}
+
+std::string content(const std::string& body)
+{
+    return joined(body, "content");
+}
+
+size_t count(const std::string& s, const std::string& what)
+{
+    size_t n = 0;
+    for (size_t at = 0; (at = s.find(what, at)) != std::string::npos; at += what.size())
+        ++n;
+    return n;
 }
 
 } // namespace
@@ -157,6 +190,43 @@ int main(int argc, char** argv)
           "a comment while waiting for the turn");
     check(content(second) == content(first) && content(first).starts_with("Hello there. x"),
           "both answers whole");
+
+    // Loops: a 60-times repeated sentence of ~15 tokens, ended by the guard after 256 + one time through.
+    model.step_ms = 0;
+    const std::string again = " The value is the same as before, so I will check it once more.";
+    const auto loop = [&](const std::string& before, int times, const std::string& tail) {
+        std::string text = before;
+        for (int i = 0; i < times; ++i)
+            text += again;
+        auto v = tok->encode(text + tail, true);
+        v.push_back(tok->eot());
+        return v;
+    };
+    model.script = loop("</think>Start.", 60, "");
+    const std::string looped = stream(opts.port, "four");
+    check(model.steps < 400 && looped.find(R"("finish_reason":"stop")") != std::string::npos &&
+              content(looped).starts_with("Start." + again) && count(content(looped), again) < 25,
+          std::format("a loop in a streamed answer ends it with stop ({} steps, {} times through)", model.steps.load(),
+                      count(content(looped), again)));
+    const std::string whole = chat(opts.port, "five", false);
+    check(content(whole).starts_with("Start. The value") && count(content(whole), " The value") == 1 &&
+              whole.find(R"("finish_reason":"stop")") != std::string::npos,
+          std::format("a whole answer is cut to the loop's first time through ({:?})", content(whole)));
+
+    model.script = loop("", 60, "");
+    model.switch_on = tok->find("</think>");
+    model.after = tok->encode("The answer.", false);
+    model.after.push_back(tok->eot());
+    const std::string thought = stream(opts.port, "six");
+    check(count(joined(thought, "reasoning_content"), again) < 25 && content(thought) == "The answer." &&
+              thought.find(R"("finish_reason":"stop")") != std::string::npos,
+          std::format("a loop in the reasoning closes it; the answer follows ({:?})", content(thought)));
+    model.switch_on = -1;
+
+    model.script = loop("</think>Code:\n```\n", 60, "\n```\nDone.");
+    const std::string code = chat(opts.port, "seven", false);
+    check(count(content(code), again) == 60 && content(code).ends_with("Done."),
+          "a repeated line inside a code block is left alone");
 
     server.stop();
     t.join();
