@@ -109,14 +109,17 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 ### Open
 
 - Decode misses still rise after a long prompt, less since staging (GLM: ~27 vs ~15 a step for the first 40 steps).
-- Expert GEMMs at few rows per expert in short prefills (512 tokens: experts ~714 ms GPU against a ~150 ms
-  weight-read bound). Each expert's gate, up and down are dispatches of their own in a concurrent encoder; one
-  dispatch over a job table of (expert, tile) pairs, each tile's arithmetic unchanged, would remove the dispatch
-  overhead but not the tile padding. First measure how much of the 714 ms is gaps between dispatches. The tile
-  choice has a cliff where short prefills land (512 tokens give ~14 rows an expert): IQ experts take 16-row tiles up
-  to 16 rows and 32-row ones from 17, and `bench/gemm_bench` (128 experts, GLM shapes; reported by a reviewer, not
-  rerun here) took gate + up 3.5 -> 4.8 ms and down 1.8-1.9 -> 2.4 ms from 16 to 17 rows. Tile sizes against the
-  measured rows-per-expert distribution, with logits parity (smaller tiles dequantize more often).
+- Expert GEMMs at few rows per expert in short prefills. 2026-10-28, GLM-5.3 after a 4000-token context: 512 new
+  tokens take 1.13 s (~450 tok/s), 1.0 s of it GPU and ~585 ms of that the expert GEMMs (~14 rows an expert), where
+  reading every expert once would take ~190 ms. `gemm_bench 128 T 4096 2048 iq2_xxs iq2_xxs`: gate + up 3.4-3.5 ms
+  for T = 8-16 (16-row tile), 4.7-4.8 ms for 17-32 (32-row), 5.9 ms for 33-48 (64-row); within a tile the time
+  hardly depends on T, so it is per pass over the weights: at <= 16 rows each weight is dequantized once, ~600 G
+  weights/s through threadgroup memory (~158 GB/s of IQ2_XXS). Two 16-row passes for 17 rows would cost ~7 ms
+  against 4.8, so no smaller tiles. The multi-token GEMV kernels are no way around it: 256 such matrices take
+  2.04 ms at 2 tokens a pass but grow linearly from there (8.2 ms at 8), ~16 ms per 16 tokens. What could gain: the
+  weights dequantized in registers (as the GEMVs do, ~1 T weights/s at 1-2 tokens) and multiplied on simdgroup
+  matrices, ~3.5 -> ~2.2 ms a layer's gate + up (estimated), ~200 ms of a 512-token turn; it changes GLM's
+  summation order, which its near-bit-exact e2e checks react to.
 - Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
   (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
   none measured:
