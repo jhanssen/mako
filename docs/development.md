@@ -52,6 +52,30 @@ For GLM-5.3: runs the tests and a fixed benchmark (prefill of 512 and 4096 new t
 128 tokens with and without drafts, each a freshly loaded engine) and prints a Markdown report to paste into an issue.
 `--quick` runs only the tests that need no GPU work.
 
+## Speed regressions
+
+The tests check results, not speed: a change that keeps every output bit-identical but makes a kernel slower passes
+them all. `bench/perf_check` catches that:
+
+```sh
+./build/bench/perf_check <model .gguf> --save   # on a commit known to be good: the baseline for this machine
+./build/bench/perf_check <model .gguf>          # after a change: compared with it (exit 1 when flagged)
+```
+
+It times a 4096-token prefill of `bench/data/perf_prompt.txt` (a fixed text, so the workload does not change with
+the sources) and 64 greedy decode steps, for GLM-5.3 or DeepSeek-V4.1, each once for its time and once with part
+timing for the GPU time by named part (and, for prefill, by section). Every run waits for macOS's nominal thermal state
+and 30 seconds more (`--pause`): a throttled M5 Max runs everything ~1.3x slower, and a second heavy run within a minute
+of the first was 8% slower even at nominal. It flags a total more than 10% slower (only between runs at nominal) and a
+part of at least 1% of the GPU time whose share grew by more than 25%; shares barely move when the whole machine slows
+down. Baselines live in `~/Library/Application Support/mako/perf/`, one per model file.
+
+Measured on the M5 Max: run against its own baseline, every share agreed within 0.1 point; GLM's times within 0.1%,
+DeepSeek's decode within 1.3% and its prefill within 6.7% (expert reads from the SSD). The `kda_prep` prefill regression
+(fixed in `ce60b6e`) moved GLM's prefill only 3.6% at 4096 tokens, under the total's threshold, and was flagged by its
+part: kda conv 1.3% -> 5.2%. Run it before committing a change to `src/kernels`, `src/core`, `src/glm` or `src/dsv41`.
+It does not cover long contexts (the prompt has ~6.8K tokens); `tools/prefill_sweep --parts` does.
+
 ## Layout
 
 | Path | Contents |
@@ -70,5 +94,5 @@ For GLM-5.3: runs the tests and a fixed benchmark (prefill of 512 and 4096 new t
 | `src/text` | tokenizer, UTF-8 streaming detokenizer |
 | `tools` | the programs above; Python generators of test data and ablation files |
 | `tests` | ctest suite and its data |
-| `bench` | SSD, matmul, GEMV and GEMM microbenchmarks |
+| `bench` | SSD, matmul, GEMV and GEMM microbenchmarks; `perf_check` (speed regressions) |
 | `docs` | these notes, architectures, performance work, the DeepSeek design, example presets |

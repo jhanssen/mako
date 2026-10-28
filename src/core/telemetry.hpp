@@ -25,6 +25,8 @@ struct MachineInfo {
     mtl::DeviceInfo gpu;
 };
 MachineInfo query_machine(const mtl::DeviceInfo& gpu);
+// macOS's thermal state now: "nominal", "fair", "serious" or "critical". Timings taken above nominal run throttled.
+std::string thermal_state();
 
 struct LoadStats {
     double dense_ms = 0, key_ms = 0, arena_ms = 0, prefill_ms = 0, warm_ms = 0, total_ms = 0;

@@ -86,6 +86,21 @@ MachineInfo query_machine(const mtl::DeviceInfo& gpu)
     return m;
 }
 
+std::string thermal_state()
+{
+    switch (NS::ProcessInfo::processInfo()->thermalState()) {
+    case NS::ProcessInfoThermalStateNominal:
+        return "nominal";
+    case NS::ProcessInfoThermalStateFair:
+        return "fair";
+    case NS::ProcessInfoThermalStateSerious:
+        return "serious";
+    case NS::ProcessInfoThermalStateCritical:
+        return "critical";
+    }
+    return "unknown";
+}
+
 void Report::machine(const MachineInfo& m)
 {
     machine_ = m;
@@ -161,9 +176,11 @@ std::string Report::markdown(size_t skip) const
 {
     const MachineInfo& m = machine_;
     std::string md = "### mako telemetry\n\n";
-    md += std::format("- mako `{}`, macOS {} ({}), {}, {}P+{}E cores, {:.1f} GB RAM, GPU wired limit {}\n", m.commit,
-                      m.macos, m.macos_build, m.chip, m.perf_cores, m.eff_cores, m.ram / 1e9,
-                      m.wired_limit_mb ? std::format("{} MB", m.wired_limit_mb) : std::string("default"));
+    md += std::format("- mako `{}`, macOS {} ({}), {}, {}P+{}E cores, {:.1f} GB RAM, GPU wired limit {}, thermal "
+                      "state {} now\n",
+                      m.commit, m.macos, m.macos_build, m.chip, m.perf_cores, m.eff_cores, m.ram / 1e9,
+                      m.wired_limit_mb ? std::format("{} MB", m.wired_limit_mb) : std::string("default"),
+                      thermal_state());
     md += std::format("- GPU {}: Apple9 {}, Apple10 {}, Metal 4 {}, max buffer {:.1f} GB, working set {:.1f} GB, "
                       "timestamps at stage boundaries {}, at dispatch boundaries {}\n",
                       m.gpu.name, m.gpu.apple9, m.gpu.apple10, m.gpu.metal4, m.gpu.max_buffer / 1e9,
