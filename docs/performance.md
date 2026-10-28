@@ -28,6 +28,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | The step's command buffer committed after layer 0 and the rest encoded into a second one while the GPU runs (`commit_ahead`; the CPU's ~0.3 ms of encoding came before the GPU started) | 24.7 -> 24.4 ms/token; tokens identical |
 | hc_step_a, hc_step_b and the rms norm after them in one dispatch (`hc_step_norm`: the token's last threadgroup, found by a device-scope fence and a counter, mixes the streams and norms x) | 180 fewer dispatches a token: -0.25 ms; outputs bit-identical (e2e tests unchanged) |
 | The router GEMV routing in its last threadgroup (`mako_mul_mv_f32_f32_4_route`); conv, gate and the q/k l2 norm in one kernel per head (`kda_prep`) | 110 fewer dispatches: no measurable change (+-0.1 ms). A dispatch boundary costs ~1 us; what a small kernel costs is its chain of dependent memory round trips (~0.8 us each), which a fused kernel keeps |
+| Prefill: `kda_prep`'s work with a threadgroup per (head, token) past 8 rows (`kda_prep_rows`, the conv state moved on by `kda_conv_shift`), same arithmetic. `kda_prep` had made prefill's conv section 1.48 s of a 20K-token prompt with 64 threadgroups walking each chunk's tokens, against 0.66 s for the separate kernels before it; unseen because no prefill was timed | 20K tokens: 717-719 -> 742-743 tok/s in alternating runs (737-744 before `kda_prep`); conv 0.37 s. GLM e2e tests pass. `bench/perf_check` now flags such a change |
 | Independent GEMVs of one input in one dispatch (`mako_mul_mv_jobs`: a job table of GPU addresses, each job its format's kernel over its own threadgroups, 4 simdgroups a threadgroup, every row summed as before): KDA q/k/v + f_a/g_a + beta; routed gate + up + the shared gate/up, both swiglus (`swiglu2`), routed down + shared down; MLA q_a + kv_a + the indexer's key, gate and weights, then q_b + the indexer's query | 24.8-25.3 -> 23.1 ms/token (three A/B pairs, 43.3 tok/s); tokens identical, e2e tests unchanged. ~8 us a merged-away dispatch: one ramp-up and tail for the group, the IQ2_XXS fixed cost once, the small Q6_K and Q8_0 GEMVs hidden under the large ones |
 | Decode GEMVs row-invariant (a token's bits the same whether it runs alone or with up to 7 others, for batching several sequences): Q6_K always through mako's 1- and 2-token kernel with multiply-add fusion off (1 token used the per-format kernel, which the 2-token kernel did not match); the short-row kernel to 8 tokens. `gemv_rows` checks every format through the plain, multi-GEMV and indexed paths | no speculative decoding 23.1 -> 23.2 ms/token, speculative ~19.8 -> ~20.05 (three and four clean runs; within their spread); e2e tests unchanged |
 
@@ -108,7 +109,27 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 
 - Decode misses still rise after a long prompt, less since staging (GLM: ~27 vs ~15 a step for the first 40 steps).
 - Expert GEMMs at few rows per expert in short prefills (512 tokens: experts ~714 ms GPU against a ~150 ms
-  weight-read bound).
+  weight-read bound). Each expert's gate, up and down are dispatches of their own in a concurrent encoder; one
+  dispatch over a job table of (expert, tile) pairs, each tile's arithmetic unchanged, would remove the dispatch
+  overhead but not the tile padding. First measure how much of the 714 ms is gaps between dispatches.
+- Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
+  (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
+  none measured:
+  - Sparse attention in one kernel: scores, softmax and output (each query's 64 heads x 2048 selected rows, the
+    running softmax in registers) instead of three dispatches through 512 KB of float scores a token and layer. The
+    sparse path is ~3.2 s (scores 0.81, softmax 0.30, output 1.26, selection 0.54, rest 0.29); perhaps 1-2 s back.
+    Another engine runs this as one kernel on the matrix units, but through a hard-coded M5 layout of the
+    cooperative tensors' elements (the API leaves it implementation-defined); here through the accessors first.
+  - Expert GEMMs at ~36 TFLOP/s against ~60 for the same shapes in `bench/gemm_bench`: the dequantization does not
+    overlap the multiply (~21%, above); double-buffering it against `matmul2d`. ~1-2 s.
+  - The stream step and norm fused for prefill as decode has them (`hc_step_norm`): hc and norm is ~2x what its
+    memory traffic needs (estimated). ~0.5 s.
+  - The shared expert and dense FFN at ~22 TFLOP/s (2.8 s).
+- MTP drafts slow decode down on long code prompts: after a 20K-token prompt 33 ms/token with them against 24 without
+  (2026-10-27). Measure their acceptance there; then stop drafting for a request whose acceptance falls below
+  break-even.
+- `checkpoint()` grows its vector without reserving `checkpoint_bytes()` (~140 MB), as DeepSeek's does: tens of ms of
+  reallocation a checkpoint (estimated).
 - Decode at 23.1 ms/token, the weights ~16.3 ms of it. Not built, by expected gain:
   - More independent GEMVs in one dispatch (`mako_mul_mv_jobs`): f_b + g_b (rows of 128: the job kernel needs the
     short-row kernel as a job type), the MLA per-head k_b and v_b with their neighbours, hc_mean + the output norm.
@@ -166,7 +187,15 @@ the sections below take it to ~25 by default.
 ### Open
 
 - Prefill reads (~6 s a group, now overlapped with the GPU work): more resident experts or fewer bytes per expert.
-- Decode misses (15-40 a step).
+  Staged misses go to the GPU in batches of up to 32 only once every one of them has been taken from the ring, so
+  one late read holds back experts that are ready; submitting the ready prefix (a minimum batch size, the order and
+  the final combine unchanged) could close GPU idle gaps. First measure the gaps.
+- Decode misses (15-40 a step). Untried: experts pinned resident by their decode request rate (an EMA per route,
+  the top share of each layer) beside the decayed score; another engine pins half of each layer for GLM-5.3 and has
+  it off for this model, unmeasured.
+- The GPU waits once per layer for all its misses. Gating each miss's gate/up on its own bytes and its down on the
+  rest would overlap compute with the remaining reads, but a miss's compute is tens of us against ~1 ms of reading:
+  well under 1 ms a step (estimated).
 - Resident-expert GEMVs (planned 2026-10-26, bit-identical work only; ceiling ~2-3 ms a step, uncertain). The
   resident-expert section runs at ~400 GB/s against ~560 for Q8_0 on the same bytes. Two measurements decide it:
   1. `bench/chain_bench`: a mode for what a MoE layer's event signal and encoder boundary cost a step (40 a step).
@@ -374,6 +403,18 @@ dispatch than the per-format ones, but decode is unchanged within noise: they we
 are arithmetic-bound. Q5_K (ISTA's dense weights) already runs at 430-540 GB/s against Q8_0's 450-570, so a kernel of
 mako's own would gain ~1 ms a step at most; not written. The per-kernel timing mode serializes the GPU and inflated
 both estimates beforehand; isolated benchmarks (`gemv_bench`) are the better guide.
+
+## Both models: open (2026-10-27)
+
+- Conversation switches copy whole contexts: parking copies the recurrent state and every cached position out, and
+  the next switch copies them back. GLM-5.3 caches ~25 KB a token, so ~0.8 GB each way at 32K tokens; switches
+  measured 8-9 ms only at short contexts. Measure two conversations at 32K with 1 s slices; if it matters, per-session
+  GPU buffers (a switch picks buffers) or a shared prefix with private suffixes.
+- Several sequences a step (continuous batching) for several agents at once: dense weights read once for all of
+  them, experts by routing overlap; the row-invariant GEMVs keep each sequence's result independent of the batch.
+  The largest throughput gain and the largest change (KDA/MLA state per sequence, the session API, the scheduler).
+- `bench/perf_check` covers ~6.8K-token prompts; a long-context variant (a 20K-token prefill on demand) would catch
+  regressions that show only there (the `kda_prep` one was ~5% of a 20K prefill).
 
 ## Both models: the first GPU work after a few seconds idle (2026-10-26)
 
