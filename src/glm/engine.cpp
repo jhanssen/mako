@@ -424,10 +424,12 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
     proj(enc, L.g_b, fga, ga_off, g2, 0, T);
     const bool fused = !probe_; // the probes read the conv output before its norm
     if (fused) {
-        // Conv, gate and the q/k norm in one dispatch, a threadgroup per head.
+        // Conv, gate and the q/k norm in one dispatch: a threadgroup per head walking the tokens, or past a decode
+        // step's rows one per (head, token) and the state moved on after.
         part(enc, "kda conv");
+        const bool rows = T > 8;
         const PrepArgs pa{inner, cfg_.conv_kernel, T, snap, D, H, cfg_.kda_gate_lower_bound, 1e-6f};
-        enc->setComputePipelineState(pso("kda_prep"));
+        enc->setComputePipelineState(pso(rows ? "kda_prep_rows" : "kda_prep"));
         enc->setBuffer(qkv, 0, 0);
         enc->setBuffer(L.conv_q.buf, L.conv_q.off, 1);
         enc->setBuffer(L.conv_k.buf, L.conv_k.off, 2);
@@ -443,8 +445,18 @@ void Engine::kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         enc->setBuffer(g, 0, 12);
         enc->setBuffer(beta, 0, 13);
         for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-            enc->dispatchThreadgroups(MTL::Size(H, 1, 1), MTL::Size(D, 1, 1));
-        after(enc, "kda_prep");
+            enc->dispatchThreadgroups(MTL::Size(H, rows ? T : 1, 1), MTL::Size(D, 1, 1));
+        after(enc, rows ? "kda_prep_rows" : "kda_prep");
+        if (rows) {
+            const ConvArgs ca{inner, cfg_.conv_kernel, T, 0};
+            enc->setComputePipelineState(pso("kda_conv_shift"));
+            enc->setBuffer(qkv, 0, 0);
+            enc->setBuffer(conv_state_[il].get(), 0, 1);
+            enc->setBytes(&ca, sizeof(ca), 2);
+            for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                enc->dispatchThreads(MTL::Size(3 * inner, 1, 1), MTL::Size(256, 1, 1));
+            after(enc, "kda_conv_shift");
+        }
     } else {
         part(enc, "kda conv");
         const ConvArgs ca{inner, cfg_.conv_kernel, T, snap};

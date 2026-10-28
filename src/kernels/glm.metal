@@ -811,6 +811,70 @@ kernel void kda_prep(device const float* x [[buffer(0)]], device const float* wq
             state[uint64_t(p * a.channels + ch) * taps + j] = hist[p][j];
 }
 
+// kda_prep with a threadgroup per (head, token), same arithmetic: each token's conv inputs come from x, or for the
+// first taps tokens from the state, which this kernel only reads (kda_conv_shift then moves it on).
+kernel void kda_prep_rows(device const float* x [[buffer(0)]], device const float* wq [[buffer(1)]],
+                          device const float* wk [[buffer(2)]], device const float* wv [[buffer(3)]],
+                          device const float* state [[buffer(4)]], device float* y [[buffer(5)]],
+                          constant PrepArgs& a [[buffer(6)]], device float* snap_state [[buffer(7)]],
+                          device const float* raw [[buffer(8)]], device const float* dt_bias [[buffer(9)]],
+                          device const float* A [[buffer(10)]], device const float* raw_beta [[buffer(11)]],
+                          device float* g [[buffer(12)]], device float* beta [[buffer(13)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[32];
+    const uint h = tg.x, t = tg.y;
+    const uint width = 3 * a.channels, taps = a.kernel_len - 1, ch = h * a.head_dim + tid;
+    float conv[3];
+    for (uint p = 0; p < 3; ++p) {
+        const uint c = p * a.channels + ch;
+        device const float* w = (p == 0 ? wq : p == 1 ? wk : wv) + uint64_t(ch) * a.kernel_len;
+        // Input at position t + d (d <= 0): x's row, or before the first token the state (oldest first).
+        auto in = [&](int d) {
+            const int q = int(t) + d;
+            return q >= 0 ? x[uint64_t(q) * width + c] : state[uint64_t(c) * taps + uint(q + int(taps))];
+        };
+        float acc = w[taps] * in(0);
+        for (uint j = 0; j < taps; ++j)
+            acc += w[j] * in(int(j) - int(taps));
+        conv[p] = acc * sigmoidf(acc);
+        if (t + 1 == a.snap)
+            for (uint j = 0; j < taps; ++j)
+                snap_state[uint64_t(c) * taps + j] = in(int(j) + 1 - int(taps));
+    }
+    for (uint p = 0; p < 2; ++p) {
+        const float psum = simd_sum(conv[p] * conv[p]);
+        if (lane == 0)
+            part[sg] = psum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float total = simd_sum(lane < a.head_dim / 32 ? part[lane] : 0.0f);
+        conv[p] *= 1.0f / max(sqrt(total), a.l2_eps);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint p = 0; p < 3; ++p)
+        y[uint64_t(t) * width + p * a.channels + ch] = conv[p];
+    const float v = (raw[uint64_t(t) * a.channels + ch] + dt_bias[ch]) * A[h];
+    g[uint64_t(t) * a.channels + ch] = a.lower_bound * sigmoidf(-v);
+    if (tid == 0)
+        beta[t * a.heads + h] = sigmoidf(raw_beta[t * a.heads + h]);
+}
+
+// The conv state after a.tokens more inputs (x as kda_conv's): the last taps of them, the state's own entries first
+// when there are fewer tokens than taps. One thread per channel of q|k|v.
+kernel void kda_conv_shift(device const float* x [[buffer(0)]], device float* state [[buffer(1)]],
+                           constant ConvArgs& a [[buffer(2)]], uint c [[thread_position_in_grid]])
+{
+    const uint width = 3 * a.channels, taps = a.kernel_len - 1;
+    if (c >= width)
+        return;
+    device float* s = state + uint64_t(c) * taps;
+    for (uint j = 0; j < taps; ++j) {
+        const int q = int(a.tokens) - int(taps) + int(j);
+        s[j] = q >= 0 ? x[uint64_t(q) * width + c] : s[j + a.tokens];
+    }
+}
+
 // y = rms_norm(x) * w * sigmoid(gate), one threadgroup per head row.
 kernel void rms_norm_gate(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                           device const float* gate [[buffer(2)]], device float* y [[buffer(3)]],
