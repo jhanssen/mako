@@ -1322,7 +1322,7 @@ void EngineBase::moe_decode(MTL::CommandBuffer* cb, MTL::ComputeCommandEncoder*&
 // buffers committed here go to `committed` (wait for them before this layer's slots are touched again); cb and enc
 // continue after.
 void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& mw,
-                             uint32_t il, MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G,
+                             uint32_t il, MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, uint32_t pos0,
                              std::vector<MTL::CommandBuffer*>& committed)
 {
     const uint32_t E = dims_.n_embd, k = dims_.n_expert_used, nff = dims_.n_ff_exp;
@@ -1337,12 +1337,8 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score),
                        penalize ? routing_.miss_penalty : 0.0f};
     MTL::Buffer* unused = scratch("p_unused", 64);
+    MTL::Buffer* biased = scratch("p_biased", uint64_t(G) * dims_.n_expert * 4);
     enc->setComputePipelineState(pso("moe_route"));
-    enc->setBuffer(rlog, 0, 0);
-    enc->setBuffer(mw.bias.buf, mw.bias.off, 1);
-    enc->setBuffer(sel, 0, 2);
-    enc->setBuffer(ew, 0, 3);
-    enc->setBuffer(scratch("p_biased", uint64_t(G) * dims_.n_expert * 4), 0, 4);
     enc->setBytes(&ra, sizeof(ra), 5);
     if (penalize)
         enc->setBuffer(arena_->slot_table(), uint64_t(il) * dims_.n_expert * 4, 6);
@@ -1351,8 +1347,23 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     enc->setBuffer(unused, 0, 7);
     enc->setBuffer(unused, 0, 8);
     enc->setBuffer(unused, 0, 9);
-    for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size(G, 1, 1), MTL::Size(32, 1, 1));
+    // Runs of rows with one bias each: the rows taking input rows route with bias_vl when the model has one.
+    for (uint32_t t0 = 0; t0 < G;) {
+        const bool vl = mw.bias_vl.buf && input_at(pos0 + t0);
+        uint32_t t1 = t0 + 1;
+        while (t1 < G && (mw.bias_vl.buf && input_at(pos0 + t1)) == vl)
+            ++t1;
+        const DevTensor& b = vl ? mw.bias_vl : mw.bias;
+        const uint64_t ne = dims_.n_expert;
+        enc->setBuffer(rlog, t0 * ne * 4, 0);
+        enc->setBuffer(b.buf, b.off, 1);
+        enc->setBuffer(sel, t0 * 16 * 4, 2);
+        enc->setBuffer(ew, t0 * 16 * 4, 3);
+        enc->setBuffer(biased, t0 * ne * 4, 4);
+        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+            enc->dispatchThreadgroups(MTL::Size(t1 - t0, 1, 1), MTL::Size(32, 1, 1));
+        t0 = t1;
+    }
     after(enc, "moe_route");
     submit(cb, enc);
     cur_cb_ = cb;

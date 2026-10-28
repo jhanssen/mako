@@ -59,6 +59,7 @@ public:
     // One MoE layer's dense parts and SwiGLU clamps (<= 0: none).
     struct MoeWeights {
         DevTensor router, bias, sh_gate, sh_up, sh_down;
+        DevTensor bias_vl; // routes the rows taking input rows (an image) when present
         float clamp_exp = 0, clamp_sh = 0;
     };
 
@@ -194,10 +195,12 @@ protected:
                     const MoeWeights* next = nullptr, uint32_t predict_k = 0, uint32_t ahead = 1);
     // block false: only the layers whose routing has already been signaled, stopping at the first that has not.
     void serve_moe(MTL::CommandBuffer* cb, bool block = true);
-    // G tokens' routed experts of arena row il (rows of xn_g) added into ffo, which holds their shared expert's
-    // output. Command buffers it commits go to `committed`: they must complete before the row's slots are used again.
+    // G tokens' routed experts of arena row il (rows of xn_g, the first at position pos0) added into ffo, which holds
+    // their shared expert's output. Command buffers it commits go to `committed`: they must complete before the row's
+    // slots are used again.
     void moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc, const MoeWeights& w, uint32_t il,
-                     MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, std::vector<MTL::CommandBuffer*>& committed);
+                     MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, uint32_t pos0,
+                     std::vector<MTL::CommandBuffer*>& committed);
     static constexpr uint32_t kBatchRows = 8192; // prefill expert rows (token, expert pairs) run and combined together
     // Staged prefill: for a group of at least kStageMinTokens (which routes to nearly every expert of every layer),
     // the arena's missing experts of every layer are read ahead into a ring (Stager) while the GPU works, and the

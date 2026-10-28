@@ -44,6 +44,10 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
 - Prefill takes embedding rows for given positions (the engines dequantise token rows on the CPU into a shared
   buffer; image rows are copied there instead). DeepSeek's Engram masks image positions as above. GLM's next-token
   block, which reads the next token's embedding, gets the image row there.
+- DeepSeek routes image rows with the checkpoint's vision router bias (`blk.N.exp_probs_b_vl.bias`) as the reference
+  does, when the model has it: ISTA's six-shard files do; Maya-S and ISTA's four-shard files do not, and route image
+  rows with the text bias. Image rows always run through the prefill MoE path (its routing takes a bias per run of
+  rows), also in a step of 8 rows or fewer.
 - `gen::Session` keys image positions by the image's content hash, so a prefix holding a different image is not
   reused.
 - Server: OpenAI `image_url` parts and Anthropic `image` blocks, base64 / `data:` URLs (no fetching), PNG and JPEG

@@ -1393,7 +1393,7 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                 ffn_dense(enc, fg, fu, fd, xn_g, ffo, cfg_.swiglu_clamp_shexp[il], std::min(chunk, G - c0),
                           uint64_t(c0) * E * 4, uint64_t(c0) * E * 4);
             if (!L.dense)
-                moe_prefill(cb, enc, L.moe, il, xn_g, ffo, G, committed);
+                moe_prefill(cb, enc, L.moe, il, xn_g, ffo, G, pos_, committed);
             ablate(enc, il, ablate_ffn_, ffo, G);
             ablate(enc, il, ablate_stream_, R, G * cfg_.hc);
             hc_post(enc, ffo, R, R2, pc_g, G);

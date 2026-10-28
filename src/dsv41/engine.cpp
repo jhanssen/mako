@@ -256,6 +256,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         }
         L->moe.router = upload(p + "ffn_gate_inp.weight");
         L->moe.bias = upload(p + "exp_probs_b.bias");
+        if (model.find(p + "exp_probs_b_vl.bias"))
+            L->moe.bias_vl = upload(p + "exp_probs_b_vl.bias");
         L->moe.sh_gate = upload(p + "ffn_gate_shexp.weight");
         L->moe.sh_up = upload(p + "ffn_up_shexp.weight");
         L->moe.sh_down = upload(p + "ffn_down_shexp.weight");
@@ -864,7 +866,11 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
         throw std::runtime_error("context full");
     apply_pressure();
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, chunk = std::min(opts_.prefill_chunk, G);
-    const bool decode = G <= kMaxDecodeTokens; // MoE with GPU routing and served misses, no expert GEMMs
+    // MoE with GPU routing and served misses, no expert GEMMs; rows taking input rows route in moe_prefill (bias_vl).
+    bool decode = G <= kMaxDecodeTokens;
+    if (decode && layers_[0]->moe.bias_vl.buf)
+        for (uint32_t i = 0; i < G; ++i)
+            decode = decode && !input_at(pos_ + i);
     // Options::prefill_skip: the first row of these tokens layer il computes. Layer il's rows need the window of
     // its own KV rows before them, so each layer down from the last starts a window (less one) earlier.
     const uint32_t W = cfg_.sliding_window, exact = std::max(W, opts_.prefill_exact_tail);
@@ -1045,7 +1051,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
                 ffn_dense(enc, L.moe.sh_gate, L.moe.sh_up, L.moe.sh_down, xn_g, ffo, L.moe.clamp_sh,
                           std::min(chunk, Gs - c0), uint64_t(c0) * E * 4, uint64_t(c0) * E * 4);
             ablate(enc, il, ablate_shexp_, ffo, 0, Gs);
-            moe_prefill(cb, enc, L.moe, il, xn_g, ffo, Gs, committed);
+            moe_prefill(cb, enc, L.moe, il, xn_g, ffo, Gs, pos_ + s, committed);
         }
         part(enc, "ffn hc post");
         if (G == 1)
