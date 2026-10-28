@@ -142,11 +142,11 @@ void Report::step(const StepStats& s)
     for (const KernelTime& k : s.kernels)
         kernels += std::format("{}{{\"kernel\":{},\"ms\":{:.4f},\"count\":{}}}", kernels.empty() ? "" : ",",
                                json_str(k.kernel), k.ms, k.count);
-    *out_ << std::format("{{\"type\":\"step\",\"pos\":{},\"token\":{},\"wall_ms\":{:.2f},\"encode_ms\":{:.2f},"
-                         "\"gpu_ms\":{:.2f},\"route_wait_ms\":{:.2f},\"ensure_ms\":{:.2f},\"read_ms\":{:.2f},"
-                         "\"hits\":{},\"misses\":{},\"read_bytes\":{}{}}}\n",
-                         s.pos, s.token, s.wall_ms, s.encode_ms, s.gpu_ms, s.route_wait_ms, s.ensure_ms, s.read_ms,
-                         s.hits, s.misses, s.read_bytes,
+    *out_ << std::format("{{\"type\":\"step\",\"pos\":{},\"token\":{},\"tokens\":{},\"wall_ms\":{:.2f},"
+                         "\"encode_ms\":{:.2f},\"gpu_ms\":{:.2f},\"route_wait_ms\":{:.2f},\"ensure_ms\":{:.2f},"
+                         "\"read_ms\":{:.2f},\"hits\":{},\"misses\":{},\"read_bytes\":{}{}}}\n",
+                         s.pos, s.token, s.tokens, s.wall_ms, s.encode_ms, s.gpu_ms, s.route_wait_ms, s.ensure_ms,
+                         s.read_ms, s.hits, s.misses, s.read_bytes,
                          (s.layers.empty() ? std::string() : ",\"layers\":[" + layers + "]") +
                              (s.kernels.empty() ? std::string() : ",\"kernels\":[" + kernels + "]"));
 }
@@ -215,9 +215,10 @@ std::string Report::markdown(size_t skip) const
         return md;
     }
     std::vector<double> wall, encode, gpu, wait, ensure, read;
-    uint64_t hits = 0, misses = 0, bytes = 0;
+    uint64_t hits = 0, misses = 0, bytes = 0, run = 0;
     for (size_t i = skip; i < steps_.size(); ++i) {
         const StepStats& s = steps_[i];
+        run += s.tokens;
         wall.push_back(s.wall_ms);
         encode.push_back(s.encode_ms);
         gpu.push_back(s.gpu_ms);
@@ -229,13 +230,23 @@ std::string Report::markdown(size_t skip) const
         bytes += s.read_bytes;
     }
     const double n = double(wall.size());
-    md += std::format("- decode, {} steps (first {} left out): {:.1f} ms/token median ({:.1f} tok/s), mean {:.1f}; per "
-                      "token: encode {:.2f} ms, GPU {:.1f} ms, CPU waiting for routing {:.1f} ms, making experts "
-                      "resident {:.1f} ms\n",
-                      wall.size(), skip, median(wall), 1e3 / median(wall), mean(wall), mean(encode), mean(gpu),
-                      mean(wait), mean(ensure));
-    md += std::format("- experts: {:.1f}% resident, {:.1f} misses/token, {:.1f} MB/token read in {:.1f} ms\n",
-                      100.0 * hits / std::max<uint64_t>(1, hits + misses), misses / n, bytes / n / 1e6, mean(read));
+    if (run == wall.size()) {
+        md += std::format("- decode, {} steps (first {} left out): {:.1f} ms/token median ({:.1f} tok/s), mean {:.1f}; "
+                          "per token: encode {:.2f} ms, GPU {:.1f} ms, CPU waiting for routing {:.1f} ms, making "
+                          "experts resident {:.1f} ms\n",
+                          wall.size(), skip, median(wall), 1e3 / median(wall), mean(wall), mean(encode), mean(gpu),
+                          mean(wait), mean(ensure));
+    } else { // drafted steps: how many of their tokens were kept is the caller's to report
+        md += std::format("- decode, {} steps (first {} left out), {:.2f} tokens run a step (drafts included, kept or "
+                          "not): {:.1f} ms/step median, mean {:.1f}; per step: encode {:.2f} ms, GPU {:.1f} ms, CPU "
+                          "waiting for routing {:.1f} ms, making experts resident {:.1f} ms\n",
+                          wall.size(), skip, run / n, median(wall), mean(wall), mean(encode), mean(gpu), mean(wait),
+                          mean(ensure));
+    }
+    const char* per = run == wall.size() ? "token" : "step";
+    md += std::format("- experts: {:.1f}% resident, {:.1f} misses/{}, {:.1f} MB/{} read in {:.1f} ms\n",
+                      100.0 * hits / std::max<uint64_t>(1, hits + misses), misses / n, per, bytes / n / 1e6, per,
+                      mean(read));
     if (level_ >= Telemetry::kernels) {
         std::vector<KernelTime> agg;
         for (size_t i = skip; i < steps_.size(); ++i)

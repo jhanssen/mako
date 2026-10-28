@@ -54,6 +54,7 @@ struct KernelTime {
 struct StepStats {
     uint32_t pos = 0;
     int32_t token = 0;
+    uint32_t tokens = 1; // run in the step (a drafted step runs its drafts too, kept or not)
     double wall_ms = 0, encode_ms = 0, gpu_ms = 0;
     double prep_ms = 0;       // CPU work before encoding (inputs read from files)
     double route_wait_ms = 0; // CPU waiting for the GPU's routing results

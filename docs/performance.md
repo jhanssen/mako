@@ -130,9 +130,12 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
   - The stream step and norm fused for prefill as decode has them (`hc_step_norm`): hc and norm is ~2x what its
     memory traffic needs (estimated). ~0.5 s.
   - The shared expert and dense FFN at ~22 TFLOP/s (2.8 s).
-- MTP drafts slow decode down on long code prompts: after a 20K-token prompt 33 ms/token with them against 24 without
-  (2026-10-27). Measure their acceptance there; then stop drafting for a request whose acceptance falls below
-  break-even.
+- MTP drafts: a two-token step costs ~31 ms at short contexts and ~34 ms after 21.9K tokens, against ~23.5 for one
+  token, so drafting pays above ~33% / ~45% acceptance. After a 21.9K-token code prompt, 97% were kept: 18.5 ms a
+  token against 23.5 without (2026-10-28). The earlier "33 against 24 ms/token" was the telemetry summary's
+  per-step time read as per token (fixed: it now reports steps and tokens run a step). A gate that stops drafting
+  below break-even would matter only for requests whose acceptance falls under a third; the server logs each
+  request's share of drafts kept, so look there before building one.
 - Decode at 23.1 ms/token, the weights ~16.3 ms of it. Not built, by expected gain:
   - More independent GEMVs in one dispatch (`mako_mul_mv_jobs`): f_b + g_b (rows of 128: the job kernel needs the
     short-row kernel as a job type), the MLA per-head k_b and v_b with their neighbours, hc_mean + the output norm.

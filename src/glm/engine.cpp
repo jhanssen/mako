@@ -899,6 +899,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     last_step_ = StepStats{};
     last_step_.pos = pos_;
     last_step_.token = tokens[0];
+    last_step_.tokens = T;
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     const uint64_t rows = kMaxDecodeTokens; // fixed sizes: the next-token block reads "xn" after the step
     MTL::Buffer* x = scratch("x", rows * E * 4);

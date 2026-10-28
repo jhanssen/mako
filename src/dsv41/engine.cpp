@@ -892,6 +892,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
     last_step_ = core::StepStats{};
     last_step_.pos = pos_;
     last_step_.token = tokens[0];
+    last_step_.tokens = G;
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
     // Engram rows of these positions (both tables), read before the GPU work that needs them.
