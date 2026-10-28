@@ -119,6 +119,9 @@ A cut in the middle of a calculation can leave the answer wrong.
   bit for bit (tests `e2e_pool`, `ds41_pool`: two threads switching at every step), except with `--miss-penalty`,
   whose routing depends on which experts the other conversations left in memory. The log line of each request names
   its conversation and its turns.
+- A stream with nothing to send for 5 seconds (waiting for its turn, reading a long prompt, reasoning the client does
+  not see) gets an SSE comment line (`: keepalive`), which clients skip, so clients that drop idle streams (pi's HTTP
+  client after 300 s) keep the connection. A long prompt is polled between prefill groups, every ~10-20 s.
 - `--learn` adds the session's routing counts to the model's profile at shutdown (SIGINT / SIGTERM), so the experts
   that start in memory follow use.
 - `--dump-requests DIR` saves each request body, for debugging a client.

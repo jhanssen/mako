@@ -51,6 +51,8 @@ void log_result(const std::string& id, const gen::GenerateResult& r, const char*
 
 } // namespace
 
+constexpr auto kKeepalive = std::chrono::seconds(5);
+
 struct Server::Impl {
     gen::Model& engine;
     const text::Tokenizer& tok;
@@ -94,11 +96,12 @@ struct Server::Impl {
                        std::vector<std::shared_ptr<const vision::Encoder::Output>>& held);
     std::list<std::pair<uint64_t, std::shared_ptr<const vision::Encoder::Output>>> image_cache; // recent first
     // Runs the request in its turns, on its conversation; on_delta gets each increment (false: the client went away),
-    // `begin` runs when its first turn comes (false: give up). False when it gave up before generating; `conv`
-    // describes its conversation for the log.
+    // `idle` each token that adds none, `begin` runs when its first turn comes (false: give up). False when it gave
+    // up before generating; `conv` describes its conversation for the log.
     bool generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                   const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
-                  const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv);
+                  const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv,
+                  const std::function<void()>& idle = {});
 };
 
 std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> prompt, Images& images) const
@@ -162,7 +165,8 @@ void Server::Impl::encode_images(Images& images, ChatRequest& cr,
 
 bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                             const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
-                            const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv)
+                            const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv,
+                            const std::function<void()>& idle)
 {
     std::vector<std::shared_ptr<const vision::Encoder::Output>> held;
     cr.gen.prefill_piece = opts.prefill_piece;
@@ -210,6 +214,8 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
             client_gone = true;
             return false;
         }
+        if (d.empty() && idle)
+            idle();
         stopped = !more;
         return more;
     }, r, pick, start);
@@ -293,7 +299,24 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
     auto shared = std::make_shared<ChatRequest>(std::move(cr));
     res.set_chunked_content_provider("text/event-stream", [this, shared, proto, prompt = std::move(prompt), id, slot,
                                                            images](size_t, httplib::DataSink& sink) {
-        const auto write = [&](const std::string& s) { return s.empty() || sink.write(s.data(), s.size()); };
+        auto last = std::chrono::steady_clock::now();
+        const auto write = [&](const std::string& s) {
+            if (s.empty())
+                return true;
+            last = std::chrono::steady_clock::now();
+            return sink.write(s.data(), s.size());
+        };
+        // An SSE comment after a few seconds without output (waiting for a turn, a long prefill, hidden reasoning):
+        // clients drop streams idle for their body timeout. Polled on this thread.
+        const auto keepalive = [&] {
+            return std::chrono::steady_clock::now() - last < kKeepalive || write(": keepalive\n\n");
+        };
+        struct Restore {
+            std::function<bool()>& f;
+            std::function<bool()> saved;
+            ~Restore() { f = std::move(saved); }
+        } restore{shared->gen.cancelled, shared->gen.cancelled};
+        shared->gen.cancelled = [&] { return !keepalive() || restore.saved(); };
         try {
             OutputParser parser(tok, shared->tools, shared->stop, shared->reasoning_first);
             bool stopped = false;
@@ -301,7 +324,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             std::string conv;
             const auto begin = [&] { return !shared->gen.cancelled() && write(proto->begin(uint32_t(prompt.size()))); };
             if (!generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); }, stopped,
-                          images.get(), begin, r, conv))
+                          images.get(), begin, r, conv, [&] { keepalive(); }))
                 return false; // gave up while waiting
             const End e = end_of(r, parser, stopped);
             log_result(id, r, end_name(e), conv);
