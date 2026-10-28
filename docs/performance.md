@@ -419,9 +419,11 @@ both estimates beforehand; isolated benchmarks (`gemv_bench`) are the better gui
 ## Both models: open (2026-10-27)
 
 - Conversation switches copy whole contexts: parking copies the recurrent state and every cached position out, and
-  the next switch copies them back. GLM-5.3 caches ~25 KB a token, so ~0.8 GB each way at 32K tokens; switches
-  measured 8-9 ms only at short contexts. Measure two conversations at 32K with 1 s slices; if it matters, per-session
-  GPU buffers (a switch picks buffers) or a shared prefix with private suffixes.
+  the next switch copies them back. Measured for GLM-5.3 at 32K positions (2026-10-28): 0.78 GB, `save_positions`
+  14 ms (67 ms when its allocation is fresh), `load_positions` 11 ms, two 2.4 ms checkpoints: ~30 ms a switch, ~3%
+  of the time when two conversations alternate at the default 1 s slices. An uninitialized buffer instead of a
+  zeroed vector and the copy on 4 threads would make it ~20 ms (copies of the same size: 13.6 -> 10.7 -> 8.0 ms);
+  not done for ~1%. Per-session GPU buffers or a shared prefix would remove the copies but cost memory.
 - Several sequences a step (continuous batching) for several agents at once: dense weights read once for all of
   them, experts by routing overlap; the row-invariant GEMVs keep each sequence's result independent of the batch.
   The largest throughput gain and the largest change (KDA/MLA state per sequence, the session API, the scheduler).
