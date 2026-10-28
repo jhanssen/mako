@@ -331,6 +331,12 @@ int main(int argc, char** argv)
         }
     const double resident = experts ? 100.0 * double(slots) / double(experts) : 100.0;
     so.park_bytes = uint64_t(base->arena_plan().park);
+    so.cache_gb = base->arena().bytes() / 1e9;
+    so.resident = resident / 100.0;
+    so.cache_counters = [base] {
+        const auto& st = base->arena().stats();
+        return mako::server::CacheCounters{st.hits, st.misses};
+    };
     mako::log::info("ready in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
                     "{:.1f} GB for parked conversations; temperature {}, top_p {}",
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(), max_ctx,

@@ -19,6 +19,29 @@ uint64_t SessionPool::parked_bytes() const
     return n;
 }
 
+void SessionPool::snapshot()
+{
+    Info in;
+    for (const Slot& s : slots_)
+        in.conversations.push_back({s.index, s.session->context().size(), s.session.get() == live_, s.busy,
+                                    s.session.get() == live_ ? 0 : s.session->bytes(), s.used_at});
+    in.parked = parked_bytes();
+    std::lock_guard lock(info_mutex_);
+    info_ = std::move(in);
+}
+
+SessionPool::Info SessionPool::info() const
+{
+    Info in;
+    {
+        std::lock_guard lock(info_mutex_);
+        in = info_;
+    }
+    std::lock_guard lock(turn_mutex_);
+    in.waiting = queue_.size();
+    return in;
+}
+
 uint32_t SessionPool::trim()
 {
     uint32_t evicted = 0;
@@ -86,12 +109,14 @@ SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
     for (Slot& slot : slots_)
         if (slot.session.get() == s) {
             slot.used = ++clock_;
+            slot.used_at = std::chrono::steady_clock::now();
             slot.busy = true;
             pick.index = slot.index;
         }
     pick.session = s;
     make_live(s);
     pick.evicted = trim();
+    snapshot();
     return pick;
 }
 
@@ -101,6 +126,7 @@ void SessionPool::release(const Session* s)
         if (slot.session.get() == s)
             slot.busy = false;
     trim();
+    snapshot();
 }
 
 bool SessionPool::take_turn(const std::function<bool()>& cancelled)
@@ -162,6 +188,7 @@ bool SessionPool::generate(std::span<const int32_t> prompt, GenerateParams p,
         take_turn({});
         const auto t = std::chrono::steady_clock::now();
         make_live(pick.session);
+        snapshot();
         pick.switch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
         ++pick.switches;
         slice_start = std::chrono::steady_clock::now();

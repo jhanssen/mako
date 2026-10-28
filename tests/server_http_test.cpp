@@ -1,6 +1,7 @@
 // The server over HTTP with a scripted stand-in for the engine (the model file gives only the tokenizer and chat
 // template): streams carry SSE comments while a request waits for its turn or its prompt is read; repetition loops
-// close the reasoning or end the answer, and are left alone in code blocks.
+// close the reasoning or end the answer, and are left alone in code blocks; /v1/status shows requests as they run and
+// after, and the /status page needs no key while /v1/status does.
 //   server_http_test <model.gguf>
 #include "gguf/gguf.hpp"
 #include "server/server.hpp"
@@ -191,6 +192,27 @@ int main(int argc, char** argv)
     check(content(second) == content(first) && content(first).starts_with("Hello there. x"),
           "both answers whole");
 
+    // Status while a request generates (~9 s at 300 ms a token) and after it.
+    std::string during;
+    std::thread b([&] { first = stream(opts.port, "status"); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+    if (auto res = httplib::Client("127.0.0.1", opts.port).Get("/v1/status"))
+        during = res->body;
+    b.join();
+    std::string after;
+    if (auto res = httplib::Client("127.0.0.1", opts.port).Get("/v1/status"))
+        after = res->body;
+    check(during.find(R"("phase":"generating")") != std::string::npos && during.find(R"("in_flight":1)") != std::string::npos,
+          "status during a request: generating, one in flight");
+    check(after.find(R"("requests":[])") != std::string::npos &&
+              after.find(R"("recent":[{"id":"chatcmpl-)") != std::string::npos &&
+              after.find(R"("finish":"stop")") != std::string::npos && after.find(R"("state":"live")") != std::string::npos,
+          "status after: no requests, the finished one recent, a live conversation");
+    {
+        const auto page = httplib::Client("127.0.0.1", opts.port).Get("/status");
+        check(page && page->status == 200 && page->body.find("/v1/status") != std::string::npos, "the status page");
+    }
+
     // Loops: a 60-times repeated sentence of ~15 tokens, ended by the guard after 256 + one time through.
     model.step_ms = 0;
     const std::string again = " The value is the same as before, so I will check it once more.";
@@ -230,6 +252,23 @@ int main(int argc, char** argv)
 
     server.stop();
     t.join();
+
+    // With an API key: the page needs none, its data does.
+    mako::server::ServerOptions keyed = opts;
+    keyed.port = opts.port + 1;
+    keyed.api_keys = {"test-key-0123456789"};
+    mako::server::Server locked(model, *tok, tmpl, keyed);
+    std::thread u([&] { locked.run(); });
+    httplib::Client lc("127.0.0.1", keyed.port);
+    for (int i = 0; i < 100 && !lc.Get("/health"); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto page = lc.Get("/status");
+    const auto bare = lc.Get("/v1/status");
+    const auto keyed_res = lc.Get("/v1/status", httplib::Headers{{"Authorization", "Bearer test-key-0123456789"}});
+    check(page && page->status == 200 && bare && bare->status == 401 && keyed_res && keyed_res->status == 200,
+          "with a key: the page open, /v1/status 401 without the key and 200 with it");
+    locked.stop();
+    u.join();
     std::println("{}", failures ? std::format("{} failed", failures) : "all passed");
     return failures ? 1 : 0;
 }

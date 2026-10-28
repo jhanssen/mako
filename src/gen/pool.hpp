@@ -55,12 +55,29 @@ public:
     uint64_t parked_bytes() const;
     uint64_t budget() const { return budget_; }
 
+    // The conversations as of the last change to them, and the requests waiting for a turn; any thread.
+    struct Info {
+        struct Conversation {
+            size_t index = 0, tokens = 0;
+            bool live = false, busy = false; // the engine's context; a request's
+            uint64_t bytes = 0;              // parked
+            std::chrono::steady_clock::time_point used;
+        };
+        std::vector<Conversation> conversations;
+        uint64_t parked = 0;
+        size_t waiting = 0;
+    };
+    Info info() const;
+    // Records the conversations for info(); by the thread generating (between tokens), for a growing context.
+    void snapshot();
+
 private:
     struct Slot {
         std::unique_ptr<Session> session;
         size_t index = 0;
         uint64_t used = 0;
         bool busy = false;
+        std::chrono::steady_clock::time_point used_at = std::chrono::steady_clock::now();
     };
     uint32_t trim();
     void make_live(Session* s);
@@ -77,7 +94,10 @@ private:
     uint64_t clock_ = 0;
     size_t next_index_ = 0;
 
-    std::mutex turn_mutex_;
+    mutable std::mutex info_mutex_;
+    Info info_;
+
+    mutable std::mutex turn_mutex_;
     std::condition_variable turn_cv_;
     std::deque<uint64_t> queue_; // waiting requests' tickets, in arrival order
     bool held_ = false;

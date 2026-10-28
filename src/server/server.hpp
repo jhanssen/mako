@@ -5,10 +5,12 @@
 #include "gen/model.hpp"
 #include "gen/session.hpp"
 #include "server/openai.hpp"
+#include "server/status.hpp"
 #include "text/tokenizer.hpp"
 #include "vision/encoder.hpp"
 #include "vision/mmproj.hpp"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +47,10 @@ struct ServerOptions {
     // blocks: one in the reasoning closes it, one in the answer ends the reply ("stop"; a whole reply is cut back to
     // the loop's first time through).
     uint32_t loop_guard = 256;
+    // For GET /v1/status: the expert cache's counters (called on a generating thread, between steps), its size and
+    // the share of the experts it holds.
+    std::function<CacheCounters()> cache_counters;
+    double cache_gb = 0, resident = 0;
     // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
     const vision::Mmproj* mmproj = nullptr;
     vision::Encoder* vision = nullptr;
@@ -59,7 +65,8 @@ bool host_allowed(const std::string& host);
 // Without keys: whether an Origin header is absent or a loopback page (http(s)://localhost, 127.0.0.1 or [::1]).
 bool origin_allowed(const std::string& origin);
 
-// OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health.
+// OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health, and
+// /v1/status (JSON) with /status (a page showing it).
 // Requests take turns generating (see ServerOptions::slice_ms), up to max_waiting waiting; each conversation keeps
 // its context between requests (see ServerOptions::park_bytes).
 class Server {

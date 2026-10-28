@@ -11,7 +11,7 @@ One request runs at a time on one session, so a conversation's next turn reuses 
 The server listens on 127.0.0.1 unless `--host` says otherwise.
 
 - **API keys**: `--api-key KEY[,KEY...]`, `--api-key-file FILE` (a key per line; keeps keys out of the shell history
-  and the process list), or `MAKO_API_KEY` / `MAKO_API_KEY_FILE` (when neither option is given). Every request but `/health` then needs one of them:
+  and the process list), or `MAKO_API_KEY` / `MAKO_API_KEY_FILE` (when neither option is given). Every request but `/health` and the `/status` page then needs one of them:
   `Authorization: Bearer KEY` (OpenAI clients' API key setting) or `x-api-key: KEY` (Anthropic clients, Claude Code's
   `ANTHROPIC_API_KEY`); others get HTTP 401. Several keys let one client's key be withdrawn. Keys under 16 characters
   get a warning (`openssl rand -hex 24` makes a good one). Another `--host` requires a key.
@@ -22,6 +22,22 @@ The server listens on 127.0.0.1 unless `--host` says otherwise.
 
 The key travels in clear text: for access from other machines, use an encrypted path (an SSH tunnel, Tailscale, or a
 reverse proxy with TLS) rather than exposing the port. Not meant for the open internet.
+
+## Status
+
+`http://127.0.0.1:8080/status` is a page that shows `GET /v1/status` (JSON), refreshed every 2 seconds:
+
+- the model, the context size, uptime and macOS's thermal state (`nominal`, `fair`, `serious` or `critical`);
+- requests in flight and waiting for a turn, and each running one's phase (`waiting`, `reading` the prompt,
+  `generating`), prompt and generated tokens and decode rate;
+- the expert cache: size, the share of experts it holds, hits and misses so far;
+- the conversations: live (the engine's context) or parked, in use, tokens, parked bytes against `--park-gb`, last
+  use;
+- the last 16 requests: how each ended, its conversation, prompt and reused tokens, prefill and decode rates, and
+  experts read from the SSD per generated token.
+
+The page itself holds no data and needs no key; with `--api-key`, it asks for one and keeps it in the browser's local
+storage for `/v1/status`.
 
 ## OpenAI
 

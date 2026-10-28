@@ -3,6 +3,8 @@
 #include "server/anthropic.hpp"
 #include "server/openai.hpp"
 #include "server/protocol.hpp"
+#include "server/status.hpp"
+#include "server/status_page.hpp"
 #include "core/log.hpp"
 #include "gen/loop_guard.hpp"
 #include "gen/pool.hpp"
@@ -65,6 +67,7 @@ struct Server::Impl {
     std::atomic<uint32_t> in_flight = 0; // accepted chat requests, generating or waiting
     httplib::Server http;
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
+    StatusBoard board;
 
     Impl(gen::Model& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
         : engine(e), tok(t), tmpl(tm), opts(std::move(o)), thinking(thinking_support(tm)),
@@ -96,14 +99,25 @@ struct Server::Impl {
     void encode_images(Images& images, ChatRequest& cr,
                        std::vector<std::shared_ptr<const vision::Encoder::Output>>& held);
     std::list<std::pair<uint64_t, std::shared_ptr<const vision::Encoder::Output>>> image_cache; // recent first
-    // Runs the request in its turns, on its conversation; on_delta gets each increment (false: the client went away),
-    // `idle` each token that adds none, `begin` runs when its first turn comes (false: give up). False when it gave
-    // up before generating; `conv` describes its conversation for the log. A loop in the answer ends it: `loop_keep`
-    // is then the generated tokens up to the loop's first time through (else 0).
-    bool generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
+    struct Outcome {
+        std::string conv;     // its conversation, for the log
+        size_t conversation = 0;
+        size_t loop_keep = 0; // a loop ended the answer: the generated tokens up to its first time through
+    };
+    // Runs request `id` in its turns, on its conversation; on_delta gets each increment (false: the client went
+    // away), `idle` each token that adds none, `begin` runs when its first turn comes (false: give up). False when it
+    // gave up before generating.
+    bool generate(const std::string& id, const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
                   const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
-                  const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv, size_t& loop_keep,
+                  const std::function<bool()>& begin, gen::GenerateResult& r, Outcome& out,
                   const std::function<void()>& idle = {});
+    CacheCounters cache() const { return opts.cache_counters ? opts.cache_counters() : CacheCounters{}; }
+    // Takes request `id` off the status board when it ends (with its result once finished() is called).
+    struct OnBoard {
+        StatusBoard& board;
+        std::string id;
+        ~OnBoard() { board.finished(id, {}, nullptr, 0, {}); }
+    };
 };
 
 std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> prompt, Images& images) const
@@ -165,10 +179,10 @@ void Server::Impl::encode_images(Images& images, ChatRequest& cr,
     cr.gen.input_rows = images.rows;
 }
 
-bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr, OutputParser& parser,
-                            const std::function<bool(const Delta&)>& on_delta, bool& stopped, Images* images,
-                            const std::function<bool()>& begin, gen::GenerateResult& r, std::string& conv,
-                            size_t& loop_keep, const std::function<void()>& idle)
+bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& prompt, ChatRequest& cr,
+                            OutputParser& parser, const std::function<bool(const Delta&)>& on_delta, bool& stopped,
+                            Images* images, const std::function<bool()>& begin, gen::GenerateResult& r, Outcome& out,
+                            const std::function<void()>& idle)
 {
     std::vector<std::shared_ptr<const vision::Encoder::Output>> held;
     cr.gen.prefill_piece = opts.prefill_piece;
@@ -199,6 +213,7 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
     size_t generated = 0, base = 0;
     bool close_reasoning = false, in_code = false;
     std::string fence_tail; // the answer's last two characters, for a ``` split across deltas
+    size_t& loop_keep = out.loop_keep;
     loop_keep = 0;
     if (rb || cr.tool_required || guard)
         cr.gen.forced = [&, nv = engine.n_vocab()](const float* logits) {
@@ -213,6 +228,7 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
     const auto start = [&](gen::GenerateParams& p) {
         if (begin && !begin())
             return false;
+        board.started(id);
         if (images && !images->prepared.empty()) {
             encode_images(*images, cr, held);
             p.input_rows = cr.gen.input_rows;
@@ -233,6 +249,14 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
             idle();
         stopped = !more;
         ++generated;
+        if (generated == 1 || generated % 64 == 0) {
+            pool.snapshot();
+            if (generated == 1)
+                board.decoding(id, cache());
+            else
+                board.cache(cache());
+        }
+        board.generated(id, generated);
         if (!guard || !more)
             return more;
         const std::string seen = fence_tail + d.content;
@@ -261,7 +285,8 @@ bool Server::Impl::generate(const std::vector<int32_t>& prompt, ChatRequest& cr,
     }, r, pick, start);
     if (!ran)
         return false;
-    conv = std::format("conversation {}{}{}, {} kept ({:.2f} of {:.1f} GB parked){}", pick.index,
+    out.conversation = pick.index;
+    out.conv = std::format("conversation {}{}{}, {} kept ({:.2f} of {:.1f} GB parked){}", pick.index,
                        pick.fresh     ? " (new)"
                        : pick.forked ? std::format(" (new, from {}'s first {} tokens)", pick.forked_from, pick.usable)
                                      : "", pick.switches ? std::format(", {} turns ({:.0f} ms switching)", pick.switches + 1, pick.switch_ms) : "",
@@ -321,13 +346,16 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             bool stopped = false;
             cr.gen.cancelled = closed;
             gen::GenerateResult r;
-            std::string conv;
-            size_t loop_keep = 0;
-            if (!generate(prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped, images.get(),
-                          [&] { return !closed(); }, r, conv, loop_keep))
+            Outcome out;
+            board.arrived(id, prompt.size());
+            const OnBoard on_board{board, id};
+            if (!generate(id, prompt, cr, parser, [&](const Delta&) { return !closed(); }, stopped, images.get(),
+                          [&] { return !closed(); }, r, out))
                 return; // gave up while waiting
+            const size_t loop_keep = out.loop_keep;
             const End e = loop_keep ? End::stop : end_of(r, parser, stopped);
-            log_result(id, r, end_name(e), conv);
+            log_result(id, r, end_name(e), out.conv);
+            board.finished(id, r, end_name(e), out.conversation, cache());
             if (loop_keep) { // the reply up to the loop's first time through
                 OutputParser kept(tok, cr.tools, cr.stop, cr.reasoning_first);
                 Delta d;
@@ -371,14 +399,16 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             OutputParser parser(tok, shared->tools, shared->stop, shared->reasoning_first);
             bool stopped = false;
             gen::GenerateResult r;
-            std::string conv;
-            size_t loop_keep = 0; // a stream cannot take back what it sent: it ends where the loop was found
+            Outcome out; // a loop ends a stream where it was found: what it sent cannot be taken back
+            board.arrived(id, prompt.size());
+            const OnBoard on_board{board, id};
             const auto begin = [&] { return !shared->gen.cancelled() && write(proto->begin(uint32_t(prompt.size()))); };
-            if (!generate(prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); }, stopped,
-                          images.get(), begin, r, conv, loop_keep, [&] { keepalive(); }))
+            if (!generate(id, prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); }, stopped,
+                          images.get(), begin, r, out, [&] { keepalive(); }))
                 return false; // gave up while waiting
-            const End e = loop_keep ? End::stop : end_of(r, parser, stopped);
-            log_result(id, r, end_name(e), conv);
+            const End e = out.loop_keep ? End::stop : end_of(r, parser, stopped);
+            log_result(id, r, end_name(e), out.conv);
+            board.finished(id, r, end_name(e), out.conversation, cache());
             if (e == End::cancelled)
                 return false;
             write(proto->end(e, parser, r));
@@ -465,7 +495,7 @@ Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Templ
     auto& h = impl_->http;
     h.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         const auto& keys = impl_->opts.api_keys;
-        const bool ok = req.path == "/health" ||
+        const bool ok = req.path == "/health" || req.path == "/status" || // the page holds no data
                         (keys.empty() ? host_allowed(req.get_header_value("Host")) &&
                                             origin_allowed(req.get_header_value("Origin"))
                                       : key_matches(req.get_header_value("Authorization"),
@@ -519,6 +549,15 @@ Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Templ
     h.Get("/models", models);
     h.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"ok"})", "application/json");
+    });
+    h.Get("/v1/status", [this](const httplib::Request&, httplib::Response& res) {
+        auto& im = *impl_;
+        const StatusHeader head{im.opts.model_id, im.engine.max_context(), im.opts.cache_gb, im.opts.resident,
+                                im.pool.budget(), im.in_flight.load()};
+        res.set_content(im.board.json(head, im.pool.info()), "application/json");
+    });
+    h.Get("/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(status_page, "text/html; charset=utf-8");
     });
 }
 
