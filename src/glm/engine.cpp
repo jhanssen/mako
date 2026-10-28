@@ -1088,6 +1088,7 @@ Engine::Checkpoint Engine::checkpoint()
 {
     Checkpoint cp;
     cp.pos = pos_;
+    cp.state.reserve(checkpoint_bytes());
     for (uint32_t il = 0; il < cfg_.n_layer; ++il)
         for (auto* b : {kda_state_[il].get(), conv_state_[il].get()})
             if (b) {
