@@ -7,8 +7,8 @@ DeepSeek-V4.1-Flash-1017 through an OpenAI- and Anthropic-compatible API. Built 
 ## Requirements
 
 - An Apple Silicon Mac (M1 or later) with 64 GB of memory or more, macOS 26 or later
-- A model, downloaded separately: which files to get is in the
-  [README](https://github.com/jhanssen/mako/blob/@COMMIT@/README.md#models)
+- A model, downloaded separately: `@NAME@/bin/mako-download glm|ds|ds-ista-xs|ds-ista-xxs` fetches and checks one
+  (`--help`), or see the [README](https://github.com/jhanssen/mako/blob/@COMMIT@/README.md#models)
 
 ## Install
 

@@ -1,7 +1,7 @@
 #!/bin/sh
-# Packages a build for release: bin/ (mako_serve, mako_calibrate; stripped and ad-hoc signed again), README.md,
-# LICENSE, THIRD_PARTY_LICENSES.txt and examples/presets.json in <out dir>/<name>/, then <archive>.tar.gz (default
-# <name>) with its .sha256 and the programs' debug symbols in <archive>-dSYM.tar.gz.
+# Packages a build for release: bin/ (mako_serve, mako_calibrate, stripped and ad-hoc signed again; mako-download),
+# README.md, LICENSE, THIRD_PARTY_LICENSES.txt and examples/presets.json in <out dir>/<name>/, then <archive>.tar.gz
+# (default <name>) with its .sha256 and the programs' debug symbols in <archive>-dSYM.tar.gz.
 #   dist/package.sh <build dir> <out dir> <name> [<archive>]
 set -eu
 
@@ -28,6 +28,7 @@ for tool in mako_serve mako_calibrate; do
     codesign --force --sign - "$pkg/bin/$tool" # stripping invalidates the linker's ad-hoc signature
 done
 
+cp "$src/tools/mako-download.sh" "$pkg/bin/mako-download"
 sed -e "s/@NAME@/$name/g" -e "s/@ARCHIVE@/$archive/g" -e "s/@COMMIT@/$commit/g" "$src/dist/README.md" > "$pkg/README.md"
 cp "$src/LICENSE" "$pkg/LICENSE"
 cp "$src/docs/presets.example.json" "$pkg/examples/presets.json"

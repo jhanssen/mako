@@ -95,20 +95,50 @@ std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
     c.hc_eps = k.f32("hyper_connection.epsilon");
 
     auto& e = c.engram;
-    e.layers = narrow(k.ints(k.either("engram.layers", "engram.layer_ids")));
-    e.num_embeddings = k.ints("engram.num_embeddings");
-    e.max_ngram = k.u32(k.either("engram.max_ngram_size", "engram_max_ngram_size"));
-    e.heads = k.u32(k.either("engram.head_count", "engram_n_heads"));
-    e.head_dim = k.u32(k.either("engram.head_dim", "engram_head_dim"));
-    e.pad_token = int32_t(k.u32(k.either("engram.pad_token_id", "engram_pad_token_id")));
-    // The hash parameters: metadata arrays, or integer tensors of the same values.
-    auto params = [&](const char* key, const char* tensor) {
-        return k.has(key) ? k.ints(key) : int_tensor(m, tensor);
-    };
-    e.token_map = narrow(params("engram.token_map", "engram_token_map.weight"));
-    e.multipliers = params("engram.multipliers", "engram_multipliers.weight");
-    e.primes = params("engram.primes", "engram_primes.weight");
-    e.offsets = params("engram.offsets", "engram_offsets.weight");
+    if (k.has("ple.layers")) {
+        // Bucket counts per (layer, column), offsets counted from the start of all layers' tables.
+        e.layers = narrow(k.ints("ple.layers"));
+        e.max_ngram = k.u32("ple.ngram_size");
+        e.heads = k.u32("ple.heads_per_ngram");
+        e.head_dim = k.u32("embedding_length_per_layer_input");
+        e.pad_token = int32_t(k.u32("engram.pad_token_id"));
+        e.token_map = narrow(k.ints("engram.token_map"));
+        e.multipliers = k.ints("ple.layer_multipliers");
+        e.primes = k.ints("ple.head_vocab_sizes");
+        e.offsets = k.ints("ple.head_offsets");
+        const size_t cols = e.columns();
+        if (cols && e.primes.size() == e.layers.size() * cols && e.offsets.size() == e.primes.size()) {
+            int64_t base = 0;
+            for (size_t l = 0; l < e.layers.size(); ++l) {
+                int64_t rows = 0;
+                for (size_t col = 0; col < cols; ++col)
+                    rows += e.primes[l * cols + col];
+                for (size_t col = 0; col < cols; ++col) {
+                    auto& off = e.offsets[l * cols + col];
+                    off -= base;
+                    if (off < 0 || off + e.primes[l * cols + col] > rows)
+                        k.missing += std::format(" ple.head_offsets(layer {} column {} outside its table)", l, col);
+                }
+                e.num_embeddings.push_back(rows);
+                base += rows;
+            }
+        }
+    } else {
+        e.layers = narrow(k.ints(k.either("engram.layers", "engram.layer_ids")));
+        e.num_embeddings = k.ints("engram.num_embeddings");
+        e.max_ngram = k.u32(k.either("engram.max_ngram_size", "engram_max_ngram_size"));
+        e.heads = k.u32(k.either("engram.head_count", "engram_n_heads"));
+        e.head_dim = k.u32(k.either("engram.head_dim", "engram_head_dim"));
+        e.pad_token = int32_t(k.u32(k.either("engram.pad_token_id", "engram_pad_token_id")));
+        // The hash parameters: metadata arrays, or integer tensors of the same values.
+        auto params = [&](const char* key, const char* tensor) {
+            return k.has(key) ? k.ints(key) : int_tensor(m, tensor);
+        };
+        e.token_map = narrow(params("engram.token_map", "engram_token_map.weight"));
+        e.multipliers = params("engram.multipliers", "engram_multipliers.weight");
+        e.primes = params("engram.primes", "engram_primes.weight");
+        e.offsets = params("engram.offsets", "engram_offsets.weight");
+    }
     if (e.token_map.empty())
         k.missing += " engram.token_map";
     const size_t nl = e.layers.size();

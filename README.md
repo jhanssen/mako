@@ -43,15 +43,22 @@ run only on the M5 Max; on an M1 Ultra only the tests that need no model have ru
 
 ## Models
 
+`tools/mako-download.sh glm|ds|ds-ista-xs|ds-ista-xxs [--vision] [--dspark]` (`bin/mako-download` in the release
+archive) downloads one of the sets below with curl, at the repository revisions mako was tested with, resumes
+interrupted files, checks each file's SHA-256 and prints the commands (and a preset) to run it. Files go to
+`~/models/<model>` unless `--dir` says otherwise; `--dry-run` lists them and the space needed. Or by hand:
+
 - **GLM-5.3-Flash**: `Maya-S-v2-IQ2_XXS/` from
   [peasantsmith/GLM-5.3-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) (3 files).
 - **DeepSeek-V4.1-Flash-1017**: `Maya-S/` from
   [peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)
   (6 files, the model and its Engram tables), and optionally `dspark/` (the drafter for speculative decoding).
-- **DeepSeek-V4.1-Flash-1017, smaller and faster**: the four `IQ2_XS` files and
+- **DeepSeek-V4.1-Flash-1017, smaller and faster**: the five `IQ2_XS` files and
   `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` from
   [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
-  in one folder (mako opens the Engram file from there). The `dspark/` drafter has not been tried with it yet.
+  in one folder, with a link to the Engram file as the build's sixth shard
+  (`ln -s DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00006-of-00006.gguf`). The
+  four-shard files published before October 27, 2026 load too. The `dspark/` drafter has not been tried with it yet.
 - **Vision** (optional, `mako_serve --mmproj FILE`, docs/vision.md): GLM-5.3's `mmproj-BF16.gguf` from
   [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF); DeepSeek-V4.1's
   `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` from
@@ -80,8 +87,8 @@ The first configure downloads pinned dependencies.
 For example, DeepSeek-V4.1 with ISTA's IQ2_XS build and cache-aware routing (the ~34 tokens/s setup above):
 
 ```sh
-./build/tools/mako_calibrate ~/models/ista/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf
-./build/tools/mako_serve ~/models/ista/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf \
+./build/tools/mako_calibrate ~/models/ds-ista-xs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf
+./build/tools/mako_serve ~/models/ds-ista-xs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf \
     --miss-penalty 0.1 --port 8080 --ctx 65536
 ```
 
