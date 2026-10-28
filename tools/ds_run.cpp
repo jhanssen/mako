@@ -243,6 +243,7 @@ int main(int argc, char** argv)
             auto t0 = std::chrono::steady_clock::now();
             engine.prefill(rest);
             const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const double gpu = engine.last_prefill().gpu_ms;
             const auto st1 = engine.arena().stats();
             engine.restore(cp);
             t0 = std::chrono::steady_clock::now();
@@ -250,9 +251,9 @@ int main(int argc, char** argv)
                 engine.prefill(rest.subspan(i, std::min<size_t>(8, rest.size() - i)));
             const double dms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             const auto st2 = engine.arena().stats();
-            std::println("{} tokens after {}: prefill {:.0f} ms ({} misses, {:.0f} ms reading), steps of 8 {:.0f} ms ({} misses, "
-                         "{:.0f} ms reading)",
-                         tail, ids.size() - tail, pms, st1.misses - st0.misses, st1.read_ms - st0.read_ms, dms,
+            std::println("{} tokens after {}: prefill {:.0f} ms (GPU {:.0f} ms; {} misses, {:.0f} ms reading), steps of 8 "
+                         "{:.0f} ms ({} misses, {:.0f} ms reading)",
+                         tail, ids.size() - tail, pms, gpu, st1.misses - st0.misses, st1.read_ms - st0.read_ms, dms,
                          st2.misses - st1.misses, st2.read_ms - st1.read_ms);
         }
         return 0;
