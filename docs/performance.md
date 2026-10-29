@@ -115,8 +115,15 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
   weight columns at a time instead of 256 (landed above): 16-row gate + up 3.5 -> 2.8 ms, 32-row 4.8 -> 3.9 ms
   (`gemm_bench 128 T 4096 2048`). Still per pass over the weights and well under their read bound (~200 GB/s of
   IQ2_XXS at 16 rows); smaller tiles lose (two 16-row passes cost more than one 32-row), and the multi-token GEMVs
-  grow linearly past 2 tokens (~16 ms per 16 tokens). Left: the weights dequantized in registers feeding simdgroup
-  matrices; it changes summation order, which GLM's near-bit-exact e2e checks react to.
+  grow linearly past 2 tokens (~16 ms per 16 tokens).
+  Future: the weights dequantized in registers (as the decode GEMVs do, ~1 T weights/s at 1-2 tokens) and fed to
+  simdgroup matrices without the threadgroup staging. A 512-token GLM turn spends ~512 ms of GPU on experts against
+  ~190 ms to read them; at ~350-400 GB/s instead of ~200 the estimate is 100-200 ms off the turn (10-18%), less at
+  256 tokens, nothing for long prompts (64-row and larger tiles are near peak), little for DeepSeek (its short turns
+  wait on SSD reads). Low to medium confidence: an earlier IQ2_XXS rewrite did not beat the existing kernels, and
+  the fused sparse attention, estimated 4-5% faster, came out 2.3x slower. It changes summation order, which GLM's
+  near-bit-exact e2e checks react to. First a standalone kernel in `bench/gemm_bench` against the 16- and 32-row
+  tiles (2.8 / 3.9 ms for 128 experts' gate and up), before any engine change.
 - Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
   (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
   none measured:
