@@ -202,12 +202,15 @@ protected:
                      MTL::Buffer* xn_g, MTL::Buffer* ffo, uint32_t G, uint32_t pos0,
                      std::vector<MTL::CommandBuffer*>& committed);
     static constexpr uint32_t kBatchRows = 8192; // prefill expert rows (token, expert pairs) run and combined together
-    // Staged prefill: for a group of at least kStageMinTokens (which routes to nearly every expert of every layer),
-    // the arena's missing experts of every layer are read ahead into a ring (Stager) while the GPU works, and the
-    // layer's MoE runs them from there instead of making them resident (so a prompt leaves the arena as the steps
-    // shaped it). end_staging() once the group's GPU work is done. staging_bytes(): the ring's size, also for scratch
-    // estimates.
-    static constexpr uint32_t kStageMinTokens = 512;
+    // Staged prefill: for a group of at least kStageMinTokens, the arena's missing experts of every layer are read
+    // ahead into a ring (Stager) while the GPU works, and the layer's MoE runs them from there instead of making them
+    // resident (so a prompt leaves the arena as the steps shaped it). end_staging() once the group's GPU work is done.
+    // staging_bytes(): the ring's size, also for scratch estimates. Smaller groups read only the experts they route
+    // to, which then stay resident: a DeepSeek group of 512-1024 tokens routes to well under all the missing ones
+    // (ISTA IQ2_XS at 512: ~2000 of ~5400), and the steps after it use them.
+    static constexpr uint32_t kStageMinTokens = 2048;
+    // Groups under this many tokens route with the decode steps' miss penalty.
+    static constexpr uint32_t kPenaltyMaxTokens = 512;
     void begin_staging(uint32_t tokens);
     void end_staging();
     // Two layers' worth of the arena's missing experts, at most MAKO_STAGE_GB (3 GB); before the arena exists, that

@@ -1331,9 +1331,8 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     MTL::Buffer* ew = scratch("p_ew", uint64_t(G) * 16 * 4);
     proj(enc, mw.router, xn_g, 0, rlog, 0, G);
     // Routing only; the CPU assigns slots after this sync.
-    // A group too small to stage its reads routes with the decode steps' miss penalty (a large one reads every
-    // missing expert ahead anyway).
-    const bool penalize = routing_.miss_penalty > 0.0f && G < kStageMinTokens;
+    // A small group routes with the decode steps' miss penalty (a large one reads most missing experts anyway).
+    const bool penalize = routing_.miss_penalty > 0.0f && G < kPenaltyMaxTokens;
     const RouteArgs ra{dims_.n_expert, k, routing_.norm ? 1u : 0u, routing_.scale, 0, uint32_t(routing_.score),
                        penalize ? routing_.miss_penalty : 0.0f};
     MTL::Buffer* unused = scratch("p_unused", 64);

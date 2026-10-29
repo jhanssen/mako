@@ -6,7 +6,8 @@
 //          [--save-profile F|default] [--split S --width W] [--dspark DIR [--gen N] [--no-spec] [--max-drafts N]
 //          [--draft-conf F]] [--dense-quant q4_k|q5_k|q6_k] [--miss-penalty F] [--prefetch K] [--prefill-skip 0|1] [-n N]
 // --tail N: the ids but the last N through prefill(), then the last N timed through prefill() and, from the same
-// checkpoint, as decode steps of up to 8 tokens; the misses and expert reads of each.
+// checkpoint, as decode steps of up to 8 tokens; the misses and expert reads of each. --tail-decode N: after the first
+// timed prefill, N greedy steps (their time and misses: what the prompt left in the expert cache).
 // --ref-from N: the reference's first position is N (a tail of a long prompt's logits). --steps-from N: the first N ids
 // through prefill(), the rest one step each. Comparisons also report the perplexity of the ids' own next tokens.
 // --imatrix-out FILE (with --gen N): the mean square of each input channel of the dense matrices' inputs over the
@@ -66,7 +67,7 @@ int main(int argc, char** argv)
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0, study_n = 0;
     bool part_timing = false;
-    size_t ref_from = 0, steps_from = 0, tail = 0;
+    size_t ref_from = 0, steps_from = 0, tail = 0, tail_decode = 0;
     std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
@@ -88,6 +89,7 @@ int main(int argc, char** argv)
             .option("--ref-from", "N", "the reference's first position (a long prompt's tail)", ref_from)
             .option("--steps-from", "N", "the first N ids through prefill, the rest one step each", steps_from)
             .option("--tail", "N", "time the last N ids through prefill and as decode steps", tail)
+            .option("--tail-decode", "N", "after --tail's first prefill, N greedy decode steps", tail_decode)
             .option("--logits-out", "FILE", "write the logits", out)
             .option("--arena-gb", "N", "the expert cache's size in GB (default: what memory allows)", opts.arena_gb)
             .option("--stage-gb", "N", "the ring prompts' missing experts are read ahead into (0: off)", opts.stage_gb)
@@ -241,10 +243,25 @@ int main(int argc, char** argv)
             engine.restore(cp);
             auto st0 = engine.arena().stats();
             auto t0 = std::chrono::steady_clock::now();
-            engine.prefill(rest);
+            const std::vector<float>& last = engine.prefill(rest);
             const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             const double gpu = engine.last_prefill().gpu_ms;
-            const auto st1 = engine.arena().stats();
+            auto st1 = engine.arena().stats();
+            const auto st_prefill = st1;
+            if (rep == 0 && tail_decode > 0) { // what the prompt left in the expert cache for the steps after it
+                int32_t token = int32_t(std::ranges::max_element(last) - last.begin());
+                const auto d0 = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < tail_decode; ++i) {
+                    const std::vector<float>& l = engine.step(token);
+                    token = int32_t(std::ranges::max_element(l) - l.begin());
+                }
+                const auto st = engine.arena().stats();
+                std::println("then {} steps: {:.1f} ms a step, {:.1f} misses a step", tail_decode,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count() /
+                                 double(tail_decode),
+                             double(st.misses - st1.misses) / double(tail_decode));
+                st1 = st;
+            }
             engine.restore(cp);
             t0 = std::chrono::steady_clock::now();
             for (size_t i = 0; i < rest.size(); i += 8)
@@ -253,7 +270,8 @@ int main(int argc, char** argv)
             const auto st2 = engine.arena().stats();
             std::println("{} tokens after {}: prefill {:.0f} ms (GPU {:.0f} ms; {} misses, {:.0f} ms reading), steps of 8 "
                          "{:.0f} ms ({} misses, {:.0f} ms reading)",
-                         tail, ids.size() - tail, pms, gpu, st1.misses - st0.misses, st1.read_ms - st0.read_ms, dms,
+                         tail, ids.size() - tail, pms, gpu, st_prefill.misses - st0.misses,
+                         st_prefill.read_ms - st0.read_ms, dms,
                          st2.misses - st1.misses, st2.read_ms - st1.read_ms);
         }
         return 0;
