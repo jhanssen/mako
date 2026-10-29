@@ -21,6 +21,8 @@
 // drafts were all right would) and reports the time and expert misses per step and per token.
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // -n N: then N greedy tokens.
+// --frontiers S: the ids S at a time through prefill(), each part timed, and after each -n greedy steps from a
+// checkpoint (restored before the next part).
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "dsv41/config.hpp"
@@ -67,7 +69,7 @@ int main(int argc, char** argv)
     bool use_prefill = false;
     uint32_t split = 0, width = 0, session_n = 0, study_n = 0;
     bool part_timing = false;
-    size_t ref_from = 0, steps_from = 0, tail = 0, tail_decode = 0;
+    size_t ref_from = 0, steps_from = 0, tail = 0, tail_decode = 0, frontiers = 0;
     std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
@@ -90,6 +92,8 @@ int main(int argc, char** argv)
             .option("--steps-from", "N", "the first N ids through prefill, the rest one step each", steps_from)
             .option("--tail", "N", "time the last N ids through prefill and as decode steps", tail)
             .option("--tail-decode", "N", "after --tail's first prefill, N greedy decode steps", tail_decode)
+            .option("--frontiers", "S", "the ids S at a time through prefill, each timed, with -n steps after each",
+                    frontiers)
             .option("--logits-out", "FILE", "write the logits", out)
             .option("--arena-gb", "N", "the expert cache's size in GB (default: what memory allows)", opts.arena_gb)
             .option("--stage-gb", "N", "the ring prompts' missing experts are read ahead into (0: off)", opts.stage_gb)
@@ -216,6 +220,31 @@ int main(int argc, char** argv)
             std::println("verify of {}: {:.1f} ms (position {} -> {})", v->size(), ms, p0, engine.position());
             engine.reset();
             engine.prefill(ids);
+        }
+        return 0;
+    }
+    if (frontiers > 0) {
+        const std::span<const int32_t> all(ids);
+        std::println("ctx,prefill_tokens,prefill_tps,misses,read_ms,gen_tokens,gen_tps,gen_misses_per_token");
+        for (size_t at = 0; at + frontiers <= ids.size(); at += frontiers) {
+            const auto st0 = engine.arena().stats();
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::vector<float>& last = engine.prefill(all.subspan(at, frontiers));
+            const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto st1 = engine.arena().stats();
+            int32_t token = int32_t(std::ranges::max_element(last) - last.begin());
+            const auto cp = engine.checkpoint();
+            const auto d0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < gen; ++i) {
+                const std::vector<float>& l = engine.step(token);
+                token = int32_t(std::ranges::max_element(l) - l.begin());
+            }
+            const double dms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
+            const auto st2 = engine.arena().stats();
+            std::println("{},{},{:.2f},{},{:.0f},{},{:.2f},{:.1f}", at + frontiers, frontiers, frontiers / pms * 1e3,
+                         st1.misses - st0.misses, st1.read_ms - st0.read_ms, gen, gen ? gen / dms * 1e3 : 0.0,
+                         gen ? double(st2.misses - st1.misses) / gen : 0.0);
+            engine.restore(cp);
         }
         return 0;
     }
