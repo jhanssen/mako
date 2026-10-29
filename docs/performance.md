@@ -106,6 +106,7 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 | `MAKO_REPEAT=label:2` for in-place costs of weights under ~50 MB | the repeat reads weights the cache still holds: Q6_K 4096x8192 came out at ~880 GB/s. `label:0` (leave out) instead |
 | Per-kernel telemetry to find slow kernels | timestamps around each dispatch inflate small kernels several-fold (one "slow" shared-expert GEMV was 93 us measured, 13 us real); repeat-in-place costs (`MAKO_REPEAT`) replaced it |
 | Software dependency tracking instead of encoder barriers: every dispatch in one concurrent encoder, each threadgroup waiting on a device counter the previous dispatch's threadgroups bump after a device-scope fence, the weights read into registers before the wait (`bench/chain_bench`) | 64 chained f16 GEMVs of 32 MB: 65 -> 63 us a link (free-running 57); a chain alternating a latency-bound small kernel and a GEMV: no change (one counter a dispatch: 20% slower from the atomics' contention; 32 counters: equal to serial). Outputs stayed bit-identical, no wait gave up. Not worth the hazard |
+| Sparse attention in one kernel for prefill (2026-10-28): per (token, 32 heads) a flash-style pass over the token's list, 16 gathered latent rows at a time into threadgroup memory serving both products, running softmax, output in registers; then with the list split over 4-16 threadgroups and a combine kernel | 4096 tokens at 16K context: 1.42-1.62 s (one range), 1.32 / 1.46 / 1.78 s (4 / 8 / 16 ranges) against 0.55-0.58 s for the three kernels (scores, softmax, output); KL against the reference unchanged (0.0069-0.0072). The 512-wide latent leaves room for 16 rows a step in 32 KB of threadgroup memory: ~129 small steps a token, each two small matmuls, a score round trip through threadgroup memory, a rescale of the 32x512 accumulator and three barriers; splitting the output width instead would recompute the scores per slice or hold 64x512 floats. Reverted |
 
 ### Open
 
@@ -119,11 +120,10 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 - Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
   (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
   none measured:
-  - Sparse attention in one kernel: scores, softmax and output (each query's 64 heads x 2048 selected rows, the
-    running softmax in registers) instead of three dispatches through 512 KB of float scores a token and layer. The
-    sparse path is ~3.2 s (scores 0.81, softmax 0.30, output 1.26, selection 0.54, rest 0.29); perhaps 1-2 s back.
-    Another engine runs this as one kernel on the matrix units, but through a hard-coded M5 layout of the
-    cooperative tensors' elements (the API leaves it implementation-defined); here through the accessors first.
+  - Sparse attention in one kernel: tried and rejected (2026-10-28, table above): 2.3-2.8x slower than the three
+    kernels at 4096 tokens. Another engine runs it as one kernel through a hard-coded M5 layout of the cooperative
+    tensors' elements; how it fits the 512-wide rows was not examined. DeepSeek-V4.1's attention (64 heads, 512
+    wide) would meet the same limit.
   - Expert GEMMs at ~36 TFLOP/s against ~60 for the same shapes in `bench/gemm_bench`: the dequantization does not
     overlap the multiply (~21%, above); double-buffering it against `matmul2d`. ~1-2 s.
   - The stream step and norm fused for prefill as decode has them (`hc_step_norm`): hc and norm is ~2x what its
