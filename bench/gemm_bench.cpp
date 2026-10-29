@@ -1,7 +1,7 @@
 // Expert GEMMs shaped like a prefill MoE layer: per expert its own weights and `tokens` rows, gate and up (k x n,
 // one type) then down (n x k, another type), in one concurrent encoder as the MoE prefill issues them. Timing only
 // (weights are random bytes).
-//   gemm_bench [experts] [tokens] [k] [n] [gate/up type] [down type]   (types: iq2_xxs iq2_s iq3_xxs q6_k q8_0 f16)
+//   gemm_bench [experts] [tokens] [k] [n] [gate/up type] [down type]   (types: iq1_s iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s q6_k q8_0 f16)
 #include "mtl/context.hpp"
 #include "mtl/gemm.hpp"
 
@@ -25,6 +25,14 @@ gguf::Type type_of(const std::string& s)
         return gguf::Type::IQ2_S;
     if (s == "iq3_xxs")
         return gguf::Type::IQ3_XXS;
+    if (s == "iq3_s")
+        return gguf::Type::IQ3_S;
+    if (s == "iq2_xs")
+        return gguf::Type::IQ2_XS;
+    if (s == "iq1_s")
+        return gguf::Type::IQ1_S;
+    if (s == "iq1_m")
+        return gguf::Type::IQ1_M;
     if (s == "q6_k")
         return gguf::Type::Q6_K;
     if (s == "q8_0")

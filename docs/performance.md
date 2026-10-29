@@ -30,6 +30,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | The router GEMV routing in its last threadgroup (`mako_mul_mv_f32_f32_4_route`); conv, gate and the q/k l2 norm in one kernel per head (`kda_prep`) | 110 fewer dispatches: no measurable change (+-0.1 ms). A dispatch boundary costs ~1 us; what a small kernel costs is its chain of dependent memory round trips (~0.8 us each), which a fused kernel keeps |
 | Prefill: `kda_prep`'s work with a threadgroup per (head, token) past 8 rows (`kda_prep_rows`, the conv state moved on by `kda_conv_shift`), same arithmetic. `kda_prep` had made prefill's conv section 1.48 s of a 20K-token prompt with 64 threadgroups walking each chunk's tokens, against 0.66 s for the separate kernels before it; unseen because no prefill was timed | 20K tokens: 717-719 -> 742-743 tok/s in alternating runs (737-744 before `kda_prep`); conv 0.37 s. GLM e2e tests pass. `bench/perf_check` now flags such a change |
 | `checkpoint()` reserves its 153 MB before copying the recurrent state in (as DeepSeek's does) | 5.9 -> 2.4 ms a checkpoint, the first in a process 22 -> 8 ms (alternating runs; one to three a request). Estimated "tens of ms" beforehand |
+| Prefill GEMM: IQ weights in tiles of up to 32 tokens dequantized 64 columns a stage instead of 256 (12-23% faster per GEMM at 16 and 32 rows for every IQ format; from 64 rows even or slower, and Q6_K / Q8_0 not faster, so those keep 256) | 256 / 512 / 1024 new tokens after 4000, alternating, two runs each: ~755 -> ~702 ms, ~1111 -> ~1065 ms, ~1810 -> ~1780 ms; experts 585 -> 512 ms GPU at 512. GLM and DeepSeek e2e tests pass |
 | Independent GEMVs of one input in one dispatch (`mako_mul_mv_jobs`: a job table of GPU addresses, each job its format's kernel over its own threadgroups, 4 simdgroups a threadgroup, every row summed as before): KDA q/k/v + f_a/g_a + beta; routed gate + up + the shared gate/up, both swiglus (`swiglu2`), routed down + shared down; MLA q_a + kv_a + the indexer's key, gate and weights, then q_b + the indexer's query | 24.8-25.3 -> 23.1 ms/token (three A/B pairs, 43.3 tok/s); tokens identical, e2e tests unchanged. ~8 us a merged-away dispatch: one ramp-up and tail for the group, the IQ2_XXS fixed cost once, the small Q6_K and Q8_0 GEMVs hidden under the large ones |
 | Decode GEMVs row-invariant (a token's bits the same whether it runs alone or with up to 7 others, for batching several sequences): Q6_K always through mako's 1- and 2-token kernel with multiply-add fusion off (1 token used the per-format kernel, which the 2-token kernel did not match); the short-row kernel to 8 tokens. `gemv_rows` checks every format through the plain, multi-GEMV and indexed paths | no speculative decoding 23.1 -> 23.2 ms/token, speculative ~19.8 -> ~20.05 (three and four clean runs; within their spread); e2e tests unchanged |
 
@@ -109,17 +110,12 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 ### Open
 
 - Decode misses still rise after a long prompt, less since staging (GLM: ~27 vs ~15 a step for the first 40 steps).
-- Expert GEMMs at few rows per expert in short prefills. 2026-10-28, GLM-5.3 after a 4000-token context: 512 new
-  tokens take 1.13 s (~450 tok/s), 1.0 s of it GPU and ~585 ms of that the expert GEMMs (~14 rows an expert), where
-  reading every expert once would take ~190 ms. `gemm_bench 128 T 4096 2048 iq2_xxs iq2_xxs`: gate + up 3.4-3.5 ms
-  for T = 8-16 (16-row tile), 4.7-4.8 ms for 17-32 (32-row), 5.9 ms for 33-48 (64-row); within a tile the time
-  hardly depends on T, so it is per pass over the weights: at <= 16 rows each weight is dequantized once, ~600 G
-  weights/s through threadgroup memory (~158 GB/s of IQ2_XXS). Two 16-row passes for 17 rows would cost ~7 ms
-  against 4.8, so no smaller tiles. The multi-token GEMV kernels are no way around it: 256 such matrices take
-  2.04 ms at 2 tokens a pass but grow linearly from there (8.2 ms at 8), ~16 ms per 16 tokens. What could gain: the
-  weights dequantized in registers (as the GEMVs do, ~1 T weights/s at 1-2 tokens) and multiplied on simdgroup
-  matrices, ~3.5 -> ~2.2 ms a layer's gate + up (estimated), ~200 ms of a 512-token turn; it changes GLM's
-  summation order, which its near-bit-exact e2e checks react to.
+- Expert GEMMs at few rows per expert in short prefills (2026-10-28). The IQ tiles of up to 32 tokens now stage 64
+  weight columns at a time instead of 256 (landed above): 16-row gate + up 3.5 -> 2.8 ms, 32-row 4.8 -> 3.9 ms
+  (`gemm_bench 128 T 4096 2048`). Still per pass over the weights and well under their read bound (~200 GB/s of
+  IQ2_XXS at 16 rows); smaller tiles lose (two 16-row passes cost more than one 32-row), and the multi-token GEMVs
+  grow linearly past 2 tokens (~16 ms per 16 tokens). Left: the weights dequantized in registers feeding simdgroup
+  matrices; it changes summation order, which GLM's near-bit-exact e2e checks react to.
 - Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
   (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
   none measured:
