@@ -25,7 +25,7 @@ the state taken before an earlier prompt's last token), samples, drafts and stop
 
 ```sh
 cmake -S . -B build -DMAKO_MODEL=<GLM-5.3 .gguf> -DMAKO_DS41_MODEL=<DeepSeek .gguf>   # or the same environment variables
-ctest --test-dir build --output-on-failure                                           # -L cpu | kernels | tokenizer | sampler | server | e2e
+ctest --test-dir build --output-on-failure                                           # -L cpu | kernels | tokenizer | sampler | server | quick | e2e | slow
 ```
 
 `MAKO_DS41_DSPARK=<dir>` adds the drafter's test, `MAKO_DS41_ENGRAM=<GGUF>` runs DeepSeek's with other Engram tables.
@@ -33,11 +33,22 @@ ctest --test-dir build --output-on-failure                                      
 - No model needed (`ctest -L cpu` for those without a GPU too, as CI runs): the kernel checks on random data
   (`quant`, `gemv_own`, `gemv_rows`, `gemm_synthetic`, `engram_decode`, `hc`), `sampler`, `presets`, `cli`,
   `template`, `vision_prep`. The others report as skipped without their model.
-- GLM-5.3's `e2e` tests (about a minute): greedy decode tokens, prefill against token-by-token decode, logits against
-  stored reference top-k, speculative steps, generation and prefix reuse through `Session`, a prompt past the
-  dense-attention window.
-- DeepSeek's `ds41_*` tests (about seven minutes): logits against the reference's on 1300 tokens (steps and prefill),
-  on a 24K-token prompt's last 1024 positions, with the miss penalty and with dense Q6_K; the drafter's greedy output.
+- GLM-5.3's `e2e` tests (about three and a half minutes): greedy decode tokens, prefill against token-by-token
+  decode, logits against stored reference top-k, speculative steps, generation and prefix reuse through `Session`, a
+  prompt past the dense-attention window.
+- DeepSeek's `ds41_*` tests (about eight minutes): logits against the reference's on 1300 tokens (prefill; steps),
+  on a 24K-token prompt's last 1024 positions, with the miss penalty and with dense Q6_K (each over the first 300
+  steps, and Q6_K also through prefill); the drafter's greedy output; two conversations taking turns. `ds41_long_noskip`
+  (the 24K prompt with every row through every layer, which is not the default) is labelled `slow` only.
+
+Which to run:
+
+| Change | While working | Before committing |
+| --- | --- | --- |
+| Kernels, `src/core`, `src/glm`, `src/dsv41` | `-L quick` (~1.3 min: GLM decode, prefill, parity, drafts; DeepSeek prefill) | `-L e2e`, and `bench/perf_check` for each model the change reaches |
+| The prefill skip, prompt lengths past a group | `-L quick` | `-L e2e` and `-L slow` |
+| `src/server`, `src/gen` | `-L server` and `-L cpu` | the same, and `-L e2e` for `gen::Session` or the pool |
+| Tokenizer, templates | `-L tokenizer` | the same |
 
 `tests/data/README.md` says how each data file was made. After an intended numerical change,
 `regress_test <model> --update` re-records `tests/data/regress_expected.txt`; review that diff.

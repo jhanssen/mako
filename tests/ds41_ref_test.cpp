@@ -1,9 +1,12 @@
 // DeepSeek-V4.1 against the reference engine's logits (top 64 per position, tests/data/ds41_*_ref.bin), one mode per
 // ctest entry:
-//   short    1300 positions of prose, step by step and through prefill
-//   long     the last 1024 of 24576 positions (the candidate stage active), through prefill and as decode steps
-//   penalty  the miss penalty at 0.1: KL bounded and fewer misses than without
-//   q6k      dense weights re-quantized to Q6_K: KL bounded
+//   prefill  1300 positions of prose through prefill (the quick check)
+//   short    the same, and step by step
+//   long     the last 1024 of 24576 positions (the candidate stage active), through prefill (early rows skipping
+//            layers) and as decode steps
+//   long_noskip  the same prefill with every row through every layer
+//   penalty  the miss penalty at 0.1: KL bounded and fewer misses than without (over the first 300 steps)
+//   q6k      dense weights re-quantized to Q6_K: KL bounded, through prefill and the first 300 steps
 //   dspark   with the drafter (a directory; skipped without one): greedy output with drafts equals it without
 //   pool     two conversations on two threads taking turns on one engine at every step (with the drafter when
 //            given): each request's tokens and logits as with its conversation alone, bit for bit
@@ -151,9 +154,10 @@ struct Parity {
     }
     double kl() const { return n ? kl_sum / n : 0; }
     double top1() const { return n ? agree / n : 0; }
-    void check_limits(const std::string& what, double kl_limit, double top1_limit) const
+    // `expected`: the positions added (0: all of the reference's).
+    void check_limits(const std::string& what, double kl_limit, double top1_limit, uint32_t expected = 0) const
     {
-        check(n == ref.positions && kl() < kl_limit && top1() > top1_limit,
+        check(n == (expected ? expected : ref.positions) && kl() < kl_limit && top1() > top1_limit,
               std::format("{} ({} positions): KL mean {:.5f} (limit {}), top-1 {:.2f}% (limit {}%), top-{} mass {:.3f}",
                           what, n, kl(), kl_limit, 100 * top1(), 100 * top1_limit, ref.k, n ? mass / n : 0));
     }
@@ -193,8 +197,9 @@ int main(int argc, char** argv)
     }
     mako::mtl::Context ctx;
     mako::dsv41::Options opts;
-    opts.max_ctx = mode == "long" ? 25600 : 4096;
-    opts.prefill_exact_tail = mode == "long" ? 1024 : 4096; // the checked positions (all of a short prompt)
+    const bool long_prompt = mode == "long" || mode == "long_noskip";
+    opts.max_ctx = long_prompt ? 25600 : 4096;
+    opts.prefill_exact_tail = long_prompt ? 1024 : 4096; // the checked positions (all of a short prompt)
     if (mode == "q6k")
         opts.dense_quant = mako::gguf::Type::Q6_K;
     if (mode == "dspark" || (mode == "pool" && !dspark.empty() && fs::exists(fs::path(dspark) / "dspark.json")))
@@ -203,48 +208,61 @@ int main(int argc, char** argv)
     const size_t V = cfg->n_vocab;
     std::println("{}", mode);
 
-    if (mode == "short" || mode == "penalty" || mode == "q6k") {
+    if (mode == "prefill" || mode == "short" || mode == "penalty" || mode == "q6k") {
         const auto ids = read_ids(kData / "ds41_short_ids.txt");
         RefTopK ref;
         if (ids.empty() || !load_ref(kData / "ds41_short_ref.bin", ref) || ref.positions != ids.size()) {
             std::println(stderr, "missing or mismatched ds41_short data");
             return 1;
         }
-        auto steps = [&](float penalty) {
+        constexpr uint32_t kFewSteps = 300;
+        // The first n positions step by step; the misses a step over the first kFewSteps.
+        auto steps = [&](float penalty, uint32_t n) {
             engine.reset();
             engine.set_miss_penalty(penalty);
             Parity p{ref};
             uint64_t misses = 0;
-            for (uint32_t t = 0; t < ids.size(); ++t) {
+            for (uint32_t t = 0; t < n; ++t) {
                 const auto& lg = engine.step(ids[t]);
-                misses += engine.last_step().misses;
+                if (t < kFewSteps)
+                    misses += engine.last_step().misses;
                 p.add(t, lg.data(), V);
             }
-            return std::pair{p, double(misses) / double(ids.size())};
+            return std::pair{p, double(misses) / double(std::min(n, kFewSteps))};
         };
-        if (mode == "short") {
-            // Measured when set (full-vocabulary KL): steps 0.00572 / 98.2%, prefill 0.0061.
-            const auto [p, misses] = steps(0);
-            p.check_limits("decode steps vs reference", 0.0075, 0.97);
+        auto prefill = [&]() {
             engine.reset();
             Parity q{ref};
             engine.set_logits_sink([&](uint32_t pos, const float* lg) { q.add(pos, lg, V); });
             engine.prefill(ids);
             engine.set_logits_sink({});
-            q.check_limits("prefill vs reference", 0.0080, 0.97);
+            return q;
+        };
+        const uint32_t all = uint32_t(ids.size());
+        if (mode == "prefill" || mode == "short") {
+            // Measured when set (full-vocabulary KL): steps 0.00572 / 98.2%, prefill 0.0061.
+            if (mode == "short") {
+                const auto [p, misses] = steps(0, all);
+                p.check_limits("decode steps vs reference", 0.0075, 0.97);
+            }
+            prefill().check_limits("prefill vs reference", 0.0080, 0.97);
         } else if (mode == "penalty") {
             // Measured when set: KL 0.0081 / 97.7%, misses 11.8 -> 4.6 a step.
-            const auto [base, base_misses] = steps(0);
-            const auto [pen, pen_misses] = steps(0.1f);
+            const auto [base, base_misses] = steps(0, kFewSteps);
+            const auto [pen, pen_misses] = steps(0.1f, all);
             pen.check_limits("miss penalty 0.1 vs reference", 0.0105, 0.965);
             check(pen_misses < 0.7 * base_misses,
-                  std::format("miss penalty 0.1: {:.1f} misses a step, {:.1f} without", pen_misses, base_misses));
+                  std::format("miss penalty 0.1: {:.1f} misses a step over the first {}, {:.1f} without", pen_misses,
+                              kFewSteps, base_misses));
         } else {
-            // Measured when set: KL 0.0068 / 98.2%.
-            const auto [p, misses] = steps(0);
-            p.check_limits("dense Q6_K steps vs reference", 0.0090, 0.965);
+            // Measured when set: the first 300 steps KL 0.0161 / 95.7% (all 1300: 0.0068 / 98.2%), prefill 0.0069 /
+            // 98.5%.
+            const auto [p, misses] = steps(0, kFewSteps);
+            p.check_limits(std::format("dense Q6_K, the first {} steps vs reference", kFewSteps), 0.021, 0.94,
+                           kFewSteps);
+            prefill().check_limits("dense Q6_K prefill vs reference", 0.0092, 0.965);
         }
-    } else if (mode == "long") {
+    } else if (mode == "long" || mode == "long_noskip") {
         const auto ids = read_ids(kData / "ds41_long_ids.txt");
         RefTopK ref;
         if (ids.empty() || !load_ref(kData / "ds41_long_ref.bin", ref) || ref.positions >= ids.size()) {
@@ -253,7 +271,7 @@ int main(int argc, char** argv)
         }
         const uint32_t from = uint32_t(ids.size() - ref.positions);
         // Measured when set (full-vocabulary KL): prefill 0.0102 / 96.9%, steps 0.0093 / 97.3%.
-        for (const bool skip : {true, false}) {
+        for (const bool skip : {mode == "long"}) {
             engine.reset();
             engine.set_prefill_skip(skip);
             Parity p{ref, from};
@@ -266,13 +284,15 @@ int main(int argc, char** argv)
                                        skip ? "early rows skip layers" : "every row", s, from),
                            0.0130, 0.955);
         }
-        engine.set_prefill_skip(true);
-        engine.reset();
-        engine.prefill(std::span<const int32_t>(ids).first(from));
-        Parity q{ref, from};
-        for (uint32_t t = from; t < ids.size(); ++t)
-            q.add(t, engine.step(ids[t]).data(), V);
-        q.check_limits(std::format("decode steps after a {}-token prefill vs reference", from), 0.0125, 0.96);
+        if (mode == "long") {
+            engine.set_prefill_skip(true);
+            engine.reset();
+            engine.prefill(std::span<const int32_t>(ids).first(from));
+            Parity q{ref, from};
+            for (uint32_t t = from; t < ids.size(); ++t)
+                q.add(t, engine.step(ids[t]).data(), V);
+            q.check_limits(std::format("decode steps after a {}-token prefill vs reference", from), 0.0125, 0.96);
+        }
     } else if (mode == "dspark") {
         const auto ids = read_ids(kData / "ds41_short_ids.txt");
         const std::vector<int32_t> prompt(ids.begin(), ids.begin() + 300);

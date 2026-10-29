@@ -71,6 +71,7 @@ foreach(c decode prefill parity spec session pool ablate long)
     add_test(NAME e2e_${c} COMMAND regress_test "${MAKO_MODEL}" ${c})
     set_tests_properties(e2e_${c} PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
 endforeach()
+set_tests_properties(e2e_decode e2e_prefill e2e_parity e2e_spec PROPERTIES LABELS "e2e;quick")
 add_test(NAME sampler COMMAND sampler_test)
 add_test(NAME loop_guard COMMAND loop_guard_test)
 add_test(NAME template COMMAND template_test)
@@ -121,12 +122,15 @@ target_link_libraries(hc_test PRIVATE mako_mtl)
 add_test(NAME hc COMMAND hc_test)
 set_tests_properties(hc PROPERTIES LABELS kernels)
 
-# DeepSeek-V4.1 against the reference engine's logits (tests/data/ds41_*): short prose, a 24K-token prompt's tail, the
-# miss penalty, dense Q6_K, and the drafter (MAKO_DS41_DSPARK).
+# DeepSeek-V4.1 against the reference engine's logits (tests/data/ds41_*): short prose (prefill alone is the quick
+# check), a 24K-token prompt's tail, the miss penalty, dense Q6_K, and the drafter (MAKO_DS41_DSPARK); long_noskip (the
+# prefill with every row through every layer, not the default) is labelled slow only.
 add_executable(ds41_ref_test ds41_ref_test.cpp)
 target_link_libraries(ds41_ref_test PRIVATE mako_dsv41 mako_gen)
 target_compile_definitions(ds41_ref_test PRIVATE MAKO_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
-foreach(m short long penalty q6k dspark pool)
+foreach(m prefill short long long_noskip penalty q6k dspark pool)
     add_test(NAME ds41_${m} COMMAND ds41_ref_test "${MAKO_DS41_MODEL}" "${DS41_ENGRAM}" ${m} "${MAKO_DS41_DSPARK}")
     set_tests_properties(ds41_${m} PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
 endforeach()
+set_tests_properties(ds41_prefill PROPERTIES LABELS "e2e;quick")
+set_tests_properties(ds41_long_noskip PROPERTIES LABELS slow)
