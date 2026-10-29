@@ -199,6 +199,8 @@ private:
     bool verifying_ = false;
     SpecStats spec_stats_;
     LogitsSink logits_sink_;
+    // Set by prefill() while it runs a group: called with the layers done, once the GPU has them up to routing.
+    std::function<void(uint32_t)> layer_done_;
     core::StepStats last_prefill_;
     std::optional<mtl::Ablation> ablation_;
     int ablate_attn_ = -1, ablate_shexp_ = -1;

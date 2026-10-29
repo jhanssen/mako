@@ -1401,6 +1401,9 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
             ablate(enc, il, ablate_stream_, R, G * cfg_.hc);
             hc_post(enc, ffo, R, R2, pc_g, G);
             std::swap(R, R2);
+            // Within a group, its share of the layers done: the GPU has a MoE layer up to routing once it returns.
+            if (progress && il + 1 < cfg_.n_layer)
+                progress(g0 + size_t(G) * (il + 1) / cfg_.n_layer);
         }
 
         // The next-token block's cache for the group's positions whose following token is known; the hidden state of

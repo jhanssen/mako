@@ -31,9 +31,9 @@ public:
 
     // Runs one token at the next position and returns its logits.
     virtual const std::vector<float>& step(int32_t token) = 0;
-    // Runs tokens at the next positions, as many steps would; returns the logits after the last. Between groups of
-    // tokens, `progress` gets the number run so far and `cancelled` is polled: true stops there, with the tokens so
-    // far in the context (position()).
+    // Runs tokens at the next positions, as many steps would; returns the logits after the last. `progress` gets the
+    // number run so far between groups of tokens, and within a group an estimate (its share of the layers done).
+    // `cancelled` is polled between groups: true stops there, with the tokens so far in the context (position()).
     virtual const std::vector<float>& prefill(std::span<const int32_t> tokens,
                                               const std::function<bool()>& cancelled = {},
                                               const std::function<void(size_t)>& progress = {}) = 0;

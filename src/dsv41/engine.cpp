@@ -826,7 +826,11 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
                                                   std::min<uint32_t>(opts_.prefill_group, uint32_t(tokens.size()))));
     for (size_t g0 = 0; g0 < tokens.size(); g0 += opts_.prefill_group) {
         const size_t n = std::min<size_t>(opts_.prefill_group, tokens.size() - g0);
+        // Within a group, its share of the layers done.
+        if (progress)
+            layer_done_ = [&](uint32_t layers) { progress(g0 + n * layers / cfg_.n_layer); };
         run(tokens.subspan(g0, n), bool(logits_sink_), opts_.prefill_skip ? pos_ + uint32_t(tokens.size() - g0) : 0);
+        layer_done_ = {};
         total.ensure_ms += last_step_.ensure_ms;
         for (size_t l = 0; l < total.layers.size() && l < last_step_.layers.size(); ++l) {
             total.layers[l].attn_ms += last_step_.layers[l].attn_ms;
@@ -1064,6 +1068,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
         std::swap(R, R2);
         prev = pcs[cur];
         cur ^= 1;
+        if (layer_done_ && il + 1 < cfg_.n_layer)
+            layer_done_(il + 1);
         // Decode: the layers encoded so far go to the GPU while the rest are encoded, and layers whose routing is
         // back are served in between (the GPU waits at each MoE layer until then).
         if (decode && !timing() && (il + 1) % kCommitLayers == 0 && il + 1 < cfg_.n_layer) {
