@@ -1,17 +1,23 @@
 // The server over HTTP with a scripted stand-in for the engine (the model file gives only the tokenizer and chat
-// template): streams carry SSE comments while a request waits for its turn or its prompt is read; repetition loops
-// close the reasoning or end the answer, and are left alone in code blocks; /v1/status shows requests as they run and
-// after, and the /status page needs no key while /v1/status does.
+// template): streams carry SSE comments while a request waits for its turn or its prompt is read, and the log gets a
+// progress line while a long prompt is read; repetition loops close the reasoning or end the answer, and are left
+// alone in code blocks; /v1/status shows requests as they run and after, and the /status page needs no key while
+// /v1/status does.
 //   server_http_test <model.gguf>
 #include "gguf/gguf.hpp"
 #include "server/server.hpp"
 
 #include <httplib.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <print>
 #include <string>
 #include <thread>
@@ -29,8 +35,8 @@ void check(bool ok, const std::string& what)
 }
 
 // Generates `script` after any prompt (greedy: one-hot logits), its last token repeated past its end; once fed
-// `switch_on`, `after` instead. A prefill takes prefill_ms, polling `cancelled` every 500 ms as an engine does between
-// groups; a step takes step_ms.
+// `switch_on`, `after` instead. A prefill takes prefill_ms, reporting progress and polling `cancelled` every 500 ms as
+// an engine does between groups; a step takes step_ms.
 class Scripted : public mako::gen::Model {
 public:
     explicit Scripted(uint32_t n_vocab) : logits_(n_vocab, 0.0f) {}
@@ -51,10 +57,14 @@ public:
         }
         return next();
     }
-    const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled) override
+    const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled,
+                                      const std::function<void(size_t)>& progress) override
     {
-        for (int ms = prefill_ms; ms > 0; ms -= 500) {
+        const int total = prefill_ms;
+        for (int ms = total; ms > 0; ms -= 500) {
             std::this_thread::sleep_for(std::chrono::milliseconds(std::min(ms, 500)));
+            if (ms > 500 && progress)
+                progress(tokens.size() * size_t(total - ms + 500) / size_t(total));
             if (ms > 500 && cancelled && cancelled())
                 break;
         }
@@ -170,9 +180,26 @@ int main(int argc, char** argv)
     for (int i = 0; i < 100 && !httplib::Client("127.0.0.1", opts.port).Get("/health"); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // A prompt read for 7 s: a comment after 5 s of silence, before the answer.
+    // A prompt read for 7 s: a comment after 5 s of silence, before the answer, and a progress line in the log.
     model.prefill_ms = 7000;
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() / "mako_server_http_test.log";
+    std::fflush(stderr);
+    const int saved_err = dup(2);
+    const int log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(log_fd, 2);
     const std::string slow = stream(opts.port, "one");
+    std::fflush(stderr);
+    dup2(saved_err, 2);
+    close(log_fd);
+    close(saved_err);
+    std::string log;
+    {
+        std::ifstream in(log_path);
+        log.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    std::filesystem::remove(log_path);
+    std::fputs(log.c_str(), stderr);
+    check(count(log, ": prompt read ") >= 1, "progress lines while the prompt is read");
     check(slow.find(": keepalive") != std::string::npos && slow.find(": keepalive") < slow.find("Hello"),
           "a comment while the prompt is read");
     check(content(slow) == "Hello there.", std::format("the answer after it ({:?})", content(slow)));

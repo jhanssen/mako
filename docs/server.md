@@ -135,6 +135,9 @@ A cut in the middle of a calculation can leave the answer wrong.
   bit for bit (tests `e2e_pool`, `ds41_pool`: two threads switching at every step), except with `--miss-penalty`,
   whose routing depends on which experts the other conversations left in memory. The log line of each request names
   its conversation and its turns.
+- A prompt read for longer than 5 seconds logs its progress every 5 seconds or more, at the end of a prefill group
+  (4096 tokens for GLM-5.3, 8192 for DeepSeek-V4.1): `chatcmpl-148: prompt read 40960 of 79411 tokens (52%), 532
+  tok/s, ~72 s left`, the rate over the tokens read so far, waits for other requests' turns included.
 - A stream with nothing to send for 5 seconds (waiting for its turn, reading a long prompt, reasoning the client does
   not see) gets an SSE comment line (`: keepalive`), which clients skip, so clients that drop idle streams (pi's HTTP
   client after 300 s) keep the connection. A long prompt is polled between prefill groups, every ~10-20 s.

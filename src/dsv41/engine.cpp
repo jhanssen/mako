@@ -795,7 +795,8 @@ const std::vector<float>& Engine::step(int32_t token)
     return logits_;
 }
 
-const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled)
+const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled,
+                                          const std::function<void(size_t)>& progress)
 {
     if (tokens.empty())
         return logits_;
@@ -840,6 +841,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
             it->ms += k.ms;
             it->count += k.count;
         }
+        if (progress && g0 + n < tokens.size())
+            progress(g0 + n);
         if (cancelled && g0 + n < tokens.size() && cancelled())
             break;
     }

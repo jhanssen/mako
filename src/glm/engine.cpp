@@ -1238,7 +1238,8 @@ int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)
 // Prompt processing: chunks of tokens go through each layer together (projections as GEMMs, the sequential parts
 // token by token inside the kernels), with one CPU synchronization per MoE layer to make the chunk's experts
 // resident. Leaves the same caches and state as step() would token by token.
-const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled)
+const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled,
+                                          const std::function<void(size_t)>& progress)
 {
     if (tokens.size() < 2 || probe_ || stream_override_ || route_override_) {
         for (int32_t t : tokens)
@@ -1472,6 +1473,8 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
             }
         }
         pool->release();
+        if (progress && g0 + G < tokens.size())
+            progress(g0 + G);
         if (cancelled && g0 + G < tokens.size() && cancelled()) {
             done = g0 + G;
             break;

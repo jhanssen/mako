@@ -55,6 +55,7 @@ void log_result(const std::string& id, const gen::GenerateResult& r, const char*
 } // namespace
 
 constexpr auto kKeepalive = std::chrono::seconds(5);
+constexpr auto kProgressEvery = std::chrono::seconds(5);
 
 struct Server::Impl {
     gen::Model& engine;
@@ -223,6 +224,26 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
                 return rb->forced(logits, nv);
             return parser.forced();
         };
+    // A line every kProgressEvery or more while a long prompt is read.
+    struct Reading {
+        std::chrono::steady_clock::time_point start, last;
+        size_t from = 0;
+        bool started = false;
+    } reading;
+    cr.gen.progress = [&](size_t read, size_t total) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!reading.started) {
+            reading = {now, now, read, true};
+            return;
+        }
+        if (now - reading.last < kProgressEvery || read <= reading.from)
+            return;
+        reading.last = now;
+        const double s = std::chrono::duration<double>(now - reading.start).count();
+        const double rate = double(read - reading.from) / s;
+        log::info("{}: prompt read {} of {} tokens ({:.0f}%), {:.0f} tok/s, ~{:.0f} s left", id, read, total,
+                  100.0 * read / total, rate, double(total - read) / rate);
+    };
     bool client_gone = false;
     gen::SessionPool::Pick pick;
     const auto start = [&](gen::GenerateParams& p) {

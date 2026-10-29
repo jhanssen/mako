@@ -232,6 +232,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     const auto rest = prompt.subspan(ctx_.size());
     if (!ctx_.empty() && mtp_next_ != rest[0])
         e_.mtp_seed(rest[0]);
+    if (p.progress)
+        p.progress(ctx_.size(), prompt.size());
     // Runs the prompt up to `end` (exclusive) and records it; false when cancelled there (the result says so).
     const auto run_to = [&](size_t end) {
         if (end <= ctx_.size())
@@ -248,7 +250,12 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
                 if (cut + kMin < end)
                     to = cut;
             }
-            e_.prefill(prompt.subspan(at, to - at), p.cancelled);
+            std::function<void(size_t)> progress;
+            if (p.progress)
+                progress = [&, at](size_t n) { p.progress(at + n, prompt.size()); };
+            e_.prefill(prompt.subspan(at, to - at), p.cancelled, progress);
+            if (p.progress && e_.position() + 1 < prompt.size())
+                p.progress(e_.position(), prompt.size());
             if (e_.position() != to || to == end)
                 break;
             at = to;

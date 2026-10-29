@@ -22,6 +22,8 @@ struct GenerateParams {
     // Polled while the prompt is read (between groups of tokens): true stops (Finish::cancelled, no tokens), keeping
     // the part read so far in the context.
     std::function<bool()> cancelled;
+    // While the prompt is read: once before (`read` the tokens reused), then between groups of tokens.
+    std::function<void(size_t read, size_t total)> progress;
     // Prompt positions whose embeddings come from rows (images), each span with a key for its content: a prefix the
     // context holds is reused only where its keys match too. The rows must outlive generate().
     struct PromptRows {
