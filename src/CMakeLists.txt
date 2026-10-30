@@ -8,7 +8,8 @@ target_include_directories(mako_gguf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set(MAKO_METALLIB ${CMAKE_BINARY_DIR}/mako.metallib)
 set(MAKO_METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/glm.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/dsv41.metal
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemv.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vision.metal)
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vision.metal
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ops.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/image.metal)
 set(_airs)
 foreach(src ${MAKO_METAL_SOURCES})
     get_filename_component(stem ${src} NAME_WE)
@@ -35,6 +36,10 @@ add_custom_target(mako_version
 add_library(mako_safetensors STATIC safetensors/safetensors.cpp)
 target_include_directories(mako_safetensors PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_safetensors PUBLIC mako_gguf PRIVATE glaze_headers)
+
+add_library(mako_image STATIC image/engine.cpp)
+target_include_directories(mako_image PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_image PUBLIC mako_gpu mako_safetensors)
 
 add_library(mako_chat STATIC chat/template.cpp)
 target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
