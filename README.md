@@ -57,7 +57,7 @@ tools/mako-download.sh glm
 
 | Set | Model | Size |
 | --- | --- | --- |
-| `glm` | GLM-5.3-Flash | 97 GB |
+| `glm` | GLM-5.3-Flash (Maya-S-v2) | 97 GB |
 | `ds` | DeepSeek-V4.1-Flash-1017 (Maya-S) | 339 GB |
 | `ds-ista-xs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XS, the fastest: ~34 tokens/s) | 266 GB |
 | `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XXS, the smallest) | 249 GB |
