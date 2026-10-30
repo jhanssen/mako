@@ -1,6 +1,7 @@
 // Conversations across an engine destroyed and built again (a model swap): a pool suspended, its engine gone, resumed
 // on a new engine of the same model gives the conversation's next turn the tokens and logits it gives without the
-// swap, bit for bit, reading only the new tokens; resumed with another identity it starts over.
+// swap, bit for bit, reading only the new tokens; resumed with another identity it starts over, as the prompt read
+// whole.
 //   reload_test <model.gguf>                        GLM-5.3
 //   reload_test <model-00001.gguf> <engram.gguf>    DeepSeek-V4.1
 #include "core/arena.hpp"
@@ -24,6 +25,7 @@
 #include <print>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -145,18 +147,32 @@ int main(int argc, char** argv)
         want[0] = run(pool, first);
         want[1] = run(pool, next(first, want[0].tokens));
     }
+    // The second turn's prompt read whole, as a conversation given up reads it (its generated tokens through prefill,
+    // not decode, so not want[1]'s logits: an M1 Ultra's greedy tokens differed there at a near-tie of 0.005).
+    Turn whole;
+    {
+        mako::gen::SessionPool pool(*engine, 64ull << 30, 16, std::chrono::milliseconds(1000), "w");
+        whole = run(pool, next(first, want[0].tokens));
+    }
     engine->reset();
     mako::gen::SessionPool pool(*engine, 64ull << 30, 16, std::chrono::milliseconds(1000), "a");
     got[0] = run(pool, first);
     pool.suspend();
     const double loaded = mako::core::query_memory(0).footprint;
     engine.reset();
-    const double unloaded = mako::core::query_memory(0).footprint;
+    // Metal gives its buffers' pages back shortly after they are released (an M1 Ultra: 8.1 GB held when the engine
+    // is gone, 0.5 GB 0.26 s later).
+    const double bound = start + double(pool.parked_bytes()) + 2e9;
+    double unloaded = mako::core::query_memory(0).footprint;
+    for (int i = 0; i < 50 && unloaded >= bound; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        unloaded = mako::core::query_memory(0).footprint;
+    }
     std::println("footprint: {:.1f} GB at the start, {:.1f} GB loaded, {:.1f} GB after the engine is gone ({:.2f} GB "
                  "of conversations parked)",
                  start / 1e9, loaded / 1e9, unloaded / 1e9, pool.parked_bytes() / 1e9);
-    check(unloaded < start + double(pool.parked_bytes()) + 2e9,
-          "destroying the engine gives its memory back (within 2 GB, beside the parked conversations)");
+    check(unloaded < bound,
+          "destroying the engine gives its memory back (within 2 GB, beside the parked conversations, in 5 s)");
     engine = make();
     pool.resume(*engine, "a");
     const auto second = next(first, got[0].tokens);
@@ -171,9 +187,10 @@ int main(int argc, char** argv)
     pool.suspend();
     pool.resume(*engine, "b");
     const Turn other = run(pool, second);
-    check(other.reused == 0 && other.tokens == want[1].tokens,
-          std::format("another identity: {} reused, tokens {}", other.reused,
-                      other.tokens == want[1].tokens ? "the same" : "differ"));
+    check(other.reused == 0 && other.tokens == whole.tokens && other.hash == whole.hash,
+          std::format("another identity: {} reused, tokens {}, logits {} (the prompt read whole)", other.reused,
+                      other.tokens == whole.tokens ? "the same" : "differ",
+                      other.hash == whole.hash ? "bit for bit" : "differ"));
     if (failures)
         std::println("{} failed", failures);
     return failures ? 1 : 0;
