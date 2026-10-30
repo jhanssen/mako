@@ -3,6 +3,12 @@
     "description": "GLM-5.3-Flash, defaults",
     "model": "/path/to/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf"
   },
+  "glm-vision-image": {
+    "description": "GLM-5.3-Flash with images as input and image generation (Qwen-Image 2.1 swapped in on request)",
+    "model": "/path/to/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
+    "--mmproj": "/path/to/mmproj-BF16.gguf",
+    "--image-model": "/path/to/Qwen-Image-2.1"
+  },
   "glm-abl": {
     "description": "GLM-5.3-Flash with an ablation file (sites ffn_out, stream)",
     "model": "/path/to/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
@@ -11,6 +17,11 @@
   "ds": {
     "description": "DeepSeek-V4.1-Flash-1017, defaults (expert read-ahead on)",
     "model": "/path/to/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf"
+  },
+  "ds-ista-xs": {
+    "description": "DeepSeek, ISTA's IQ2_XS build with cache-aware routing: ~34 tok/s, the same perplexity as Maya-S",
+    "model": "/path/to/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf",
+    "--miss-penalty": 0.1
   },
   "ds-abl": {
     "description": "DeepSeek with an ablation file (sites attn_out, shexp_out)",

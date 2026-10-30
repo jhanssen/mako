@@ -1,4 +1,4 @@
-# Vision (design, in progress)
+# Vision
 
 Images as prompt input for both models, from a projector file (an "mmproj" GGUF) next to the text model:
 
@@ -50,8 +50,8 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
   rows), also in a step of 8 rows or fewer.
 - `gen::Session` keys image positions by the image's content hash, so a prefix holding a different image is not
   reused.
-- Server: OpenAI `image_url` parts and Anthropic `image` blocks, base64 / `data:` URLs (no fetching), PNG and JPEG
-  decoded with ImageIO. `--mmproj FILE` loads the projector (its ~1 GB comes out of the expert cache budget).
+- Server: OpenAI `image_url` parts and Anthropic `image` blocks, base64 / `data:` URLs (no fetching), PNG, JPEG and
+  the other formats ImageIO reads. `--mmproj FILE` loads the projector (its ~1 GB comes out of the expert cache budget).
 
 ## Checking it
 

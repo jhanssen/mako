@@ -30,9 +30,9 @@
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
-// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's directory (its files as published), for
-// /v1/images/generations: an image request waits for the chat requests in progress, then the LLM is unloaded (its
-// conversations kept in memory) and the image model loaded; the next chat request loads the LLM again.
+// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's or Krea 2's directory (its files as
+// published), for /v1/images/generations: an image request waits for the chat requests in progress, then the LLM is
+// unloaded (its conversations kept in memory) and the image model loaded; the next chat request loads the LLM again.
 // --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE); --image-steps and --image-terminal set the
 // schedule (a 4-step distilled LoRA: --image-steps 4 --image-terminal 0); --image-text-encoder loads the text encoder
 // from another directory (the same model's weights, changed: e.g. refusal-ablated), --image-transformer the transformer
@@ -174,7 +174,7 @@ int main(int argc, char** argv)
             .option("--ablate", "FILE", "remove per-layer directions (an ablation file)", ablate)
             .option("--ablate-scale", "S", "multiply the ablation's strength", ablate_scale)
             .flag("--learn", "add the session's routing counts to the model's profile on exit", learn)
-            .option("--dump-requests", "DIR", "write each request and response to DIR", so.dump_dir)
+            .option("--dump-requests", "DIR", "write each request body to DIR", so.dump_dir)
             .parse(argc, argv);
     const char* model_path = args[0].c_str();
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).

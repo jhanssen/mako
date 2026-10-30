@@ -2,7 +2,7 @@
 
 The model-backed tests compare mako against reference implementations running the same GGUF files. The files here
 hold the inputs and the reference's outputs; the reference itself is not needed to run the tests, only to regenerate
-them. All of it was made with the Maya-S quants (see the README): GLM-5.3-Flash `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS`
+them. All of it was made with the Maya-S quants (see `docs/models.md`): GLM-5.3-Flash `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS`
 and DeepSeek-V4.1-Flash-1017 `DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS`. The DeepSeek reference engine read the
 Engram tables in MXFP8 (the `UD-Q8_K_XL` build's shard 8 of 9); the current Maya-S set carries them in Q6_K in its
 last two shards (its model shards are byte for byte the ones the references were made with), and the tests run with
@@ -75,3 +75,11 @@ values..." for the first column's decoded row of the first positions), from proj
 Engram GGUF's `deepseek41.engram.*` keys. The decoded values are from the Maya-S set's Q6_K tables, by
 `tools/gen_engram_values.py` (an independent decode of the raw bytes). `tools/engram_rows` prints mako's side for
 comparison.
+
+## Vision (`vision/`)
+
+`tools/gen_vision_fixtures.py tests/data/vision` writes the images: smooth ramps with a periodic checker, in the common
+PNG colour types and bit depths (`gray8`, `graya8`, `pal8`, `rgb16`, `rgba8`) and RGB at sizes that take each of the
+preprocessing's sizing paths. `expected.txt` holds, per projector type (`glm5v`, `deepseek41v`) and image, the size
+the reference prepares it to and the SHA-256 of its prepared input (fp32 planar, `ref_vision`'s `inp_raw`);
+`vision_prep` checks mako's preprocessing gives the same bytes.

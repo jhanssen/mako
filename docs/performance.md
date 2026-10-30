@@ -4,7 +4,7 @@ Measured on an M5 Max (128 GB, 40-core GPU) unless noted. Numbers are from inter
 identical runs vary up to ~12 ms/step over long benchmark stretches, and the machine drifted ~15% slower over one
 evening in both arms, so single runs or runs hours apart are not comparable.
 
-## GLM-5.3-Flash (Maya-S IQ2_XXS, 96.5 GB; experts ~86 GB)
+## GLM-5.3-Flash (Maya-S-v2 IQ2_XXS, 96.5 GB; experts ~86 GB)
 
 ### Landed
 
@@ -63,9 +63,10 @@ MB GEMV adds ~4 us over free-running). Fusing kernels removes the ~1 us boundary
 475 GB/s; so the big GEMVs hold ~1.5-2 ms (the IQ2_S kernel, the IQ2_XXS fixed cost, independent GEMVs in separate
 dispatches), the small kernels ~4.5 ms, the dense weights the rest. With the multi-GEMV dispatches: 23.1 ms/token.
 
-Decode at 15K context after these: ~46-54 ms per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads
-10-19 ms (not overlapped), drafting ~2.3 ms. The big GEMVs already run at ~400 GB/s of the 553 GB/s measured (614
-GB/s specified); the estimated bandwidth floor is ~20 ms/step.
+Decode at 15K context after these, before every expert was resident (the cache margin, DeepSeek's table): ~46-54 ms
+per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads 10-19 ms (not overlapped), drafting ~2.3 ms.
+Since then a two-token step costs ~34 ms after 21.9K tokens (MTP drafts, Open). The big GEMVs already run at ~400
+GB/s of the 553 GB/s measured (614 GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 
 Dense re-quantization at load (`mako_run --dense-quant q5_k|q4_k`, or `MAKO_DENSE_QUANT`; every Q6_K and Q8_0
 dense matrix, from the stored Q6_K rows, unweighted), 512-token parity prompt against the reference (`regress_test
@@ -107,10 +108,12 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 | Per-kernel telemetry to find slow kernels | timestamps around each dispatch inflate small kernels several-fold (one "slow" shared-expert GEMV was 93 us measured, 13 us real); repeat-in-place costs (`MAKO_REPEAT`) replaced it |
 | Software dependency tracking instead of encoder barriers: every dispatch in one concurrent encoder, each threadgroup waiting on a device counter the previous dispatch's threadgroups bump after a device-scope fence, the weights read into registers before the wait (`bench/chain_bench`) | 64 chained f16 GEMVs of 32 MB: 65 -> 63 us a link (free-running 57); a chain alternating a latency-bound small kernel and a GEMV: no change (one counter a dispatch: 20% slower from the atomics' contention; 32 counters: equal to serial). Outputs stayed bit-identical, no wait gave up. Not worth the hazard |
 | Sparse attention in one kernel for prefill (2026-10-28): per (token, 32 heads) a flash-style pass over the token's list, 16 gathered latent rows at a time into threadgroup memory serving both products, running softmax, output in registers; then with the list split over 4-16 threadgroups and a combine kernel | 4096 tokens at 16K context: 1.42-1.62 s (one range), 1.32 / 1.46 / 1.78 s (4 / 8 / 16 ranges) against 0.55-0.58 s for the three kernels (scores, softmax, output); KL against the reference unchanged (0.0069-0.0072). The 512-wide latent leaves room for 16 rows a step in 32 KB of threadgroup memory: ~129 small steps a token, each two small matmuls, a score round trip through threadgroup memory, a rescale of the 32x512 accumulator and three barriers; splitting the output width instead would recompute the scores per slice or hold 64x512 floats. Reverted |
+| Dense weights below Q6_K | Q5_K drops decode top-1 to ~90% (the dense-quant table above); declined |
 
 ### Open
 
-- Decode misses still rise after a long prompt, less since staging (GLM: ~27 vs ~15 a step for the first 40 steps).
+- Decode misses rising after a long prompt: GLM-5.3 holds every expert on 128 GB now, so only on smaller Macs (~27
+  vs ~15 a step for the first 40 steps, measured before the larger cache). DeepSeek: its Open list.
 - Expert GEMMs at few rows per expert in short prefills (2026-10-28). The IQ tiles of up to 32 tokens now stage 64
   weight columns at a time instead of 256 (landed above): 16-row gate + up 3.5 -> 2.8 ms, 32-row 4.8 -> 3.9 ms
   (`gemm_bench 128 T 4096 2048`). Still per pass over the weights and well under their read bound (~200 GB/s of
@@ -121,13 +124,13 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
   ~190 ms to read them; at ~350-400 GB/s instead of ~200 the estimate is 100-200 ms off the turn (10-18%), less at
   256 tokens, nothing for long prompts (64-row and larger tiles are near peak), little for DeepSeek (its short turns
   wait on SSD reads). Low to medium confidence: an earlier IQ2_XXS rewrite did not beat the existing kernels, and
-  the fused sparse attention, estimated 4-5% faster, came out 2.3x slower. It changes summation order, which GLM's
+  the fused sparse attention, estimated 4-5% faster, came out 2.3-3.2x slower. It changes summation order, which GLM's
   near-bit-exact e2e checks react to. First a standalone kernel in `bench/gemm_bench` against the 16- and 32-row
   tiles (2.8 / 3.9 ms for 128 experts' gate and up), before any engine change.
 - Prefill at 20K tokens (2026-10-27, `prefill_sweep --parts`, ~745 tok/s, 27.6 s GPU): experts 9.7 s, KDA 8.4 s
   (q/k/v 3.1, scan 1.3, output 1.0, gates 1.0, conv 0.4), MLA 6.3 s, FFN 2.8 s, hc and norm 1.4 s. By expected gain,
   none measured:
-  - Sparse attention in one kernel: tried and rejected (2026-10-28, table above): 2.3-2.8x slower than the three
+  - Sparse attention in one kernel: tried and rejected (2026-10-28, table above): 2.3-3.2x slower than the three
     kernels at 4096 tokens. Another engine runs it as one kernel through a hard-coded M5 layout of the cooperative
     tensors' elements; how it fits the 512-wide rows was not examined. DeepSeek-V4.1's attention (64 heads, 512
     wide) would meet the same limit.
@@ -142,7 +145,7 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
   per-step time read as per token (fixed: it now reports steps and tokens run a step). A gate that stops drafting
   below break-even would matter only for requests whose acceptance falls under a third; the server logs each
   request's share of drafts kept, so look there before building one.
-- Decode at 23.1 ms/token, the weights ~16.3 ms of it. Not built, by expected gain:
+- Decode at ~23.2 ms/token, the weights ~16.3 ms of it. Not built, by expected gain:
   - More independent GEMVs in one dispatch (`mako_mul_mv_jobs`): f_b + g_b (rows of 128: the job kernel needs the
     short-row kernel as a job type), the MLA per-head k_b and v_b with their neighbours, hc_mean + the output norm.
     ~0.3 ms.
@@ -159,9 +162,8 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
     latency; the kernels take T <= 8 rows already, the KDA/MLA state and the session API do not.
   - An exact top-k head from a low-bit sketch (bounded error per row from the quantization residual and ||x||)
     with exact rescoring of the candidates: ~0.3-0.6 ms of the head's 0.9, greedy/top-k sampling only.
-  - Dense weights below Q6_K: measured above and declined (Q5_K drops decode top-1 to ~90%).
 
-## DeepSeek-V4.1-Flash-1017 (Maya-S IQ2_XXS, ~178 GB; ~40% of experts resident on 128 GB)
+## DeepSeek-V4.1-Flash-1017 (Maya-S IQ2_XXS, 178 GB + Engram tables; ~55% of experts resident on 128 GB)
 
 ### Landed
 
@@ -204,7 +206,8 @@ the sections below take it to ~25 by default.
   Staged misses go to the GPU in batches of up to 32 only once every one of them has been taken from the ring, so
   one late read holds back experts that are ready; submitting the ready prefix (a minimum batch size, the order and
   the final combine unchanged) could close GPU idle gaps. First measure the gaps.
-- Decode misses (15-40 a step). Untried: experts pinned resident by their decode request rate (an EMA per route,
+- Decode misses (~9 a step on Maya-S and 6-7 on ISTA IQ2_XS in the A/B runs above; 15-40 before read-ahead and the
+  larger cache). Untried: experts pinned resident by their decode request rate (an EMA per route,
   the top share of each layer) beside the decayed score; another engine pins half of each layer for GLM-5.3 and has
   it off for this model, unmeasured.
 - Engram rows are read before the step's command buffer is made (`read_raw`, synchronous), both tables at once,
@@ -230,8 +233,8 @@ the sections below take it to ~25 by default.
   the idle pass, the IQ2_XXS fixed cost), each checked bit-identical with `--logits-out` over per-position decode
   and A/B timed (three pairs, no telemetry, equal misses); expected 1-2 ms. Below that: record the numbers and stop.
 - DSpark (opt-in, `--dspark DIR`): greedy output identical to plain decoding (verify up to 8 tokens runs the decode
-  path); 19.8 -> 22.5 tok/s on code (93% of drafts kept), 23.5 -> 22.8 on a story (70%), its 8 GB costing the cache
-  ~9%. Draft rounds take ~11 ms (the reference engine's ~2.4). Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
+  path); measured before read-ahead (2026-10-25): 19.8 -> 22.5 tok/s on code (93% of drafts kept), 23.5 -> 22.8 on
+  a story (70%), its 8 GB costing the cache ~9%. Draft rounds take ~11 ms (the reference engine's ~2.4). Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
   6 tokens costs 47-62 / 63 / 101 / 155-185 ms with ~12 misses per token at every width (tokens in a step share
   almost no experts; wider steps still pay off because the dense weights are read once and one step's misses are
   read in parallel). The reference engine's DSpark: on code 97% of drafts kept, 4.6 tokens a round (-> ~1.5-1.65x
@@ -437,8 +440,9 @@ both estimates beforehand; isolated benchmarks (`gemv_bench`) are the better gui
 - Several sequences a step (continuous batching) for several agents at once: dense weights read once for all of
   them, experts by routing overlap; the row-invariant GEMVs keep each sequence's result independent of the batch.
   The largest throughput gain and the largest change (KDA/MLA state per sequence, the session API, the scheduler).
-- `bench/perf_check` covers ~6.8K-token prompts; a long-context variant (a 20K-token prefill on demand) would catch
-  regressions that show only there (the `kda_prep` one was ~5% of a 20K prefill).
+- `bench/perf_check` covers ~5-6K-token prompts; a long-context run (`--prompt 20000` exists; it needs a longer
+  `bench/data/perf_prompt.txt`) would catch regressions that show only there (the `kda_prep` one was ~5% of a 20K
+  prefill).
 
 ## Both models: the first GPU work after a few seconds idle (2026-10-26)
 
@@ -462,6 +466,22 @@ Residency sets (`MTLResidencySet` with the arena's buffers) did not help:
 
 Not pursued: a keep-alive (touching the arena about once a second while idle) would likely remove the ~0.35 s, but adds
 a periodic GPU wake-up and its management for a cost paid only after pauses. Left as it is.
+
+## Image models (2026-10-29)
+
+Qwen-Image 2.1, 1024x1024 and 40 steps, each after a 5-minute cool-down: 63.0 s (step 2 1.28 s, step 40 1.77 s); the
+reference pipeline on MPS in BF16 65.1 s (1.36 / 1.75 s). Both slow down with heat during a run while macOS reports
+the nominal thermal state (pauses between steps restore the speed). From 79.9 s by:
+
+- attention with each simdgroup on its own rows: 12.0 -> 7.1 ms a layer;
+- the GEMMs run on a multiple of 256 rows (the first step's text + image rows took 64-row tiles, twice as slow);
+- dense BF16 / F16 weights read by matmul2d straight from device memory: 55 -> 63 TFLOP/s (BF16 with F32
+  accumulation is as fast as F16 on the M5);
+- q / k / v and gate / up one GEMM each, with the heads' norms fused;
+- the VAE's convolution weights in F16 on that GEMM.
+
+The text's keys and values are cached after the first step. Krea 2 Turbo: 1024x1024 in 8 steps, 23 s. Qwen-Image
+2.1 with a 4-step distilled LoRA (lightx2v's Lightning): 6.9 s.
 
 ## Apple10 (M5) versus Apple9 (M3/M4)
 

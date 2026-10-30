@@ -41,13 +41,14 @@ add_executable(safetensors_test safetensors_test.cpp)
 target_link_libraries(safetensors_test PRIVATE mako_safetensors)
 add_test(NAME safetensors COMMAND safetensors_test "${MAKO_QWEN_IMAGE}")
 set_tests_properties(safetensors PROPERTIES LABELS cpu SKIP_RETURN_CODE 77)
-# Qwen-Image 2.1 against the reference pipeline's tensors (MAKO_QWEN_IMAGE_REF).
+# Krea 2 against the reference pipeline's tensors (MAKO_KREA2_REF).
 add_executable(krea_ref_test krea_ref_test.cpp)
 target_link_libraries(krea_ref_test PRIVATE mako_imagegen mako_text glaze_headers)
 foreach(m tokens text dit vae pipeline)
     add_test(NAME krea_${m} COMMAND krea_ref_test "${MAKO_KREA2}" "${MAKO_KREA2_TRANSFORMER}" "${MAKO_KREA2_REF}" ${m})
     set_tests_properties(krea_${m} PROPERTIES LABELS image SKIP_RETURN_CODE 77)
 endforeach()
+# Qwen-Image 2.1 against the reference pipeline's tensors (MAKO_QWEN_IMAGE_REF).
 add_executable(image_ref_test image_ref_test.cpp)
 target_link_libraries(image_ref_test PRIVATE mako_imagegen mako_text glaze_headers)
 foreach(m tokens text dit vae pipeline)
@@ -62,7 +63,7 @@ target_link_libraries(regress_test PRIVATE mako_glm mako_text)
 target_compile_definitions(regress_test PRIVATE MAKO_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data"
                                                 MAKO_CALIBRATION="${CMAKE_SOURCE_DIR}/data/calibration.txt")
 
-# ctest -L kernels | tokenizer | sampler | server | e2e; every test exits 77 (skipped) without MAKO_MODEL.
+# ctest -L <label> (ctest --print-labels); a test whose model is not configured exits 77 (skipped).
 add_test(NAME tokenizer COMMAND tokenizer_test "${MAKO_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_tokenizer_cases.bin
                                 ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_tokenizer_expected.txt)
 # DeepSeek-V4.1's tokenizer on the same cases (expected ids from the reference tokenizer).

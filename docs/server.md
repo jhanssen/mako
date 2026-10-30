@@ -2,7 +2,7 @@
 
 ```sh
 ./build/tools/mako_serve <first .gguf of the model> [--host 127.0.0.1] [--port 8080] [--ctx 131072] [--no-spec]
-                         [--image-model <Qwen-Image 2.1 dir>]
+                         [--model-id NAME] [--image-model <Qwen-Image 2.1 or Krea 2 dir>]
 ```
 
 One request runs at a time on one session, so a conversation's next turn reuses the context the previous one left.
@@ -53,7 +53,8 @@ storage for `/v1/status`.
 
 - `POST /v1/messages` (text, thinking, tool_use / tool_result, streaming, `tool_choice`) and
   `POST /v1/messages/count_tokens`; thinking as in [Thinking](#thinking).
-- Image and document blocks and server tools are rejected.
+- Image blocks need `--mmproj` (see [Images](#images)). Document blocks, images in the system prompt and server tools
+  are rejected.
 - Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, any `ANTHROPIC_API_KEY` (its first request is a ~11K-token
   prompt).
 
@@ -118,6 +119,8 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
 - LoRAs: `--image-lora FILE[:SCALE]` (repeatable) merges each into the image model when it loads; Diffusers, PEFT and
   ComfyUI key names. `--image-steps N` and `--image-terminal F` set the schedule: a 4-step distilled LoRA such as
   lightx2v's Qwen-Image-2.1-Lightning takes `--image-steps 4 --image-terminal 0` (1024x1024 in ~7 s).
+- Not yet: condition images (edits, references; `/v1/images/edits`), image to image, and per-request seed, steps or
+  LoRAs.
 - `--image-text-encoder DIR` takes the text encoder from another directory of safetensors (the same architecture
   with changed weights, such as a refusal-ablated one), leaving the model's own directory as published;
   `--image-transformer PATH` the transformer from another file or directory (such as a Krea 2 checkpoint with LoRAs
@@ -191,6 +194,8 @@ A cut in the middle of a calculation can leave the answer wrong.
 - `--learn` adds the session's routing counts to the model's profile at shutdown (SIGINT / SIGTERM), so the experts
   that start in memory follow use.
 - `--dump-requests DIR` saves each request body, for debugging a client.
+- `--model-id NAME` sets the model name `/v1/models` and the responses report (default: the GGUF's
+  `general.basename`, else the file name).
 
 ## Clients
 

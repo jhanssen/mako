@@ -7,9 +7,9 @@ The expert cache takes what is available at startup within a margin (a quarter o
 
 ## Presets and the environment
 
-The tools (`mako_serve`, `mako_calibrate`, `mako_run`, `ds_run`, `prefill_sweep`) take their options from, lowest
-precedence first, environment variables, presets and the command line. `--help` lists each tool's options with their
-variables.
+The tools (`mako_serve`, `mako_calibrate`, `mako_run`, `ds_run`, `prefill_sweep`, `mako_image`) take their options
+from, lowest precedence first, environment variables, presets and the command line. `--help` lists each tool's options
+with their variables.
 
 - Each long option has a variable: `--arena-gb 40` is `MAKO_ARENA_GB=40`, `--miss-penalty 0.1`
   `MAKO_MISS_PENALTY=0.1`. A flag's variable takes `1` / `0` (or `true`, `yes`, `on` / `false`, `no`, `off`); every flag
@@ -40,7 +40,8 @@ Measured in `performance.md`.
   defaults: ~29 tokens/s on a short prompt instead of ~25.
 - `--dense-quant q4_k|q5_k|q6_k`: re-quantizes the dense Q8_0 weights at load; `--imatrix FILE` (from `ds_run --gen N
   --imatrix-out FILE`) weights the rounding.
-- `--prefetch K` (default 4; 0: off): reads ahead the experts the router two layers later predicts. Results unchanged.
+- `--prefetch K` (default 4; 0: off): reads ahead the experts the router D layers later predicts (`--prefetch-ahead
+  D`, default 2). Results unchanged.
 - `--prefill-skip 0|1` (default 1): a long prompt's earlier rows skip the layers after the last KV source, which only
   the last few thousand rows need. Results unchanged.
 - `--engram FILE` (`mako_serve`, `mako_calibrate`): the Engram tables of another GGUF (Q6_K or MXFP8) instead of the
@@ -58,7 +59,8 @@ Measured in `performance.md`.
 ## Ablation
 
 `--ablate FILE` (`mako_serve`, `mako_run`, `ds_run`) removes per-layer directions from chosen rows of the computation:
-x -= scale (x . v) v per direction, the vectors' norms carrying the strength, `--ablate-scale` multiplying it.
+x -= scale (x . v) v per direction, the vectors' norms carrying the strength, `--ablate-scale` multiplying it
+(`mako_serve` and `mako_run`).
 
 - Format (`MAKOABL1`, `src/mtl/ablation.hpp`): n_embd, n_layer, site names, then float32 vectors
   [layer][site][k][n_embd]. `tools/make_ablation.py` builds one from raw [layer][k][n_embd] directions.

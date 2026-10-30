@@ -1,7 +1,8 @@
 # Model architectures, as mako implements them
 
-What each layer computes, in the terms mako's code uses. Shapes are from the Maya-S GGUFs' metadata and tensors;
-semantics were checked against reference implementations' logits (see `tests/data/README.md`).
+What each layer computes, in the terms mako's code uses. The LLMs' shapes are from the Maya-S GGUFs' metadata and
+tensors, the image models' from their configs; semantics were checked against the reference implementations' outputs
+(see `tests/data/README.md` and the `image` tests).
 
 ## Shared by both
 
@@ -74,4 +75,51 @@ semantics were checked against reference implementations' logits (see `tests/dat
 - **Chat template**: DeepSeek's encoder (`<｜User｜>` / `<｜Assistant｜>`, `<think>` for thinking mode, a reasoning
   effort line, tool calls in DSML tags); `tests/data/ds41_template/` holds its fixtures.
 
-`docs/dsv41-design.md` covers how mako's DeepSeek engine is built around this.
+## Image models
+
+Both run from their original files (BF16 safetensors and configs), not a GGUF: the published GGUFs hold only the
+transformer, as F16 (BF16 values below ~6.1e-5 lose bits there) or quantized. They share `image::Engine`: the Qwen3-VL
+text encoder, the VAE decoder, the flow-matching Euler schedule and the denoising loop. `Engine::open` picks the model
+from `model_index.json`.
+
+### Qwen-Image 2.1
+
+- Transformer (13.25 GiB): 32 layers, hidden 4096 (32 heads of 128), MLP ratio 3, 64 latent channels in and out,
+  patch size 1, rotary positions on three axes (16 / 56 / 56), `causal_condition`. A 1024x1024 image is 4096 latent
+  positions; a step is ~57 TFLOP (2 x 7B x 4096), compute bound like a prefill.
+- Text encoder (16.3 GiB): Qwen3-VL; text part 36 layers, hidden 4096, 8 KV heads, interleaved multi-axis rotary
+  positions; a 27-layer vision tower for image prompts (not used yet).
+- VAE (1.26 GiB): 4 channels (RGBA), 64-channel latent, 16x spatial compression (sides multiples of 32), with the
+  temporal settings of a video VAE.
+- Schedule: dynamic shift; 40 steps.
+
+### Krea 2
+
+- Transformer (12B): 28 single-stream blocks over [text, image], hidden 6144 (48 query heads, 12 key / value heads
+  of 128), a sigmoid gate on the attention output, SwiGLU 16384, RMS norms with zero-centred scales, one shared
+  timestep modulation plus a learned table per block, rotary axes 32 / 48 / 48 (theta 1000; the text at the origin).
+- Text: Qwen3-VL-4B's hidden states 2, 5, ..., 35 per token, fused by two blocks across the twelve layers, a learned
+  mix, and two blocks across the tokens (2560 wide, 20 heads). The reference pads the text to 512 rows and masks the
+  padding; mako runs only the prompt's rows, which gives the same result.
+- VAE: the first Qwen-Image's (16 channels, 8x), the transformer's tokens its 2x2 patches; causal 3D convolutions
+  reduced to their last time tap.
+- Turbo (`is_distilled`): 8 steps, a fixed shift (mu 1.15), no guidance.
+
+## How the engines are built
+
+Three layers, shared as far down as the models allow:
+
+- **`gpu::Runtime`** (`src/gpu`): Metal plumbing, shared with the image models (`image::Engine`): scratch buffers,
+  the pipeline cache, dispatch helpers, encoders and timing.
+- **`core::EngineBase`** (`src/core`): what the routed-expert LLMs share: weights from the model's GGUF files, the
+  expert arena (cache, lending, scoring, profiles), decode's GPU routing with the CPU serving misses between a
+  layer's router and its experts, staged prefill with batched miss reads, hyper-connections, input rows.
+- **`glm::Engine`, `dsv41::Engine`**: the model-specific parts: the layer graph, attention and its caches, Engram,
+  the drafter (GLM's MTP layer, DeepSeek's DSpark), the per-token state.
+
+`Session`, the session pool, the sampler and the server talk to an LLM only through `gen::Model` (`src/gen/model.hpp`:
+prefill, step, checkpoints, drafts and their verification), so both models share them.
+
+Accuracy: where the reference rounds activations as part of the model (DeepSeek's FP8 window KV and attention output,
+FP4 compressed KV, index keys and queries), mako rounds the same way, which also keeps those caches small; everything
+else is computed in F32/F16. Both models are checked against the reference implementations' logits.
