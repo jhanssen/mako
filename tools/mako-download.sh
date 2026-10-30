@@ -2,12 +2,15 @@
 # Downloads a model mako runs from Hugging Face, at the repository revisions this version of mako was tested with,
 # and checks each file's size and SHA-256. Interrupted downloads resume; files already complete are kept.
 #   tools/mako-download.sh <model> [--vision] [--dspark] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
-# HF_TOKEN, when set, is sent with each request.
+#                          [--curl]
+# With the hf CLI when it is installed (Xet storage, its saved login), else with curl. HF_TOKEN, when set, is sent with
+# each request.
 set -eu
 
 usage() {
     cat >&2 <<'EOF'
 usage: mako-download.sh <model> [--vision] [--dspark] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
+                        [--curl]
 
 models:
   glm           GLM-5.3-Flash, Maya-S-v2 IQ2_XXS (96.5 GB)
@@ -22,6 +25,7 @@ models:
   --no-verify   skip the SHA-256 check (sizes are still checked)
   --recheck     also check the SHA-256 of files already in DIR
   --dry-run     list the files and the space needed, download nothing
+  --curl        download with curl even when the hf CLI is installed
 EOF
     exit 2
 }
@@ -68,9 +72,10 @@ EOF
 [ $# -ge 1 ] || usage
 model=$1
 shift
-vision=0 dspark=0 ablate=0 verify=1 recheck=0 dry=0 dir=
+vision=0 dspark=0 ablate=0 verify=1 recheck=0 dry=0 dir= curl=0
 while [ $# -gt 0 ]; do
     case $1 in
+    --curl) curl=1 ;;
     --vision) vision=1 ;;
     --dspark) dspark=1 ;;
     --ablate) ablate=1 ;;
@@ -148,7 +153,7 @@ check() { # file sha; a mismatch renames it to <name>.bad
     echo "     checking SHA-256"
     got=$(openssl dgst -sha256 -r "$1" | cut -d ' ' -f 1)
     if [ "$got" != "$2" ]; then
-        bad=${1%.part}.bad
+        bad=$dest.bad
         mv "$1" "$bad"
         echo "${bad##*/}: SHA-256 $got, expected $2" >&2
         exit 1
@@ -166,15 +171,23 @@ download() { # repo path size sha
         return
     fi
     mkdir -p "$(dirname "$dest")"
-    [ "$(fsize "$part")" -gt "$3" ] && rm -f "$part"
-    if [ "$(fsize "$part")" != "$3" ]; then
+    if [ -n "$hf" ]; then
+        # hf keeps the repository's folders under --local-dir (and its resume state in .cache there), so the file is
+        # staged in DIR/.hf and moved into place once checked.
+        part=$hf/$2
         echo "get  ${dest##*/} ($(gb $3))"
-        set -- "$@" "$url" "$part"
-        if [ -n "${HF_TOKEN:-}" ]; then
-            curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -H "Authorization: Bearer $HF_TOKEN" \
-                -o "$6" "$5"
-        else
-            curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -o "$6" "$5"
+        hf download "${spec%@*}" "$2" --revision "${spec#*@}" --local-dir "$hf" >/dev/null
+    else
+        [ "$(fsize "$part")" -gt "$3" ] && rm -f "$part"
+        if [ "$(fsize "$part")" != "$3" ]; then
+            echo "get  ${dest##*/} ($(gb $3))"
+            set -- "$@" "$url" "$part"
+            if [ -n "${HF_TOKEN:-}" ]; then
+                curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -H "Authorization: Bearer $HF_TOKEN" \
+                    -o "$6" "$5"
+            else
+                curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -o "$6" "$5"
+            fi
         fi
     fi
     if [ "$(fsize "$part")" != "$3" ]; then
@@ -185,11 +198,17 @@ download() { # repo path size sha
     mv "$part" "$dest"
 }
 
+hf=
+if [ $curl = 0 ] && command -v hf >/dev/null 2>&1; then
+    hf=$dir/.hf
+    echo "downloading with $(command -v hf)"
+fi
 while read -r repo path size sha; do
     download "$repo" "$path" "$size" "$sha" </dev/null
 done <<EOF
 $files
 EOF
+if [ -n "$hf" ]; then rm -rf "$hf"; fi
 
 # The ISTA builds open the shared Engram file as their last shard.
 if [ -n "$link" ]; then

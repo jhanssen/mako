@@ -24,91 +24,81 @@
                                     :=@@*
 ```
 
-An inference engine for very large mixture-of-experts models on Apple Silicon Macs (C++ and Metal), serving
-**GLM-5.3-Flash** and **DeepSeek-V4.1-Flash-1017** through an OpenAI- and Anthropic-compatible API. Weights that don't
-fit in memory stream from the SSD into a unified-memory expert cache.
+Runs mixture-of-experts models larger than your Mac's memory.
 
-Early, but usable: on a 128 GB M5 Max, DeepSeek-V4.1 (Maya-S) decodes at ~25 tokens/s (~19 at 16-32K tokens of context)
-and prefills ~500-800 tokens/s. ISTA's smaller IQ2_XS build with cache-aware routing (`--miss-penalty 0.1`) decodes at
-~34 tokens/s with the same perplexity as Maya-S on our prose and code texts (measurements in `docs/performance.md`). Tuned for M5 and should work on any Apple Silicon Mac
-(M1 and later), but tested thoroughly only on an M5 Max and briefly on a 16 GB M4: there the tests that fit pass and
-GLM-5.3 decodes the same tokens as on the M5 (with `--arena-gb 3`, below the memory it is meant for). DeepSeek-V4.1 has
-run only on the M5 Max; on an M1 Ultra only the tests that need no model have run.
+- **Models:** GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017
+- **API:** OpenAI- and Anthropic-compatible (works with Claude Code)
+- **Speed:** DeepSeek-V4.1 decodes at ~25-34 tokens/s on a 128 GB M5 Max
+- **Optional:** image input, image generation (Qwen-Image 2.1, Krea 2)
+
+Early, but usable.
 
 ## Requirements
 
 - Apple Silicon Mac (M1 or later) with 64-256 GB of memory, macOS 26 or later
-- Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`)
+- Xcode with the Metal toolchain: `xcodebuild -downloadComponent MetalToolchain`
 - CMake 4.3 or later, Ninja
+- 100-340 GB of disk for a model
 
-## Models
+## Quick start
 
-`tools/mako-download.sh glm|ds|ds-ista-xs|ds-ista-xxs [--vision] [--dspark] [--ablate]` (`bin/mako-download` in the release
-archive) downloads one of the sets below with curl, at the repository revisions mako was tested with, resumes
-interrupted files, checks each file's SHA-256 and prints the commands (and a preset) to run it. Files go to
-`~/models/<model>` unless `--dir` says otherwise; `--dry-run` lists them and the space needed. Or by hand:
-
-- **GLM-5.3-Flash**: `Maya-S-v2-IQ2_XXS/` from
-  [peasantsmith/GLM-5.3-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) (3 files).
-- **DeepSeek-V4.1-Flash-1017**: `Maya-S/` from
-  [peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)
-  (6 files, the model and its Engram tables), and optionally `dspark/` (the drafter for speculative decoding).
-- **DeepSeek-V4.1-Flash-1017, smaller and faster**: the five `IQ2_XS` files and
-  `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` from
-  [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF),
-  in one folder, with a link to the Engram file as the build's sixth shard
-  (`ln -s DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00006-of-00006.gguf`). The
-  four-shard files published before October 27, 2026 load too. The `dspark/` drafter has not been tried with it yet.
-- **Vision** (optional, `mako_serve --mmproj FILE`, docs/vision.md): GLM-5.3's `mmproj-BF16.gguf` from
-  [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF); DeepSeek-V4.1's
-  `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` from
-  [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-  (it serves both DeepSeek builds above).
-
-## Build
-
-Prebuilt: the [nightly](https://github.com/jhanssen/mako/releases/tag/nightly) release (`mako_serve` and
-`mako_calibrate`, rebuilt each night `main` has changed; unsigned, see the README.md inside). To build:
+**1. Build** (or take `mako_serve` and `mako_calibrate` from the [nightly release](https://github.com/jhanssen/mako/releases/tag/nightly)):
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-The first configure downloads pinned dependencies.
-
-## Run the server
+**2. Download a model:**
 
 ```sh
-./build/tools/mako_calibrate <first .gguf of the model>    # once per model: which experts start in memory
-./build/tools/mako_serve <first .gguf of the model> --port 8080 --ctx 65536
+tools/mako-download.sh glm
 ```
 
-For example, DeepSeek-V4.1 with ISTA's IQ2_XS build and cache-aware routing (the ~34 tokens/s setup above):
+| Set | Model | Size |
+| --- | --- | --- |
+| `glm` | GLM-5.3-Flash | 97 GB |
+| `ds` | DeepSeek-V4.1-Flash-1017 (Maya-S) | 339 GB |
+| `ds-ista-xs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XS, the fastest: ~34 tokens/s) | 266 GB |
+| `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XXS, the smallest) | 249 GB |
+
+Files go to `~/models/<set>`. The script downloads with the `hf` CLI when it's installed (and uses its saved login),
+otherwise with curl. It resumes interrupted downloads, checks every file's SHA-256 and, when done, prints the commands
+to run the model. Options:
+
+- `--vision`: add the vision projector, for images as input
+- `--dspark`: add DeepSeek's drafter, for speculative decoding
+- `--dir DIR`: download somewhere else
+- `--dry-run`: list the files and the space needed
+
+More on the models, and downloading by hand: [docs/models.md](docs/models.md).
+
+**3. Calibrate once, then serve** (the download script prints these commands for the model you chose):
 
 ```sh
-./build/tools/mako_calibrate ~/models/ds-ista-xs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf
-./build/tools/mako_serve ~/models/ds-ista-xs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf \
-    --miss-penalty 0.1 --port 8080 --ctx 65536
+./build/tools/mako_calibrate ~/models/glm/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf
+./build/tools/mako_serve ~/models/glm/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf --port 8080 --ctx 65536
 ```
 
-Then point a client at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic; Claude Code with
-`ANTHROPIC_BASE_URL`). For DeepSeek's drafter add `--dspark <dspark dir>`. It listens on 127.0.0.1; for access
-from other machines, see [Server](docs/server.md#access) (API key, encrypted transport).
+**4. Connect a client:**
 
-Named option sets go in `~/Library/Application Support/mako/presets.json` (`--preset NAME`; examples in
-`docs/presets.example.json`), and every option can come from the environment (`--arena-gb 40` is `MAKO_ARENA_GB=40`;
-the command line wins). `--help` lists a tool's options.
+- OpenAI: `http://127.0.0.1:8080/v1`
+- Anthropic: `http://127.0.0.1:8080` (for Claude Code, set `ANTHROPIC_BASE_URL`)
 
-## More
+`mako_serve --help` lists every option.
 
-- [Server](docs/server.md): API coverage, queueing, clients
-- [Options](docs/options.md): memory, presets and the environment, DeepSeek speed/accuracy trade-offs, drafters, ablation
-- [Development](docs/development.md): other tools, tests, self-check, source layout
-- [Architecture](docs/architecture.md), [performance work](docs/performance.md),
-  [DeepSeek design](docs/dsv41-design.md), [test data](tests/data/README.md)
+## Docs
+
+| | |
+| --- | --- |
+| [Models](docs/models.md) | which to pick, downloads, tested hardware |
+| [Server](docs/server.md) | API coverage, remote access, image generation, clients |
+| [Options](docs/options.md) | memory, presets and environment variables, speed/accuracy trade-offs, drafters |
+| [Vision](docs/vision.md) | images as prompt input |
+| [Development](docs/development.md) | tools, tests, source layout |
+| [Architecture](docs/architecture.md), [Performance](docs/performance.md), [DeepSeek design](docs/dsv41-design.md) | how it works |
 
 ## License
 
-MIT (`LICENSE`). The GEMV kernels downloaded at configure are MIT-licensed by their authors; their license comes with
-them.
+MIT (`LICENSE`). The GEMV kernels downloaded at configure time are MIT-licensed by their authors; their license comes
+with them.
