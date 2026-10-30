@@ -4,6 +4,8 @@
 //   text     the text encoder's output (the transformer's prompt embeddings)
 //   dit      the transformer on the reference's prompt embeddings and latents: each stage of the first two steps (the
 //            whole sequence, then the image's rows against the cached text) and every step's prediction
+//   vae      the VAE decoder on the reference's final latents
+//   pipeline the prompt to the image (the reference's starting noise): token ids, noise levels, the image
 //   image_ref_test <model dir> <reference dir> <mode>
 #include "image/engine.hpp"
 #include "mtl/context.hpp"
@@ -75,13 +77,6 @@ Diff diff(const std::vector<float>& got, const std::vector<float>& want, size_t 
     return d;
 }
 
-// The pipeline's text-to-image prompt template.
-std::string templated(const std::string& prompt)
-{
-    return "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\n" + prompt +
-           "<|im_end|>\n<|im_start|>assistant\n";
-}
-
 } // namespace
 
 int main(int argc, char** argv)
@@ -109,9 +104,9 @@ int main(int argc, char** argv)
         want.push_back(int32_t(v.get_number()));
 
     if (mode == "tokens") {
-        const auto ids = tok->encode(templated(prompt), true);
+        const auto ids = tok->encode(mako::image::Engine::templated(prompt), true);
         check(ids == want, std::format("the template's {} token ids (the reference's {})", ids.size(), want.size()));
-        check(tok->decode(ids) == templated(prompt), "they decode to the template");
+        check(tok->decode(ids) == mako::image::Engine::templated(prompt), "they decode to the template");
     } else if (mode == "text") {
         mako::mtl::Context ctx;
         mako::image::Engine engine(model.string(), ctx);
@@ -167,6 +162,69 @@ int main(int argc, char** argv)
             const Diff d = diff(it->second, want_s, width);
             std::println("  {:4} {}: rel error {:.2e}, lowest row cosine {:.5f}", "", name, d.rel, d.min_cos);
         }
+    } else if (mode == "vae") {
+        mako::mtl::Context ctx;
+        mako::image::Engine engine(model.string(), ctx);
+        const uint32_t size = uint32_t(manifest["size"].get_number()), g = size / 16;
+        std::vector<float> vae_in;
+        engine.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
+            if (name == "vae_in")
+                vae_in.assign(data, data + n);
+            if (const char* dump = std::getenv("MAKO_DUMP_VAE"))
+                std::ofstream(std::format("{}.{}{}", dump, name, layer >= 0 ? std::to_string(layer) : ""), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(data), std::streamsize(n * 4));
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto img = engine.decode(read_f32(ref / "final_latents.f32"), g, g);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        // The reference's are channels first.
+        auto planar = [](const std::vector<float>& v, size_t pixels, size_t c) {
+            std::vector<float> o(v.size());
+            for (size_t p = 0; p < pixels; ++p)
+                for (size_t ch = 0; ch < c; ++ch)
+                    o[ch * pixels + p] = v[p * c + ch];
+            return o;
+        };
+        const auto want_in = read_f32(ref / "vae_in.f32");
+        const Diff din = diff(planar(vae_in, size_t(g) * g, 64), want_in, size_t(g) * g);
+        check(din.rel < 1e-5, std::format("denormalized latents: rel error {:.2e}", din.rel));
+        const auto want = read_f32(ref / "vae_out.f32");
+        if (img.size() != want.size()) {
+            check(false, std::format("{} values, the reference {}", img.size(), want.size()));
+        } else {
+            const Diff d = diff(planar(img, size_t(size) * size, 4), want, size_t(size) * size);
+            check(d.rel < 0.02, std::format("{}x{} RGBA: rel error {:.2e}, lowest channel cosine {:.5f} ({:.0f} ms)",
+                                            size, size, d.rel, d.min_cos, ms));
+        }
+    } else if (mode == "pipeline") {
+        mako::mtl::Context ctx;
+        mako::image::Engine engine(model.string(), ctx);
+        const uint32_t size = uint32_t(manifest["size"].get_number()), g = size / 16;
+        check(engine.system_tokens() == uint32_t(manifest["drop_idx"].get_number()),
+              std::format("the template's system part: {} tokens", engine.system_tokens()));
+        const auto sig = engine.sigmas(uint32_t(manifest["steps"].get_number()), g * g);
+        double worst = 0;
+        const auto& ws = manifest["sigmas"].get_array();
+        for (size_t i = 0; i < ws.size() && i < sig.size(); ++i)
+            worst = std::max(worst, std::abs(double(sig[i]) - ws[i].get_number()));
+        check(sig.size() == ws.size() && worst < 1e-6, std::format("{} noise levels, largest difference {:.1e}", sig.size(), worst));
+        const auto noise = read_f32(ref / "step0_latents.f32");
+        mako::image::Engine::Request r;
+        r.prompt = prompt;
+        r.width = r.height = size;
+        r.steps = uint32_t(manifest["steps"].get_number());
+        r.noise = noise;
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto img = engine.generate(r);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::vector<float> planar(img.size());
+        const size_t px = size_t(size) * size;
+        for (size_t p = 0; p < px; ++p)
+            for (size_t ch = 0; ch < 4; ++ch)
+                planar[ch * px + p] = img[p * 4 + ch];
+        const Diff d = diff(planar, read_f32(ref / "vae_out.f32"), px);
+        check(d.rel < 0.05, std::format("{}x{}, {} steps: rel error {:.2e}, lowest channel cosine {:.5f} ({:.0f} ms)",
+                                        size, size, r.steps, d.rel, d.min_cos, ms));
     } else {
         std::println(stderr, "unknown mode {}", mode);
         return 2;

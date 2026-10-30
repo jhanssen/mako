@@ -34,11 +34,17 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
    gives the same tokens and logits, bit for bit, reading only its new tokens.
 5. The model manager and its swap path, with the LLM as the only model; check that the footprint falls back after an
    unload.
-6. The image model:
-   - safetensors reader and the tensor source (step 3);
-   - BF16 GEMM with F32 accumulation (first a `gemm_bench` check of the M5's `bfloat` support and speed);
-   - the text encoder, the transformer, the VAE (convolutions), the scheduler;
-   - each checked against the Diffusers pipeline's intermediate tensors at a fixed seed.
+6. Done: the image model from the original files.
+   - safetensors reader (`mako_safetensors`); the weight types still come from `gguf` (step 3's move left out);
+   - BF16 GEMM with F32 accumulation: as fast as F16 on the M5 (55 TFLOP/s on a 4096-token MLP);
+   - the Qwen3-VL text encoder, the transformer (with the text's keys and values cached after the first step), the
+     VAE decoder (convolutions as im2col + GEMM), the flow-matching Euler scheduler, PNG output, `tools/mako_image`;
+   - against the reference pipeline's fp32 tensors (`image_ref_test`): the text encoder 1.2e-2 relative (the
+     pipeline's own BF16 run: 7.8-8.6e-2), predictions <= 1.6e-2, the VAE 7e-4, the prompt to the image at 512x512
+     and 3 steps 5e-3.
+   - Speed, 1024x1024 and 40 steps: 88.7 s (step 2 1.67 s, steps slowing to 2.4 s by the end); the reference
+     pipeline on MPS in BF16: 70.7 s (1.66 s a step). Not yet profiled.
+   - mako's starting noise comes from its own generator: a seed gives another image than the reference's.
 7. The image endpoint, progress per denoising step, the status page. Requests (decided 2026-10-29):
    - OpenAI's `/v1/images/generations` as is (`prompt`, `n`, `size`, `response_format`), so its clients work;
    - extra fields that clients unaware of them leave out: `seed`, `steps`, `guidance`, `negative_prompt`, any size

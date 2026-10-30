@@ -37,9 +37,10 @@ add_library(mako_safetensors STATIC safetensors/safetensors.cpp)
 target_include_directories(mako_safetensors PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_safetensors PUBLIC mako_gguf PRIVATE glaze_headers)
 
-add_library(mako_image STATIC image/engine.cpp)
-target_include_directories(mako_image PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mako_image PUBLIC mako_gpu mako_safetensors)
+add_library(mako_imagegen STATIC image/engine.cpp image/png.cpp)
+target_include_directories(mako_imagegen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_imagegen PUBLIC mako_gpu mako_safetensors mako_text PRIVATE glaze_headers "-framework ImageIO"
+                      "-framework CoreGraphics" "-framework CoreFoundation")
 
 add_library(mako_chat STATIC chat/template.cpp)
 target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

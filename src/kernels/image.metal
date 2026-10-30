@@ -60,3 +60,117 @@ kernel void gate_add(device float* x [[buffer(0)]], device const float* y [[buff
     const float g = mod[(row < a.split ? a.mod_stride : 0) + a.mod_off + i];
     x[uint64_t(row) * a.n + i] += precise::tanh(g) * y[uint64_t(row) * a.n + i];
 }
+
+// The VAE decoder's pieces; images are channels-last, [height][width][channels] (a pixel a row).
+
+struct Im2colArgs {
+    uint h, w, c;   // input image
+    uint p0, rows;  // output pixels [p0, p0 + rows)
+    uint kpad;      // columns, 9 * c padded to a multiple of 32
+};
+
+// out[r][ch * 9 + ky * 3 + kx] = x[y + ky - 1][x + kx - 1][ch] for output pixel p0 + r = (y, x), zero outside the
+// image and past 9 * c. Grid (kpad, rows).
+kernel void im2col3x3(device const float* x [[buffer(0)]], device half* out [[buffer(1)]],
+                      constant Im2colArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x, r = gid.y;
+    if (col >= a.kpad || r >= a.rows)
+        return;
+    float v = 0.0f;
+    if (col < 9 * a.c) {
+        const uint ch = col / 9, kk = col % 9, p = a.p0 + r;
+        const int y = int(p / a.w) + int(kk / 3) - 1, xx = int(p % a.w) + int(kk % 3) - 1;
+        if (y >= 0 && y < int(a.h) && xx >= 0 && xx < int(a.w))
+            v = x[(uint64_t(y) * a.w + uint(xx)) * a.c + ch];
+    }
+    out[uint64_t(r) * a.kpad + col] = half(v);
+}
+
+// y[r][i] += b[i]. Grid (n, rows).
+kernel void bias_rows(device float* y [[buffer(0)]], device const float* b [[buffer(1)]], constant uint& n [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < n)
+        y[uint64_t(gid.y) * n + gid.x] += b[gid.x];
+}
+
+struct UpArgs {
+    uint h, w, c;    // input
+    uint c_out;      // dup_up: output channels
+    uint ft;         // dup_up: temporal factor (1 or 2; the last temporal copy is kept)
+    uint repeats;    // dup_up: c_out * ft * 4 / c
+};
+
+// Nearest 2x: y[2y + i][2x + j][ch] = x[y][x][ch]. Grid (c, 2w, 2h).
+kernel void upsample2x(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                       constant UpArgs& a [[buffer(2)]], uint3 gid [[thread_position_in_grid]])
+{
+    const uint ch = gid.x, ox = gid.y, oy = gid.z;
+    if (ch >= a.c || ox >= 2 * a.w || oy >= 2 * a.h)
+        return;
+    y[(uint64_t(oy) * 2 * a.w + ox) * a.c + ch] = x[(uint64_t(oy / 2) * a.w + ox / 2) * a.c + ch];
+}
+
+// The duplicating shortcut of an up block, added into y: input channels repeated, the copies laid out as
+// (out channel, time, i, j) and the 2x2 (i, j) spread over pixels; only the last time copy is kept.
+// Grid (c_out, 2w, 2h).
+kernel void dup_up_add(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                       constant UpArgs& a [[buffer(2)]], uint3 gid [[thread_position_in_grid]])
+{
+    const uint o = gid.x, ox = gid.y, oy = gid.z;
+    if (o >= a.c_out || ox >= 2 * a.w || oy >= 2 * a.h)
+        return;
+    const uint i = oy % 2, j = ox % 2, t = a.ft - 1;
+    const uint cc = ((o * a.ft + t) * 2 + i) * 2 + j;
+    y[(uint64_t(oy) * 2 * a.w + ox) * a.c_out + o] += x[(uint64_t(oy / 2) * a.w + ox / 2) * a.c + cc / a.repeats];
+}
+
+// Row softmax of scale * x, in place; one threadgroup per row.
+kernel void softmax_rows(device float* x [[buffer(0)]], constant float2& a [[buffer(1)]],
+                         uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    const uint n = uint(a.x);
+    const float scale = a.y;
+    device float* r = x + uint64_t(row) * n;
+    float m = -INFINITY;
+    for (uint i = tid; i < n; i += TG)
+        m = max(m, r[i] * scale);
+    m = simd_max(m);
+    if (tid % 32 == 0)
+        scratch[tid / 32] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = scratch[0];
+    for (uint i = 1; i < TG / 32; ++i)
+        m = max(m, scratch[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.0f;
+    for (uint i = tid; i < n; i += TG) {
+        const float e = exp(r[i] * scale - m);
+        r[i] = e;
+        s += e;
+    }
+    const float inv = 1.0f / tg_sum(s, scratch, tid);
+    for (uint i = tid; i < n; i += TG)
+        r[i] *= inv;
+}
+
+// y[c][r] = x[r][col0 + c] for rows x cols of x (rows ldx apart). Grid (cols, rows).
+struct TransposeArgs {
+    uint rows, cols, ldx, col0;
+};
+kernel void transpose_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                          constant TransposeArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.cols && gid.y < a.rows)
+        y[uint64_t(gid.x) * a.rows + gid.y] = x[uint64_t(gid.y) * a.ldx + a.col0 + gid.x];
+}
+
+// y[r][c] = x[r][col0 + c] for rows x cols of x (rows ldx apart). Grid (cols, rows).
+kernel void copy_cols(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                      constant TransposeArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.cols && gid.y < a.rows)
+        y[uint64_t(gid.y) * a.cols + gid.x] = x[uint64_t(gid.y) * a.ldx + a.col0 + gid.x];
+}

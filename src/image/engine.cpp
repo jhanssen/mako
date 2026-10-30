@@ -2,9 +2,15 @@
 
 #include "gguf/read_pool.hpp"
 
+#include <glaze/glaze.hpp>
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <fstream>
+#include <iterator>
+#include <random>
 #include <stdexcept>
 
 namespace mako::image {
@@ -25,6 +31,15 @@ struct ModArgs {
 };
 struct HeadRowsArgs {
     uint32_t dim, src_pad, dst_pad, rows;
+};
+struct Im2colArgs {
+    uint32_t h, w, c, p0, rows, kpad;
+};
+struct UpArgs {
+    uint32_t h, w, c, c_out, ft, repeats;
+};
+struct TransposeArgs {
+    uint32_t rows, cols, ldx, col0;
 };
 
 // Pairs i of the rotary angle table for (frame, height, width) positions: 8 pairs on the frame axis, then 28 each on
@@ -57,7 +72,7 @@ safetensors::Files open_files(const std::string& dir)
 
 Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry)
     : gpu::Runtime(ctx, telemetry), text_files_(open_files(dir + "/text_encoder")),
-      dit_files_(open_files(dir + "/transformer"))
+      dit_files_(open_files(dir + "/transformer")), vae_files_(open_files(dir + "/vae"))
 {
     const std::string p = "model.language_model.";
     embd_ = text_files_.find(p + "embed_tokens.weight");
@@ -84,6 +99,164 @@ Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemet
     if (text_.empty())
         throw std::runtime_error("text encoder: no layers");
     load_transformer(dir);
+    load_vae();
+    // The latents' normalization, from the VAE's config.
+    std::ifstream in(dir + "/vae/config.json", std::ios::binary);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    glz::generic j;
+    if (glz::read_json(j, text) || !j.contains("latents_mean") || !j.contains("latents_std"))
+        throw std::runtime_error("vae/config.json: no latents_mean / latents_std");
+    for (const auto& v : j["latents_mean"].get_array())
+        lat_mean_.push_back(float(v.get_number()));
+    for (const auto& v : j["latents_std"].get_array())
+        lat_std_.push_back(float(v.get_number()));
+    if (lat_mean_.size() != kLatent || lat_std_.size() != kLatent)
+        throw std::runtime_error("vae/config.json: latents_mean / latents_std not 64 wide");
+
+    std::ifstream sin(dir + "/scheduler/scheduler_config.json", std::ios::binary);
+    const std::string stext{std::istreambuf_iterator<char>(sin), std::istreambuf_iterator<char>()};
+    glz::generic sj;
+    if (glz::read_json(sj, stext) || !sj.is_object())
+        throw std::runtime_error("scheduler/scheduler_config.json missing or unreadable");
+    auto num = [&](const char* key, double& v) {
+        if (sj.contains(key) && sj[key].is_number())
+            v = sj[key].get_number();
+    };
+    num("base_image_seq_len", sched_.base_seq);
+    num("max_image_seq_len", sched_.max_seq);
+    num("base_shift", sched_.base_shift);
+    num("max_shift", sched_.max_shift);
+    num("shift_terminal", sched_.terminal);
+
+    auto t = text::Tokenizer::load_json(dir + "/processor/tokenizer.json");
+    if (!t)
+        throw std::runtime_error(t.error());
+    tok_ = std::move(*t);
+    drop_ = uint32_t(tok_->encode("<|im_start|>system\n" + std::string(kSystem) + "<|im_end|>\n", true).size());
+}
+
+std::string Engine::templated(const std::string& prompt)
+{
+    return "<|im_start|>system\n" + std::string(kSystem) + "<|im_end|>\n<|im_start|>user\n" +
+           (prompt.empty() ? " " : prompt) + "<|im_end|>\n<|im_start|>assistant\n";
+}
+
+std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens) const
+{
+    const double m = (sched_.max_shift - sched_.base_shift) / (sched_.max_seq - sched_.base_seq);
+    const double mu = double(tokens) * m + (sched_.base_shift - m * sched_.base_seq);
+    std::vector<float> s(steps);
+    for (uint32_t i = 0; i < steps; ++i) {
+        // linspace(1, 1 / steps, steps), then exp(mu) / (exp(mu) + 1 / t - 1), in float as the scheduler does.
+        const float t = steps == 1 ? 1.0f : float(1.0 + (1.0 / steps - 1.0) * double(i) / double(steps - 1));
+        s[i] = float(std::exp(mu) / (std::exp(mu) + (1.0 / double(t) - 1.0)));
+    }
+    if (sched_.terminal > 0 && steps > 0) {
+        const float scale = (1.0f - s.back()) / (1.0f - float(sched_.terminal));
+        for (float& v : s)
+            v = 1.0f - (1.0f - v) / scale;
+    }
+    s.push_back(0.0f);
+    return s;
+}
+
+std::vector<float> Engine::generate(const Request& r)
+{
+    if (r.width % 32 || r.height % 32 || !r.width || !r.height)
+        throw std::runtime_error("width and height must be multiples of 32");
+    const uint32_t h = r.height / 16, w = r.width / 16, N = h * w;
+    const auto ids = tok_->encode(templated(r.prompt), true);
+    const auto prompt = encode_text(ids, drop_);
+    std::vector<float> x(uint64_t(N) * kLatent);
+    if (!r.noise.empty()) {
+        if (r.noise.size() != x.size())
+            throw std::runtime_error("noise must be [h * w][64]");
+        std::copy(r.noise.begin(), r.noise.end(), x.begin());
+    } else {
+        std::mt19937_64 rng(r.seed);
+        std::normal_distribution<float> nd;
+        for (float& v : x)
+            v = nd(rng);
+    }
+    const auto sig = sigmas(r.steps, N);
+    begin(prompt, h, w);
+    for (uint32_t i = 0; i < r.steps; ++i) {
+        const auto v = step(x, sig[i]);
+        const float dt = sig[i + 1] - sig[i];
+        for (size_t j = 0; j < x.size(); ++j)
+            x[j] += dt * v[j];
+        if (r.progress)
+            r.progress(i + 1, r.steps);
+    }
+    return decode(x, h, w);
+}
+
+Engine::Conv Engine::load_conv(const std::string& name, uint32_t k)
+{
+    const auto r = vae_files_.find(name + ".weight");
+    const auto rb = vae_files_.find(name + ".bias");
+    if (!r || !rb || r.tensor->type != gguf::Type::F32 || r.tensor->dims.size() != 4)
+        throw std::runtime_error(name + ": missing, or not an F32 convolution");
+    Conv c;
+    c.k = k;
+    c.cout = uint32_t(r.tensor->dims[3]);
+    c.cin = uint32_t(r.tensor->dims[2]);
+    if (r.tensor->dims[0] != k || r.tensor->dims[1] != k)
+        throw std::runtime_error(name + ": unexpected kernel size");
+    const uint32_t cols = c.cin * k * k;
+    c.kpad = round_up(cols, 32);
+    c.w = reserve(uint64_t(c.cout) * c.kpad * 4, gguf::Type::F32, {c.kpad, c.cout});
+    auto* dst = reinterpret_cast<float*>(static_cast<char*>(c.w.buf->contents()) + c.w.off);
+    std::vector<float> row(cols);
+    for (uint32_t o = 0; o < c.cout; ++o) {
+        gguf::read_exact(r.file->fd(), row.data(), uint64_t(cols) * 4, r.tensor->offset + uint64_t(o) * cols * 4);
+        std::copy(row.begin(), row.end(), dst + uint64_t(o) * c.kpad);
+        std::fill(dst + uint64_t(o) * c.kpad + cols, dst + uint64_t(o + 1) * c.kpad, 0.0f);
+    }
+    c.b = upload(vae_files_, name + ".bias", false);
+    return c;
+}
+
+void Engine::load_vae()
+{
+    auto res = [&](const std::string& p) {
+        Res r;
+        r.g1 = upload(vae_files_, p + ".norm1.gamma", false);
+        r.g2 = upload(vae_files_, p + ".norm2.gamma", false);
+        r.c1 = load_conv(p + ".conv1", 3);
+        r.c2 = load_conv(p + ".conv2", 3);
+        if (vae_files_.find(p + ".conv_shortcut.weight")) {
+            r.sc = load_conv(p + ".conv_shortcut", 1);
+            r.shortcut = true;
+        }
+        return r;
+    };
+    post_quant_ = load_conv("post_quant_conv", 1);
+    conv_in_ = load_conv("decoder.conv_in", 3);
+    mid0_ = res("decoder.mid_block.resnets.0");
+    mid1_ = res("decoder.mid_block.resnets.1");
+    attn_g_ = upload(vae_files_, "decoder.mid_block.attentions.0.norm.gamma", false);
+    qkv_ = load_conv("decoder.mid_block.attentions.0.to_qkv", 1);
+    attn_proj_ = load_conv("decoder.mid_block.attentions.0.proj", 1);
+    for (uint32_t i = 0;; ++i) {
+        const std::string p = std::format("decoder.up_blocks.{}", i);
+        if (!vae_files_.find(p + ".resnets.0.conv1.weight"))
+            break;
+        Up u;
+        for (uint32_t j = 0; vae_files_.find(std::format("{}.resnets.{}.conv1.weight", p, j)); ++j)
+            u.res.push_back(res(std::format("{}.resnets.{}", p, j)));
+        u.cin = u.res.front().c1.cin;
+        u.cout = u.res.back().c2.cout;
+        if (vae_files_.find(p + ".upsampler.resample.1.weight")) {
+            u.up = true;
+            u.conv = load_conv(p + ".upsampler.resample.1", 3);
+            // Blocks that also upsample in time (a time convolution) keep the second of two time copies.
+            u.ft = vae_files_.find(p + ".upsampler.time_conv.weight") ? 2 : 1;
+        }
+        ups_.push_back(std::move(u));
+    }
+    out_g_ = upload(vae_files_, "decoder.norm_out.gamma", false);
+    conv_out_ = load_conv("decoder.conv_out", 3);
 }
 
 void Engine::load_transformer(const std::string&)
@@ -394,6 +567,157 @@ std::vector<float> Engine::step(std::span<const float> latents, float sigma)
     finish(cb);
     const auto* o = static_cast<const float*>(out->contents()) + uint64_t(T - N) * kLatent;
     return std::vector<float>(o, o + uint64_t(N) * kLatent);
+}
+
+void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* x, uint32_t h, uint32_t w,
+                  MTL::Buffer* y)
+{
+    const uint32_t rows = h * w;
+    if (c.k == 1) {
+        gemm_->encode(enc, gguf::Type::F32, c.kpad, c.cout, rows, c.w.buf, c.w.off,
+                      halves(enc, x, 0, rows, c.cin, 0), 0, y, 0);
+        after(enc, "conv1x1");
+    } else {
+        // Image rows a pass, so the unfolded copy stays near 256 MB.
+        const uint32_t chunk = std::max(32u, uint32_t((256ull << 20) / (uint64_t(c.kpad) * 2)) / 32 * 32);
+        MTL::Buffer* col = scratch("v_col", uint64_t(std::min(chunk, rows)) * c.kpad * 2);
+        for (uint32_t p0 = 0; p0 < rows; p0 += chunk) {
+            const uint32_t n = std::min(chunk, rows - p0);
+            const Im2colArgs a{h, w, c.cin, p0, n, c.kpad};
+            dispatch(enc, "im2col3x3", {x, col}, &a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
+            gemm_->encode(enc, gguf::Type::F32, c.kpad, c.cout, n, c.w.buf, c.w.off, col, 0, y,
+                          uint64_t(p0) * c.cout * 4);
+            after(enc, "conv3x3");
+        }
+    }
+    enc->setComputePipelineState(pso("bias_rows"));
+    enc->setBuffer(y, 0, 0);
+    enc->setBuffer(c.b.buf, c.b.off, 1); // within the weight buffers
+    enc->setBytes(&c.cout, sizeof(c.cout), 2);
+    enc->dispatchThreads(MTL::Size(c.cout, rows, 1), MTL::Size(64, 1, 1));
+    after(enc, "bias_rows");
+}
+
+void Engine::norm_silu(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, MTL::Buffer* y,
+                       uint32_t rows, uint32_t c)
+{
+    // x / ||x|| * sqrt(c) * g over each pixel's channels: an RMS norm (eps as the reference's 1e-12 on the norm).
+    norm(enc, x, &g, y, rows, c, c, 1e-24f / float(c));
+    uint32_t n = rows * c;
+    dispatch(enc, "silu", {y}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+}
+
+void Engine::res_block(MTL::ComputeCommandEncoder*& enc, const Res& r, MTL::Buffer* x, uint32_t h, uint32_t w,
+                       MTL::Buffer* y, MTL::Buffer* t1, MTL::Buffer* t2)
+{
+    const uint32_t rows = h * w, cin = r.c1.cin, cout = r.c2.cout;
+    norm_silu(enc, x, r.g1, t1, rows, cin);
+    conv(enc, r.c1, t1, h, w, t2);
+    norm_silu(enc, t2, r.g2, t2, rows, cout);
+    conv(enc, r.c2, t2, h, w, y);
+    if (r.shortcut) {
+        conv(enc, r.sc, x, h, w, t1);
+        add(enc, y, t1, y, rows * cout);
+    } else {
+        add(enc, y, x, y, rows * cout);
+    }
+}
+
+std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, uint32_t w)
+{
+    if (latents.size() != uint64_t(h) * w * kLatent)
+        throw std::runtime_error("latents must be [h * w][64]");
+    // The largest image: the last up block's input, at the output's size, and the widest channels at its scale.
+    uint64_t most = uint64_t(h) * w * kLatent;
+    uint32_t hh = h, ww = w;
+    most = std::max(most, uint64_t(hh) * ww * conv_in_.cout);
+    for (const Up& u : ups_) {
+        most = std::max(most, uint64_t(hh) * ww * std::max(u.cin, u.cout));
+        if (u.up) {
+            hh *= 2;
+            ww *= 2;
+            most = std::max(most, uint64_t(hh) * ww * u.cout);
+        }
+    }
+    const uint32_t H = hh, W = ww;
+    MTL::Buffer* a = scratch("v_a", most * 4);
+    MTL::Buffer* b = scratch("v_b", most * 4);
+    MTL::Buffer* t1 = scratch("v_t1", most * 4);
+    MTL::Buffer* t2 = scratch("v_t2", most * 4);
+    MTL::Buffer* keep = scratch("v_keep", most * 4);
+    auto* lat = static_cast<float*>(a->contents());
+    for (uint64_t i = 0; i < uint64_t(h) * w; ++i)
+        for (uint32_t ch = 0; ch < kLatent; ++ch)
+            lat[i * kLatent + ch] = latents[i * kLatent + ch] * lat_std_[ch] + lat_mean_[ch];
+
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    probe(enc, "vae_in", -1, a, uint64_t(h) * w * kLatent);
+    conv(enc, post_quant_, a, h, w, b);
+    probe(enc, "vae_pq", -1, b, uint64_t(h) * w * kLatent);
+    conv(enc, conv_in_, b, h, w, a);
+    probe(enc, "vae_conv_in", -1, a, uint64_t(h) * w * conv_in_.cout);
+    hh = h;
+    ww = w;
+    res_block(enc, mid0_, a, hh, ww, b, t1, t2);
+    {
+        // Single-head attention over the pixels, channels wide.
+        const uint32_t n = hh * ww, c = qkv_.cin;
+        norm(enc, b, &attn_g_, t1, n, c, c, 1e-24f / float(c));
+        conv(enc, qkv_, t1, hh, ww, t2); // [n][3c]: q, k, v
+        MTL::Buffer* kc = scratch("v_k", uint64_t(n) * c * 4);
+        MTL::Buffer* vt = scratch("v_vt", uint64_t(n) * c * 4);
+        MTL::Buffer* sc = scratch("v_s", uint64_t(n) * n * 4);
+        const TransposeArgs ka{n, c, 3 * c, c}, va{n, c, 3 * c, 2 * c};
+        dispatch(enc, "copy_cols", {t2, kc}, &ka, sizeof(ka), MTL::Size(c, n, 1), MTL::Size(256, 1, 1));
+        dispatch(enc, "transpose_f32", {t2, vt}, &va, sizeof(va), MTL::Size(c, n, 1), MTL::Size(256, 1, 1));
+        gemm_->encode(enc, gguf::Type::F32, c, n, n, kc, 0, halves(enc, t2, 0, n, c, 3 * c), 0, sc, 0);
+        after(enc, "vae scores");
+        const float sa[2] = {float(n), 1.0f / std::sqrt(float(c))};
+        dispatch(enc, "softmax_rows", {sc}, sa, sizeof(sa), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1), false);
+        gemm_->encode(enc, gguf::Type::F32, n, c, n, vt, 0, halves(enc, sc, 0, n, n, 0), 0, t1, 0);
+        after(enc, "vae pv");
+        conv(enc, attn_proj_, t1, hh, ww, a);
+        add(enc, a, b, b, n * c);
+    }
+    res_block(enc, mid1_, b, hh, ww, a, t1, t2);
+    probe(enc, "vae_mid", -1, a, uint64_t(hh) * ww * mid1_.c2.cout);
+    MTL::Buffer* x = a;
+    MTL::Buffer* y = b;
+    for (const Up& u : ups_) {
+        const uint32_t rows = hh * ww;
+        if (u.up) { // the block's input, for the duplicating shortcut
+            const uint32_t n = rows * u.cin;
+            dispatch(enc, "copy_f32", {x, keep}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+        }
+        for (const Res& r : u.res) {
+            res_block(enc, r, x, hh, ww, y, t1, t2);
+            std::swap(x, y);
+        }
+        if (u.up) {
+            const UpArgs ua{hh, ww, u.cout, u.cout, u.ft, u.cout * u.ft * 4 / u.cin};
+            dispatch(enc, "upsample2x", {x, t1}, &ua, sizeof(ua), MTL::Size(u.cout, 2 * ww, 2 * hh),
+                     MTL::Size(64, 1, 1));
+            conv(enc, u.conv, t1, 2 * hh, 2 * ww, y);
+            const UpArgs da{hh, ww, u.cin, u.cout, u.ft, u.cout * u.ft * 4 / u.cin};
+            dispatch(enc, "dup_up_add", {keep, y}, &da, sizeof(da), MTL::Size(u.cout, 2 * ww, 2 * hh),
+                     MTL::Size(64, 1, 1));
+            std::swap(x, y);
+            hh *= 2;
+            ww *= 2;
+        }
+        probe(enc, "vae_up", int(&u - ups_.data()), x, uint64_t(hh) * ww * u.cout);
+    }
+    norm_silu(enc, x, out_g_, t1, hh * ww, conv_out_.cin);
+    conv(enc, conv_out_, t1, hh, ww, y);
+    enc->endEncoding();
+    finish(cb);
+    const auto* o = static_cast<const float*>(y->contents());
+    std::vector<float> img(uint64_t(H) * W * 4);
+    for (size_t i = 0; i < img.size(); ++i)
+        img[i] = std::clamp(o[i], -1.0f, 1.0f);
+    return img;
 }
 
 } // namespace mako::image

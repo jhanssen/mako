@@ -6,6 +6,7 @@
 ./build/tools/mako_run <GLM-5.3 .gguf> <token,ids,...> [-n N] [--spec] [--temp T]   # GLM-5.3: top logits, greedy tokens
 ./build/tools/ds_run <DeepSeek .gguf> <Engram .gguf> --ids I,J,... [-n N]          # DeepSeek-V4.1 (the Engram argument:
                                                                                     # the model's first file again)
+./build/tools/mako_image <Qwen-Image dir> "<prompt>" [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--rgb]
 ```
 
 `mako_run` samples with `--temp T` (`--top-k`, `--top-p`, `--min-p`, `--seed`). `ds_run` also compares logits with a
@@ -29,6 +30,9 @@ ctest --test-dir build --output-on-failure                                      
 ```
 
 `MAKO_DS41_DSPARK=<dir>` adds the drafter's test, `MAKO_DS41_ENGRAM=<GGUF>` runs DeepSeek's with other Engram tables.
+`MAKO_QWEN_IMAGE=<dir>` (the model's files as published) and `MAKO_QWEN_IMAGE_REF=<dir>` (reference tensors from the
+original pipeline, fp32 on the CPU: a Python script written beside the model, not part of the repository) enable the
+`image` tests.
 
 - No model needed (`ctest -L cpu` for those without a GPU too, as CI runs): the kernel checks on random data
   (`quant`, `gemv_own`, `gemv_rows`, `gemm_synthetic`, `engram_decode`, `hc`), `sampler`, `presets`, `cli`,
@@ -40,6 +44,9 @@ ctest --test-dir build --output-on-failure                                      
   on a 24K-token prompt's last 1024 positions, with the miss penalty and with dense Q6_K (each over the first 300
   steps, and Q6_K also through prefill); the drafter's greedy output; two conversations taking turns. `ds41_long_noskip`
   (the 24K prompt with every row through every layer, which is not the default) is labelled `slow` only.
+- Qwen-Image 2.1's `image` tests (about 20 seconds), against the reference tensors at 512x512 and 3 steps: the
+  prompt's token ids, the text encoder's output, the transformer's stages and predictions, the VAE decoder, and the
+  prompt to the image; `safetensors` reads the model's files.
 
 Which to run:
 
@@ -49,6 +56,7 @@ Which to run:
 | The prefill skip, prompt lengths past a group | `-L quick` | `-L e2e` and `-L slow` |
 | `src/server`, `src/gen` | `-L server` and `-L cpu` | the same, and `-L e2e` for `gen::Session` or the pool |
 | Tokenizer, templates | `-L tokenizer` | the same |
+| `src/image`, `src/kernels/image.metal`, `src/kernels/ops.metal` | `-L image` | the same, and `bench/perf_check` for the LLMs when a shared kernel or `src/gpu` changed |
 
 `tests/data/README.md` says how each data file was made. After an intended numerical change,
 `regress_test <model> --update` re-records `tests/data/regress_expected.txt`; review that diff.
@@ -96,6 +104,8 @@ It does not cover long contexts (the prompt has ~6.8K tokens); `tools/prefill_sw
 | `src/app` | command-line options: the environment, presets |
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
+| `src/image` | Qwen-Image 2.1: text encoder, diffusion transformer, VAE decoder, scheduler, PNG |
+| `src/safetensors` | safetensors reader |
 | `src/gpu` | what any model's GPU code shares: weights and scratch buffers, pipelines, dispatch, command buffers, timing, probes, GEMV / GEMM wrappers |
 | `src/core` | what the routed-expert LLMs share on top of it: expert arena, staging, routing profiles, telemetry reports |
 | `src/glm` | GLM-5.3-Flash config and engine |
