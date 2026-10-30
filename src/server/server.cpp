@@ -5,6 +5,7 @@
 #include "server/protocol.hpp"
 #include "server/status.hpp"
 #include "server/status_page.hpp"
+#include "image/png.hpp"
 #include "core/log.hpp"
 #include "gen/loop_guard.hpp"
 #include "gen/pool.hpp"
@@ -12,6 +13,7 @@
 #include "vision/prompt.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
+#include <glaze/glaze.hpp>
 #include <httplib.h>
 
 #include <algorithm>
@@ -24,6 +26,8 @@
 #include <format>
 #include <mutex>
 #include <print>
+#include <random>
+#include <span>
 
 namespace mako::server {
 
@@ -58,7 +62,8 @@ constexpr auto kKeepalive = std::chrono::seconds(5);
 constexpr auto kProgressEvery = std::chrono::seconds(5);
 
 struct Server::Impl {
-    gen::Model& engine;
+    Models& models;
+    uint32_t max_context = 0, n_vocab = 0; // the LLM's (the same after a reload)
     const text::Tokenizer& tok;
     const chat::Template& tmpl;
     ServerOptions opts;
@@ -70,10 +75,13 @@ struct Server::Impl {
     std::atomic<uint64_t> next_id = 0; // handlers run on several threads
     StatusBoard board;
 
-    Impl(gen::Model& e, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
-        : engine(e), tok(t), tmpl(tm), opts(std::move(o)), thinking(thinking_support(tm)),
-          pool(e, opts.park_bytes, opts.max_conversations, std::chrono::milliseconds(opts.slice_ms))
+    Impl(Models& m, const text::Tokenizer& t, const chat::Template& tm, ServerOptions o)
+        : models(m), max_context(m.first_llm().max_context()), n_vocab(m.first_llm().n_vocab()), tok(t), tmpl(tm),
+          opts(std::move(o)), thinking(thinking_support(tm)),
+          pool(m.first_llm(), opts.park_bytes, opts.max_conversations, std::chrono::milliseconds(opts.slice_ms),
+               opts.model_id)
     {
+        models.attach(pool, opts.model_id);
         thinking.default_effort = opts.reasoning_effort;
         user_turn = tok.find("<|user|>");
         if (user_turn < 0)
@@ -86,6 +94,9 @@ struct Server::Impl {
     void serve(const httplib::Request& req, httplib::Response& res, const std::function<ChatRequest()>& parse,
                const ErrorBody& error, const char* id_prefix, const MakeProtocol& make);
     void count_tokens(const httplib::Request& req, httplib::Response& res);
+    // POST /v1/images/generations: OpenAI's fields (prompt, n, size, response_format b64_json, output_format png or
+    // jpeg; model, quality, style, background, moderation and user accepted and left alone).
+    void images(const httplib::Request& req, httplib::Response& res);
     // A request's images, sized when it is parsed and encoded when it runs.
     struct Images {
         std::vector<vision::Prepared> prepared;
@@ -191,7 +202,7 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
     if (const auto it = std::ranges::find(prompt, user_turn); user_turn >= 0 && it != prompt.end())
         cr.gen.fork_point = size_t(it - prompt.begin());
     cr.gen.stop_tokens = {tok.eos(), tok.eot(), tok.find("<|observation|>")};
-    const uint32_t room = engine.max_context() - uint32_t(prompt.size());
+    const uint32_t room = max_context - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
     cr.gen.speculative = opts.speculative;
     // The reasoning budget, cut to leave a capped reply room to answer.
@@ -217,7 +228,7 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
     size_t& loop_keep = out.loop_keep;
     loop_keep = 0;
     if (rb || cr.tool_required || guard)
-        cr.gen.forced = [&, nv = engine.n_vocab()](const float* logits) {
+        cr.gen.forced = [&, nv = n_vocab](const float* logits) {
             if (close_reasoning && parser.in_reasoning())
                 return think_end;
             if (rb && parser.in_reasoning())
@@ -256,6 +267,8 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
         }
         return true;
     };
+    // The LLM in memory for the whole request (an image request waits for it to end, then swaps).
+    const auto lease = models.llm();
     const bool ran = pool.generate(prompt, cr.gen, [&](int32_t token) {
         Delta d;
         if (rb)
@@ -348,9 +361,9 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
     } catch (const std::exception& e) {
         return fail(400, e.what());
     }
-    if (prompt.size() >= engine.max_context())
+    if (prompt.size() >= max_context)
         return fail(400, std::format("the prompt is {} tokens; the context holds {}", prompt.size(),
-                                     engine.max_context()));
+                                     max_context));
     if (in_flight.fetch_add(1) > opts.max_waiting) {
         --in_flight;
         res.set_header("Retry-After", "2");
@@ -442,6 +455,113 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
     });
 }
 
+namespace {
+
+std::string base64(std::span<const uint8_t> in)
+{
+    static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        const uint32_t v = uint32_t(in[i]) << 16 | (i + 1 < in.size() ? uint32_t(in[i + 1]) << 8 : 0) |
+                           (i + 2 < in.size() ? uint32_t(in[i + 2]) : 0);
+        out += kTable[v >> 18];
+        out += kTable[(v >> 12) & 63];
+        out += i + 1 < in.size() ? kTable[(v >> 6) & 63] : '=';
+        out += i + 2 < in.size() ? kTable[v & 63] : '=';
+    }
+    return out;
+}
+
+} // namespace
+
+void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
+{
+    auto fail = [&](int status, const std::string& message, const char* type) {
+        res.status = status;
+        res.set_content(error_body(message, type), "application/json");
+    };
+    if (!models.has_image())
+        return fail(404, "this server has no image model (start it with --image-model)", "not_found_error");
+    glz::generic body;
+    if (glz::read_json(body, req.body) || !body.is_object())
+        return fail(400, "the body is not a JSON object", "invalid_request_error");
+    if (!body.contains("prompt") || !body["prompt"].is_string() || body["prompt"].get_string().empty())
+        return fail(400, "prompt is required", "invalid_request_error");
+    const std::string prompt = body["prompt"].get_string();
+    uint32_t n = 1, width = 1024, height = 1024;
+    if (body.contains("n")) {
+        if (!body["n"].is_number() || body["n"].get_number() < 1 || body["n"].get_number() > 4)
+            return fail(400, "n must be 1 to 4", "invalid_request_error");
+        n = uint32_t(body["n"].get_number());
+    }
+    if (body.contains("size") && body["size"].is_string() && body["size"].get_string() != "auto") {
+        const std::string sz = body["size"].get_string();
+        unsigned w = 0, h = 0;
+        char x = 0;
+        if (std::sscanf(sz.c_str(), "%u%c%u", &w, &x, &h) != 3 || x != 'x' || w % 32 || h % 32 || w < 256 ||
+            h < 256 || uint64_t(w) * h > 2048ull * 2048)
+            return fail(400, "size must be WIDTHxHEIGHT, multiples of 32 from 256, at most 2048x2048 pixels",
+                        "invalid_request_error");
+        width = w;
+        height = h;
+    }
+    if (body.contains("response_format") && body["response_format"].is_string() &&
+        body["response_format"].get_string() != "b64_json")
+        return fail(400, "response_format: only b64_json (images are not stored)", "invalid_request_error");
+    bool jpeg = false;
+    if (body.contains("output_format") && body["output_format"].is_string()) {
+        const std::string f = body["output_format"].get_string();
+        if (f != "png" && f != "jpeg")
+            return fail(400, "output_format: png or jpeg", "invalid_request_error");
+        jpeg = f == "jpeg";
+    }
+    if (in_flight.fetch_add(1) > opts.max_waiting) {
+        --in_flight;
+        return fail(503, std::format("{} requests are already waiting", opts.max_waiting), "server_busy");
+    }
+    const auto slot = std::shared_ptr<void>(nullptr, [this](void*) { --in_flight; });
+    const std::string id = std::format("img-{}", next_id.fetch_add(1) + 1);
+    log::info("{}: {} image{} {}x{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height);
+    std::string data = "[";
+    try {
+        auto engine = models.image();
+        std::random_device rd;
+        for (uint32_t i = 0; i < n; ++i) {
+            image::Engine::Request r;
+            r.prompt = prompt;
+            r.width = width;
+            r.height = height;
+            r.seed = (uint64_t(rd()) << 32) | rd();
+            auto last = std::chrono::steady_clock::now();
+            const auto t0 = last;
+            r.progress = [&](uint32_t step, uint32_t steps) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last < kProgressEvery && step < steps)
+                    return;
+                last = now;
+                const double s = std::chrono::duration<double>(now - t0).count();
+                log::info("{}: image {} of {}, step {} of {} ({:.1f} s a step, ~{:.0f} s left)", id, i + 1, n, step,
+                          steps, s / step, s / step * (steps - step));
+            };
+            const auto img = engine->generate(r);
+            const auto bytes = image::encode_png(image::to_rgba8(img), width, height, false, jpeg);
+            log::info("{}: image {} of {} in {:.1f} s (seed {})", id, i + 1, n,
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), r.seed);
+            data += std::format(R"({}{{"b64_json":"{}"}})", i ? "," : "", base64(bytes));
+        }
+    } catch (const std::exception& e) {
+        log::error("{}: {}", id, e.what());
+        return fail(500, e.what(), "server_error");
+    }
+    data += "]";
+    const int64_t created =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    res.set_content(std::format(R"({{"created":{},"data":{},"output_format":"{}","size":"{}x{}"}})", created, data,
+                                jpeg ? "jpeg" : "png", width, height),
+                    "application/json");
+}
+
 void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& res)
 {
     try {
@@ -510,8 +630,8 @@ bool origin_allowed(const std::string& origin)
     return false;
 }
 
-Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts)
-    : impl_(std::make_unique<Impl>(engine, tok, tmpl, std::move(opts)))
+Server::Server(Models& models, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts)
+    : impl_(std::make_unique<Impl>(models, tok, tmpl, std::move(opts)))
 {
     auto& h = impl_->http;
     h.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
@@ -563,18 +683,21 @@ Server::Server(gen::Model& engine, const text::Tokenizer& tok, const chat::Templ
     h.Post("/v1/messages", messages);
     h.Post("/v1/messages/count_tokens",
            [this](const httplib::Request& req, httplib::Response& res) { impl_->count_tokens(req, res); });
-    const auto models = [this](const httplib::Request&, httplib::Response& res) {
+    const auto list_models = [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(models_body(impl_->opts.model_id), "application/json");
     };
-    h.Get("/v1/models", models);
-    h.Get("/models", models);
+    const auto images = [this](const httplib::Request& req, httplib::Response& res) { impl_->images(req, res); };
+    h.Post("/v1/images/generations", images);
+    h.Post("/images/generations", images);
+    h.Get("/v1/models", list_models);
+    h.Get("/models", list_models);
     h.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"ok"})", "application/json");
     });
     h.Get("/v1/status", [this](const httplib::Request&, httplib::Response& res) {
         auto& im = *impl_;
-        const StatusHeader head{im.opts.model_id, im.engine.max_context(), im.opts.cache_gb, im.opts.resident,
-                                im.pool.budget(), im.in_flight.load()};
+        const StatusHeader head{im.opts.model_id, im.max_context,      im.opts.cache_gb,       im.opts.resident,
+                                im.pool.budget(),  im.in_flight.load(), im.models.resident()};
         res.set_content(im.board.json(head, im.pool.info()), "application/json");
     });
     h.Get("/status", [](const httplib::Request&, httplib::Response& res) {

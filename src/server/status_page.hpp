@@ -75,7 +75,8 @@ function table(el, cols, rows, none) {
 function render(s) {
   $("model").textContent = s.model;
   document.title = s.model + " · mako";
-  $("facts").innerHTML = `context ${num(s.context)} tokens · up ${dur(s.uptime_s)} · thermal ${pill(s.thermal)}`;
+  $("facts").innerHTML = `context ${num(s.context)} tokens · up ${dur(s.uptime_s)} · thermal ${pill(s.thermal)}` +
+    (s.loaded && s.loaded != "llm" ? ` · loaded ${pill(s.loaded)}` : "");
   const c = s.expert_cache;
   const tiles = [
     ["in flight", num(s.in_flight)], ["waiting for a turn", num(s.waiting)], ["requests served", num(s.served)],

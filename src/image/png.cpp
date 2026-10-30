@@ -34,8 +34,9 @@ std::vector<uint8_t> to_rgba8(std::span<const float> rgba)
     return out;
 }
 
-std::vector<uint8_t> encode_png(std::span<const uint8_t> rgba8, uint32_t width, uint32_t height, bool rgb)
+std::vector<uint8_t> encode_png(std::span<const uint8_t> rgba8, uint32_t width, uint32_t height, bool rgb, bool jpeg)
 {
+    rgb = rgb || jpeg;
     if (rgba8.size() != size_t(width) * height * 4)
         throw std::runtime_error("encode_png: not width x height RGBA");
     std::vector<uint8_t> px(rgba8.begin(), rgba8.end());
@@ -49,10 +50,17 @@ std::vector<uint8_t> encode_png(std::span<const uint8_t> rgba8, uint32_t width, 
     Cf<CGImageRef> img(CGImageCreate(width, height, 8, 32, size_t(width) * 4, cs.ref, info, prov.ref, nullptr, false,
                                      kCGRenderingIntentDefault));
     Cf<CFMutableDataRef> out(CFDataCreateMutable(nullptr, 0));
-    Cf<CGImageDestinationRef> dst(CGImageDestinationCreateWithData(out.ref, CFSTR("public.png"), 1, nullptr));
+    Cf<CGImageDestinationRef> dst(
+        CGImageDestinationCreateWithData(out.ref, jpeg ? CFSTR("public.jpeg") : CFSTR("public.png"), 1, nullptr));
     if (!img.ref || !dst.ref)
         throw std::runtime_error("encode_png: ImageIO could not set up the image");
-    CGImageDestinationAddImage(dst.ref, img.ref, nullptr);
+    const float quality = 0.92f;
+    Cf<CFNumberRef> q(CFNumberCreate(nullptr, kCFNumberFloatType, &quality));
+    const void* keys[] = {kCGImageDestinationLossyCompressionQuality};
+    const void* values[] = {q.ref};
+    Cf<CFDictionaryRef> props(CFDictionaryCreate(nullptr, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                                                 &kCFTypeDictionaryValueCallBacks));
+    CGImageDestinationAddImage(dst.ref, img.ref, jpeg ? props.ref : nullptr);
     if (!CGImageDestinationFinalize(dst.ref))
         throw std::runtime_error("encode_png: ImageIO could not write the PNG");
     const auto* p = CFDataGetBytePtr(out.ref);

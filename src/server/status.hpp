@@ -24,6 +24,7 @@ struct StatusHeader {
     double cache_gb = 0, resident = 0; // the expert cache's size and the share of the experts it holds
     uint64_t park_budget = 0;
     uint32_t in_flight = 0;
+    std::string loaded = "llm"; // the model in memory: llm, image or none (swapping)
 };
 
 // Requests in progress and recently finished, and the expert cache's counters; any thread.

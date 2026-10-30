@@ -32,8 +32,10 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
    engine; `resume(engine, identity)` rebinds the conversations to a new engine of the same model, or gives them up
    for another identity. `e2e_reload` / `ds41_reload`: the next turn across an engine destroyed and built again
    gives the same tokens and logits, bit for bit, reading only its new tokens.
-5. The model manager and its swap path, with the LLM as the only model; check that the footprint falls back after an
-   unload.
+5. Done: the model manager (`server::Models`): leases of the LLM or the image model, the swap when a lease of the
+   other comes (an image lease waits for the LLM leases out; LLM leases asked for meanwhile wait for it), the
+   conversations parked in memory across it. Tried with GLM-5.3: image model in 4.7 s, a 512x512 image in 12.3 s, the
+   LLM back in 10.1 s, the conversation's next turn reusing its prompt.
 6. Done: the image model from the original files.
    - safetensors reader (`mako_safetensors`); the weight types still come from `gguf` (step 3's move left out);
    - BF16 GEMM with F32 accumulation: as fast as F16 on the M5 (55 TFLOP/s on a 4096-token MLP);
@@ -50,13 +52,9 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
      from device memory (55 -> 63 TFLOP/s), q / k / v and gate / up one GEMM each with the heads' norms fused, the
      VAE's convolution weights in F16 on that GEMM.
    - mako's starting noise comes from its own generator: a seed gives another image than the reference's.
-7. The image endpoint, progress per denoising step, the status page. Requests (decided 2026-10-29):
-   - OpenAI's `/v1/images/generations` as is (`prompt`, `n`, `size`, `response_format`), so its clients work;
-   - extra fields that clients unaware of them leave out: `seed`, `steps`, `guidance`, `negative_prompt`, any size
-     in multiples of 32, later an input image for editing;
-   - presets by name (`presets.json`) for sets of them;
-   - defaults from the model's own recommendations (to be read from its pipeline code). No workflow graphs.
-
+7. Done: `/v1/images/generations` with OpenAI's fields (`docs/server.md`), progress in the log, the loaded model on
+   the status page. Extensions (seed, steps, guidance, presets, `quality` as steps, streamed progress) wait for the
+   user's decisions (2026-10-29: "regular openai api first").
 8. Next (the user's priorities, 2026-10-29): images as input and LoRAs.
    - Condition images (one pipeline mode in 2.1: edits and references by prompt): the Qwen3-VL vision tower in the
      text encoder, the VAE encoder (latent tokens ahead of the target image), image blocks in the attention mask

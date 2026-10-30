@@ -175,7 +175,8 @@ int main(int argc, char** argv)
     opts.port = 18734;
     opts.model_id = "m";
     opts.slice_ms = 60000; // a waiting request waits for the whole of the one generating
-    mako::server::Server server(model, *tok, tmpl, opts);
+    mako::server::Models models(model);
+    mako::server::Server server(models, *tok, tmpl, opts);
     std::thread t([&] { server.run(); });
     for (int i = 0; i < 100 && !httplib::Client("127.0.0.1", opts.port).Get("/health"); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -284,7 +285,8 @@ int main(int argc, char** argv)
     mako::server::ServerOptions keyed = opts;
     keyed.port = opts.port + 1;
     keyed.api_keys = {"test-key-0123456789"};
-    mako::server::Server locked(model, *tok, tmpl, keyed);
+    mako::server::Models locked_models(model);
+    mako::server::Server locked(locked_models, *tok, tmpl, keyed);
     std::thread u([&] { locked.run(); });
     httplib::Client lc("127.0.0.1", keyed.port);
     for (int i = 0; i < 100 && !lc.Get("/health"); ++i)

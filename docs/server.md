@@ -2,6 +2,7 @@
 
 ```sh
 ./build/tools/mako_serve <first .gguf of the model> [--host 127.0.0.1] [--port 8080] [--ctx 131072] [--no-spec]
+                         [--image-model <Qwen-Image 2.1 dir>]
 ```
 
 One request runs at a time on one session, so a conversation's next turn reuses the context the previous one left.
@@ -84,6 +85,27 @@ The log gives each new image's rows (`image 1036x1036: 1369 rows in 572 ms`) and
 (`prompt 1395 tokens (1380 reused)`). A new image costs its encoding (~0.3 s at 1024x1024, ~3 s for GLM at
 2000x2000) plus the prefill of its rows (GLM ~570 rows/s; DeepSeek ~100/s on a short prompt, its missing experts
 read from the SSD); later turns reuse it.
+
+## Image generation
+
+`--image-model DIR` (Qwen-Image 2.1's directory, its files as published) adds `POST /v1/images/generations`, OpenAI's
+image API:
+
+```sh
+curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a misty harbour town at dawn", "size": "1024x1024"}' | jq -r '.data[0].b64_json' | base64 -d > out.png
+```
+
+- Fields: `prompt` (required), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32 from 256, at most 2048x2048
+  pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored), `output_format` (`png` or
+  `jpeg`). `model`, `quality`, `style`, `background`, `moderation` and `user` are accepted and left alone: 40 steps,
+  a random seed for each image (in the log).
+- One model is in memory at a time. An image request waits for the chat requests in progress (chat requests that
+  come meanwhile wait for it), then the LLM is unloaded, its conversations staying in memory, and the image model
+  loaded (~5 s); the next chat request loads the LLM again (~10 s) and continues its conversation where it was. The
+  status page shows which is loaded.
+- Time: ~13 s for 512x512, ~63 s for 1024x1024 (40 steps), slower as the Mac heats up; the log has each image's
+  progress.
 
 ## Thinking
 

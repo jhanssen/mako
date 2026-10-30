@@ -39,7 +39,7 @@ struct RecentJson {
     double ago_s = 0;
 };
 struct StatusJson {
-    std::string model, thermal;
+    std::string model, thermal, loaded;
     uint32_t context = 0, in_flight = 0;
     size_t waiting = 0;
     uint64_t served = 0;
@@ -147,6 +147,7 @@ std::string StatusBoard::json(const StatusHeader& h, const gen::SessionPool::Inf
     const auto now = Clock::now();
     StatusJson s;
     s.model = h.model;
+    s.loaded = h.loaded;
     s.thermal = core::thermal_state();
     s.context = h.context;
     s.in_flight = h.in_flight;

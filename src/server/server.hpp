@@ -4,6 +4,7 @@
 #include "gen/sampler.hpp"
 #include "gen/model.hpp"
 #include "gen/session.hpp"
+#include "server/models.hpp"
 #include "server/openai.hpp"
 #include "server/status.hpp"
 #include "text/tokenizer.hpp"
@@ -65,13 +66,14 @@ bool host_allowed(const std::string& host);
 // Without keys: whether an Origin header is absent or a loopback page (http(s)://localhost, 127.0.0.1 or [::1]).
 bool origin_allowed(const std::string& origin);
 
-// OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/models, /health, and
-// /v1/status (JSON) with /status (a page showing it).
+// OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/images/generations (with
+// an image model: Models swaps it in and the LLM out), /v1/models, /health, and /v1/status (JSON) with /status (a
+// page showing it).
 // Requests take turns generating (see ServerOptions::slice_ms), up to max_waiting waiting; each conversation keeps
 // its context between requests (see ServerOptions::park_bytes).
 class Server {
 public:
-    Server(gen::Model& model, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);
+    Server(Models& models, const text::Tokenizer& tok, const chat::Template& tmpl, ServerOptions opts);
     ~Server();
 
     // Serves until stop(); false if the address could not be bound.

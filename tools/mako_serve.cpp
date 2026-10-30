@@ -4,7 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N]
+//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--image-model DIR]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -28,7 +28,9 @@
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
-// engine's prefill group) and queues again.
+// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's directory (its files as published), for
+// /v1/images/generations: an image request waits for the chat requests in progress, then the LLM is unloaded (its
+// conversations kept in memory) and the image model loaded; the next chat request loads the LLM again.
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "chat/template.hpp"
@@ -38,6 +40,7 @@
 #include "dsv41/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "image/engine.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "server/server.hpp"
@@ -83,7 +86,7 @@ int main(int argc, char** argv)
     };
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1, park_gb = -1;
-    std::string ablate, engram, dspark, imatrix, mmproj_path;
+    std::string ablate, engram, dspark, imatrix, mmproj_path, image_model;
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
@@ -139,6 +142,8 @@ int main(int argc, char** argv)
                     "end repetition loops of N tokens or more in reasoning or answers (default 256; 0: off)",
                     so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
+            .option("--image-model", "DIR", "Qwen-Image 2.1's files, for /v1/images/generations (swapped in)",
+                    image_model)
             .option("--image-max-tokens", "N", "scale larger images down to at most N prompt rows (16 or more)",
                     [&](const std::string& v) {
                         image_max_tokens = mako::app::Cli::parse<uint32_t>(v);
@@ -251,21 +256,18 @@ int main(int argc, char** argv)
         so.vision = vision.get();
         mako::log::info("vision projector {}: {} blocks, rows of {}", mmproj_path, mmproj->n_layer, mmproj->out_embd);
     }
-    std::unique_ptr<mako::glm::Engine> glm_engine;
-    std::unique_ptr<mako::dsv41::Engine> ds_engine;
-    mako::gen::Model* model_if = nullptr;
-    mako::core::EngineBase* base = nullptr;
-    double expected_resident = 50; // below this share of the experts, the cache is smaller than this Mac allows
-    try {
+    // Below this share of the experts resident, the cache is smaller than this Mac allows.
+    const double expected_resident = deepseek ? 25 : 50;
+    // The LLM: loaded now, and again after an image request had it unloaded.
+    auto load_llm = [&]() -> mako::server::Models::Llm {
+        mako::server::Models::Llm l;
         uint32_t n_embd = 0, n_layer = 0;
         std::span<const std::string_view> sites;
         std::function<void(mako::mtl::Ablation)> set_ablation;
         if (deepseek) {
             auto cfg = mako::dsv41::Config::load(*model);
-            if (!cfg) {
-                mako::log::error("{}", cfg.error());
-                return 1;
-            }
+            if (!cfg)
+                throw std::runtime_error(cfg.error());
             mako::dsv41::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
@@ -279,49 +281,55 @@ int main(int argc, char** argv)
             opts.prefetch_ahead = prefetch_ahead;
             opts.dense_imatrix = imatrix;
             opts.dense_quant = dense_quant;
-            ds_engine = std::make_unique<mako::dsv41::Engine>(*model, *cfg, opts, ctx);
+            auto e = std::make_unique<mako::dsv41::Engine>(*model, *cfg, opts, ctx);
             so.prefill_piece = opts.prefill_group;
-            model_if = ds_engine.get();
-            base = ds_engine.get();
+            so.speculative = e->has_drafter();
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
             sites = mako::dsv41::Engine::kAblationSites;
-            set_ablation = [&](mako::mtl::Ablation a) { ds_engine->set_ablation(std::move(a)); };
-            expected_resident = 25;
-            so.speculative = ds_engine->has_drafter();
+            set_ablation = [p = e.get()](mako::mtl::Ablation a) { p->set_ablation(std::move(a)); };
+            l.base = e.get();
+            l.model = std::move(e);
         } else {
             auto cfg = mako::glm::Config::load(*model);
-            if (!cfg) {
-                mako::log::error("{}", cfg.error());
-                return 1;
-            }
+            if (!cfg)
+                throw std::runtime_error(cfg.error());
             mako::glm::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
             opts.park_gb = park_gb;
             opts.stage_gb = stage_gb;
             opts.mtp = so.speculative;
-            glm_engine = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
+            auto e = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
             so.prefill_piece = opts.prefill_group;
-            model_if = glm_engine.get();
-            base = glm_engine.get();
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
             sites = mako::glm::Engine::kAblationSites;
-            set_ablation = [&](mako::mtl::Ablation a) { glm_engine->set_ablation(std::move(a)); };
+            set_ablation = [p = e.get()](mako::mtl::Ablation a) { p->set_ablation(std::move(a)); };
+            l.base = e.get();
+            l.model = std::move(e);
         }
-        if (mmproj && mmproj->out_embd != n_embd) {
-            mako::log::error("the projector's rows are {} wide; the model's embeddings {}", mmproj->out_embd, n_embd);
-            return 1;
-        }
+        if (mmproj && mmproj->out_embd != n_embd)
+            throw std::runtime_error(std::format("the projector's rows are {} wide; the model's embeddings {}",
+                                                 mmproj->out_embd, n_embd));
         if (!ablate.empty()) {
             auto a = mako::mtl::Ablation::load(ablate, ctx, n_embd, n_layer, sites);
             a.set_scale(ablate_scale);
             set_ablation(std::move(a));
             mako::log::info("ablating the directions in {} (scale {})", ablate, ablate_scale);
         }
+        return l;
+    };
+    mako::server::Models::LoadImage load_image;
+    if (!image_model.empty())
+        load_image = [&] { return std::make_unique<mako::image::Engine>(image_model, ctx); };
+    std::optional<mako::server::Models> models;
+    try {
+        models.emplace(load_llm, load_image);
     } catch (const std::exception& e) {
         mako::log::error("{}", e.what());
         return 1;
     }
+    mako::core::EngineBase* base = nullptr;
+    models->with_llm([&](mako::core::EngineBase& b) { base = &b; });
     uint64_t slots = 0, experts = 0;
     const auto& usage = base->arena().usage();
     for (uint32_t l = 0; l < usage.size(); ++l)
@@ -333,9 +341,10 @@ int main(int argc, char** argv)
     so.park_bytes = uint64_t(base->arena_plan().park);
     so.cache_gb = base->arena().bytes() / 1e9;
     so.resident = resident / 100.0;
-    so.cache_counters = [base] {
-        const auto& st = base->arena().stats();
-        return mako::server::CacheCounters{st.hits, st.misses};
+    so.cache_counters = [&models] {
+        mako::server::CacheCounters c;
+        models->with_llm([&](mako::core::EngineBase& b) { c = {b.arena().stats().hits, b.arena().stats().misses}; });
+        return c;
     };
     mako::log::info("ready in {:.1f} s; context {} tokens; expert cache {:.1f} GB ({:.0f}% of the experts); "
                     "{:.1f} GB for parked conversations; temperature {}, top_p {}",
@@ -346,7 +355,9 @@ int main(int argc, char** argv)
         mako::log::warn("little memory was free for the expert cache (a process that just exited may still be "
                         "returning its memory); decoding will read experts from the SSD often");
     {
-        mako::server::Server server(*model_if, *tok, *tmpl, so);
+        if (models->has_image())
+            mako::log::info("image model {}: loaded for image requests, in place of the LLM", image_model);
+        mako::server::Server server(*models, *tok, *tmpl, so);
         std::jthread stopper([&] {
             int sig = 0;
             sigwait(&stop_signals, &sig);
@@ -360,9 +371,10 @@ int main(int argc, char** argv)
         if (!listened)
             return 1;
     } // the server's threads are done before the profile is written
-    if (learn) {
-        base->save_profile(base->default_profile(), true);
-        mako::log::info("routing counts added to {}", base->default_profile().string());
-    }
+    if (learn && !models->with_llm([](mako::core::EngineBase& b) {
+            b.save_profile(b.default_profile(), true);
+            mako::log::info("routing counts added to {}", b.default_profile().string());
+        }))
+        mako::log::warn("--learn: the LLM was not loaded at the end (the image model was); no routing counts saved");
     return 0;
 }
