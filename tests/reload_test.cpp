@@ -3,6 +3,7 @@
 // swap, bit for bit, reading only the new tokens; resumed with another identity it starts over.
 //   reload_test <model.gguf>                        GLM-5.3
 //   reload_test <model-00001.gguf> <engram.gguf>    DeepSeek-V4.1
+#include "core/arena.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engine.hpp"
 #include "dsv41/engram.hpp"
@@ -137,6 +138,7 @@ int main(int argc, char** argv)
 
     // Both turns on one engine; then the first, a swap, the second.
     std::array<Turn, 2> want, got;
+    const double start = mako::core::query_memory(0).footprint;
     engine = make();
     {
         mako::gen::SessionPool pool(*engine, 64ull << 30, 16, std::chrono::milliseconds(1000), "a");
@@ -147,7 +149,14 @@ int main(int argc, char** argv)
     mako::gen::SessionPool pool(*engine, 64ull << 30, 16, std::chrono::milliseconds(1000), "a");
     got[0] = run(pool, first);
     pool.suspend();
+    const double loaded = mako::core::query_memory(0).footprint;
     engine.reset();
+    const double unloaded = mako::core::query_memory(0).footprint;
+    std::println("footprint: {:.1f} GB at the start, {:.1f} GB loaded, {:.1f} GB after the engine is gone ({:.2f} GB "
+                 "of conversations parked)",
+                 start / 1e9, loaded / 1e9, unloaded / 1e9, pool.parked_bytes() / 1e9);
+    check(unloaded < start + double(pool.parked_bytes()) + 2e9,
+          "destroying the engine gives its memory back (within 2 GB, beside the parked conversations)");
     engine = make();
     pool.resume(*engine, "a");
     const auto second = next(first, got[0].tokens);
