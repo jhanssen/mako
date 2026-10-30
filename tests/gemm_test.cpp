@@ -2,7 +2,7 @@
 // tensors (one expert's matrix) and formats without CPU dequantization the reference is the per-format GEMV.
 //   gemm_test <model shard.gguf> [tensor ...]
 //   gemm_test --synthetic   random blocks of formats no test model carries (IQ4_XS, IQ2_XS, IQ1_S, IQ1_M), against
-//                           the GEMV
+//                           the GEMV; random BF16 weights with bfloat activations, against the CPU
 #include "gguf/gguf.hpp"
 #include "mtl/context.hpp"
 #include "mtl/gemm.hpp"
@@ -38,7 +38,7 @@ int main(int argc, char** argv)
     }
     std::vector<std::string> names(argv + 2, argv + argc);
     if (synthetic)
-        names = {"iq4_xs", "iq2_xs", "iq1_s", "iq1_m"};
+        names = {"iq4_xs", "iq2_xs", "iq1_s", "iq1_m", "bf16"};
     else if (names.empty())
         names = {"blk.0.attn_q.weight",       "blk.0.ffn_down.weight",      "blk.0.ssm_f_a.weight",
                  "blk.0.hc_attn_fn.weight",   "blk.3.ffn_gate_inp.weight",  "blk.3.ffn_gate_exps.weight",
@@ -55,7 +55,19 @@ int main(int argc, char** argv)
         mako::gguf::Tensor synth;
         const mako::gguf::Tensor* t = &synth;
         std::span<const std::byte> data;
-        if (synthetic) {
+        if (synthetic && name == "bf16") {
+            // Weights of the scale a model's dense matrices have.
+            synth.type = mako::gguf::Type::BF16;
+            synth.dims = {2048, 4096};
+            fake.resize(2048ull * 4096 * 2);
+            auto* b = reinterpret_cast<uint16_t*>(fake.data());
+            for (uint64_t i = 0; i < 2048ull * 4096; ++i) {
+                const float v = 0.02f * nd(rng);
+                uint32_t u;
+                std::memcpy(&u, &v, 4);
+                b[i] = uint16_t(u >> 16);
+            }
+        } else if (synthetic) {
             // An expert-down-sized matrix of random blocks, the block scale d small enough for half activations
             // (IQ1_M keeps d in the top nibbles of its four 16-bit scale words).
             using T = mako::gguf::Type;
@@ -112,13 +124,24 @@ int main(int argc, char** argv)
             auto x = buffer(uint64_t(k) * tokens * 4), xh = buffer(uint64_t(k) * tokens * 2);
             auto y = buffer(uint64_t(n) * tokens * 4);
             auto* xf = static_cast<float*>(x->contents());
-            for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i)
+            const bool bf16 = mako::mtl::Gemm::bf16_input(t->type);
+            for (uint64_t i = 0; i < uint64_t(k) * tokens; ++i) {
                 xf[i] = nd(rng);
+                if (bf16) { // the values the GPU's conversion keeps, so the reference sees them too
+                    uint32_t u;
+                    std::memcpy(&u, &xf[i], 4);
+                    u &= 0xffff0000u;
+                    std::memcpy(&xf[i], &u, 4);
+                }
+            }
             auto yref = buffer(uint64_t(n) * tokens * 4);
             gemm.set_few_tokens(tokens <= 2 ? 2 : 0); // up to 2 tokens the few-token kernel, where it has one
             auto* cb = ctx.queue()->commandBuffer();
             auto* enc = cb->computeCommandEncoder();
-            gemm.to_half(enc, x.get(), 0, tokens, k, 0, xh.get(), 0);
+            if (bf16)
+                gemm.to_bf16(enc, x.get(), 0, tokens, k, 0, xh.get(), 0);
+            else
+                gemm.to_half(enc, x.get(), 0, tokens, k, 0, xh.get(), 0);
             enc->memoryBarrier(MTL::BarrierScopeBuffers);
             gemm.encode(enc, t->type, k, n, tokens, w.get(), 0, xh.get(), 0, y.get(), 0);
             if (!cpu_ref) {
