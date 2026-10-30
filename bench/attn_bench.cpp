@@ -12,6 +12,7 @@
 #include <print>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -56,7 +57,9 @@ int main(int argc, char** argv)
                 std::memset(static_cast<char*>(b->contents()) + (uint64_t(h) * k_pad + r) * D * 2, 0, D * 2);
     const double flop = 4.0 * n_q * double(n_k) * D * heads;
     std::vector<float> base;
-    for (const auto& [name, b] : std::vector<std::pair<std::string, uint32_t>>{{"flash_attn_128_32x128", 32}}) {
+    // name, queries a threadgroup, threads a threadgroup
+    for (const auto& [name, b, threads] : std::vector<std::tuple<std::string, uint32_t, uint32_t>>{
+             {"flash_attn_sg_128_16x32_4", 64, 128}}) {
         auto pso = ctx.pipeline(lib.get(), name);
         auto o = buffer(uint64_t(n_q) * heads * D * 4);
         const AttnArgs a{n_q, round_up(n_q, b), n_k, k_pad, heads, heads, n_k - n_q, block, heads * D,
@@ -71,7 +74,7 @@ int main(int argc, char** argv)
             enc->setBuffer(o.get(), 0, 3);
             enc->setBytes(&a, sizeof(a), 4);
             for (int i = 0; i < reps; ++i)
-                enc->dispatchThreadgroups(MTL::Size(a.q_pad / b, heads, 1), MTL::Size(256, 1, 1));
+                enc->dispatchThreadgroups(MTL::Size(a.q_pad / b, heads, 1), MTL::Size(threads, 1, 1));
             enc->endEncoding();
             cb->commit();
             cb->waitUntilCompleted();

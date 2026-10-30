@@ -42,8 +42,13 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
    - against the reference pipeline's fp32 tensors (`image_ref_test`): the text encoder 1.2e-2 relative (the
      pipeline's own BF16 run: 7.8-8.6e-2), predictions <= 1.6e-2, the VAE 7e-4, the prompt to the image at 512x512
      and 3 steps 5e-3.
-   - Speed, 1024x1024 and 40 steps: 88.7 s (step 2 1.67 s, steps slowing to 2.4 s by the end); the reference
-     pipeline on MPS in BF16: 70.7 s (1.66 s a step). Not yet profiled.
+   - Speed, 1024x1024 and 40 steps, each after a 5-minute cool-down: 63.0 s (step 2 1.28 s, step 40 1.77 s); the
+     reference pipeline on MPS in BF16 65.1 s (1.36 / 1.75 s). Both slow down with heat during a run while macOS
+     reports the nominal thermal state (pauses between steps restore the speed). From 79.9 s by: attention with
+     each simdgroup on its own rows (12.0 -> 7.1 ms a layer), the GEMMs run on a multiple of 256 rows (the first
+     step's text + image rows took 64-row tiles, twice as slow), dense BF16 / F16 weights read by matmul2d straight
+     from device memory (55 -> 63 TFLOP/s), q / k / v and gate / up one GEMM each with the heads' norms fused, the
+     VAE's convolution weights in F16 on that GEMM.
    - mako's starting noise comes from its own generator: a seed gives another image than the reference's.
 7. The image endpoint, progress per denoising step, the status page. Requests (decided 2026-10-29):
    - OpenAI's `/v1/images/generations` as is (`prompt`, `n`, `size`, `response_format`), so its clients work;
@@ -51,6 +56,13 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
      in multiples of 32, later an input image for editing;
    - presets by name (`presets.json`) for sets of them;
    - defaults from the model's own recommendations (to be read from its pipeline code). No workflow graphs.
+
+8. Next (the user's priorities, 2026-10-29): images as input and LoRAs.
+   - Condition images (one pipeline mode in 2.1: edits and references by prompt): the Qwen3-VL vision tower in the
+     text encoder, the VAE encoder (latent tokens ahead of the target image), image blocks in the attention mask
+     (each condition image its own bidirectional block), the image template; `/v1/images/edits`.
+   - img2img: the VAE encoder and the schedule started part-way (sigma below 1).
+   - LoRAs: which exist for 2.1 and their key naming first; merged at load, or applied at run time (per request).
 
 ## Qwen-Image 2.1
 

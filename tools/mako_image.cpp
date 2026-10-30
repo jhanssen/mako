@@ -1,5 +1,5 @@
 // Text to image with Qwen-Image 2.1 from its original files.
-//   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--rgb]
+//   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--count N] [--rgb]
 #include "app/cli.hpp"
 #include "core/log.hpp"
 #include "core/telemetry.hpp"
@@ -8,6 +8,7 @@
 #include "mtl/context.hpp"
 
 #include <chrono>
+#include <format>
 #include <print>
 
 int main(int argc, char** argv)
@@ -15,6 +16,7 @@ int main(int argc, char** argv)
     std::string out = "image.png";
     uint32_t width = 1024, height = 1024, steps = 40;
     uint64_t seed = 0;
+    uint32_t count = 1;
     bool rgb = false;
     mako::app::Cli cli("mako_image", "<model dir> <prompt>", 2, 2);
     cli.option("-o", "FILE", "the PNG to write (default image.png)", out)
@@ -22,6 +24,7 @@ int main(int argc, char** argv)
         .option("--height", "N", "pixels, a multiple of 32 (default 1024)", height)
         .option("--steps", "N", "denoising steps (default 40)", steps)
         .option("--seed", "N", "the starting noise's seed (default 0)", seed)
+        .option("--count", "N", "images, seeds counting up from --seed, out-N.png after the first (default 1)", count)
         .flag("--rgb", "leave the alpha channel out", rgb);
     const auto pos = cli.parse(argc, argv);
     using Clock = std::chrono::steady_clock;
@@ -31,23 +34,31 @@ int main(int argc, char** argv)
         mako::mtl::Context ctx;
         mako::image::Engine engine(pos[0], ctx);
         mako::log::info("loaded in {:.1f} s", ms_since(t_load) / 1e3);
-        mako::image::Engine::Request r;
-        r.prompt = pos[1];
-        r.width = width;
-        r.height = height;
-        r.steps = steps;
-        r.seed = seed;
-        auto t_step = Clock::now();
-        r.progress = [&](uint32_t i, uint32_t n) {
-            mako::log::info("step {} of {}: {:.0f} ms, thermal {}", i, n, ms_since(t_step), mako::core::thermal_state());
-            t_step = Clock::now();
-        };
-        const auto t0 = Clock::now();
-        const auto img = engine.generate(r);
-        const double gen = ms_since(t0);
-        const auto png = mako::image::encode_png(mako::image::to_rgba8(img), width, height, rgb);
-        mako::image::write_file(out, png);
-        mako::log::info("{}x{}, {} steps in {:.1f} s: {}", width, height, steps, gen / 1e3, out);
+        for (uint32_t n = 0; n < count; ++n) {
+            mako::image::Engine::Request r;
+            r.prompt = pos[1];
+            r.width = width;
+            r.height = height;
+            r.steps = steps;
+            r.seed = seed + n;
+            auto t_step = Clock::now();
+            r.progress = [&](uint32_t i, uint32_t total) {
+                mako::log::info("step {} of {}: {:.0f} ms, thermal {}", i, total, ms_since(t_step),
+                                mako::core::thermal_state());
+                t_step = Clock::now();
+            };
+            const auto t0 = Clock::now();
+            const auto img = engine.generate(r);
+            const double gen = ms_since(t0);
+            std::string path = out;
+            if (n > 0) {
+                const size_t dot = out.rfind('.');
+                path = dot == std::string::npos ? std::format("{}-{}", out, n)
+                                                : std::format("{}-{}{}", out.substr(0, dot), n, out.substr(dot));
+            }
+            mako::image::write_file(path, mako::image::encode_png(mako::image::to_rgba8(img), width, height, rgb));
+            mako::log::info("{}x{}, {} steps in {:.1f} s: {}", width, height, steps, gen / 1e3, path);
+        }
     } catch (const std::exception& e) {
         mako::log::error("{}", e.what());
         return 1;

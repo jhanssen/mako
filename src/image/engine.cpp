@@ -32,6 +32,10 @@ struct ModArgs {
 struct HeadRowsArgs {
     uint32_t dim, src_pad, dst_pad, rows;
 };
+struct HeadsNormArgs {
+    uint32_t ld, col0, dim, n_pad, row0, rope;
+    float eps;
+};
 struct Im2colArgs {
     uint32_t h, w, c, p0, rows, kpad;
 };
@@ -204,14 +208,17 @@ Engine::Conv Engine::load_conv(const std::string& name, uint32_t k)
     if (r.tensor->dims[0] != k || r.tensor->dims[1] != k)
         throw std::runtime_error(name + ": unexpected kernel size");
     const uint32_t cols = c.cin * k * k;
-    c.kpad = round_up(cols, 32);
-    c.w = reserve(uint64_t(c.cout) * c.kpad * 4, gguf::Type::F32, {c.kpad, c.cout});
-    auto* dst = reinterpret_cast<float*>(static_cast<char*>(c.w.buf->contents()) + c.w.off);
+    // 3x3: the unfolded rows padded for the direct GEMM; 1x1: the input's own rows (the staged GEMM where they are not
+    // a multiple of 64).
+    c.kpad = round_up(cols, k == 3 ? 64 : 32);
+    // Half, as the activations it multiplies are (the direct GEMM reads it unstaged).
+    c.w = reserve(uint64_t(c.cout) * c.kpad * 2, gguf::Type::F16, {c.kpad, c.cout});
+    auto* dst = reinterpret_cast<__fp16*>(static_cast<char*>(c.w.buf->contents()) + c.w.off);
     std::vector<float> row(cols);
     for (uint32_t o = 0; o < c.cout; ++o) {
         gguf::read_exact(r.file->fd(), row.data(), uint64_t(cols) * 4, r.tensor->offset + uint64_t(o) * cols * 4);
-        std::copy(row.begin(), row.end(), dst + uint64_t(o) * c.kpad);
-        std::fill(dst + uint64_t(o) * c.kpad + cols, dst + uint64_t(o + 1) * c.kpad, 0.0f);
+        for (uint32_t i = 0; i < c.kpad; ++i)
+            dst[uint64_t(o) * c.kpad + i] = __fp16(i < cols ? row[i] : 0.0f);
     }
     c.b = upload(vae_files_, name + ".bias", false);
     return c;
@@ -280,19 +287,40 @@ void Engine::load_transformer(const std::string&)
         if (!f.find(b + "attn.to_q.weight"))
             break;
         Block B;
-        B.q = upload(f, b + "attn.to_q.weight", true);
-        B.k = upload(f, b + "attn.to_k.weight", true);
-        B.v = upload(f, b + "attn.to_v.weight", true);
+        const std::string qkv[3] = {b + "attn.to_q.weight", b + "attn.to_k.weight", b + "attn.to_v.weight"};
+        B.qkv = upload_rows(f, qkv);
         B.o = upload(f, b + "attn.to_out.0.weight", true);
         B.norm_q = upload(f, b + "attn.norm_q.weight", false);
         B.norm_k = upload(f, b + "attn.norm_k.weight", false);
-        B.gate = upload(f, b + "img_mlp.gate_layer.weight", true);
-        B.up = upload(f, b + "img_mlp.proj.weight", true);
+        const std::string gu[2] = {b + "img_mlp.gate_layer.weight", b + "img_mlp.proj.weight"};
+        B.gate_up = upload_rows(f, gu);
         B.down = upload(f, b + "img_mlp.out.weight", true);
         blocks_.push_back(std::move(B));
     }
     if (blocks_.empty())
         throw std::runtime_error("transformer: no blocks");
+}
+
+Engine::Tensor Engine::upload_rows(const safetensors::Files& files, std::span<const std::string> names)
+{
+    uint64_t bytes = 0, rows = 0, k = 0;
+    for (const auto& n : names) {
+        const auto r = files.find(n);
+        if (!r || r.tensor->type != gguf::Type::BF16 || r.tensor->dims.size() != 2 || (k && r.tensor->dims[0] != k))
+            throw std::runtime_error(n + ": missing, or not a BF16 matrix of the others' width");
+        k = r.tensor->dims[0];
+        rows += r.tensor->dims[1];
+        bytes += r.tensor->bytes;
+    }
+    Tensor t = reserve(bytes, gguf::Type::BF16, {k, rows});
+    uint64_t off = 0;
+    for (const auto& n : names) {
+        const auto r = files.find(n);
+        gguf::read_exact(r.file->fd(), static_cast<char*>(t.buf->contents()) + t.off + off, r.tensor->bytes,
+                         r.tensor->offset);
+        off += r.tensor->bytes;
+    }
+    return t;
 }
 
 Engine::Tensor Engine::upload(const safetensors::Files& files, const std::string& name, bool matrix)
@@ -340,8 +368,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Bu
 {
     const AttnArgs a{n_q, q_pad, n_k, k_pad, n_heads, kv_heads, q_pos0, block, n_heads * kHeadDim,
                      1.0f / std::sqrt(float(kHeadDim))};
-    dispatch(enc, "flash_attn_128_32x128", {q, k, v, o}, &a, sizeof(a), MTL::Size(q_pad / 32, n_heads, 1),
-             MTL::Size(256, 1, 1), false);
+    dispatch(enc, "flash_attn_sg_128_16x32_4", {q, k, v, o}, &a, sizeof(a),
+             MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
 }
 
 std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t drop)
@@ -349,7 +377,7 @@ std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t dr
     const uint32_t T = uint32_t(ids.size()), E = kTextEmbd, kv = kTextKvHeads * kHeadDim;
     if (T <= drop)
         throw std::runtime_error("the prompt is all template");
-    const uint32_t q_pad = round_up(T, 32), k_pad = round_up(T, 128);
+    const uint32_t q_pad = round_up(T, kAttnRows), k_pad = round_up(T, 128);
     MTL::Buffer* x = scratch("t_x", uint64_t(T) * E * 4);
     MTL::Buffer* xn = scratch("t_xn", uint64_t(T) * E * 4);
     MTL::Buffer* q = scratch("t_q", uint64_t(T) * E * 4);
@@ -436,19 +464,23 @@ std::vector<float> Engine::step(std::span<const float> latents, float sigma)
     const bool first = steps_++ == 0;
     // The first step runs the text rows too; later ones only the image's, against the text's cached keys and values.
     const uint32_t S = S_, T = first ? S + N : N, row0 = first ? 0 : S, n_k = S + N;
-    const uint32_t q_pad = round_up(T, 32), k_pad = round_up(n_k, 128), split = first ? S : 0;
-    MTL::Buffer* x = scratch("d_x", uint64_t(T) * D * 4);
-    MTL::Buffer* xn = scratch("d_xn", uint64_t(T) * D * 4);
-    MTL::Buffer* q = scratch("d_q", uint64_t(T) * D * 4);
-    MTL::Buffer* k = scratch("d_k", uint64_t(T) * D * 4);
-    MTL::Buffer* v = scratch("d_v", uint64_t(T) * D * 4);
+    const uint32_t q_pad = round_up(T, kAttnRows), k_pad = round_up(n_k, 128), split = first ? S : 0;
+    // The GEMMs run a multiple of 256 rows (the rest ignored): fewer rows, as the first step's text and image make,
+    // would take 64-row tiles that read the weights four times as often (that step took twice as long).
+    const uint32_t Tg = T > 256 ? round_up(T, 256) : T;
+    MTL::Buffer* x = scratch("d_x", uint64_t(Tg) * D * 4);
+    MTL::Buffer* xn = scratch("d_xn", uint64_t(Tg) * D * 4);
+    MTL::Buffer* qkv = scratch("d_qkv", uint64_t(Tg) * 3 * D * 4);
+    const uint64_t nff = blocks_.front().down.dims[0];
+    MTL::Buffer* gu = scratch("d_gu", uint64_t(Tg) * 2 * nff * 4);
+    MTL::Buffer* ffm = scratch("d_ffm", uint64_t(Tg) * nff * 4);
     MTL::Buffer* qh = scratch("d_qh", uint64_t(kHeads) * q_pad * kHeadDim * 2);
     MTL::Buffer* kh = scratch("d_kh", uint64_t(kHeads) * k_pad * kHeadDim * 2);
     MTL::Buffer* vh = scratch("d_vh", uint64_t(kHeads) * k_pad * kHeadDim * 2);
-    MTL::Buffer* att = scratch("d_att", uint64_t(T) * D * 4);
-    MTL::Buffer* y = scratch("d_y", uint64_t(T) * D * 4);
+    MTL::Buffer* att = scratch("d_att", uint64_t(Tg) * D * 4);
+    MTL::Buffer* y = scratch("d_y", uint64_t(Tg) * D * 4);
     MTL::Buffer* lat = scratch("d_lat", uint64_t(N) * kLatent * 4);
-    MTL::Buffer* out = scratch("d_out", uint64_t(T) * kLatent * 4);
+    MTL::Buffer* out = scratch("d_out", uint64_t(Tg) * kLatent * 4);
     MTL::Buffer* tp = scratch("d_tproj", 2 * kTimeDim * 4);
     MTL::Buffer* temb = scratch("d_temb", 2 * D * 4);
     MTL::Buffer* temb_s = scratch("d_temb_s", 2 * D * 4);
@@ -501,29 +533,29 @@ std::vector<float> Engine::step(std::span<const float> latents, float sigma)
         cur_layer_ = il;
         ModArgs ma{D, kEps, split, mstride, 0};
         dispatch(enc, "ln_modulate", {x, mod, xn}, &ma, sizeof(ma), MTL::Size(T, 1, 1), MTL::Size(256, 1, 1), false);
-        proj(enc, B.q, xn, 0, q, 0, T);
-        proj(enc, B.k, xn, 0, k, 0, T);
-        proj(enc, B.v, xn, 0, v, 0, T);
-        norm(enc, q, &B.norm_q, q, T * kHeads, kHeadDim, kHeadDim, kEps);
-        norm(enc, k, &B.norm_k, k, T * kHeads, kHeadDim, kHeadDim, kEps);
-        // The rotary table's rows from this step's first token on.
-        HeadsArgs ha{T, D, 0, kHeadDim, q_pad, 0, 2};
-        enc->setComputePipelineState(pso("heads_half"));
-        enc->setBuffer(q, 0, 0);
+        proj(enc, B.qkv, xn, 0, qkv, 0, Tg);
+        // q and k RMS-normed per head and rotated (the table's rows from this step's first token on), v as it is.
+        HeadsNormArgs hn{3 * D, 0, kHeadDim, q_pad, 0, 2, kEps};
+        enc->setComputePipelineState(pso("heads_norm_half"));
+        enc->setBuffer(qkv, 0, 0);
         enc->setBuffer(cs, uint64_t(row0) * kHeadDim / 2 * 8, 1);
         enc->setBuffer(qh, 0, 2);
-        enc->setBytes(&ha, sizeof(ha), 3);
-        enc->dispatchThreads(MTL::Size(kHeadDim / 2, T, kHeads), MTL::Size(64, 1, 1));
-        after(enc, "heads_half");
-        ha.n_pad = k_pad;
-        ha.row0 = row0;
-        enc->setBuffer(k, 0, 0);
+        enc->setBuffer(B.norm_q.buf, B.norm_q.off, 3);
+        enc->setBytes(&hn, sizeof(hn), 4);
+        enc->dispatchThreadgroups(MTL::Size(T, kHeads, 1), MTL::Size(kHeadDim / 2, 1, 1));
+        after(enc, "heads_norm_half");
+        hn.col0 = D;
+        hn.n_pad = k_pad;
+        hn.row0 = row0;
         enc->setBuffer(kh, 0, 2);
-        enc->setBytes(&ha, sizeof(ha), 3);
-        enc->dispatchThreads(MTL::Size(kHeadDim / 2, T, kHeads), MTL::Size(64, 1, 1));
-        after(enc, "heads_half");
-        ha.rope = 0;
-        enc->setBuffer(v, 0, 0);
+        enc->setBuffer(B.norm_k.buf, B.norm_k.off, 3);
+        enc->setBytes(&hn, sizeof(hn), 4);
+        enc->dispatchThreadgroups(MTL::Size(T, kHeads, 1), MTL::Size(kHeadDim / 2, 1, 1));
+        after(enc, "heads_norm_half");
+        HeadsArgs ha{T, 3 * D, 2 * D, kHeadDim, k_pad, row0, 0};
+        enc->setComputePipelineState(pso("heads_half"));
+        enc->setBuffer(qkv, 0, 0);
+        enc->setBuffer(cs, 0, 1);
         enc->setBuffer(vh, 0, 2);
         enc->setBytes(&ha, sizeof(ha), 3);
         enc->dispatchThreads(MTL::Size(kHeadDim / 2, T, kHeads), MTL::Size(64, 1, 1));
@@ -549,12 +581,15 @@ std::vector<float> Engine::step(std::span<const float> latents, float sigma)
                      MTL::Size(128, 1, 1));
         }
         attention(enc, qh, kh, vh, att, T, q_pad, n_k, k_pad, kHeads, kHeads, row0, S);
-        proj(enc, B.o, att, 0, y, 0, T);
+        proj(enc, B.o, att, 0, y, 0, Tg);
         ma.mod_off = D;
         dispatch(enc, "gate_add", {x, y, mod}, &ma, sizeof(ma), MTL::Size(D, T, 1), MTL::Size(256, 1, 1));
         ma.mod_off = 2 * D;
         dispatch(enc, "ln_modulate", {x, mod, xn}, &ma, sizeof(ma), MTL::Size(T, 1, 1), MTL::Size(256, 1, 1), false);
-        ffn_dense(enc, B.gate, B.up, B.down, xn, y, 0.0f, T);
+        proj(enc, B.gate_up, xn, 0, gu, 0, Tg);
+        uint32_t nff = uint32_t(B.down.dims[0]);
+        dispatch(enc, "swiglu_rows", {gu, ffm}, &nff, sizeof(nff), MTL::Size(nff, Tg, 1), MTL::Size(256, 1, 1));
+        proj(enc, B.down, ffm, 0, y, 0, Tg);
         ma.mod_off = 3 * D;
         dispatch(enc, "gate_add", {x, y, mod}, &ma, sizeof(ma), MTL::Size(D, T, 1), MTL::Size(256, 1, 1));
         probe(enc, "block", int(il), x, uint64_t(T) * D);
@@ -562,7 +597,7 @@ std::vector<float> Engine::step(std::span<const float> latents, float sigma)
     ModArgs oa{D, kEps, split, D, 0};
     dispatch(enc, "ln_modulate", {x, omod, xn}, &oa, sizeof(oa), MTL::Size(T, 1, 1), MTL::Size(256, 1, 1), false);
     probe(enc, "norm_out", -1, xn, uint64_t(T) * D);
-    proj(enc, proj_out_, xn, 0, out, 0, T);
+    proj(enc, proj_out_, xn, 0, out, 0, Tg);
     enc->endEncoding();
     finish(cb);
     const auto* o = static_cast<const float*>(out->contents()) + uint64_t(T - N) * kLatent;
@@ -574,19 +609,19 @@ void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* 
 {
     const uint32_t rows = h * w;
     if (c.k == 1) {
-        gemm_->encode(enc, gguf::Type::F32, c.kpad, c.cout, rows, c.w.buf, c.w.off,
-                      halves(enc, x, 0, rows, c.cin, 0), 0, y, 0);
+        gemm_->encode(enc, gguf::Type::F16, c.kpad, c.cout, rows, c.w.buf, c.w.off,
+                      halves(enc, x, 0, rows, c.cin, 0), 0, y, 0, 0, 0, c.kpad % 64 == 0);
         after(enc, "conv1x1");
     } else {
-        // Image rows a pass, so the unfolded copy stays near 256 MB.
-        const uint32_t chunk = std::max(32u, uint32_t((256ull << 20) / (uint64_t(c.kpad) * 2)) / 32 * 32);
+        // Image rows a pass, so the unfolded copy stays near 256 MB, in multiples of 256 (the GEMM's largest tiles).
+        const uint32_t chunk = std::max(256u, uint32_t((256ull << 20) / (uint64_t(c.kpad) * 2)) / 256 * 256);
         MTL::Buffer* col = scratch("v_col", uint64_t(std::min(chunk, rows)) * c.kpad * 2);
         for (uint32_t p0 = 0; p0 < rows; p0 += chunk) {
             const uint32_t n = std::min(chunk, rows - p0);
             const Im2colArgs a{h, w, c.cin, p0, n, c.kpad};
             dispatch(enc, "im2col3x3", {x, col}, &a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
-            gemm_->encode(enc, gguf::Type::F32, c.kpad, c.cout, n, c.w.buf, c.w.off, col, 0, y,
-                          uint64_t(p0) * c.cout * 4);
+            gemm_->encode(enc, gguf::Type::F16, c.kpad, c.cout, n, c.w.buf, c.w.off, col, 0, y,
+                          uint64_t(p0) * c.cout * 4, 0, 0, true);
             after(enc, "conv3x3");
         }
     }

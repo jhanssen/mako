@@ -70,12 +70,14 @@ private:
                    uint32_t q_pos0, uint32_t block);
 
     struct Block {
-        Tensor q, k, v, o, norm_q, norm_k, gate, up, down;
+        Tensor qkv, o, norm_q, norm_k, gate_up, down; // q, k, v and gate, up side by side: one GEMM each
     };
+    // BF16 matrices of one width, their rows one after another in one tensor.
+    Tensor upload_rows(const safetensors::Files& files, std::span<const std::string> names);
     void load_transformer(const std::string& dir);
 
-    // The VAE's convolutions as GEMMs over channels-last images: weights [cout][kpad] (cin * k * k columns, zero
-    // padded to a multiple of 32), F32.
+    // The VAE's convolutions as GEMMs over channels-last images: weights F16 [cout][kpad] (cin * k * k columns, a 3x3's
+    // zero padded to a multiple of 64).
     struct Conv {
         Tensor w, b;
         uint32_t cin = 0, cout = 0, k = 3, kpad = 0;
@@ -104,6 +106,7 @@ private:
     safetensors::Files::Ref embd_;
     std::vector<TextLayer> text_;
     static constexpr uint32_t kTextEmbd = 4096, kTextHeads = 32, kTextKvHeads = 8, kHeadDim = 128;
+    static constexpr uint32_t kAttnRows = 64; // queries a threadgroup of the attention kernel
     static constexpr float kTextEps = 1e-6f, kTextTheta = 5e6f;
 
     Tensor img_in_, txt_norm_, txt_in1_, txt_in2_, t_lin1_, t_lin2_, mod_, out_lin_, proj_out_;
