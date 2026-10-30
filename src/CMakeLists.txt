@@ -32,6 +32,10 @@ add_custom_target(mako_version
     BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp
     COMMENT "Checking the commit")
 
+add_library(mako_safetensors STATIC safetensors/safetensors.cpp)
+target_include_directories(mako_safetensors PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_safetensors PUBLIC mako_gguf PRIVATE glaze_headers)
+
 add_library(mako_chat STATIC chat/template.cpp)
 target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_chat PRIVATE jinja_engine)
