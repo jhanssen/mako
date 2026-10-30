@@ -7,7 +7,7 @@
 //   vae      the VAE decoder on the reference's final latents
 //   pipeline the prompt to the image (the reference's starting noise): token ids, noise levels, the image
 //   image_ref_test <model dir> <reference dir> <mode>
-#include "image/engine.hpp"
+#include "image/qwen_image.hpp"
 #include "mtl/context.hpp"
 #include "text/tokenizer.hpp"
 
@@ -104,12 +104,12 @@ int main(int argc, char** argv)
         want.push_back(int32_t(v.get_number()));
 
     if (mode == "tokens") {
-        const auto ids = tok->encode(mako::image::Engine::templated(prompt), true);
+        const auto ids = tok->encode(mako::image::QwenImage::templated(prompt), true);
         check(ids == want, std::format("the template's {} token ids (the reference's {})", ids.size(), want.size()));
-        check(tok->decode(ids) == mako::image::Engine::templated(prompt), "they decode to the template");
+        check(tok->decode(ids) == mako::image::QwenImage::templated(prompt), "they decode to the template");
     } else if (mode == "text") {
         mako::mtl::Context ctx;
-        mako::image::Engine engine(model.string(), ctx);
+        mako::image::QwenImage engine(model.string(), ctx);
         const auto t0 = std::chrono::steady_clock::now();
         const auto got = engine.encode_text(want, uint32_t(manifest["drop_idx"].get_number()));
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -126,7 +126,7 @@ int main(int argc, char** argv)
         }
     } else if (mode == "dit") {
         mako::mtl::Context ctx;
-        mako::image::Engine engine(model.string(), ctx);
+        mako::image::QwenImage engine(model.string(), ctx);
         const uint32_t size = uint32_t(manifest["size"].get_number()), g = size / 16, N = g * g;
         std::map<std::string, std::vector<float>> got;
         uint32_t step = 0;
@@ -164,7 +164,7 @@ int main(int argc, char** argv)
         }
     } else if (mode == "vae") {
         mako::mtl::Context ctx;
-        mako::image::Engine engine(model.string(), ctx);
+        mako::image::QwenImage engine(model.string(), ctx);
         const uint32_t size = uint32_t(manifest["size"].get_number()), g = size / 16;
         std::vector<float> vae_in;
         engine.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
@@ -198,7 +198,7 @@ int main(int argc, char** argv)
         }
     } else if (mode == "pipeline") {
         mako::mtl::Context ctx;
-        mako::image::Engine engine(model.string(), ctx);
+        mako::image::QwenImage engine(model.string(), ctx);
         const uint32_t size = uint32_t(manifest["size"].get_number()), g = size / 16;
         check(engine.system_tokens() == uint32_t(manifest["drop_idx"].get_number()),
               std::format("the template's system part: {} tokens", engine.system_tokens()));

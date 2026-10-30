@@ -53,8 +53,8 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
      VAE's convolution weights in F16 on that GEMM.
    - mako's starting noise comes from its own generator: a seed gives another image than the reference's.
 7. Done: `/v1/images/generations` with OpenAI's fields (`docs/server.md`), progress in the log, the loaded model on
-   the status page. Extensions (seed, steps, guidance, presets, `quality` as steps, streamed progress) wait for the
-   user's decisions (2026-10-29: "regular openai api first").
+   the status page. Extensions: `negative_prompt` and `guidance_scale` (step 10); seed, steps, presets, `quality` as
+   steps and streamed progress wait for the user's decisions.
 8. Next (the user's priorities, 2026-10-29): images as input and LoRAs.
    - Condition images (one pipeline mode in 2.1: edits and references by prompt): the Qwen3-VL vision tower in the
      text encoder, the VAE encoder (latent tokens ahead of the target image), image blocks in the attention mask
@@ -67,6 +67,30 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
      4-step Lightning (128 matrices; 4 steps without terminal stretch, 1024x1024 in 6.9 s, clean, where 4 steps
      without it are smeared), Next-Scene (ComfyUI, 192) and Natural-Exposure (PEFT, 224) stacked with it. Per-request
      LoRAs (applied at run time, or merged and taken back) later.
+
+9. Done: Krea 2 (`image::Krea2`; `Engine::open` picks the model from `model_index.json`). The image models share
+   `image::Engine`: the Qwen3-VL text encoder (its width, heads and taps from the weights), the VAE decoder (Qwen-Image
+   2.1's 16x one, or the first Qwen-Image's 8x one with a token's 2x2 patch unpacked and its causal 3D convolutions
+   reduced to their last time tap), the schedule and the denoising loop. Krea 2 from `krea/Krea-2-Turbo` (text
+   encoder, VAE, configs), its transformer from that repository or a single-file checkpoint in the original names
+   (`--transformer`). Against the reference pipeline in fp32 (`tests/krea_ref_test`, 256x256, 2 steps): the twelve
+   tapped text states 2.5e-3, predictions 1.2-2.1e-2, the VAE 5e-3, the image 0.133 (the reference in BF16: 0.158).
+   1024x1024 in 8 steps: 23 s.
+10. Done: negative prompts (classifier-free guidance, `Request::negative` / `guidance`): a second text in its own
+    slot (`begin` / `step` slot 1), velocity neg + scale * (pos - neg) each step, twice the transformer's work.
+    Without a negative prompt nothing changes. Scales tried (`docs/server.md`): Qwen-Image 2.1 clean at 2-6 (default
+    4); Krea 2 Turbo, distilled without guidance, clean only to 2 (default 2) and weak there.
+
+## Krea 2
+
+- Transformer (12B): 28 single-stream blocks over [text, image], hidden 6144 (48 query heads, 12 key / value heads
+  of 128), a sigmoid gate on the attention output, SwiGLU 16384, RMS norms with zero-centred scales, one shared
+  timestep modulation plus a learned table per block, rotary axes 32 / 48 / 48 (theta 1000; the text at the origin).
+- Text: Qwen3-VL-4B's hidden states 2, 5, ..., 35 per token, fused by two blocks across the twelve layers, a learned
+  mix, and two blocks across the tokens (2560 wide, 20 heads). The reference pads the text to 512 rows and masks the
+  padding; mako runs only the prompt's rows, which gives the same result.
+- VAE: the first Qwen-Image's (16 channels, 8x), the transformer's tokens its 2x2 patches.
+- Turbo (`is_distilled`): 8 steps, a fixed shift (mu 1.15), no guidance.
 
 ## Qwen-Image 2.1
 

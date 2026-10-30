@@ -510,6 +510,20 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
     if (body.contains("response_format") && body["response_format"].is_string() &&
         body["response_format"].get_string() != "b64_json")
         return fail(400, "response_format: only b64_json (images are not stored)", "invalid_request_error");
+    // Extensions: a negative prompt (classifier-free guidance) and its scale.
+    std::optional<std::string> negative;
+    std::optional<float> guidance = opts.image_guidance;
+    if (body.contains("negative_prompt") && !body["negative_prompt"].is_null()) {
+        if (!body["negative_prompt"].is_string())
+            return fail(400, "negative_prompt must be a string", "invalid_request_error");
+        negative = body["negative_prompt"].get_string();
+    }
+    if (body.contains("guidance_scale") && !body["guidance_scale"].is_null()) {
+        if (!body["guidance_scale"].is_number() || body["guidance_scale"].get_number() < 0 ||
+            body["guidance_scale"].get_number() > 30)
+            return fail(400, "guidance_scale must be a number from 0 to 30", "invalid_request_error");
+        guidance = float(body["guidance_scale"].get_number());
+    }
     bool jpeg = false;
     if (body.contains("output_format") && body["output_format"].is_string()) {
         const std::string f = body["output_format"].get_string();
@@ -523,7 +537,8 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
     }
     const auto slot = std::shared_ptr<void>(nullptr, [this](void*) { --in_flight; });
     const std::string id = std::format("img-{}", next_id.fetch_add(1) + 1);
-    log::info("{}: {} image{} {}x{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height);
+    log::info("{}: {} image{} {}x{}{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height,
+              negative ? ", a negative prompt" : "");
     std::string data = "[";
     try {
         auto engine = models.image();
@@ -536,6 +551,8 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             r.seed = (uint64_t(rd()) << 32) | rd();
             r.steps = opts.image_steps;
             r.terminal = opts.image_terminal;
+            r.negative = negative;
+            r.guidance = guidance;
             auto last = std::chrono::steady_clock::now();
             const auto t0 = last;
             r.progress = [&](uint32_t step, uint32_t steps) {

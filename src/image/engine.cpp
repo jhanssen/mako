@@ -2,6 +2,8 @@
 
 #include "core/log.hpp"
 #include "gguf/read_pool.hpp"
+#include "image/krea2.hpp"
+#include "image/qwen_image.hpp"
 
 #include <glaze/glaze.hpp>
 
@@ -9,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
@@ -23,21 +26,13 @@ namespace {
 struct HeadsArgs {
     uint32_t rows, ld, col0, dim, n_pad, row0, rope;
 };
-struct AttnArgs {
-    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
-    float scale;
-};
-struct ModArgs {
-    uint32_t n;
-    float eps;
-    uint32_t split, mod_stride, mod_off;
-};
-struct HeadRowsArgs {
-    uint32_t dim, src_pad, dst_pad, rows;
-};
 struct HeadsNormArgs {
     uint32_t ld, col0, dim, n_pad, row0, rope;
     float eps;
+};
+struct AttnArgs {
+    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
+    float scale;
 };
 struct Im2colArgs {
     uint32_t h, w, c, p0, rows, kpad;
@@ -53,42 +48,86 @@ struct LoraArgs {
     float scale;
 };
 
-// Pairs i of the rotary angle table for (frame, height, width) positions: 8 pairs on the frame axis, then 28 each on
-// height and width (axes 16 / 56 / 56 of the 128 dims), theta 10000.
-void rope3(float* cs, int64_t f, int64_t hpos, int64_t wpos)
-{
-    constexpr int dims[3] = {16, 56, 56};
-    const int64_t pos[3] = {f, hpos, wpos};
-    uint32_t i = 0;
-    for (int a = 0; a < 3; ++a)
-        for (int j = 0; j < dims[a] / 2; ++j, ++i) {
-            const float inv = 1.0f / std::pow(10000.0f, float(2 * j) / float(dims[a]));
-            const float ang = float(pos[a]) * inv;
-            cs[2 * i] = std::cos(ang);
-            cs[2 * i + 1] = std::sin(ang);
-        }
-}
-
 uint32_t round_up(uint32_t x, uint32_t m) { return (x + m - 1) / m * m; }
 
-safetensors::Files open_files(const std::string& dir)
+safetensors::Files open_files(const std::string& path)
 {
-    auto f = safetensors::Files::open(dir);
+    auto f = safetensors::Files::open(path);
     if (!f)
         throw std::runtime_error(f.error());
     return std::move(*f);
 }
 
+glz::generic read_json_file(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("cannot open " + path);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    glz::generic j;
+    if (glz::read_json(j, text) || !j.is_object())
+        throw std::runtime_error(path + ": not a JSON object");
+    return j;
+}
+
+// Round to nearest even BF16.
+uint16_t to_bf16(float f)
+{
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return uint16_t((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+}
+
+// A tensor's values as floats (F32, F16 or BF16).
+std::vector<float> read_floats(const safetensors::File& f, const gguf::Tensor& t)
+{
+    const uint64_t n = t.elements();
+    std::vector<float> out(n);
+    std::vector<std::byte> raw(t.bytes);
+    gguf::read_exact(f.fd(), raw.data(), t.bytes, t.offset);
+    for (uint64_t i = 0; i < n; ++i) {
+        if (t.type == gguf::Type::F32) {
+            std::memcpy(&out[i], raw.data() + i * 4, 4);
+        } else if (t.type == gguf::Type::F16) {
+            __fp16 h;
+            std::memcpy(&h, raw.data() + i * 2, 2);
+            out[i] = float(h);
+        } else {
+            uint16_t b;
+            std::memcpy(&b, raw.data() + i * 2, 2);
+            const uint32_t u = uint32_t(b) << 16;
+            std::memcpy(&out[i], &u, 4);
+        }
+    }
+    return out;
+}
+
 } // namespace
 
-Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry, const std::string& text_encoder)
-    : gpu::Runtime(ctx, telemetry), text_files_(open_files(text_encoder.empty() ? dir + "/text_encoder" : text_encoder)),
-      dit_files_(open_files(dir + "/transformer")), vae_files_(open_files(dir + "/vae"))
+std::unique_ptr<Engine> Engine::open(const std::string& dir, mtl::Context& ctx, const Options& opts)
 {
-    const std::string p = "model.language_model.";
+    const auto j = read_json_file(dir + "/model_index.json");
+    const std::string cls = j.contains("_class_name") && j["_class_name"].is_string() ? j["_class_name"].get_string() : "";
+    if (cls == "QwenImage21Pipeline")
+        return std::make_unique<QwenImage>(dir, ctx, opts);
+    if (cls == "Krea2Pipeline")
+        return std::make_unique<Krea2>(dir, ctx, opts);
+    throw std::runtime_error(std::format("{}: an image model mako does not know ({})", dir, cls.empty() ? "?" : cls));
+}
+
+Engine::Engine(const std::string& dir, mtl::Context& ctx, const Options& opts)
+    : gpu::Runtime(ctx, opts.telemetry), dir_(dir),
+      text_files_(open_files(opts.text_encoder.empty() ? dir + "/text_encoder" : opts.text_encoder)),
+      vae_files_(open_files(dir + "/vae"))
+{
+    // The language model's tensors, under the full model's prefix or the bare one's.
+    std::string p = "model.language_model.";
+    if (!text_files_.find(p + "embed_tokens.weight"))
+        p = "language_model.";
     embd_ = text_files_.find(p + "embed_tokens.weight");
-    if (!embd_ || embd_.tensor->type != gguf::Type::BF16 || embd_.tensor->dims[0] != kTextEmbd)
-        throw std::runtime_error("text encoder: embed_tokens missing or not BF16 [4096 x vocab]");
+    if (!embd_ || embd_.tensor->type != gguf::Type::BF16)
+        throw std::runtime_error("text encoder: embed_tokens missing or not BF16");
+    tE_ = uint32_t(embd_.tensor->dims[0]);
     for (uint32_t i = 0;; ++i) {
         const std::string l = std::format("{}layers.{}.", p, i);
         if (!text_files_.find(l + "input_layernorm.weight"))
@@ -109,26 +148,39 @@ Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemet
     }
     if (text_.empty())
         throw std::runtime_error("text encoder: no layers");
-    load_transformer(dir);
-    load_vae();
-    // The latents' normalization, from the VAE's config.
-    std::ifstream in(dir + "/vae/config.json", std::ios::binary);
-    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    glz::generic j;
-    if (glz::read_json(j, text) || !j.contains("latents_mean") || !j.contains("latents_std"))
-        throw std::runtime_error("vae/config.json: no latents_mean / latents_std");
-    for (const auto& v : j["latents_mean"].get_array())
-        lat_mean_.push_back(float(v.get_number()));
-    for (const auto& v : j["latents_std"].get_array())
-        lat_std_.push_back(float(v.get_number()));
-    if (lat_mean_.size() != kLatent || lat_std_.size() != kLatent)
-        throw std::runtime_error("vae/config.json: latents_mean / latents_std not 64 wide");
+    if (text_[0].q_norm.dims[0] != kHeadDim)
+        throw std::runtime_error("text encoder: heads not 128 wide");
+    tHeads_ = uint32_t(text_[0].q.dims[1] / kHeadDim);
+    tKv_ = uint32_t(text_[0].k.dims[1] / kHeadDim);
+    // eps and the rotary base from the encoder's config, where it has one beside the weights.
+    const std::string tdir = opts.text_encoder.empty() ? dir + "/text_encoder" : opts.text_encoder;
+    if (std::filesystem::exists(tdir + "/config.json")) {
+        auto j = read_json_file(tdir + "/config.json");
+        const auto& t = j.contains("text_config") ? j["text_config"] : j;
+        if (t.contains("rms_norm_eps") && t["rms_norm_eps"].is_number())
+            tEps_ = float(t["rms_norm_eps"].get_number());
+        if (t.contains("rope_theta") && t["rope_theta"].is_number())
+            tTheta_ = float(t["rope_theta"].get_number());
+        if (t.contains("rope_parameters") && t["rope_parameters"].contains("rope_theta"))
+            tTheta_ = float(t["rope_parameters"]["rope_theta"].get_number());
+    }
 
-    std::ifstream sin(dir + "/scheduler/scheduler_config.json", std::ios::binary);
-    const std::string stext{std::istreambuf_iterator<char>(sin), std::istreambuf_iterator<char>()};
-    glz::generic sj;
-    if (glz::read_json(sj, stext) || !sj.is_object())
-        throw std::runtime_error("scheduler/scheduler_config.json missing or unreadable");
+    load_vae();
+    const auto vj = read_json_file(dir + "/vae/config.json");
+    if (!vj.contains("latents_mean") || !vj.contains("latents_std"))
+        throw std::runtime_error("vae/config.json: no latents_mean / latents_std");
+    for (const auto& v : vj["latents_mean"].get_array())
+        lat_mean_.push_back(float(v.get_number()));
+    for (const auto& v : vj["latents_std"].get_array())
+        lat_std_.push_back(float(v.get_number()));
+    z_ = uint32_t(post_quant_.cin);
+    patch_ = z_ == kLatent ? 1 : z_ * 4 == kLatent ? 2 : 0;
+    if (!patch_ || lat_mean_.size() != z_ || lat_std_.size() != z_)
+        throw std::runtime_error(std::format("vae: {} latent channels, {} means, {} deviations", z_, lat_mean_.size(),
+                                             lat_std_.size()));
+    residual_ = vj.contains("is_residual") && vj["is_residual"].is_boolean() && vj["is_residual"].get_boolean();
+
+    const auto sj = read_json_file(dir + "/scheduler/scheduler_config.json");
     auto num = [&](const char* key, double& v) {
         if (sj.contains(key) && sj[key].is_number())
             v = sj[key].get_number();
@@ -139,24 +191,19 @@ Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemet
     num("max_shift", sched_.max_shift);
     num("shift_terminal", sched_.terminal);
 
-    auto t = text::Tokenizer::load_json(dir + "/processor/tokenizer.json");
+    const std::string tp = std::filesystem::exists(dir + "/processor/tokenizer.json") ? dir + "/processor/tokenizer.json"
+                                                                                       : dir + "/tokenizer/tokenizer.json";
+    auto t = text::Tokenizer::load_json(tp);
     if (!t)
         throw std::runtime_error(t.error());
     tok_ = std::move(*t);
-    drop_ = uint32_t(tok_->encode("<|im_start|>system\n" + std::string(kSystem) + "<|im_end|>\n", true).size());
-}
-
-std::string Engine::templated(const std::string& prompt)
-{
-    return "<|im_start|>system\n" + std::string(kSystem) + "<|im_end|>\n<|im_start|>user\n" +
-           (prompt.empty() ? " " : prompt) + "<|im_end|>\n<|im_start|>assistant\n";
 }
 
 std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens, std::optional<float> terminal) const
 {
     const double term = terminal ? double(*terminal) : sched_.terminal;
     const double m = (sched_.max_shift - sched_.base_shift) / (sched_.max_seq - sched_.base_seq);
-    const double mu = double(tokens) * m + (sched_.base_shift - m * sched_.base_seq);
+    const double mu = sched_.mu ? *sched_.mu : double(tokens) * m + (sched_.base_shift - m * sched_.base_seq);
     std::vector<float> s(steps);
     for (uint32_t i = 0; i < steps; ++i) {
         // linspace(1, 1 / steps, steps), then exp(mu) / (exp(mu) + 1 / t - 1), in float as the scheduler does.
@@ -176,9 +223,8 @@ std::vector<float> Engine::generate(const Request& r)
 {
     if (r.width % 32 || r.height % 32 || !r.width || !r.height)
         throw std::runtime_error("width and height must be multiples of 32");
-    const uint32_t h = r.height / 16, w = r.width / 16, N = h * w;
-    const auto ids = tok_->encode(templated(r.prompt), true);
-    const auto prompt = encode_text(ids, drop_);
+    const uint32_t h = r.height / 16, w = r.width / 16, N = h * w, steps = r.steps ? r.steps : default_steps();
+    const auto prompt = prompt_embeddings(r.prompt);
     std::vector<float> x(uint64_t(N) * kLatent);
     if (!r.noise.empty()) {
         if (r.noise.size() != x.size())
@@ -190,43 +236,271 @@ std::vector<float> Engine::generate(const Request& r)
         for (float& v : x)
             v = nd(rng);
     }
-    const auto sig = sigmas(r.steps, N, r.terminal);
+    const auto sig = sigmas(steps, N, r.terminal);
     begin(prompt, h, w);
-    for (uint32_t i = 0; i < r.steps; ++i) {
-        const auto v = step(x, sig[i]);
+    const float scale = r.guidance.value_or(default_guidance());
+    if (r.negative)
+        begin(prompt_embeddings(*r.negative), h, w, 1);
+    for (uint32_t i = 0; i < steps; ++i) {
+        auto v = step(x, sig[i]);
+        if (r.negative) {
+            const auto neg = step(x, sig[i], 1);
+            for (size_t j = 0; j < v.size(); ++j)
+                v[j] = neg[j] + scale * (v[j] - neg[j]);
+        }
         const float dt = sig[i + 1] - sig[i];
         for (size_t j = 0; j < x.size(); ++j)
             x[j] += dt * v[j];
         if (r.progress)
-            r.progress(i + 1, r.steps);
+            r.progress(i + 1, steps);
     }
     return decode(x, h, w);
+}
+
+Engine::Tensor Engine::upload_rows(const safetensors::Files& files, std::span<const std::string> names)
+{
+    uint64_t rows = 0, k = 0;
+    for (const auto& n : names) {
+        const auto r = files.find(n);
+        if (!r || (r.tensor->type != gguf::Type::BF16 && r.tensor->type != gguf::Type::F32) ||
+            r.tensor->dims.size() != 2 || (k && r.tensor->dims[0] != k))
+            throw std::runtime_error(n + ": missing, or not a BF16 or F32 matrix of the others' width");
+        k = r.tensor->dims[0];
+        rows += r.tensor->dims[1];
+    }
+    Tensor t = reserve(rows * k * 2, gguf::Type::BF16, {k, rows});
+    char* dst = static_cast<char*>(t.buf->contents()) + t.off;
+    for (const auto& n : names) {
+        const auto r = files.find(n);
+        if (r.tensor->type == gguf::Type::BF16) {
+            gguf::read_exact(r.file->fd(), dst, r.tensor->bytes, r.tensor->offset);
+            dst += r.tensor->bytes;
+        } else {
+            const auto f = read_floats(*r.file, *r.tensor);
+            auto* o = reinterpret_cast<uint16_t*>(dst);
+            for (size_t i = 0; i < f.size(); ++i)
+                o[i] = to_bf16(f[i]);
+            dst += f.size() * 2;
+        }
+    }
+    return t;
+}
+
+Engine::Tensor Engine::upload(const safetensors::Files& files, const std::string& name, bool matrix)
+{
+    const auto r = files.find(name);
+    if (!r)
+        throw std::runtime_error("missing tensor " + name);
+    if (matrix && r.tensor->type == gguf::Type::F32 && r.tensor->dims.size() == 2) {
+        const std::string n[1] = {name};
+        return upload_rows(files, n);
+    }
+    return upload_raw(r.file->fd(), r.tensor->offset, r.tensor->bytes, r.tensor->type, r.tensor->dims, name, matrix);
+}
+
+std::vector<float> Engine::floats(const safetensors::Files& files, const std::string& name)
+{
+    const auto r = files.find(name);
+    if (!r)
+        throw std::runtime_error("missing tensor " + name);
+    return read_floats(*r.file, *r.tensor);
+}
+
+Engine::Tensor Engine::upload_plus_one(const safetensors::Files& files, const std::string& name)
+{
+    const auto r = files.find(name);
+    if (!r)
+        throw std::runtime_error("missing tensor " + name);
+    const auto f = read_floats(*r.file, *r.tensor);
+    Tensor t = reserve(f.size() * 4, gguf::Type::F32, {f.size()});
+    auto* o = reinterpret_cast<float*>(static_cast<char*>(t.buf->contents()) + t.off);
+    for (size_t i = 0; i < f.size(); ++i)
+        o[i] = f[i] + 1.0f;
+    return t;
+}
+
+void Engine::embed(std::span<const int32_t> ids, float* out) const
+{
+    const uint64_t vocab = embd_.tensor->dims[1], row = uint64_t(tE_) * 2;
+    std::vector<uint16_t> raw(tE_);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0 || uint64_t(ids[i]) >= vocab)
+            throw std::runtime_error("token out of range");
+        gguf::read_exact(embd_.file->fd(), raw.data(), row, embd_.tensor->offset + uint64_t(ids[i]) * row);
+        auto* o = reinterpret_cast<uint32_t*>(out + i * tE_);
+        for (uint32_t j = 0; j < tE_; ++j)
+            o[j] = uint32_t(raw[j]) << 16;
+    }
+}
+
+void Engine::add(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* z, MTL::Buffer* y, uint32_t n)
+{
+    dispatch(enc, "add", {x, z, y}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+}
+
+void Engine::unary(MTL::ComputeCommandEncoder*& enc, const char* fn, MTL::Buffer* x, uint32_t n)
+{
+    dispatch(enc, fn, {x}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+}
+
+void Engine::bias(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* y, const Tensor& b, uint32_t n, uint32_t rows,
+                  uint64_t y_off)
+{
+    enc->setComputePipelineState(pso("bias_rows"));
+    enc->setBuffer(y, y_off, 0);
+    enc->setBuffer(b.buf, b.off, 1);
+    enc->setBytes(&n, sizeof(n), 2);
+    enc->dispatchThreads(MTL::Size(n, rows, 1), MTL::Size(64, 1, 1));
+    after(enc, "bias_rows");
+}
+
+void Engine::heads(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint32_t ld, uint32_t col0, uint32_t n_heads,
+                   uint32_t T, uint32_t n_pad, MTL::Buffer* cs, uint32_t rope, MTL::Buffer* y)
+{
+    const HeadsArgs a{T, ld, col0, kHeadDim, n_pad, 0, rope};
+    dispatch(enc, "heads_half", {x, cs ? cs : x, y}, &a, sizeof(a), MTL::Size(kHeadDim / 2, T, n_heads),
+             MTL::Size(64, 1, 1));
+    if (n_pad > T) {
+        const uint32_t c[4] = {kHeadDim, n_pad, T, 0};
+        dispatch(enc, "heads_clear", {y}, c, sizeof(c), MTL::Size(kHeadDim, n_pad - T, n_heads), MTL::Size(128, 1, 1));
+    }
+}
+
+void Engine::heads_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint32_t ld, uint32_t col0, uint32_t n_heads,
+                        uint32_t T, uint32_t n_pad, MTL::Buffer* cs, uint64_t cs_off, uint32_t rope, const Tensor& w,
+                        float eps, uint32_t row0, MTL::Buffer* y)
+{
+    const HeadsNormArgs a{ld, col0, kHeadDim, n_pad, row0, rope, eps};
+    enc->setComputePipelineState(pso("heads_norm_half"));
+    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(cs ? cs : x, cs ? cs_off : 0, 1);
+    enc->setBuffer(y, 0, 2);
+    enc->setBuffer(w.buf, w.off, 3);
+    enc->setBytes(&a, sizeof(a), 4);
+    enc->dispatchThreadgroups(MTL::Size(T, n_heads, 1), MTL::Size(kHeadDim / 2, 1, 1));
+    after(enc, "heads_norm_half");
+}
+
+void Engine::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v,
+                       MTL::Buffer* o, uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad, uint32_t n_heads,
+                       uint32_t kv_heads, uint32_t q_pos0, uint32_t block)
+{
+    const AttnArgs a{n_q, q_pad, n_k, k_pad, n_heads, kv_heads, q_pos0, block, n_heads * kHeadDim,
+                     1.0f / std::sqrt(float(kHeadDim))};
+    dispatch(enc, "flash_attn_sg_128_16x32_4", {q, k, v, o}, &a, sizeof(a),
+             MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
+}
+
+std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps)
+{
+    const uint32_t T = uint32_t(ids.size()), E = tE_, kv = tKv_ * kHeadDim, qw = tHeads_ * kHeadDim;
+    if (T <= drop)
+        throw std::runtime_error("the prompt is all template");
+    uint32_t layers = uint32_t(text_.size());
+    if (!taps.empty()) {
+        layers = *std::max_element(taps.begin(), taps.end());
+        if (layers > text_.size())
+            throw std::runtime_error("text encoder: a tapped layer past its last");
+    }
+    const uint32_t nt = taps.empty() ? 1 : uint32_t(taps.size());
+    const uint32_t q_pad = round_up(T, kAttnRows), k_pad = round_up(T, 128);
+    MTL::Buffer* x = scratch("t_x", uint64_t(T) * E * 4);
+    MTL::Buffer* xn = scratch("t_xn", uint64_t(T) * E * 4);
+    MTL::Buffer* q = scratch("t_q", uint64_t(T) * qw * 4);
+    MTL::Buffer* k = scratch("t_k", uint64_t(T) * kv * 4);
+    MTL::Buffer* v = scratch("t_v", uint64_t(T) * kv * 4);
+    MTL::Buffer* qh = scratch("t_qh", uint64_t(tHeads_) * q_pad * kHeadDim * 2);
+    MTL::Buffer* kh = scratch("t_kh", uint64_t(tKv_) * k_pad * kHeadDim * 2);
+    MTL::Buffer* vh = scratch("t_vh", uint64_t(tKv_) * k_pad * kHeadDim * 2);
+    MTL::Buffer* att = scratch("t_att", uint64_t(T) * qw * 4);
+    MTL::Buffer* y = scratch("t_y", uint64_t(T) * E * 4);
+    MTL::Buffer* cs = scratch("t_cs", uint64_t(T) * kHeadDim / 2 * 8);
+    MTL::Buffer* out = scratch("t_out", uint64_t(T) * nt * E * 4);
+    embed(ids, static_cast<float*>(x->contents()));
+    // Text positions are the same on the three rotary axes, which makes the multi-axis rotation the plain one.
+    auto* c = static_cast<float*>(cs->contents());
+    for (uint32_t t = 0; t < T; ++t)
+        for (uint32_t i = 0; i < kHeadDim / 2; ++i) {
+            const float inv = 1.0f / std::pow(tTheta_, float(2 * i) / float(kHeadDim));
+            const float ang = float(t) * inv;
+            c[(uint64_t(t) * kHeadDim / 2 + i) * 2] = std::cos(ang);
+            c[(uint64_t(t) * kHeadDim / 2 + i) * 2 + 1] = std::sin(ang);
+        }
+
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    // Hidden state i (0: the embeddings) into its column of the taps' rows.
+    auto tap = [&](uint32_t i) {
+        for (uint32_t j = 0; j < taps.size(); ++j)
+            if (taps[j] == i) {
+                const uint32_t a[2] = {E, nt * E};
+                enc->setComputePipelineState(pso("copy_rows"));
+                enc->setBuffer(x, 0, 0);
+                enc->setBuffer(out, uint64_t(j) * E * 4, 1);
+                enc->setBytes(a, sizeof(a), 2);
+                enc->dispatchThreads(MTL::Size(E, T, 1), MTL::Size(256, 1, 1));
+                after(enc, "copy_rows");
+            }
+    };
+    tap(0);
+    for (uint32_t il = 0; il < layers; ++il) {
+        const TextLayer& L = text_[il];
+        cur_layer_ = il;
+        norm(enc, x, &L.attn_norm, xn, T, E, E, tEps_);
+        proj(enc, L.q, xn, 0, q, 0, T);
+        proj(enc, L.k, xn, 0, k, 0, T);
+        proj(enc, L.v, xn, 0, v, 0, T);
+        norm(enc, q, &L.q_norm, q, T * tHeads_, kHeadDim, kHeadDim, tEps_);
+        norm(enc, k, &L.k_norm, k, T * tKv_, kHeadDim, kHeadDim, tEps_);
+        heads(enc, q, qw, 0, tHeads_, T, q_pad, cs, 1, qh);
+        heads(enc, k, kv, 0, tKv_, T, k_pad, cs, 1, kh);
+        heads(enc, v, kv, 0, tKv_, T, k_pad, nullptr, 0, vh);
+        attention(enc, qh, kh, vh, att, T, q_pad, T, k_pad, tHeads_, tKv_, 0, UINT32_MAX);
+        proj(enc, L.o, att, 0, y, 0, T);
+        add(enc, x, y, x, T * E);
+        norm(enc, x, &L.ffn_norm, xn, T, E, E, tEps_);
+        ffn_dense(enc, L.gate, L.up, L.down, xn, y, 0.0f, T);
+        add(enc, x, y, x, T * E);
+        tap(il + 1);
+    }
+    enc->endEncoding();
+    finish(cb);
+    const auto* src = static_cast<const float*>((taps.empty() ? x : out)->contents());
+    return std::vector<float>(src + uint64_t(drop) * nt * E, src + uint64_t(T) * nt * E);
 }
 
 Engine::Conv Engine::load_conv(const std::string& name, uint32_t k)
 {
     const auto r = vae_files_.find(name + ".weight");
     const auto rb = vae_files_.find(name + ".bias");
-    if (!r || !rb || r.tensor->type != gguf::Type::F32 || r.tensor->dims.size() != 4)
+    const size_t nd = r ? r.tensor->dims.size() : 0;
+    if (!r || !rb || r.tensor->type != gguf::Type::F32 || (nd != 4 && nd != 5))
         throw std::runtime_error(name + ": missing, or not an F32 convolution");
     Conv c;
     c.k = k;
-    c.cout = uint32_t(r.tensor->dims[3]);
-    c.cin = uint32_t(r.tensor->dims[2]);
+    c.cout = uint32_t(r.tensor->dims[nd - 1]);
+    c.cin = uint32_t(r.tensor->dims[nd - 2]);
+    // A causal 3D convolution over one frame sees only its last time tap (the earlier ones read the zero padding).
+    const uint32_t kt = nd == 5 ? uint32_t(r.tensor->dims[2]) : 1;
     if (r.tensor->dims[0] != k || r.tensor->dims[1] != k)
         throw std::runtime_error(name + ": unexpected kernel size");
-    const uint32_t cols = c.cin * k * k;
+    const uint32_t cols = c.cin * k * k, kk = k * k;
     // 3x3: the unfolded rows padded for the direct GEMM; 1x1: the input's own rows (the staged GEMM where they are not
     // a multiple of 64).
     c.kpad = round_up(cols, k == 3 ? 64 : 32);
     // Half, as the activations it multiplies are (the direct GEMM reads it unstaged).
     c.w = reserve(uint64_t(c.cout) * c.kpad * 2, gguf::Type::F16, {c.kpad, c.cout});
     auto* dst = reinterpret_cast<__fp16*>(static_cast<char*>(c.w.buf->contents()) + c.w.off);
-    std::vector<float> row(cols);
+    std::vector<float> row(uint64_t(cols) * kt);
     for (uint32_t o = 0; o < c.cout; ++o) {
-        gguf::read_exact(r.file->fd(), row.data(), uint64_t(cols) * 4, r.tensor->offset + uint64_t(o) * cols * 4);
-        for (uint32_t i = 0; i < c.kpad; ++i)
-            dst[uint64_t(o) * c.kpad + i] = __fp16(i < cols ? row[i] : 0.0f);
+        gguf::read_exact(r.file->fd(), row.data(), row.size() * 4, r.tensor->offset + uint64_t(o) * row.size() * 4);
+        for (uint32_t i = 0; i < c.kpad; ++i) {
+            float v = 0.0f;
+            if (i < cols)
+                v = row[(uint64_t(i / kk) * kt + kt - 1) * kk + i % kk];
+            dst[uint64_t(o) * c.kpad + i] = __fp16(v);
+        }
     }
     c.b = upload(vae_files_, name + ".bias", false);
     return c;
@@ -262,354 +536,17 @@ void Engine::load_vae()
             u.res.push_back(res(std::format("{}.resnets.{}", p, j)));
         u.cin = u.res.front().c1.cin;
         u.cout = u.res.back().c2.cout;
-        if (vae_files_.find(p + ".upsampler.resample.1.weight")) {
-            u.up = true;
-            u.conv = load_conv(p + ".upsampler.resample.1", 3);
-            // Blocks that also upsample in time (a time convolution) keep the second of two time copies.
-            u.ft = vae_files_.find(p + ".upsampler.time_conv.weight") ? 2 : 1;
-        }
+        for (const char* up : {".upsampler", ".upsamplers.0"})
+            if (vae_files_.find(p + up + ".resample.1.weight")) {
+                u.up = true;
+                u.conv = load_conv(p + up + ".resample.1", 3);
+                // Blocks that also upsample in time (a time convolution) keep the second of two time copies.
+                u.ft = vae_files_.find(p + up + ".time_conv.weight") ? 2 : 1;
+            }
         ups_.push_back(std::move(u));
     }
     out_g_ = upload(vae_files_, "decoder.norm_out.gamma", false);
     conv_out_ = load_conv("decoder.conv_out", 3);
-}
-
-void Engine::load_transformer(const std::string&)
-{
-    const auto& f = dit_files_;
-    img_in_ = upload(f, "img_in.weight", true);
-    txt_norm_ = upload(f, "txt_in.text_norm.weight", false);
-    // Stored zero-centred: the scale is weight + 1.
-    auto* tn = reinterpret_cast<float*>(static_cast<char*>(txt_norm_.buf->contents()) + txt_norm_.off);
-    for (uint32_t i = 0; i < kDim; ++i)
-        tn[i] += 1.0f;
-    txt_in1_ = upload(f, "txt_in.in_layer.weight", true);
-    txt_in2_ = upload(f, "txt_in.out_layer.weight", true);
-    t_lin1_ = upload(f, "time_text_embed.timestep_embedder.linear_1.weight", true);
-    t_lin2_ = upload(f, "time_text_embed.timestep_embedder.linear_2.weight", true);
-    mod_ = upload(f, "modulation.1.weight", true);
-    out_lin_ = upload(f, "norm_out.linear.weight", true);
-    proj_out_ = upload(f, "proj_out.weight", true);
-    for (uint32_t i = 0;; ++i) {
-        const std::string b = std::format("transformer_blocks.{}.", i);
-        if (!f.find(b + "attn.to_q.weight"))
-            break;
-        Block B;
-        const std::string qkv[3] = {b + "attn.to_q.weight", b + "attn.to_k.weight", b + "attn.to_v.weight"};
-        B.qkv = upload_rows(f, qkv);
-        B.o = upload(f, b + "attn.to_out.0.weight", true);
-        B.norm_q = upload(f, b + "attn.norm_q.weight", false);
-        B.norm_k = upload(f, b + "attn.norm_k.weight", false);
-        const std::string gu[2] = {b + "img_mlp.gate_layer.weight", b + "img_mlp.proj.weight"};
-        B.gate_up = upload_rows(f, gu);
-        B.down = upload(f, b + "img_mlp.out.weight", true);
-        blocks_.push_back(std::move(B));
-    }
-    if (blocks_.empty())
-        throw std::runtime_error("transformer: no blocks");
-}
-
-Engine::Tensor Engine::upload_rows(const safetensors::Files& files, std::span<const std::string> names)
-{
-    uint64_t bytes = 0, rows = 0, k = 0;
-    for (const auto& n : names) {
-        const auto r = files.find(n);
-        if (!r || r.tensor->type != gguf::Type::BF16 || r.tensor->dims.size() != 2 || (k && r.tensor->dims[0] != k))
-            throw std::runtime_error(n + ": missing, or not a BF16 matrix of the others' width");
-        k = r.tensor->dims[0];
-        rows += r.tensor->dims[1];
-        bytes += r.tensor->bytes;
-    }
-    Tensor t = reserve(bytes, gguf::Type::BF16, {k, rows});
-    uint64_t off = 0;
-    for (const auto& n : names) {
-        const auto r = files.find(n);
-        gguf::read_exact(r.file->fd(), static_cast<char*>(t.buf->contents()) + t.off + off, r.tensor->bytes,
-                         r.tensor->offset);
-        off += r.tensor->bytes;
-    }
-    return t;
-}
-
-Engine::Tensor Engine::upload(const safetensors::Files& files, const std::string& name, bool matrix)
-{
-    const auto r = files.find(name);
-    if (!r)
-        throw std::runtime_error("missing tensor " + name);
-    return upload_raw(r.file->fd(), r.tensor->offset, r.tensor->bytes, r.tensor->type, r.tensor->dims, name, matrix);
-}
-
-void Engine::embed(std::span<const int32_t> ids, float* out) const
-{
-    const uint64_t vocab = embd_.tensor->dims[1], row = uint64_t(kTextEmbd) * 2;
-    std::vector<uint16_t> raw(kTextEmbd);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] < 0 || uint64_t(ids[i]) >= vocab)
-            throw std::runtime_error("token out of range");
-        gguf::read_exact(embd_.file->fd(), raw.data(), row, embd_.tensor->offset + uint64_t(ids[i]) * row);
-        auto* o = reinterpret_cast<uint32_t*>(out + i * kTextEmbd);
-        for (uint32_t j = 0; j < kTextEmbd; ++j)
-            o[j] = uint32_t(raw[j]) << 16;
-    }
-}
-
-void Engine::add(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, MTL::Buffer* z, MTL::Buffer* y, uint32_t n)
-{
-    dispatch(enc, "add", {x, z, y}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
-}
-
-void Engine::heads(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint32_t ld, uint32_t col0, uint32_t n_heads,
-                   uint32_t T, uint32_t n_pad, MTL::Buffer* cs, uint32_t rope, MTL::Buffer* y)
-{
-    const HeadsArgs a{T, ld, col0, kHeadDim, n_pad, 0, rope};
-    dispatch(enc, "heads_half", {x, cs ? cs : x, y}, &a, sizeof(a), MTL::Size(kHeadDim / 2, T, n_heads),
-             MTL::Size(64, 1, 1));
-    if (n_pad > T) {
-        const uint32_t c[4] = {kHeadDim, n_pad, T, 0};
-        dispatch(enc, "heads_clear", {y}, c, sizeof(c), MTL::Size(kHeadDim, n_pad - T, n_heads), MTL::Size(128, 1, 1));
-    }
-}
-
-void Engine::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v,
-                       MTL::Buffer* o, uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad, uint32_t n_heads,
-                       uint32_t kv_heads, uint32_t q_pos0, uint32_t block)
-{
-    const AttnArgs a{n_q, q_pad, n_k, k_pad, n_heads, kv_heads, q_pos0, block, n_heads * kHeadDim,
-                     1.0f / std::sqrt(float(kHeadDim))};
-    dispatch(enc, "flash_attn_sg_128_16x32_4", {q, k, v, o}, &a, sizeof(a),
-             MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
-}
-
-std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t drop)
-{
-    const uint32_t T = uint32_t(ids.size()), E = kTextEmbd, kv = kTextKvHeads * kHeadDim;
-    if (T <= drop)
-        throw std::runtime_error("the prompt is all template");
-    const uint32_t q_pad = round_up(T, kAttnRows), k_pad = round_up(T, 128);
-    MTL::Buffer* x = scratch("t_x", uint64_t(T) * E * 4);
-    MTL::Buffer* xn = scratch("t_xn", uint64_t(T) * E * 4);
-    MTL::Buffer* q = scratch("t_q", uint64_t(T) * E * 4);
-    MTL::Buffer* k = scratch("t_k", uint64_t(T) * kv * 4);
-    MTL::Buffer* v = scratch("t_v", uint64_t(T) * kv * 4);
-    MTL::Buffer* qh = scratch("t_qh", uint64_t(kTextHeads) * q_pad * kHeadDim * 2);
-    MTL::Buffer* kh = scratch("t_kh", uint64_t(kTextKvHeads) * k_pad * kHeadDim * 2);
-    MTL::Buffer* vh = scratch("t_vh", uint64_t(kTextKvHeads) * k_pad * kHeadDim * 2);
-    MTL::Buffer* att = scratch("t_att", uint64_t(T) * E * 4);
-    MTL::Buffer* y = scratch("t_y", uint64_t(T) * E * 4);
-    MTL::Buffer* cs = scratch("t_cs", uint64_t(T) * kHeadDim / 2 * 8);
-    embed(ids, static_cast<float*>(x->contents()));
-    // Text positions are the same on the three rotary axes, which makes the multi-axis rotation the plain one.
-    auto* c = static_cast<float*>(cs->contents());
-    for (uint32_t t = 0; t < T; ++t)
-        for (uint32_t i = 0; i < kHeadDim / 2; ++i) {
-            const float inv = 1.0f / std::pow(kTextTheta, float(2 * i) / float(kHeadDim));
-            const float ang = float(t) * inv;
-            c[(uint64_t(t) * kHeadDim / 2 + i) * 2] = std::cos(ang);
-            c[(uint64_t(t) * kHeadDim / 2 + i) * 2 + 1] = std::sin(ang);
-        }
-
-    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
-    cur_cb_ = cb;
-    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
-    for (uint32_t il = 0; il < text_.size(); ++il) {
-        const TextLayer& L = text_[il];
-        cur_layer_ = il;
-        norm(enc, x, &L.attn_norm, xn, T, E, E, kTextEps);
-        proj(enc, L.q, xn, 0, q, 0, T);
-        proj(enc, L.k, xn, 0, k, 0, T);
-        proj(enc, L.v, xn, 0, v, 0, T);
-        norm(enc, q, &L.q_norm, q, T * kTextHeads, kHeadDim, kHeadDim, kTextEps);
-        norm(enc, k, &L.k_norm, k, T * kTextKvHeads, kHeadDim, kHeadDim, kTextEps);
-        heads(enc, q, E, 0, kTextHeads, T, q_pad, cs, 1, qh);
-        heads(enc, k, kv, 0, kTextKvHeads, T, k_pad, cs, 1, kh);
-        heads(enc, v, kv, 0, kTextKvHeads, T, k_pad, nullptr, 0, vh);
-        attention(enc, qh, kh, vh, att, T, q_pad, T, k_pad, kTextHeads, kTextKvHeads, 0, UINT32_MAX);
-        proj(enc, L.o, att, 0, y, 0, T);
-        add(enc, x, y, x, T * E);
-        norm(enc, x, &L.ffn_norm, xn, T, E, E, kTextEps);
-        ffn_dense(enc, L.gate, L.up, L.down, xn, y, 0.0f, T);
-        add(enc, x, y, x, T * E);
-    }
-    enc->endEncoding();
-    finish(cb);
-    const auto* xf = static_cast<const float*>(x->contents());
-    return std::vector<float>(xf + uint64_t(drop) * E, xf + uint64_t(T) * E);
-}
-
-void Engine::begin(std::span<const float> prompt, uint32_t h, uint32_t w)
-{
-    if (prompt.empty() || prompt.size() % kDim)
-        throw std::runtime_error("prompt embeddings must be rows of 4096");
-    S_ = uint32_t(prompt.size() / kDim);
-    gh_ = h;
-    gw_ = w;
-    steps_ = 0;
-    prompt_.assign(prompt.begin(), prompt.end());
-    text_k_.clear();
-    text_v_.clear();
-    for (size_t b = 0; b < blocks_.size(); ++b) {
-        const uint64_t bytes = uint64_t(kHeads) * S_ * kHeadDim * 2;
-        text_k_.emplace_back(ctx_.device()->newBuffer(bytes, MTL::ResourceStorageModeShared));
-        text_v_.emplace_back(ctx_.device()->newBuffer(bytes, MTL::ResourceStorageModeShared));
-    }
-    // Text positions advance on all three axes; the image block takes the next frame position and a height / width
-    // grid centred on zero.
-    MTL::Buffer* cs = scratch("d_cs", uint64_t(S_ + h * w) * kHeadDim / 2 * 8);
-    auto* c = static_cast<float*>(cs->contents());
-    for (uint32_t t = 0; t < S_; ++t)
-        rope3(c + uint64_t(t) * kHeadDim, t, t, t);
-    for (uint32_t y = 0; y < h; ++y)
-        for (uint32_t x = 0; x < w; ++x)
-            rope3(c + uint64_t(S_ + y * w + x) * kHeadDim, S_, int64_t(y) - int64_t(h - h / 2),
-                  int64_t(x) - int64_t(w - w / 2));
-}
-
-std::vector<float> Engine::step(std::span<const float> latents, float sigma)
-{
-    const uint32_t N = gh_ * gw_, D = kDim;
-    if (latents.size() != uint64_t(N) * kLatent)
-        throw std::runtime_error("latents must be [h * w][64]");
-    const bool first = steps_++ == 0;
-    // The first step runs the text rows too; later ones only the image's, against the text's cached keys and values.
-    const uint32_t S = S_, T = first ? S + N : N, row0 = first ? 0 : S, n_k = S + N;
-    const uint32_t q_pad = round_up(T, kAttnRows), k_pad = round_up(n_k, 128), split = first ? S : 0;
-    // The GEMMs run a multiple of 256 rows (the rest ignored): fewer rows, as the first step's text and image make,
-    // would take 64-row tiles that read the weights four times as often (that step took twice as long).
-    const uint32_t Tg = T > 256 ? round_up(T, 256) : T;
-    MTL::Buffer* x = scratch("d_x", uint64_t(Tg) * D * 4);
-    MTL::Buffer* xn = scratch("d_xn", uint64_t(Tg) * D * 4);
-    MTL::Buffer* qkv = scratch("d_qkv", uint64_t(Tg) * 3 * D * 4);
-    const uint64_t nff = blocks_.front().down.dims[0];
-    MTL::Buffer* gu = scratch("d_gu", uint64_t(Tg) * 2 * nff * 4);
-    MTL::Buffer* ffm = scratch("d_ffm", uint64_t(Tg) * nff * 4);
-    MTL::Buffer* qh = scratch("d_qh", uint64_t(kHeads) * q_pad * kHeadDim * 2);
-    MTL::Buffer* kh = scratch("d_kh", uint64_t(kHeads) * k_pad * kHeadDim * 2);
-    MTL::Buffer* vh = scratch("d_vh", uint64_t(kHeads) * k_pad * kHeadDim * 2);
-    MTL::Buffer* att = scratch("d_att", uint64_t(Tg) * D * 4);
-    MTL::Buffer* y = scratch("d_y", uint64_t(Tg) * D * 4);
-    MTL::Buffer* lat = scratch("d_lat", uint64_t(N) * kLatent * 4);
-    MTL::Buffer* out = scratch("d_out", uint64_t(Tg) * kLatent * 4);
-    MTL::Buffer* tp = scratch("d_tproj", 2 * kTimeDim * 4);
-    MTL::Buffer* temb = scratch("d_temb", 2 * D * 4);
-    MTL::Buffer* temb_s = scratch("d_temb_s", 2 * D * 4);
-    MTL::Buffer* mod = scratch("d_mod", 2 * 4 * D * 4);
-    MTL::Buffer* omod = scratch("d_omod", 2 * D * 4);
-    MTL::Buffer* cs = scratch("d_cs", uint64_t(S + N) * kHeadDim / 2 * 8);
-    std::memcpy(lat->contents(), latents.data(), latents.size() * 4);
-    // Sinusoidal timestep embeddings (cos half first) of 1000 * sigma and of 0, the text's.
-    auto* tpf = static_cast<float*>(tp->contents());
-    for (int r = 0; r < 2; ++r)
-        for (uint32_t i = 0; i < kTimeDim / 2; ++i) {
-            const float freq = std::exp(-std::log(10000.0f) * float(i) / float(kTimeDim / 2));
-            const float arg = (r == 0 ? 1000.0f * sigma : 0.0f) * freq;
-            tpf[r * kTimeDim + i] = std::cos(arg);
-            tpf[r * kTimeDim + kTimeDim / 2 + i] = std::sin(arg);
-        }
-    if (first) {
-        MTL::Buffer* pr = scratch("d_prompt", uint64_t(S) * D * 4);
-        std::memcpy(pr->contents(), prompt_.data(), prompt_.size() * 4);
-    }
-
-    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
-    cur_cb_ = cb;
-    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
-    proj(enc, t_lin1_, tp, 0, temb, 0, 2);
-    uint32_t n2 = 2 * D;
-    dispatch(enc, "silu", {temb}, &n2, sizeof(n2), MTL::Size(n2, 1, 1), MTL::Size(256, 1, 1));
-    proj(enc, t_lin2_, temb, 0, temb_s, 0, 2);
-    probe(enc, "temb", -1, temb_s, 2 * D);
-    // silu(temb) feeds the block modulation and the final norm's.
-    dispatch(enc, "silu", {temb_s}, &n2, sizeof(n2), MTL::Size(n2, 1, 1), MTL::Size(256, 1, 1));
-    proj(enc, mod_, temb_s, 0, mod, 0, 2);
-    probe(enc, "modulation", -1, mod, 2 * 4 * D);
-    proj(enc, out_lin_, temb_s, 0, omod, 0, 2);
-    if (first) {
-        MTL::Buffer* pr = scratch("d_prompt", uint64_t(S) * D * 4);
-        norm(enc, pr, &txt_norm_, xn, S, D, D, kEps);
-        proj(enc, txt_in1_, xn, 0, y, 0, S);
-        uint32_t n = S * D;
-        dispatch(enc, "gelu_tanh", {y}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
-        proj(enc, txt_in2_, y, 0, x, 0, S);
-        probe(enc, "txt_in", -1, x, uint64_t(S) * D);
-    }
-    proj(enc, img_in_, lat, 0, x, uint64_t(T - N) * D * 4, N);
-    probe(enc, "img_in", -1, x, uint64_t(N) * D, uint64_t(T - N) * D * 4);
-
-    const uint32_t mstride = 4 * D;
-    for (uint32_t il = 0; il < blocks_.size(); ++il) {
-        const Block& B = blocks_[il];
-        cur_layer_ = il;
-        ModArgs ma{D, kEps, split, mstride, 0};
-        dispatch(enc, "ln_modulate", {x, mod, xn}, &ma, sizeof(ma), MTL::Size(T, 1, 1), MTL::Size(256, 1, 1), false);
-        proj(enc, B.qkv, xn, 0, qkv, 0, Tg);
-        // q and k RMS-normed per head and rotated (the table's rows from this step's first token on), v as it is.
-        HeadsNormArgs hn{3 * D, 0, kHeadDim, q_pad, 0, 2, kEps};
-        enc->setComputePipelineState(pso("heads_norm_half"));
-        enc->setBuffer(qkv, 0, 0);
-        enc->setBuffer(cs, uint64_t(row0) * kHeadDim / 2 * 8, 1);
-        enc->setBuffer(qh, 0, 2);
-        enc->setBuffer(B.norm_q.buf, B.norm_q.off, 3);
-        enc->setBytes(&hn, sizeof(hn), 4);
-        enc->dispatchThreadgroups(MTL::Size(T, kHeads, 1), MTL::Size(kHeadDim / 2, 1, 1));
-        after(enc, "heads_norm_half");
-        hn.col0 = D;
-        hn.n_pad = k_pad;
-        hn.row0 = row0;
-        enc->setBuffer(kh, 0, 2);
-        enc->setBuffer(B.norm_k.buf, B.norm_k.off, 3);
-        enc->setBytes(&hn, sizeof(hn), 4);
-        enc->dispatchThreadgroups(MTL::Size(T, kHeads, 1), MTL::Size(kHeadDim / 2, 1, 1));
-        after(enc, "heads_norm_half");
-        HeadsArgs ha{T, 3 * D, 2 * D, kHeadDim, k_pad, row0, 0};
-        enc->setComputePipelineState(pso("heads_half"));
-        enc->setBuffer(qkv, 0, 0);
-        enc->setBuffer(cs, 0, 1);
-        enc->setBuffer(vh, 0, 2);
-        enc->setBytes(&ha, sizeof(ha), 3);
-        enc->dispatchThreads(MTL::Size(kHeadDim / 2, T, kHeads), MTL::Size(64, 1, 1));
-        after(enc, "heads_half");
-        HeadRowsArgs hr{kHeadDim, k_pad, S, S};
-        if (first) { // keep the text's keys and values
-            dispatch(enc, "heads_rows", {kh, text_k_[il].get()}, &hr, sizeof(hr), MTL::Size(kHeadDim, S, kHeads),
-                     MTL::Size(128, 1, 1));
-            dispatch(enc, "heads_rows", {vh, text_v_[il].get()}, &hr, sizeof(hr), MTL::Size(kHeadDim, S, kHeads),
-                     MTL::Size(128, 1, 1));
-        } else {
-            hr = {kHeadDim, S, k_pad, S};
-            dispatch(enc, "heads_rows", {text_k_[il].get(), kh}, &hr, sizeof(hr), MTL::Size(kHeadDim, S, kHeads),
-                     MTL::Size(128, 1, 1));
-            dispatch(enc, "heads_rows", {text_v_[il].get(), vh}, &hr, sizeof(hr), MTL::Size(kHeadDim, S, kHeads),
-                     MTL::Size(128, 1, 1));
-        }
-        if (k_pad > n_k) {
-            const uint32_t c[4] = {kHeadDim, k_pad, n_k, 0};
-            dispatch(enc, "heads_clear", {kh}, c, sizeof(c), MTL::Size(kHeadDim, k_pad - n_k, kHeads),
-                     MTL::Size(128, 1, 1));
-            dispatch(enc, "heads_clear", {vh}, c, sizeof(c), MTL::Size(kHeadDim, k_pad - n_k, kHeads),
-                     MTL::Size(128, 1, 1));
-        }
-        attention(enc, qh, kh, vh, att, T, q_pad, n_k, k_pad, kHeads, kHeads, row0, S);
-        proj(enc, B.o, att, 0, y, 0, Tg);
-        ma.mod_off = D;
-        dispatch(enc, "gate_add", {x, y, mod}, &ma, sizeof(ma), MTL::Size(D, T, 1), MTL::Size(256, 1, 1));
-        ma.mod_off = 2 * D;
-        dispatch(enc, "ln_modulate", {x, mod, xn}, &ma, sizeof(ma), MTL::Size(T, 1, 1), MTL::Size(256, 1, 1), false);
-        proj(enc, B.gate_up, xn, 0, gu, 0, Tg);
-        uint32_t nff = uint32_t(B.down.dims[0]);
-        dispatch(enc, "swiglu_rows", {gu, ffm}, &nff, sizeof(nff), MTL::Size(nff, Tg, 1), MTL::Size(256, 1, 1));
-        proj(enc, B.down, ffm, 0, y, 0, Tg);
-        ma.mod_off = 3 * D;
-        dispatch(enc, "gate_add", {x, y, mod}, &ma, sizeof(ma), MTL::Size(D, T, 1), MTL::Size(256, 1, 1));
-        probe(enc, "block", int(il), x, uint64_t(T) * D);
-    }
-    ModArgs oa{D, kEps, split, D, 0};
-    dispatch(enc, "ln_modulate", {x, omod, xn}, &oa, sizeof(oa), MTL::Size(T, 1, 1), MTL::Size(256, 1, 1), false);
-    probe(enc, "norm_out", -1, xn, uint64_t(T) * D);
-    proj(enc, proj_out_, xn, 0, out, 0, Tg);
-    enc->endEncoding();
-    finish(cb);
-    const auto* o = static_cast<const float*>(out->contents()) + uint64_t(T - N) * kLatent;
-    return std::vector<float>(o, o + uint64_t(N) * kLatent);
 }
 
 void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* x, uint32_t h, uint32_t w,
@@ -617,8 +554,15 @@ void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* 
 {
     const uint32_t rows = h * w;
     if (c.k == 1) {
+        MTL::Buffer* in = x;
+        if (c.kpad != c.cin) { // rows zero padded to the GEMM's
+            in = scratch("v_pad", uint64_t(rows) * c.kpad * 4);
+            std::memset(in->contents(), 0, uint64_t(rows) * c.kpad * 4);
+            const uint32_t a[2] = {c.cin, c.kpad};
+            dispatch(enc, "copy_rows", {x, in}, a, sizeof(a), MTL::Size(c.cin, rows, 1), MTL::Size(256, 1, 1));
+        }
         gemm_->encode(enc, gguf::Type::F16, c.kpad, c.cout, rows, c.w.buf, c.w.off,
-                      halves(enc, x, 0, rows, c.cin, 0), 0, y, 0, 0, 0, c.kpad % 64 == 0);
+                      halves(enc, in, 0, rows, c.kpad, 0), 0, y, 0, 0, 0, c.kpad % 64 == 0);
         after(enc, "conv1x1");
     } else {
         // Image rows a pass, so the unfolded copy stays near 256 MB, in multiples of 256 (the GEMM's largest tiles).
@@ -633,12 +577,7 @@ void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* 
             after(enc, "conv3x3");
         }
     }
-    enc->setComputePipelineState(pso("bias_rows"));
-    enc->setBuffer(y, 0, 0);
-    enc->setBuffer(c.b.buf, c.b.off, 1); // within the weight buffers
-    enc->setBytes(&c.cout, sizeof(c.cout), 2);
-    enc->dispatchThreads(MTL::Size(c.cout, rows, 1), MTL::Size(64, 1, 1));
-    after(enc, "bias_rows");
+    bias(enc, y, c.b, c.cout, rows);
 }
 
 void Engine::norm_silu(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, MTL::Buffer* y,
@@ -646,8 +585,7 @@ void Engine::norm_silu(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const T
 {
     // x / ||x|| * sqrt(c) * g over each pixel's channels: an RMS norm (eps as the reference's 1e-12 on the norm).
     norm(enc, x, &g, y, rows, c, c, 1e-24f / float(c));
-    uint32_t n = rows * c;
-    dispatch(enc, "silu", {y}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+    unary(enc, "silu", y, rows * c);
 }
 
 void Engine::res_block(MTL::ComputeCommandEncoder*& enc, const Res& r, MTL::Buffer* x, uint32_t h, uint32_t w,
@@ -670,9 +608,11 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
 {
     if (latents.size() != uint64_t(h) * w * kLatent)
         throw std::runtime_error("latents must be [h * w][64]");
+    // The VAE's own latent image: a token's 2x2 patch spread over pixels where it packs one.
+    const uint32_t lh = h * patch_, lw = w * patch_;
     // The largest image: the last up block's input, at the output's size, and the widest channels at its scale.
-    uint64_t most = uint64_t(h) * w * kLatent;
-    uint32_t hh = h, ww = w;
+    uint64_t most = uint64_t(lh) * lw * z_;
+    uint32_t hh = lh, ww = lw;
     most = std::max(most, uint64_t(hh) * ww * conv_in_.cout);
     for (const Up& u : ups_) {
         most = std::max(most, uint64_t(hh) * ww * std::max(u.cin, u.cout));
@@ -683,26 +623,34 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
         }
     }
     const uint32_t H = hh, W = ww;
+    if (H != 16 * h || W != 16 * w)
+        throw std::runtime_error("vae: not a 16x decoder for its tokens");
     MTL::Buffer* a = scratch("v_a", most * 4);
     MTL::Buffer* b = scratch("v_b", most * 4);
     MTL::Buffer* t1 = scratch("v_t1", most * 4);
     MTL::Buffer* t2 = scratch("v_t2", most * 4);
     MTL::Buffer* keep = scratch("v_keep", most * 4);
     auto* lat = static_cast<float*>(a->contents());
-    for (uint64_t i = 0; i < uint64_t(h) * w; ++i)
-        for (uint32_t ch = 0; ch < kLatent; ++ch)
-            lat[i * kLatent + ch] = latents[i * kLatent + ch] * lat_std_[ch] + lat_mean_[ch];
+    const uint32_t p = patch_;
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+            for (uint32_t ch = 0; ch < z_; ++ch)
+                for (uint32_t py = 0; py < p; ++py)
+                    for (uint32_t px = 0; px < p; ++px) {
+                        const float v = latents[(uint64_t(y) * w + x) * kLatent + (ch * p + py) * p + px];
+                        lat[((uint64_t(y) * p + py) * lw + x * p + px) * z_ + ch] = v * lat_std_[ch] + lat_mean_[ch];
+                    }
 
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     cur_cb_ = cb;
     MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
-    probe(enc, "vae_in", -1, a, uint64_t(h) * w * kLatent);
-    conv(enc, post_quant_, a, h, w, b);
-    probe(enc, "vae_pq", -1, b, uint64_t(h) * w * kLatent);
-    conv(enc, conv_in_, b, h, w, a);
-    probe(enc, "vae_conv_in", -1, a, uint64_t(h) * w * conv_in_.cout);
-    hh = h;
-    ww = w;
+    probe(enc, "vae_in", -1, a, uint64_t(lh) * lw * z_);
+    conv(enc, post_quant_, a, lh, lw, b);
+    probe(enc, "vae_pq", -1, b, uint64_t(lh) * lw * z_);
+    conv(enc, conv_in_, b, lh, lw, a);
+    probe(enc, "vae_conv_in", -1, a, uint64_t(lh) * lw * conv_in_.cout);
+    hh = lh;
+    ww = lw;
     res_block(enc, mid0_, a, hh, ww, b, t1, t2);
     {
         // Single-head attention over the pixels, channels wide.
@@ -730,7 +678,7 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
     MTL::Buffer* y = b;
     for (const Up& u : ups_) {
         const uint32_t rows = hh * ww;
-        if (u.up) { // the block's input, for the duplicating shortcut
+        if (u.up && residual_) { // the block's input, for the duplicating shortcut
             const uint32_t n = rows * u.cin;
             dispatch(enc, "copy_f32", {x, keep}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
         }
@@ -743,53 +691,30 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
             dispatch(enc, "upsample2x", {x, t1}, &ua, sizeof(ua), MTL::Size(u.cout, 2 * ww, 2 * hh),
                      MTL::Size(64, 1, 1));
             conv(enc, u.conv, t1, 2 * hh, 2 * ww, y);
-            const UpArgs da{hh, ww, u.cin, u.cout, u.ft, u.cout * u.ft * 4 / u.cin};
-            dispatch(enc, "dup_up_add", {keep, y}, &da, sizeof(da), MTL::Size(u.cout, 2 * ww, 2 * hh),
-                     MTL::Size(64, 1, 1));
+            if (residual_) {
+                const UpArgs da{hh, ww, u.cin, u.cout, u.ft, u.cout * u.ft * 4 / u.cin};
+                dispatch(enc, "dup_up_add", {keep, y}, &da, sizeof(da), MTL::Size(u.cout, 2 * ww, 2 * hh),
+                         MTL::Size(64, 1, 1));
+            }
             std::swap(x, y);
             hh *= 2;
             ww *= 2;
         }
-        probe(enc, "vae_up", int(&u - ups_.data()), x, uint64_t(hh) * ww * u.cout);
+        probe(enc, "vae_up", int(&u - ups_.data()), x, uint64_t(hh) * ww * (u.up ? u.conv.cout : u.cout));
     }
     norm_silu(enc, x, out_g_, t1, hh * ww, conv_out_.cin);
     conv(enc, conv_out_, t1, hh, ww, y);
     enc->endEncoding();
     finish(cb);
+    // RGB (opaque) or RGBA.
     const auto* o = static_cast<const float*>(y->contents());
+    const uint32_t oc = conv_out_.cout;
     std::vector<float> img(uint64_t(H) * W * 4);
-    for (size_t i = 0; i < img.size(); ++i)
-        img[i] = std::clamp(o[i], -1.0f, 1.0f);
+    for (uint64_t px = 0; px < uint64_t(H) * W; ++px)
+        for (uint32_t ch = 0; ch < 4; ++ch)
+            img[px * 4 + ch] = ch < oc ? std::clamp(o[px * oc + ch], -1.0f, 1.0f) : 1.0f;
     return img;
 }
-
-namespace {
-
-// A tensor's values as floats (F32, F16 or BF16).
-std::vector<float> read_floats(const safetensors::File& f, const gguf::Tensor& t)
-{
-    const uint64_t n = t.elements();
-    std::vector<float> out(n);
-    std::vector<std::byte> raw(t.bytes);
-    gguf::read_exact(f.fd(), raw.data(), t.bytes, t.offset);
-    for (uint64_t i = 0; i < n; ++i) {
-        if (t.type == gguf::Type::F32) {
-            std::memcpy(&out[i], raw.data() + i * 4, 4);
-        } else if (t.type == gguf::Type::F16) {
-            __fp16 h;
-            std::memcpy(&h, raw.data() + i * 2, 2);
-            out[i] = float(h);
-        } else {
-            uint16_t b;
-            std::memcpy(&b, raw.data() + i * 2, 2);
-            const uint32_t u = uint32_t(b) << 16;
-            std::memcpy(&out[i], &u, 4);
-        }
-    }
-    return out;
-}
-
-} // namespace
 
 uint32_t Engine::add_lora(const std::string& path, float scale)
 {
@@ -830,56 +755,15 @@ uint32_t Engine::add_lora(const std::string& path, float scale)
         if (!known)
             unknown.push_back(t.name);
     }
-    // The weight a module adapts: its matrix and the rows it has there (q, k, v and gate, up share one).
-    struct Target {
-        Tensor* w = nullptr;
-        uint32_t row0 = 0, rows = 0;
-    };
-    const uint32_t D = kDim, nff = uint32_t(blocks_.front().down.dims[0]);
-    auto target = [&](const std::string& m) -> Target {
-        unsigned b = 0;
-        int used = 0;
-        if (std::sscanf(m.c_str(), "transformer_blocks.%u.%n", &b, &used) == 1 && used > 0 && b < blocks_.size()) {
-            Block& B = blocks_[b];
-            const std::string_view rest = std::string_view(m).substr(size_t(used));
-            if (rest == "attn.to_q")
-                return {&B.qkv, 0, D};
-            if (rest == "attn.to_k")
-                return {&B.qkv, D, D};
-            if (rest == "attn.to_v")
-                return {&B.qkv, 2 * D, D};
-            if (rest == "attn.to_out.0")
-                return {&B.o, 0, D};
-            if (rest == "img_mlp.gate_layer")
-                return {&B.gate_up, 0, nff};
-            if (rest == "img_mlp.proj")
-                return {&B.gate_up, nff, nff};
-            if (rest == "img_mlp.gate_up") // gate rows first
-                return {&B.gate_up, 0, 2 * nff};
-            if (rest == "img_mlp.out")
-                return {&B.down, 0, D};
-            return {};
-        }
-        Tensor* t = m == "img_in" ? &img_in_
-                    : m == "txt_in.in_layer" ? &txt_in1_
-                    : m == "txt_in.out_layer" ? &txt_in2_
-                    : m == "proj_out" ? &proj_out_
-                    : m == "norm_out.linear" ? &out_lin_
-                    : m == "modulation.1" ? &mod_
-                    : m == "time_text_embed.timestep_embedder.linear_1" ? &t_lin1_
-                    : m == "time_text_embed.timestep_embedder.linear_2" ? &t_lin2_
-                                                                         : nullptr;
-        return t ? Target{t, 0, uint32_t(t->dims[1])} : Target{};
-    };
     for (const auto& [m, p] : mods)
-        if (!p.a || !p.b || !target(m).w)
+        if (!p.a || !p.b || !lora_target(m).w)
             unknown.push_back(m);
     if (!unknown.empty())
-        throw std::runtime_error(std::format("{}: {} keys this engine does not adapt, e.g. {}", path, unknown.size(),
+        throw std::runtime_error(std::format("{}: {} keys {} does not adapt, e.g. {}", path, unknown.size(), name(),
                                              unknown.front()));
     uint32_t done = 0, rank_seen = 0;
     for (const auto& [m, p] : mods) {
-        const Target tg = target(m);
+        const LoraTarget tg = lora_target(m);
         const uint32_t k = uint32_t(tg.w->dims[0]), rank = uint32_t(p.a->dims[1]);
         // A is [rank][k] and B [rows][rank] (row-major), so their contiguous dimensions come first here.
         if (p.a->dims[0] != k || p.b->dims[0] != rank || p.b->dims[1] != tg.rows || tg.w->type != gguf::Type::BF16)

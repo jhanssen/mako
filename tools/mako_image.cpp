@@ -1,9 +1,13 @@
-// Text to image with Qwen-Image 2.1 from its original files.
+// Text to image with Qwen-Image 2.1 or Krea 2 from their original files.
 //   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--count N] [--rgb]
-//              [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR]
+//              [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR] [--transformer PATH]
+//              [--negative TEXT] [--guidance F]
 // --lora merges a LoRA into the weights (repeatable; SCALE its strength, default 1). --terminal: the schedule's last
 // noise level (0: not stretched there, as distilled few-step LoRAs are trained; default: the model's).
 // --text-encoder: another directory of the text encoder's weights (e.g. a refusal-ablated one; default: the model's).
+// --transformer: another file or directory of the transformer's weights (e.g. a checkpoint with LoRAs merged).
+// --negative: what the image should not be (classifier-free guidance: twice the transformer's work a step);
+// --guidance its scale (default: the model's).
 #include "app/cli.hpp"
 #include "core/log.hpp"
 #include "core/telemetry.hpp"
@@ -21,24 +25,30 @@
 int main(int argc, char** argv)
 {
     std::string out = "image.png";
-    uint32_t width = 1024, height = 1024, steps = 40;
+    uint32_t width = 1024, height = 1024, steps = 0;
     uint64_t seed = 0;
     uint32_t count = 1;
     std::vector<std::pair<std::string, float>> loras;
-    std::optional<float> terminal;
-    std::string text_encoder;
+    std::optional<float> terminal, guidance;
+    std::optional<std::string> negative;
+    std::string text_encoder, transformer;
     bool rgb = false;
     mako::app::Cli cli("mako_image", "<model dir> <prompt>", 2, 2);
     cli.option("-o", "FILE", "the PNG to write (default image.png)", out)
         .option("--width", "N", "pixels, a multiple of 32 (default 1024)", width)
         .option("--height", "N", "pixels, a multiple of 32 (default 1024)", height)
-        .option("--steps", "N", "denoising steps (default 40)", steps)
+        .option("--steps", "N", "denoising steps (default: the model's)", steps)
         .option("--seed", "N", "the starting noise's seed (default 0)", seed)
         .option("--count", "N", "images, seeds counting up from --seed, out-N.png after the first (default 1)", count)
         .flag("--rgb", "leave the alpha channel out", rgb)
         .option("--lora", "FILE[:SCALE]", "merge a LoRA (repeatable)",
                 [&](const std::string& v) { loras.push_back(mako::image::parse_lora(v)); })
         .option("--text-encoder", "DIR", "another directory of the text encoder's weights", text_encoder)
+        .option("--transformer", "PATH", "another file or directory of the transformer's weights", transformer)
+        .option("--negative", "TEXT", "what the image should not be (guidance: two passes a step)",
+                [&](const std::string& v) { negative = v; })
+        .option("--guidance", "F", "the guidance scale with --negative (default: the model's)",
+                [&](const std::string& v) { guidance = mako::app::Cli::parse<float>(v); })
         .option("--terminal", "F", "the schedule's last noise level (0: none)",
                 [&](const std::string& v) { terminal = mako::app::Cli::parse<float>(v); });
     const auto pos = cli.parse(argc, argv);
@@ -47,7 +57,8 @@ int main(int argc, char** argv)
     try {
         const auto t_load = Clock::now();
         mako::mtl::Context ctx;
-        mako::image::Engine engine(pos[0], ctx, mako::gpu::Telemetry::off, text_encoder);
+        auto model = mako::image::Engine::open(pos[0], ctx, {text_encoder, transformer});
+        auto& engine = *model;
         for (const auto& [path, scale] : loras)
             engine.add_lora(path, scale);
         mako::log::info("loaded in {:.1f} s", ms_since(t_load) / 1e3);
@@ -59,6 +70,8 @@ int main(int argc, char** argv)
             r.steps = steps;
             r.seed = seed + n;
             r.terminal = terminal;
+            r.negative = negative;
+            r.guidance = guidance;
             auto t_step = Clock::now();
             r.progress = [&](uint32_t i, uint32_t total) {
                 mako::log::info("step {} of {}: {:.0f} ms, thermal {}", i, total, ms_since(t_step),
@@ -75,7 +88,8 @@ int main(int argc, char** argv)
                                                 : std::format("{}-{}{}", out.substr(0, dot), n, out.substr(dot));
             }
             mako::image::write_file(path, mako::image::encode_png(mako::image::to_rgba8(img), width, height, rgb));
-            mako::log::info("{}x{}, {} steps in {:.1f} s: {}", width, height, steps, gen / 1e3, path);
+            mako::log::info("{}x{}, {} steps in {:.1f} s: {}", width, height, steps ? steps : engine.default_steps(),
+                            gen / 1e3, path);
         }
     } catch (const std::exception& e) {
         mako::log::error("{}", e.what());

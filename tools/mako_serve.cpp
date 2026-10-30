@@ -6,6 +6,7 @@
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
 //              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--image-model DIR]
 //              [--image-lora FILE[:SCALE] ...] [--image-steps N] [--image-terminal F] [--image-text-encoder DIR]
+//              [--image-transformer PATH] [--image-guidance F]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -34,7 +35,9 @@
 // conversations kept in memory) and the image model loaded; the next chat request loads the LLM again.
 // --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE); --image-steps and --image-terminal set the
 // schedule (a 4-step distilled LoRA: --image-steps 4 --image-terminal 0); --image-text-encoder loads the text encoder
-// from another directory (the same model's weights, changed: e.g. refusal-ablated).
+// from another directory (the same model's weights, changed: e.g. refusal-ablated), --image-transformer the transformer
+// from another file or directory (e.g. a checkpoint with LoRAs merged); --image-guidance the guidance scale of requests
+// with a negative prompt that name none.
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "chat/template.hpp"
@@ -92,7 +95,7 @@ int main(int argc, char** argv)
     double arena_gb = -1, stage_gb = -1, park_gb = -1;
     std::string ablate, engram, dspark, imatrix, mmproj_path, image_model;
     std::vector<std::pair<std::string, float>> image_loras;
-    std::string image_text_encoder;
+    std::string image_text_encoder, image_transformer;
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
@@ -148,14 +151,18 @@ int main(int argc, char** argv)
                     "end repetition loops of N tokens or more in reasoning or answers (default 256; 0: off)",
                     so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
-            .option("--image-model", "DIR", "Qwen-Image 2.1's files, for /v1/images/generations (swapped in)",
+            .option("--image-model", "DIR", "Qwen-Image 2.1's or Krea 2's files, for /v1/images/generations (swapped in)",
                     image_model)
             .option("--image-lora", "FILE[:SCALE]", "merge a LoRA into the image model (repeatable)",
                     [&](const std::string& v) { image_loras.push_back(mako::image::parse_lora(v)); })
             .option("--image-text-encoder", "DIR", "another directory of the image model's text encoder weights",
                     image_text_encoder)
-            .option("--image-steps", "N", "denoising steps of an image (default 40; 4 with a 4-step LoRA)",
+            .option("--image-transformer", "PATH", "another file or directory of the image model's transformer weights",
+                    image_transformer)
+            .option("--image-steps", "N", "denoising steps of an image (default: the model's; 4 with a 4-step LoRA)",
                     so.image_steps)
+            .option("--image-guidance", "F", "guidance scale for negative prompts (default: the model's)",
+                    [&](const std::string& v) { so.image_guidance = mako::app::Cli::parse<float>(v); })
             .option("--image-terminal", "F", "the schedule's last noise level (0: none, as few-step LoRAs want)",
                     [&](const std::string& v) { so.image_terminal = mako::app::Cli::parse<float>(v); })
             .option("--image-max-tokens", "N", "scale larger images down to at most N prompt rows (16 or more)",
@@ -335,8 +342,7 @@ int main(int argc, char** argv)
     mako::server::Models::LoadImage load_image;
     if (!image_model.empty())
         load_image = [&] {
-            auto e = std::make_unique<mako::image::Engine>(image_model, ctx, mako::gpu::Telemetry::off,
-                                                           image_text_encoder);
+            auto e = mako::image::Engine::open(image_model, ctx, {image_text_encoder, image_transformer});
             for (const auto& [path, scale] : image_loras)
                 e->add_lora(path, scale);
             return e;

@@ -6,8 +6,9 @@
 ./build/tools/mako_run <GLM-5.3 .gguf> <token,ids,...> [-n N] [--spec] [--temp T]   # GLM-5.3: top logits, greedy tokens
 ./build/tools/ds_run <DeepSeek .gguf> <Engram .gguf> --ids I,J,... [-n N]          # DeepSeek-V4.1 (the Engram argument:
                                                                                     # the model's first file again)
-./build/tools/mako_image <Qwen-Image dir> "<prompt>" [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--rgb]
-                         [--count N] [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR]
+./build/tools/mako_image <image model dir> "<prompt>" [-o out.png] [--width N] [--height N] [--steps N] [--seed N]
+                         [--rgb] [--count N] [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR]
+                         [--transformer PATH] [--negative TEXT] [--guidance F]   # Qwen-Image 2.1 or Krea 2
 ```
 
 `mako_run` samples with `--temp T` (`--top-k`, `--top-p`, `--min-p`, `--seed`). `ds_run` also compares logits with a

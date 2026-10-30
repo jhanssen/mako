@@ -195,3 +195,156 @@ kernel void lora_merge(device bfloat* w [[buffer(0)]], device const float* a [[b
     device bfloat* x = w + uint64_t(r) * p.k + c;
     *x = bfloat(float(*x) + p.scale * d);
 }
+
+// Krea 2's transformer: RMS norms with per-step scales and shifts, gated residuals and attention outputs, and the text
+// fusion's attention across each token's tapped layers.
+
+struct KreaModArgs {
+    uint n;      // model width
+    uint blocks;
+};
+
+// Each block's modulation from the step's shared vector tm [6][n] plus the block's table [6][n], with the block's two
+// norm scales (w [blocks][2][n], already + 1) folded in: out [blocks][6][n] = (w1 (1 + prescale), preshift, pregate,
+// w2 (1 + postscale), postshift, postgate). Grid (n, blocks).
+kernel void krea_mod(device const float* tm [[buffer(0)]], device const float* table [[buffer(1)]],
+                     device const float* w [[buffer(2)]], device float* out [[buffer(3)]],
+                     constant KreaModArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x, b = gid.y;
+    if (i >= a.n || b >= a.blocks)
+        return;
+    device const float* t = table + uint64_t(b) * 6 * a.n;
+    device float* o = out + uint64_t(b) * 6 * a.n;
+    float m[6];
+    for (uint k = 0; k < 6; ++k)
+        m[k] = tm[k * a.n + i] + t[k * a.n + i];
+    o[i] = w[(uint64_t(b) * 2) * a.n + i] * (1.0f + m[0]);
+    o[a.n + i] = m[1];
+    o[2 * a.n + i] = m[2];
+    o[3 * a.n + i] = w[(uint64_t(b) * 2 + 1) * a.n + i] * (1.0f + m[3]);
+    o[4 * a.n + i] = m[4];
+    o[5 * a.n + i] = m[5];
+}
+
+// The final layer's: out [2][n] = (w (1 + temb + table[0]), temb + table[1]). Grid n.
+kernel void krea_final_mod(device const float* temb [[buffer(0)]], device const float* table [[buffer(1)]],
+                           device const float* w [[buffer(2)]], device float* out [[buffer(3)]],
+                           constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]])
+{
+    if (i >= n)
+        return;
+    out[i] = w[i] * (1.0f + temb[i] + table[i]);
+    out[n + i] = temb[i] + table[n + i];
+}
+
+struct RmsAffineArgs {
+    uint n;
+    float eps;
+};
+
+// y = x / rms(x) * s + b over each row (s, b: [n]); one threadgroup per row.
+kernel void rms_affine(device const float* x [[buffer(0)]], device const float* s [[buffer(1)]],
+                       device const float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                       constant RmsAffineArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device const float* xr = x + uint64_t(row) * a.n;
+    device float* yr = y + uint64_t(row) * a.n;
+    float v = 0.0f;
+    for (uint i = tid; i < a.n; i += TG)
+        v += xr[i] * xr[i];
+    const float inv = rsqrt(tg_sum(v, scratch, tid) / float(a.n) + a.eps);
+    for (uint i = tid; i < a.n; i += TG)
+        yr[i] = xr[i] * inv * s[i] + b[i];
+}
+
+// x += g * y over rows of n (g: [n]). Grid (n, rows).
+kernel void scale_add(device float* x [[buffer(0)]], device const float* y [[buffer(1)]],
+                      device const float* g [[buffer(2)]], constant uint& n [[buffer(3)]],
+                      uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < n)
+        x[uint64_t(gid.y) * n + gid.x] += g[gid.x] * y[uint64_t(gid.y) * n + gid.x];
+}
+
+struct GateArgs {
+    uint n, ld, col0;
+};
+
+// x[r][i] *= sigmoid(src[r][col0 + i]) (src rows ld apart). Grid (n, rows).
+kernel void sigmoid_mul(device float* x [[buffer(0)]], device const float* src [[buffer(1)]],
+                        constant GateArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= a.n)
+        return;
+    const float g = src[uint64_t(gid.y) * a.ld + a.col0 + gid.x];
+    x[uint64_t(gid.y) * a.n + gid.x] *= 1.0f / (1.0f + exp(-g));
+}
+
+struct GroupAttnArgs {
+    uint rows;  // all rows, `group` per token
+    uint group;
+    uint heads; // of 128, as many key / value heads
+    uint ld;    // of the q | k | v rows
+    float eps;
+};
+
+// Attention within each run of `group` rows (no mask, no rotation), q and k RMS-normed per head (times wq, wk) first.
+// qkv rows [q | k | v] of heads * 128; out [rows][heads * 128]. One thread per (row, head).
+kernel void attn_groups(device const float* qkv [[buffer(0)]], device const float* wq [[buffer(1)]],
+                        device const float* wk [[buffer(2)]], device float* out [[buffer(3)]],
+                        constant GroupAttnArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint r = gid.x, h = gid.y;
+    if (r >= a.rows || h >= a.heads)
+        return;
+    const uint w = a.heads * 128, r0 = r / a.group * a.group;
+    device const float* q = qkv + uint64_t(r) * a.ld + h * 128;
+    float qs = 0.0f;
+    for (uint d = 0; d < 128; ++d)
+        qs += q[d] * q[d];
+    const float qinv = rsqrt(qs / 128.0f + a.eps) * rsqrt(128.0f);
+    float score[32];
+    float m = -INFINITY;
+    for (uint j = 0; j < a.group; ++j) {
+        device const float* k = qkv + uint64_t(r0 + j) * a.ld + w + h * 128;
+        float ks = 0.0f, dot = 0.0f;
+        for (uint d = 0; d < 128; ++d) {
+            ks += k[d] * k[d];
+            dot += q[d] * wq[d] * k[d] * wk[d];
+        }
+        score[j] = dot * qinv * rsqrt(ks / 128.0f + a.eps);
+        m = max(m, score[j]);
+    }
+    float sum = 0.0f;
+    for (uint j = 0; j < a.group; ++j) {
+        score[j] = exp(score[j] - m);
+        sum += score[j];
+    }
+    device float* o = out + uint64_t(r) * w + h * 128;
+    for (uint d = 0; d < 128; ++d) {
+        float acc = 0.0f;
+        for (uint j = 0; j < a.group; ++j)
+            acc += score[j] * qkv[uint64_t(r0 + j) * a.ld + 2 * w + h * 128 + d];
+        o[d] = acc / sum;
+    }
+}
+
+struct LayerMixArgs {
+    uint n, layers;
+    float p[16];
+};
+
+// out[s][i] = sum_l p[l] x[s][l][i]. Grid (n, tokens).
+kernel void layer_mix(device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
+                      constant LayerMixArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= a.n)
+        return;
+    float acc = 0.0f;
+    for (uint l = 0; l < a.layers; ++l)
+        acc += a.p[l] * x[(uint64_t(gid.y) * a.layers + l) * a.n + gid.x];
+    out[uint64_t(gid.y) * a.n + gid.x] = acc;
+}

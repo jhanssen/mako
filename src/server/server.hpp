@@ -52,9 +52,12 @@ struct ServerOptions {
     // the share of the experts it holds.
     std::function<CacheCounters()> cache_counters;
     double cache_gb = 0, resident = 0;
-    // Image generation: steps of an image, and the schedule's last noise level (0: not stretched; unset: the model's).
-    uint32_t image_steps = 40;
+    // Image generation: steps of an image (0: the model's), and the schedule's last noise level (0: not stretched;
+    // unset: the model's).
+    uint32_t image_steps = 0;
     std::optional<float> image_terminal;
+    // The guidance scale of requests with a negative prompt that name none (unset: the model's).
+    std::optional<float> image_guidance;
     // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
     const vision::Mmproj* mmproj = nullptr;
     vision::Encoder* vision = nullptr;
