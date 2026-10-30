@@ -113,6 +113,8 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
 - LoRAs: `--image-lora FILE[:SCALE]` (repeatable) merges each into the image model when it loads; Diffusers, PEFT and
   ComfyUI key names. `--image-steps N` and `--image-terminal F` set the schedule: a 4-step distilled LoRA such as
   lightx2v's Qwen-Image-2.1-Lightning takes `--image-steps 4 --image-terminal 0` (1024x1024 in ~7 s).
+- `--image-text-encoder DIR` takes the text encoder from another directory of safetensors (the same architecture
+  with changed weights, such as a refusal-ablated one), leaving the model's own directory as published.
 
 ## Thinking
 

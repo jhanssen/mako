@@ -81,8 +81,8 @@ safetensors::Files open_files(const std::string& dir)
 
 } // namespace
 
-Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry)
-    : gpu::Runtime(ctx, telemetry), text_files_(open_files(dir + "/text_encoder")),
+Engine::Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry, const std::string& text_encoder)
+    : gpu::Runtime(ctx, telemetry), text_files_(open_files(text_encoder.empty() ? dir + "/text_encoder" : text_encoder)),
       dit_files_(open_files(dir + "/transformer")), vae_files_(open_files(dir + "/vae"))
 {
     const std::string p = "model.language_model.";

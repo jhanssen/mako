@@ -18,7 +18,10 @@ namespace mako::image {
 // Qwen3-VL language model), the diffusion transformer and the VAE decoder.
 class Engine : public gpu::Runtime {
 public:
-    Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry = gpu::Telemetry::off);
+    // text_encoder: another directory of the text encoder's safetensors (the same model's weights, changed; empty:
+    // dir's text_encoder/).
+    Engine(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry = gpu::Telemetry::off,
+           const std::string& text_encoder = {});
 
     // The text encoder over a prompt's token ids: its last layer's output before the final norm, rows [drop, n)
     // (drop: the template's system part), [n - drop][4096].

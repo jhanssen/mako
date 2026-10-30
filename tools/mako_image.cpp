@@ -1,8 +1,9 @@
 // Text to image with Qwen-Image 2.1 from its original files.
 //   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--count N] [--rgb]
-//              [--lora FILE[:SCALE] ...] [--terminal F]
+//              [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR]
 // --lora merges a LoRA into the weights (repeatable; SCALE its strength, default 1). --terminal: the schedule's last
 // noise level (0: not stretched there, as distilled few-step LoRAs are trained; default: the model's).
+// --text-encoder: another directory of the text encoder's weights (e.g. a refusal-ablated one; default: the model's).
 #include "app/cli.hpp"
 #include "core/log.hpp"
 #include "core/telemetry.hpp"
@@ -25,6 +26,7 @@ int main(int argc, char** argv)
     uint32_t count = 1;
     std::vector<std::pair<std::string, float>> loras;
     std::optional<float> terminal;
+    std::string text_encoder;
     bool rgb = false;
     mako::app::Cli cli("mako_image", "<model dir> <prompt>", 2, 2);
     cli.option("-o", "FILE", "the PNG to write (default image.png)", out)
@@ -36,6 +38,7 @@ int main(int argc, char** argv)
         .flag("--rgb", "leave the alpha channel out", rgb)
         .option("--lora", "FILE[:SCALE]", "merge a LoRA (repeatable)",
                 [&](const std::string& v) { loras.push_back(mako::image::parse_lora(v)); })
+        .option("--text-encoder", "DIR", "another directory of the text encoder's weights", text_encoder)
         .option("--terminal", "F", "the schedule's last noise level (0: none)",
                 [&](const std::string& v) { terminal = mako::app::Cli::parse<float>(v); });
     const auto pos = cli.parse(argc, argv);
@@ -44,7 +47,7 @@ int main(int argc, char** argv)
     try {
         const auto t_load = Clock::now();
         mako::mtl::Context ctx;
-        mako::image::Engine engine(pos[0], ctx);
+        mako::image::Engine engine(pos[0], ctx, mako::gpu::Telemetry::off, text_encoder);
         for (const auto& [path, scale] : loras)
             engine.add_lora(path, scale);
         mako::log::info("loaded in {:.1f} s", ms_since(t_load) / 1e3);
