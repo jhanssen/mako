@@ -80,4 +80,4 @@ target_link_libraries(mako_vision PUBLIC mako_gguf mako_mtl PRIVATE "-framework 
                       "-framework CoreFoundation")
 
 add_library(mako_text STATIC text/stream.cpp text/tokenizer.cpp)
-target_link_libraries(mako_text PUBLIC mako_gguf)
+target_link_libraries(mako_text PUBLIC mako_gguf PRIVATE glaze_headers)
