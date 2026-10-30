@@ -174,3 +174,24 @@ kernel void copy_cols(device const float* x [[buffer(0)]], device float* y [[buf
     if (gid.x < a.cols && gid.y < a.rows)
         y[uint64_t(gid.y) * a.cols + gid.x] = x[uint64_t(gid.y) * a.ldx + a.col0 + gid.x];
 }
+
+struct LoraArgs {
+    uint k, rows, rank; // the matrix's row length, the rows adapted, the adapter's rank
+    float scale;
+};
+
+// W[r][c] += scale * sum_j B[r][j] * A[j][c] over BF16 rows of W (from the adapted ones on), in float, rounded back.
+// Grid (k, rows).
+kernel void lora_merge(device bfloat* w [[buffer(0)]], device const float* a [[buffer(1)]],
+                       device const float* b [[buffer(2)]], constant LoraArgs& p [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x, r = gid.y;
+    if (c >= p.k || r >= p.rows)
+        return;
+    float d = 0.0f;
+    for (uint j = 0; j < p.rank; ++j)
+        d += b[uint64_t(r) * p.rank + j] * a[uint64_t(j) * p.k + c];
+    device bfloat* x = w + uint64_t(r) * p.k + c;
+    *x = bfloat(float(*x) + p.scale * d);
+}

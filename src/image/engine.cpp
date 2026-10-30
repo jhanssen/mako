@@ -1,15 +1,18 @@
 #include "image/engine.hpp"
 
+#include "core/log.hpp"
 #include "gguf/read_pool.hpp"
 
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <random>
 #include <stdexcept>
 
@@ -44,6 +47,10 @@ struct UpArgs {
 };
 struct TransposeArgs {
     uint32_t rows, cols, ldx, col0;
+};
+struct LoraArgs {
+    uint32_t k, rows, rank;
+    float scale;
 };
 
 // Pairs i of the rotary angle table for (frame, height, width) positions: 8 pairs on the frame axis, then 28 each on
@@ -145,8 +152,9 @@ std::string Engine::templated(const std::string& prompt)
            (prompt.empty() ? " " : prompt) + "<|im_end|>\n<|im_start|>assistant\n";
 }
 
-std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens) const
+std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens, std::optional<float> terminal) const
 {
+    const double term = terminal ? double(*terminal) : sched_.terminal;
     const double m = (sched_.max_shift - sched_.base_shift) / (sched_.max_seq - sched_.base_seq);
     const double mu = double(tokens) * m + (sched_.base_shift - m * sched_.base_seq);
     std::vector<float> s(steps);
@@ -155,8 +163,8 @@ std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens) const
         const float t = steps == 1 ? 1.0f : float(1.0 + (1.0 / steps - 1.0) * double(i) / double(steps - 1));
         s[i] = float(std::exp(mu) / (std::exp(mu) + (1.0 / double(t) - 1.0)));
     }
-    if (sched_.terminal > 0 && steps > 0) {
-        const float scale = (1.0f - s.back()) / (1.0f - float(sched_.terminal));
+    if (term > 0 && steps > 0) {
+        const float scale = (1.0f - s.back()) / (1.0f - float(term));
         for (float& v : s)
             v = 1.0f - (1.0f - v) / scale;
     }
@@ -182,7 +190,7 @@ std::vector<float> Engine::generate(const Request& r)
         for (float& v : x)
             v = nd(rng);
     }
-    const auto sig = sigmas(r.steps, N);
+    const auto sig = sigmas(r.steps, N, r.terminal);
     begin(prompt, h, w);
     for (uint32_t i = 0; i < r.steps; ++i) {
         const auto v = step(x, sig[i]);
@@ -753,6 +761,171 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
     for (size_t i = 0; i < img.size(); ++i)
         img[i] = std::clamp(o[i], -1.0f, 1.0f);
     return img;
+}
+
+namespace {
+
+// A tensor's values as floats (F32, F16 or BF16).
+std::vector<float> read_floats(const safetensors::File& f, const gguf::Tensor& t)
+{
+    const uint64_t n = t.elements();
+    std::vector<float> out(n);
+    std::vector<std::byte> raw(t.bytes);
+    gguf::read_exact(f.fd(), raw.data(), t.bytes, t.offset);
+    for (uint64_t i = 0; i < n; ++i) {
+        if (t.type == gguf::Type::F32) {
+            std::memcpy(&out[i], raw.data() + i * 4, 4);
+        } else if (t.type == gguf::Type::F16) {
+            __fp16 h;
+            std::memcpy(&h, raw.data() + i * 2, 2);
+            out[i] = float(h);
+        } else {
+            uint16_t b;
+            std::memcpy(&b, raw.data() + i * 2, 2);
+            const uint32_t u = uint32_t(b) << 16;
+            std::memcpy(&out[i], &u, 4);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+uint32_t Engine::add_lora(const std::string& path, float scale)
+{
+    auto file = safetensors::File::open(path);
+    if (!file)
+        throw std::runtime_error(file.error());
+    // The adapter's alpha for every matrix, from a PEFT config in the metadata.
+    std::optional<double> alpha;
+    if (const auto it = file->metadata().find("lora_adapter_metadata"); it != file->metadata().end()) {
+        glz::generic j;
+        if (!glz::read_json(j, it->second) && j.is_object())
+            for (const char* k : {"transformer.lora_alpha", "lora_alpha"})
+                if (j.contains(k) && j[k].is_number())
+                    alpha = j[k].get_number();
+    }
+    struct Pair {
+        const gguf::Tensor *a = nullptr, *b = nullptr, *alpha = nullptr;
+    };
+    std::map<std::string, Pair> mods;
+    std::vector<std::string> unknown;
+    static constexpr std::pair<const char*, int> kSuffixes[] = {
+        {".lora.down.weight", 0}, {".lora.up.weight", 1},  {".lora_down.weight", 0},       {".lora_up.weight", 1},
+        {".lora_A.weight", 0},    {".lora_B.weight", 1},   {".lora_A.default.weight", 0}, {".lora_B.default.weight", 1},
+        {".alpha", 2}};
+    for (const auto& t : file->tensors()) {
+        std::string_view name = t.name;
+        for (const char* p : {"base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer."})
+            if (name.starts_with(p))
+                name.remove_prefix(std::strlen(p));
+        bool known = false;
+        for (const auto& [suffix, role] : kSuffixes)
+            if (name.ends_with(suffix)) {
+                Pair& p = mods[std::string(name.substr(0, name.size() - std::strlen(suffix)))];
+                (role == 0 ? p.a : role == 1 ? p.b : p.alpha) = &t;
+                known = true;
+                break;
+            }
+        if (!known)
+            unknown.push_back(t.name);
+    }
+    // The weight a module adapts: its matrix and the rows it has there (q, k, v and gate, up share one).
+    struct Target {
+        Tensor* w = nullptr;
+        uint32_t row0 = 0, rows = 0;
+    };
+    const uint32_t D = kDim, nff = uint32_t(blocks_.front().down.dims[0]);
+    auto target = [&](const std::string& m) -> Target {
+        unsigned b = 0;
+        int used = 0;
+        if (std::sscanf(m.c_str(), "transformer_blocks.%u.%n", &b, &used) == 1 && used > 0 && b < blocks_.size()) {
+            Block& B = blocks_[b];
+            const std::string_view rest = std::string_view(m).substr(size_t(used));
+            if (rest == "attn.to_q")
+                return {&B.qkv, 0, D};
+            if (rest == "attn.to_k")
+                return {&B.qkv, D, D};
+            if (rest == "attn.to_v")
+                return {&B.qkv, 2 * D, D};
+            if (rest == "attn.to_out.0")
+                return {&B.o, 0, D};
+            if (rest == "img_mlp.gate_layer")
+                return {&B.gate_up, 0, nff};
+            if (rest == "img_mlp.proj")
+                return {&B.gate_up, nff, nff};
+            if (rest == "img_mlp.gate_up") // gate rows first
+                return {&B.gate_up, 0, 2 * nff};
+            if (rest == "img_mlp.out")
+                return {&B.down, 0, D};
+            return {};
+        }
+        Tensor* t = m == "img_in" ? &img_in_
+                    : m == "txt_in.in_layer" ? &txt_in1_
+                    : m == "txt_in.out_layer" ? &txt_in2_
+                    : m == "proj_out" ? &proj_out_
+                    : m == "norm_out.linear" ? &out_lin_
+                    : m == "modulation.1" ? &mod_
+                    : m == "time_text_embed.timestep_embedder.linear_1" ? &t_lin1_
+                    : m == "time_text_embed.timestep_embedder.linear_2" ? &t_lin2_
+                                                                         : nullptr;
+        return t ? Target{t, 0, uint32_t(t->dims[1])} : Target{};
+    };
+    for (const auto& [m, p] : mods)
+        if (!p.a || !p.b || !target(m).w)
+            unknown.push_back(m);
+    if (!unknown.empty())
+        throw std::runtime_error(std::format("{}: {} keys this engine does not adapt, e.g. {}", path, unknown.size(),
+                                             unknown.front()));
+    uint32_t done = 0, rank_seen = 0;
+    for (const auto& [m, p] : mods) {
+        const Target tg = target(m);
+        const uint32_t k = uint32_t(tg.w->dims[0]), rank = uint32_t(p.a->dims[1]);
+        // A is [rank][k] and B [rows][rank] (row-major), so their contiguous dimensions come first here.
+        if (p.a->dims[0] != k || p.b->dims[0] != rank || p.b->dims[1] != tg.rows || tg.w->type != gguf::Type::BF16)
+            throw std::runtime_error(std::format("{}: {} does not fit the weight it adapts", path, m));
+        double a = alpha.value_or(double(rank));
+        if (p.alpha)
+            a = read_floats(*file, *p.alpha).front();
+        const auto av = read_floats(*file, *p.a), bv = read_floats(*file, *p.b);
+        MTL::Buffer* ab = scratch("l_a", av.size() * 4);
+        MTL::Buffer* bb = scratch("l_b", bv.size() * 4);
+        std::memcpy(ab->contents(), av.data(), av.size() * 4);
+        std::memcpy(bb->contents(), bv.data(), bv.size() * 4);
+        const LoraArgs la{k, tg.rows, rank, float(double(scale) * a / double(rank))};
+        MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+        cur_cb_ = cb;
+        MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+        enc->setComputePipelineState(pso("lora_merge"));
+        enc->setBuffer(tg.w->buf, tg.w->off + uint64_t(tg.row0) * k * 2, 0);
+        enc->setBuffer(ab, 0, 1);
+        enc->setBuffer(bb, 0, 2);
+        enc->setBytes(&la, sizeof(la), 3);
+        enc->dispatchThreads(MTL::Size(k, tg.rows, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+        finish(cb);
+        ++done;
+        rank_seen = rank;
+    }
+    if (!done)
+        throw std::runtime_error(path + ": no LoRA weights in it");
+    log::info("LoRA {}: {} matrices adapted (rank {}, alpha {}), scale {}", path, done, rank_seen,
+              alpha ? std::format("{}", *alpha) : std::string("= rank"), scale);
+    return done;
+}
+
+std::pair<std::string, float> parse_lora(const std::string& spec)
+{
+    const size_t colon = spec.rfind(':');
+    if (colon != std::string::npos && colon + 1 < spec.size()) {
+        char* end = nullptr;
+        const float v = std::strtof(spec.c_str() + colon + 1, &end);
+        if (end && *end == '\0')
+            return {spec.substr(0, colon), v};
+    }
+    if (spec.empty())
+        throw std::invalid_argument("names no LoRA file");
+    return {spec, 1.0f};
 }
 
 } // namespace mako::image

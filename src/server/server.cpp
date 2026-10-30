@@ -95,7 +95,8 @@ struct Server::Impl {
                const ErrorBody& error, const char* id_prefix, const MakeProtocol& make);
     void count_tokens(const httplib::Request& req, httplib::Response& res);
     // POST /v1/images/generations: OpenAI's fields (prompt, n, size, response_format b64_json, output_format png or
-    // jpeg; model, quality, style, background, moderation and user accepted and left alone).
+    // jpeg; model, quality, style, background, moderation and user accepted and left alone); steps and the schedule's
+    // end from the options.
     void images(const httplib::Request& req, httplib::Response& res);
     // A request's images, sized when it is parsed and encoded when it runs.
     struct Images {
@@ -533,6 +534,8 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             r.width = width;
             r.height = height;
             r.seed = (uint64_t(rd()) << 32) | rd();
+            r.steps = opts.image_steps;
+            r.terminal = opts.image_terminal;
             auto last = std::chrono::steady_clock::now();
             const auto t0 = last;
             r.progress = [&](uint32_t step, uint32_t steps) {

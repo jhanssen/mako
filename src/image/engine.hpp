@@ -36,7 +36,7 @@ public:
 
     // The noise levels of `steps` denoising steps for an image of `tokens` latent tokens, then 0 (the scheduler's
     // dynamic shift, stretched to end at its terminal value).
-    std::vector<float> sigmas(uint32_t steps, uint32_t tokens) const;
+    std::vector<float> sigmas(uint32_t steps, uint32_t tokens, std::optional<float> terminal = std::nullopt) const;
 
     struct Request {
         std::string prompt;
@@ -44,10 +44,17 @@ public:
         uint32_t steps = 40;
         uint64_t seed = 0;
         std::span<const float> noise; // instead of the seed's: [h * w][64]
+        std::optional<float> terminal; // the schedule's last noise level (0: not stretched); unset: the model's
         std::function<void(uint32_t step, uint32_t steps)> progress;
     };
     // Text to image: RGBA [height][width][4] in [-1, 1].
     std::vector<float> generate(const Request& r);
+
+    // Merges a LoRA into the transformer's weights for good: W += scale * (alpha / rank) * B A for each matrix it
+    // adapts (rounded back to BF16). Keys as Diffusers, PEFT or ComfyUI name them; alpha from the adapter's .alpha
+    // tensors, else its PEFT config in the metadata, else the rank. Returns the matrices adapted; throws on a file
+    // it cannot use (keys it does not know are an error).
+    uint32_t add_lora(const std::string& path, float scale = 1.0f);
     const text::Tokenizer& tokenizer() const { return *tok_; }
     // The prompt template around `prompt`, and the token count of its system part.
     static std::string templated(const std::string& prompt);
@@ -132,5 +139,8 @@ private:
         double base_seq = 256, max_seq = 4096, base_shift = 0.5, max_shift = 1.15, terminal = 0;
     } sched_;
 };
+
+// "FILE" or "FILE:SCALE" (the scale a number after the last colon). Throws std::invalid_argument.
+std::pair<std::string, float> parse_lora(const std::string& spec);
 
 } // namespace mako::image

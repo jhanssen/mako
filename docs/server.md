@@ -106,6 +106,9 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   status page shows which is loaded.
 - Time: ~13 s for 512x512, ~63 s for 1024x1024 (40 steps), slower as the Mac heats up; the log has each image's
   progress.
+- LoRAs: `--image-lora FILE[:SCALE]` (repeatable) merges each into the image model when it loads; Diffusers, PEFT and
+  ComfyUI key names. `--image-steps N` and `--image-terminal F` set the schedule: a 4-step distilled LoRA such as
+  lightx2v's Qwen-Image-2.1-Lightning takes `--image-steps 4 --image-terminal 0` (1024x1024 in ~7 s).
 
 ## Thinking
 

@@ -60,7 +60,13 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
      text encoder, the VAE encoder (latent tokens ahead of the target image), image blocks in the attention mask
      (each condition image its own bidirectional block), the image template; `/v1/images/edits`.
    - img2img: the VAE encoder and the schedule started part-way (sigma below 1).
-   - LoRAs: which exist for 2.1 and their key naming first; merged at load, or applied at run time (per request).
+   - Done, LoRAs merged at load (`Engine::add_lora`): W += scale * alpha / rank * B A on the GPU, rounded back to
+     BF16; several add up. Diffusers (`transformer.*.lora.down/up`), PEFT (`lora_A/B.default`) and ComfyUI
+     (`diffusion_model.*.lora_A/B`, the MLP's `gate_up` gate rows first) names; alpha from `.alpha` tensors, else a
+     PEFT config in the metadata, else the rank (files that state none: assumed, unverified). Tried: lightx2v's
+     4-step Lightning (128 matrices; 4 steps without terminal stretch, 1024x1024 in 6.9 s, clean, where 4 steps
+     without it are smeared), Next-Scene (ComfyUI, 192) and Natural-Exposure (PEFT, 224) stacked with it. Per-request
+     LoRAs (applied at run time, or merged and taken back) later.
 
 ## Qwen-Image 2.1
 
