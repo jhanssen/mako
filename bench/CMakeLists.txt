@@ -8,6 +8,8 @@ add_executable(mem_watchdog mem_watchdog.cpp)
 add_executable(mm_types_bench mm_types_bench.cpp)
 target_link_libraries(mm_types_bench PRIVATE mako_mtl)
 
+add_executable(attn_bench attn_bench.cpp)
+target_link_libraries(attn_bench PRIVATE mako_mtl)
 add_executable(gemm_bench gemm_bench.cpp)
 target_link_libraries(gemm_bench PRIVATE mako_mtl)
 

@@ -20,7 +20,7 @@ if(MAKO_REF_SRC AND MAKO_REF_BUILD)
 endif()
 
 add_executable(mako_image mako_image.cpp)
-target_link_libraries(mako_image PRIVATE mako_imagegen mako_app)
+target_link_libraries(mako_image PRIVATE mako_imagegen mako_core mako_app)
 add_executable(mako_serve mako_serve.cpp)
 target_link_libraries(mako_serve PRIVATE mako_server mako_dsv41 mako_app)
 

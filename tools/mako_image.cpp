@@ -2,6 +2,7 @@
 //   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--rgb]
 #include "app/cli.hpp"
 #include "core/log.hpp"
+#include "core/telemetry.hpp"
 #include "image/engine.hpp"
 #include "image/png.hpp"
 #include "mtl/context.hpp"
@@ -38,7 +39,7 @@ int main(int argc, char** argv)
         r.seed = seed;
         auto t_step = Clock::now();
         r.progress = [&](uint32_t i, uint32_t n) {
-            mako::log::info("step {} of {}: {:.0f} ms", i, n, ms_since(t_step));
+            mako::log::info("step {} of {}: {:.0f} ms, thermal {}", i, n, ms_since(t_step), mako::core::thermal_state());
             t_step = Clock::now();
         };
         const auto t0 = Clock::now();

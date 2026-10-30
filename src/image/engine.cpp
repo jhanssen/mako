@@ -340,7 +340,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Bu
 {
     const AttnArgs a{n_q, q_pad, n_k, k_pad, n_heads, kv_heads, q_pos0, block, n_heads * kHeadDim,
                      1.0f / std::sqrt(float(kHeadDim))};
-    dispatch(enc, "flash_attn_128", {q, k, v, o}, &a, sizeof(a), MTL::Size(q_pad / 32, n_heads, 1),
+    dispatch(enc, "flash_attn_128_32x128", {q, k, v, o}, &a, sizeof(a), MTL::Size(q_pad / 32, n_heads, 1),
              MTL::Size(256, 1, 1), false);
 }
 
