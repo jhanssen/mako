@@ -50,9 +50,14 @@ target_link_libraries(mako_app PRIVATE glaze_headers)
 add_library(mako_gen STATIC gen/loop_guard.cpp gen/pool.cpp gen/sampler.cpp gen/session.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# What any model's GPU code shares; nothing model-specific links into it.
+add_library(mako_gpu STATIC gpu/runtime.cpp)
+target_include_directories(mako_gpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_gpu PUBLIC mako_mtl mako_gguf)
+
 add_library(mako_core STATIC core/arena.cpp core/engine_base.cpp core/profile.cpp core/stager.cpp core/telemetry.cpp)
 target_include_directories(mako_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mako_core PUBLIC mako_mtl mako_gguf)
+target_link_libraries(mako_core PUBLIC mako_gpu mako_mtl mako_gguf)
 target_include_directories(mako_core PRIVATE ${CMAKE_BINARY_DIR}/generated)
 add_dependencies(mako_core mako_version)
 

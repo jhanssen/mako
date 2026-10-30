@@ -1137,8 +1137,6 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
     pos_ += G;
     pool->release();
 
-    stats_.expert_read_ms = arena_->stats().read_ms;
-    stats_.expert_bytes = arena_->stats().read_bytes;
     stats_.step_ms += ms_since(step_start_);
     const ExpertArena::Stats& after_stats = arena_->stats();
     last_step_.wall_ms = ms_since(step_start_);

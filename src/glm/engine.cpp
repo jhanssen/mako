@@ -658,8 +658,7 @@ void Engine::mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, 
         // The heads write disjoint columns of y: one concurrent encoder, so their GEMMs overlap.
         enc->endEncoding();
         enc = encoder(cur_cb_, cur_layer_, 0, MTL::DispatchTypeConcurrent);
-        if (part_timing_ && !timed_.empty())
-            timed_.back().kernel = "mla k_b v_b";
+        name_part("mla k_b v_b");
         for (uint32_t h = 0; h < H; ++h)
             gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off + h * mat, xh, uint64_t(h) * xw * 2, y,
                           uint64_t(h) * yw * 4, H * yw, H * xw);
@@ -1004,8 +1003,6 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     const auto* lgp = static_cast<const float*>(lg->contents());
     logits_all_.assign(lgp, lgp + uint64_t(T) * cfg_.n_vocab);
     std::memcpy(logits_.data(), lgp + uint64_t(T - 1) * cfg_.n_vocab, uint64_t(cfg_.n_vocab) * 4);
-    stats_.expert_read_ms = arena_->stats().read_ms;
-    stats_.expert_bytes = arena_->stats().read_bytes;
     pos_ += T;
     last_tokens_ = T;
     pool->release();
@@ -1486,8 +1483,6 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
     pos_ += uint32_t(done);
     last_pos0_ = pos_ - 1; // mtp_draft() continues from the last position
     last_tokens_ = 1;
-    stats_.expert_read_ms = arena_->stats().read_ms;
-    stats_.expert_bytes = arena_->stats().read_bytes;
     const ExpertArena::Stats& arena_after = arena_->stats();
     total.wall_ms = ms_since(t_start);
     total.gpu_ms = stats_.gpu_exec_ms - gpu_before;

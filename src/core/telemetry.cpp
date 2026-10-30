@@ -56,21 +56,6 @@ double median(std::vector<double> v)
 
 } // namespace
 
-std::optional<Telemetry> parse_telemetry(std::string_view s)
-{
-    if (s == "off")
-        return Telemetry::off;
-    if (s == "summary")
-        return Telemetry::summary;
-    if (s == "steps")
-        return Telemetry::steps;
-    if (s == "layers")
-        return Telemetry::layers;
-    if (s == "kernels")
-        return Telemetry::kernels;
-    return std::nullopt;
-}
-
 MachineInfo query_machine(const mtl::DeviceInfo& gpu)
 {
     MachineInfo m;

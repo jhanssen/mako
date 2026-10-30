@@ -6,9 +6,7 @@
 #include "core/telemetry.hpp"
 #include "gen/model.hpp"
 #include "gguf/model_files.hpp"
-#include "mtl/context.hpp"
-#include "mtl/gemm.hpp"
-#include "mtl/gemv.hpp"
+#include "gpu/runtime.hpp"
 
 #include <dispatch/dispatch.h>
 
@@ -45,17 +43,12 @@ struct Routing {
     float miss_penalty = 0.0f;
 };
 
-// The GPU runtime models share: resident dense weights, scratch buffers, kernel dispatch with telemetry and probes,
-// and the routed-expert arena with decode's GPU routing served by the CPU (misses read between a layer's router and
-// its experts). A model's engine derives from it and adds its layer graph.
-class EngineBase {
+// What the routed-expert LLMs share on top of the GPU runtime: weights from the model's GGUF files, the
+// routed-expert arena with decode's GPU routing served by the CPU (misses read between a layer's router and its
+// experts), staged prefill, hyper-connections, input rows. A model's engine derives from it and adds its layer graph.
+class EngineBase : public gpu::Runtime {
 public:
-    struct DevTensor {
-        MTL::Buffer* buf = nullptr;
-        uint64_t off = 0;
-        gguf::Type type = gguf::Type::F32;
-        std::vector<uint64_t> dims;
-    };
+    using DevTensor = gpu::Runtime::Tensor;
     // One MoE layer's dense parts and SwiGLU clamps (<= 0: none).
     struct MoeWeights {
         DevTensor router, bias, sh_gate, sh_up, sh_down;
@@ -63,19 +56,9 @@ public:
         float clamp_exp = 0, clamp_sh = 0;
     };
 
-    // Called after each named stage of a step with the fp32 values it produced (for parity checks).
-    using Probe = std::function<void(const std::string& name, int layer, const float* data, size_t n)>;
-    void set_probe(Probe probe) { probe_ = std::move(probe); }
     // Called after routing a MoE layer; may overwrite the selected experts and their final weights (k each).
     using RouteOverride = std::function<void(int layer, int* sel, float* w, size_t k)>;
     void set_route_override(RouteOverride f) { route_override_ = std::move(f); }
-
-    struct Stats {
-        double expert_read_ms = 0, gpu_wait_ms = 0, gpu_exec_ms = 0; // exec: GPU start to end, summed
-        double encode_ms = 0, step_ms = 0; // encode: step start to the first commit
-        uint64_t expert_bytes = 0;
-    };
-    const Stats& stats() const { return stats_; }
 
     // The memory figures the arena was sized from and its size (bytes).
     struct ArenaPlan {
@@ -91,15 +74,6 @@ public:
     const StepStats& last_step() const { return last_step_; }
     // Prefill at the layers level: also time named parts of each layer (StepStats::parts); adds encoders.
     void set_part_timing(bool on);
-    // Bytes of all scratch buffers allocated so far.
-    uint64_t scratch_bytes() const
-    {
-        uint64_t n = 0;
-        for (const auto& [name, b] : scratch_)
-            n += b->length();
-        return n;
-    }
-
     const std::string& routing_key() const { return routing_key_; }
     const std::filesystem::path& default_profile() const { return default_profile_; }
     const std::filesystem::path& loaded_profile() const { return loaded_profile_; } // empty: none
@@ -108,17 +82,14 @@ public:
 
 protected:
     static constexpr uint32_t kMaxDecodeTokens = 8;
-    // proj() of at least this many tokens uses the GEMM (fewer: the GEMV, which reads each weight once for them and
-    // gives every token the same result as alone).
-    uint32_t gemm_min_tokens_ = 5;
 
     EngineBase(const gguf::ModelFiles& model, mtl::Context& ctx, Telemetry telemetry);
-    ~EngineBase();
+    ~EngineBase() override;
     EngineBase(const EngineBase&) = delete;
     EngineBase& operator=(const EngineBase&) = delete;
 
-    // Reads a dense tensor into the resident weight buffers (BF16 becomes F32).
-    // Dense weights; Q8_0 and Q6_K matrices are re-quantized to dense_quant_ when it is set.
+    // Reads a dense tensor into the resident weight buffers (BF16 becomes F32); Q8_0 and Q6_K matrices are
+    // re-quantized to dense_quant_ when it is set.
     DevTensor upload(const std::string& name);
     DevTensor upload_requant(int fd, const gguf::Tensor& t, gguf::Type to, const std::string& name);
     std::optional<gguf::Type> dense_quant_;
@@ -126,11 +97,6 @@ protected:
     // groups read different inputs), weighting the re-quantization's rounding.
     std::map<std::string, std::vector<float>> importance_;
     uint64_t requant_bytes_ = 0; // bytes the re-quantization saved
-    // The same from `bytes` at `offset` of a file (tensors outside the GGUF, e.g. a drafter's own file).
-    DevTensor upload_raw(int fd, uint64_t offset, uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims,
-                         const std::string& what);
-    // Room for `bytes` in the resident weight buffers, for the caller to fill.
-    DevTensor reserve(uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims);
     // A routed experts tensor [k, n, n_expert] as the arena reads it; `prefill`: it also needs the prefill GEMM.
     ExpertArena::Part expert(const std::string& name, bool prefill);
 
@@ -149,20 +115,6 @@ protected:
     // derived constructor, after every upload() and with load_.dense_ms set.
     void init_runtime(ArenaInit init);
 
-    MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
-    MTL::ComputePipelineState* pso(const std::string& fn);
-
-    // batch > 1: that many matrices from w on, each its own y block of t rows; x_shared: all read the same x.
-    void gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
-              uint64_t y_off, uint32_t batch = 1, uint32_t t = 1, bool x_shared = false);
-    // b's rows follow a's in memory, same type and shape: one batched GEMV can run both.
-    static bool adjacent(const DevTensor& a, const DevTensor& b);
-    void proj(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
-              uint64_t y_off, uint32_t T, uint32_t ldy = 0);
-    void dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
-                  const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads = true);
-    void norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const DevTensor* w, MTL::Buffer* y, uint32_t rows,
-              uint32_t n, uint32_t wn, float eps, uint64_t x_off = 0, uint64_t y_off = 0, uint32_t ystride = 0);
     // x = mHC pre-mix of the streams R for T tokens; pc keeps each token's pre/post/comb for hc_post. R (and out)
     // at byte offset r_off: a chunk's rows of a longer stream.
     void hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale, const DevTensor& base,
@@ -175,15 +127,6 @@ protected:
     void hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, MTL::Buffer* R, MTL::Buffer* R_out,
                  const DevTensor& fn, const DevTensor& scale, const DevTensor& base, MTL::Buffer* x, MTL::Buffer* pc,
                  uint32_t T = 1, const DevTensor* norm_w = nullptr, MTL::Buffer* xn = nullptr);
-    // Independent GEMVs over the same tokens in one dispatch (Gemv::encode_jobs), when every job's format has a
-    // kernel there (gemv_jobs_ok); the table rows come from the step's jobs_table_.
-    bool gemv_jobs_ok(std::span<const mtl::Gemv::Job> jobs) const;
-    void gemv_jobs(MTL::ComputeCommandEncoder*& enc, std::span<const mtl::Gemv::Job> jobs);
-    mtl::Gemv::Job gemv_job(const DevTensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y, uint64_t y_off,
-                            uint32_t batch, uint32_t t, bool x_shared) const;
-    void ffn_dense(MTL::ComputeCommandEncoder*& enc, const DevTensor& gate, const DevTensor& up,
-                   const DevTensor& down, MTL::Buffer* xn, MTL::Buffer* out, float limit, uint32_t T,
-                   uint64_t x_off = 0, uint64_t out_off = 0);
     // T (<= kMaxDecodeTokens) tokens' routed FFN plus shared expert of arena row il, rows of xn into rows of ffo.
     // With `sho_out` the shared expert's output stays there and goes through `between` (an encoder hook, e.g. an
     // ablation) before it is combined.
@@ -233,64 +176,25 @@ protected:
         bool lend_ = false;
         std::map<std::string, MTL::Buffer*> kept_;
     };
-    // A half copy of rows x cols of x (rows ld floats apart, 0: cols) for the GEMM, in one shared scratch buffer.
-    MTL::Buffer* halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
-                        uint32_t ld);
-    // A compute encoder, timed as `section` of `layer` when per-layer telemetry is on.
-    MTL::ComputeCommandEncoder* encoder(MTL::CommandBuffer* cb, uint32_t layer, int section,
-                                        MTL::DispatchType type = MTL::DispatchTypeSerial);
-    // At the kernels telemetry level, closes the encoder holding the dispatch just encoded, labelled `kernel`,
-    // and opens the next one.
-    void after(MTL::ComputeCommandEncoder*& enc, std::string_view kernel);
+    // The step's encoder timestamps into last_step_: per-layer section times (sections: 0 attention, 1 FFN to
+    // routing, 2 resident experts, 3 misses and the rest), parts and kernels.
     void resolve_layer_times(uint64_t cpu0, uint64_t gpu0);
-    void finish(MTL::CommandBuffer* cb);
-    void submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
-    // Commits what cb holds, so the GPU starts on it while the rest of the step is encoded into a new command
-    // buffer (finish() accounts for both). Not while a MoE layer waits for the CPU: finish() serves those.
-    void commit_ahead(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
+    // finish() serves the MoE layers waiting for the CPU, then passes on the resident layers' counts; no commit
+    // ahead while a MoE layer waits.
+    void on_committed(MTL::CommandBuffer* cb) override { serve_moe(cb); }
+    void on_completed() override { note_resident(); }
+    bool commit_ahead_ok() const override { return pending_moe_.empty(); }
     // dst[i] = the embedding of tokens[i] at sequence position pos0 + i (E floats each): its input row when one
     // stands there, else its row of token_embd.
     void embed(const gguf::ModelFiles::Ref& token_embd, std::span<const int32_t> tokens, uint32_t pos0, float* dst) const;
     // Whether an input row stands at position pos.
     bool input_at(uint32_t pos) const;
-    void probe(MTL::ComputeCommandEncoder*& enc, const std::string& name, int layer, MTL::Buffer* buf, size_t n,
-               uint64_t off = 0);
-    void deliver_probes();
     void apply_pressure();
-    bool timing() const { return !samples_.empty() && tel_ >= Telemetry::layers; }
-    // At the layers level with part timing on: the dispatches from here to the next part() (or the end of the
-    // section's encoder) are timed as `name`, within the current section.
-    void part(MTL::ComputeCommandEncoder*& enc, std::string_view name);
-    // MAKO_REPEAT=<label substrings, comma-separated>:<n> encodes matching GEMVs, norms and helper dispatches n times, so the extra
-    // step time measures their cost in place (they all recompute their output from their inputs). Repeats read
-    // weights the cache may still hold; n = 0 leaves them out instead (the output is then meaningless).
-    int repeats(std::string_view label) const
-    {
-        if (repeat_n_ == 1)
-            return 1;
-        for (size_t p = 0; p <= repeat_label_.size();) { // comma-separated label substrings
-            const size_t e = std::min(repeat_label_.find(',', p), repeat_label_.size());
-            if (e > p && label.find(std::string_view(repeat_label_).substr(p, e - p)) != std::string_view::npos)
-                return repeat_n_;
-            p = e + 1;
-        }
-        return 1;
-    }
 
     const gguf::ModelFiles& model_;
-    mtl::Context& ctx_;
     Dims dims_;
     Routing routing_;
     std::vector<char> layer_mla_; // telemetry: the layer's attention counts as MLA (else KDA)
-    std::unique_ptr<mtl::Gemv> gemv_;
-    std::unique_ptr<mtl::Gemm> gemm_;
-    mtl::Ref<MTL::Library> lib_;
-    std::map<std::string, mtl::Ref<MTL::ComputePipelineState>> psos_;
-
-    std::vector<mtl::Ref<MTL::Buffer>> weight_chunks_;
-    uint64_t chunk_used_ = 0;
-    uint64_t dense_bytes_ = 0;
-    std::map<std::string, mtl::Ref<MTL::Buffer>> scratch_;
     std::map<std::string, int> nocache_fds_; // shard path -> descriptor for expert reads
     std::unique_ptr<LockedMemory> simulated_; // before arena_: released after it
     // macOS memory-pressure level (0 normal, 1 warning, 2 critical), set from a dispatch source; applied between
@@ -325,43 +229,11 @@ protected:
     std::unique_ptr<Stager> stager_;
     uint64_t stage_bytes_ = 3ull << 30;
 
-    Probe probe_;
     RouteOverride route_override_;
-    std::chrono::steady_clock::time_point step_start_;
     LoadStats load_;
     StepStats last_step_;
-    Telemetry tel_ = Telemetry::off; // the level in effect (prefill runs kernel-level telemetry as summary)
-    // Per-layer telemetry: GPU timestamps at the start and end of timed encoders.
-    bool part_timing_ = false;
-    void add_samples(uint64_t want); // timestamp sample buffers for at least `want` samples
-    struct Timed {
-        uint32_t layer;
-        int section; // 0 attention, 1 FFN (to routing), 2 resident experts, 3 misses and the rest; -1 one kernel
-        NS::UInteger start, end;
-        std::string kernel; // kernels level; empty: the encoder held no dispatch
-    };
-    std::string repeat_label_;
-    int repeat_n_ = 1;
-    std::string last_pso_; // the kernel a direct dispatch runs, for repeats()
-    MTL::CommandBuffer* cur_cb_ = nullptr;
-    std::vector<MTL::CommandBuffer*> ahead_; // committed by commit_ahead, waited for in finish()
-    mtl::Ref<MTL::Buffer> hc_counters_;      // hc_step_norm: a threadgroup counter per token, zero between dispatches
-    mtl::Ref<MTL::Buffer> route_counters_;   // the routing router GEMV: the same
-    mtl::Ref<MTL::Buffer> jobs_table_;       // multi-GEMV dispatches' job tables of the step, jobs_off_ used so far
-    uint64_t jobs_off_ = 0;
-    uint32_t cur_layer_ = 0;
-    std::vector<mtl::Ref<MTL::CounterSampleBuffer>> samples_; // kSamplesPerBuffer each; index / that picks one
-    std::vector<Timed> timed_;
-    NS::UInteger next_sample_ = 0;
-    bool encoding_ = false;
-    struct PendingProbe {
-        std::string name;
-        int layer;
-        mtl::Ref<MTL::Buffer> copy;
-        size_t n;
-    };
-    std::vector<PendingProbe> pending_probes_;
-    Stats stats_;
+    mtl::Ref<MTL::Buffer> hc_counters_;    // hc_step_norm: a threadgroup counter per token, zero between dispatches
+    mtl::Ref<MTL::Buffer> route_counters_; // the routing router GEMV: the same
 };
 
 } // namespace mako::core

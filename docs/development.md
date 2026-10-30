@@ -96,7 +96,8 @@ It does not cover long contexts (the prompt has ~6.8K tokens); `tools/prefill_sw
 | `src/app` | command-line options: the environment, presets |
 | `src/mtl` | Metal context, GEMV wrapper, embedded shader libraries |
 | `src/kernels` | Metal kernels |
-| `src/core` | what the engines share: GPU runtime base, expert arena, routing profiles, telemetry |
+| `src/gpu` | what any model's GPU code shares: weights and scratch buffers, pipelines, dispatch, command buffers, timing, probes, GEMV / GEMM wrappers |
+| `src/core` | what the routed-expert LLMs share on top of it: expert arena, staging, routing profiles, telemetry reports |
 | `src/glm` | GLM-5.3-Flash config and engine |
 | `src/dsv41` | DeepSeek-V4.1 config, Engram tables and engine |
 | `src/chat` | chat templates (the GGUF's Jinja template) |

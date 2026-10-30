@@ -408,8 +408,8 @@ int main(int argc, char** argv)
     }
     const auto& as = engine.arena().stats();
     std::println("expert hits {} misses {} ({:.1f}% hit), reads {:.0f} ms ({:.2f} GB), gpu wait {:.0f} ms", as.hits,
-                 as.misses, 100.0 * as.hits / std::max<uint64_t>(1, as.hits + as.misses), st.expert_read_ms,
-                 st.expert_bytes / 1e9, st.gpu_wait_ms);
+                 as.misses, 100.0 * as.hits / std::max<uint64_t>(1, as.hits + as.misses), as.read_ms,
+                 as.read_bytes / 1e9, st.gpu_wait_ms);
     const double steps = double(ids.size() + gen_ids.size());
     std::println("per step: {:.1f} ms in step(), {:.1f} ms encoding, {:.1f} ms commit to done, {:.1f} ms GPU start to end",
                  st.step_ms / steps, st.encode_ms / steps, st.gpu_wait_ms / steps, st.gpu_exec_ms / steps);
