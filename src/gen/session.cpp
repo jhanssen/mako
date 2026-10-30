@@ -37,7 +37,7 @@ void Session::clear()
     if (parked_)
         parked_.reset(); // the engine holds another session's context
     else
-        e_.reset();
+        e_->reset();
     ctx_.clear();
     keys_.clear();
     saved_.clear();
@@ -88,7 +88,7 @@ void Session::fork(const Session& src, size_t pos)
     keys_ = src.keys_;
     cut_keys(pos);
     saved_ = {{it->cp, ++clock_, it->fork}}; // shared with src
-    parked_ = Parked{it->cp, e_.save_positions(uint32_t(pos))};
+    parked_ = Parked{it->cp, e_->save_positions(uint32_t(pos))};
     mtp_next_ = -1;
 }
 
@@ -96,14 +96,14 @@ void Session::park()
 {
     if (parked_)
         return;
-    if (e_.position() != ctx_.size() || ctx_.empty()) {
+    if (e_->position() != ctx_.size() || ctx_.empty()) {
         ctx_.clear();
         keys_.clear();
         saved_.clear();
         mtp_next_ = -1;
         return;
     }
-    Parked p{std::make_shared<const Model::Checkpoint>(e_.checkpoint()), e_.save_positions(uint32_t(ctx_.size()))};
+    Parked p{std::make_shared<const Model::Checkpoint>(e_->checkpoint()), e_->save_positions(uint32_t(ctx_.size()))};
     parked_ = std::move(p);
     // The newest checkpoint stays (another try at the last prompt) and the fork point's; the parked state continues
     // the context.
@@ -113,14 +113,21 @@ void Session::park()
     std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos != newest && !s.fork; });
 }
 
+void Session::rebind(Model& model)
+{
+    if (!parked_ && !ctx_.empty())
+        throw std::logic_error("rebind() of a session the engine holds");
+    e_ = &model;
+}
+
 void Session::unpark()
 {
     if (!parked_) {
         clear();
         return;
     }
-    e_.restore(*parked_->cp);
-    e_.load_positions(parked_->cp->pos, parked_->positions);
+    e_->restore(*parked_->cp);
+    e_->load_positions(parked_->cp->pos, parked_->positions);
     parked_.reset();
 }
 
@@ -139,7 +146,7 @@ uint64_t Session::bytes(std::unordered_set<const void*>* seen) const
 void Session::rewind(size_t keep)
 {
     // The model moved outside this session (another user, or a new session over a used model): nothing is known.
-    if (e_.position() != ctx_.size())
+    if (e_->position() != ctx_.size())
         clear();
     if (keep >= ctx_.size())
         return;
@@ -148,12 +155,12 @@ void Session::rewind(size_t keep)
         if (s.cp->pos <= keep && (!best || s.cp->pos > best->cp->pos))
             best = &s;
     if (best) {
-        e_.restore(*best->cp);
+        e_->restore(*best->cp);
         best->used = ++clock_;
     } else {
-        e_.reset();
+        e_->reset();
     }
-    ctx_.resize(e_.position());
+    ctx_.resize(e_->position());
     cut_keys(ctx_.size());
     // Checkpoints past the divergence would describe tokens that are about to be overwritten.
     std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos > keep; });
@@ -177,7 +184,7 @@ void Session::save_checkpoint(bool fork)
         if (victim != saved_.end())
             saved_.erase(victim);
     }
-    saved_.push_back({std::make_shared<const Model::Checkpoint>(e_.checkpoint()), ++clock_, fork});
+    saved_.push_back({std::make_shared<const Model::Checkpoint>(e_->checkpoint()), ++clock_, fork});
 }
 
 GenerateResult Session::generate(std::span<const int32_t> prompt, const GenerateParams& p,
@@ -199,7 +206,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         throw std::invalid_argument("empty prompt");
     if (parked_)
         throw std::logic_error("generate() on a parked session");
-    if (prompt.size() > e_.max_context())
+    if (prompt.size() > e_->max_context())
         throw std::invalid_argument("prompt longer than the context");
     GenerateResult res;
     res.prompt_tokens = uint32_t(prompt.size());
@@ -222,16 +229,16 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     std::vector<InputRows> rows;
     for (const auto& r : p.input_rows)
         rows.push_back(r.rows);
-    e_.set_input_rows(rows);
+    e_->set_input_rows(rows);
     struct Unset {
         Model& e;
         ~Unset() { e.set_input_rows({}); }
-    } unset{e_};
+    } unset{*e_};
 
     const auto t_prefill = std::chrono::steady_clock::now();
     const auto rest = prompt.subspan(ctx_.size());
     if (!ctx_.empty() && mtp_next_ != rest[0])
-        e_.mtp_seed(rest[0]);
+        e_->mtp_seed(rest[0]);
     if (p.progress)
         p.progress(ctx_.size(), prompt.size());
     // Runs the prompt up to `end` (exclusive) and records it; false when cancelled there (the result says so).
@@ -253,32 +260,32 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             std::function<void(size_t)> progress;
             if (p.progress)
                 progress = [&, at](size_t n) { p.progress(at + n, prompt.size()); };
-            e_.prefill(prompt.subspan(at, to - at), p.cancelled, progress);
-            if (p.progress && e_.position() + 1 < prompt.size())
-                p.progress(e_.position(), prompt.size());
-            if (e_.position() != to || to == end)
+            e_->prefill(prompt.subspan(at, to - at), p.cancelled, progress);
+            if (p.progress && e_->position() + 1 < prompt.size())
+                p.progress(e_->position(), prompt.size());
+            if (e_->position() != to || to == end)
                 break;
             at = to;
             ctx_.assign(prompt.begin(), prompt.begin() + at);
             keep_keys(at);
-            if (e_.has_mtp())
-                e_.mtp_seed(prompt[at]);
+            if (e_->has_mtp())
+                e_->mtp_seed(prompt[at]);
             if (p.cancelled && p.cancelled())
                 break;
             if (p.yield)
                 p.yield();
         }
-        const size_t read = e_.position();
+        const size_t read = e_->position();
         ctx_.assign(prompt.begin(), prompt.begin() + read);
         keep_keys(read);
         if (read == end) {
             // The next-token block learns the token after the part (within it, prefill gave it each next token).
-            if (e_.has_mtp())
-                e_.mtp_seed(prompt[read]);
+            if (e_->has_mtp())
+                e_->mtp_seed(prompt[read]);
             return true;
         }
         // The next-token block's cache already holds the last position read with the prompt's next token.
-        mtp_next_ = e_.has_mtp() ? prompt[read] : -1;
+        mtp_next_ = e_->has_mtp() ? prompt[read] : -1;
         res.finish = Finish::cancelled;
         res.prefill_ms = ms_since(t_prefill);
         return false;
@@ -303,15 +310,15 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     keep_keys(prompt.size());
     if (!ctx_.empty())
         save_checkpoint();
-    const std::vector<float>& lp = e_.step(prompt.back());
+    const std::vector<float>& lp = e_->step(prompt.back());
     ctx_.push_back(prompt.back());
-    e_.set_input_rows({});
+    e_->set_input_rows({});
     res.prefill_ms = ms_since(t_prefill);
 
     const auto t_decode = std::chrono::steady_clock::now();
-    const uint32_t nv = e_.n_vocab();
+    const uint32_t nv = e_->n_vocab();
     Sampler sampler(p.sampling, nv, p.seed);
-    const bool spec = p.speculative && e_.has_mtp();
+    const bool spec = p.speculative && e_->has_mtp();
     // Takes a decided token; false when generation ends with it.
     auto emit = [&](int32_t t) {
         sampler.accept(t);
@@ -328,7 +335,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             res.finish = Finish::max_tokens;
             return false;
         }
-        if (e_.position() >= e_.max_context()) {
+        if (e_->position() >= e_->max_context()) {
             res.finish = Finish::context_full;
             return false;
         }
@@ -340,26 +347,26 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         return f >= 0 ? f : sampler.sample(logits);
     };
     int32_t token = choose(lp.data());
-    if (p.speculative && e_.has_drafter()) {
+    if (p.speculative && e_->has_drafter()) {
         // Each round: drafts after `token`, then token and the drafts in one verify; drafts are kept up to the first
         // the sampler rejects (it then gives the token in its place), and after the last kept the trunk's next.
         while (p.max_tokens > 0 && emit(token)) {
             if (p.yield)
                 p.yield();
-            std::vector<int32_t> drafts = e_.draft(token);
-            const uint32_t room = std::min<uint32_t>(e_.max_context() - e_.position(),
+            std::vector<int32_t> drafts = e_->draft(token);
+            const uint32_t room = std::min<uint32_t>(e_->max_context() - e_->position(),
                                                      p.max_tokens - uint32_t(res.tokens.size()) + 1);
             if (drafts.size() + 1 > room)
                 drafts.resize(room > 0 ? room - 1 : 0);
             if (drafts.empty()) {
-                const std::vector<float>& l = e_.step(token);
+                const std::vector<float>& l = e_->step(token);
                 ctx_.push_back(token);
                 token = choose(l.data());
                 continue;
             }
             std::vector<int32_t> run{token};
             run.insert(run.end(), drafts.begin(), drafts.end());
-            const std::vector<float>& rows = e_.verify(run);
+            const std::vector<float>& rows = e_->verify(run);
             res.drafts += uint32_t(drafts.size());
             uint32_t kept = 0;
             int32_t next = -1;
@@ -380,7 +387,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
                     break;
                 }
             }
-            e_.keep(kept + 1);
+            e_->keep(kept + 1);
             ctx_.insert(ctx_.end(), run.begin(), run.begin() + kept + 1);
             if (!more)
                 break;
@@ -389,14 +396,14 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         res.decode_ms = ms_since(t_decode);
         return res;
     }
-    int32_t draft = spec ? e_.mtp_draft(token) : -1;
+    int32_t draft = spec ? e_->mtp_draft(token) : -1;
     mtp_next_ = spec ? token : -1;
     while (p.max_tokens > 0 && emit(token)) {
         if (p.yield)
             p.yield();
-        if (draft >= 0 && e_.position() + 2 <= e_.max_context()) {
+        if (draft >= 0 && e_->position() + 2 <= e_->max_context()) {
             // Verify [token, draft] in one two-token step.
-            const std::vector<float>& two = e_.step2(token, draft);
+            const std::vector<float>& two = e_->step2(token, draft);
             ctx_.push_back(token);
             ctx_.push_back(draft);
             ++res.drafts;
@@ -404,29 +411,29 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             const int32_t f = p.forced ? p.forced(two.data()) : -1;
             const int32_t t1 = f >= 0 ? (accepted = f == draft, f) : sampler.verify(two.data(), draft, accepted);
             if (!accepted) {
-                e_.rollback();
+                e_->rollback();
                 ctx_.pop_back();
                 token = t1;
-                draft = e_.mtp_draft(token);
+                draft = e_->mtp_draft(token);
                 mtp_next_ = token;
                 continue;
             }
             ++res.accepted;
             if (!emit(draft)) {
                 // The block's cache at token's position still needs the draft as its next token.
-                e_.mtp_draft(draft);
+                e_->mtp_draft(draft);
                 mtp_next_ = -1;
                 break;
             }
             token = choose(two.data() + nv);
             const int32_t both[2] = {draft, token};
-            draft = e_.mtp_draft(std::span<const int32_t>(both));
+            draft = e_->mtp_draft(std::span<const int32_t>(both));
             mtp_next_ = token;
         } else {
-            const std::vector<float>& l = e_.step(token);
+            const std::vector<float>& l = e_->step(token);
             ctx_.push_back(token);
             token = choose(l.data());
-            draft = spec ? e_.mtp_draft(token) : -1;
+            draft = spec ? e_->mtp_draft(token) : -1;
             mtp_next_ = spec ? token : -1;
         }
     }

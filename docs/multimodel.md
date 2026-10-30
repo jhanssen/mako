@@ -1,41 +1,46 @@
 # Several models in one server
 
 Plan (2026-10-29) for serving the LLMs and an image model, Qwen-Image 2.1, from one `mako_serve`: one model resident
-at a time, swapped when a request needs the other, conversations kept across a swap. Steps 1-5 change no behaviour
-and are checked as any engine change is (tests, `perf_check`); the image work starts after them.
+at a time, swapped when a request needs the other, conversations kept across a swap. The refactoring steps change no
+behaviour and are checked as any engine change is (tests, `perf_check`); the image work starts after them.
 
 ## Layers
 
 | Layer | Contents | Knows of |
 | --- | --- | --- |
-| `gpu` | device, pipeline cache, command recording and submission, timing and telemetry, probes; the memory owner; tensors from a format-neutral source; generic ops by type (GEMM / GEMV incl. BF16 with F32 accumulation, norms, attention causal / bidirectional / block-causal, elementwise, convolutions) | nothing above it |
+| `gpu` | device, pipeline cache, command recording and submission, timing and telemetry, probes; tensors from a format-neutral source; generic ops by type (GEMM / GEMV incl. BF16 with F32 accumulation, norms, attention causal / bidirectional / block-causal, elementwise, convolutions) | nothing above it |
 | formats | `gguf` (as now), `safetensors`; both give tensor descriptors (name, type, dims, file, offset) | `gpu`'s tensor source |
 | `llm` | the routed-expert machinery now in `core` (arena, stager, routing profiles, MoE decode and prefill, hyper-connections, input rows); `glm`, `dsv41`, `gen`, `text`, `chat`, the vision projector | `gpu`, formats |
 | `image` | Qwen3-VL text encoder, the diffusion transformer, the VAE, the flow-matching scheduler, PNG output | `gpu`, formats |
-| runtime | the model manager: loads and unloads models through the memory owner, decides swaps, holds conversations outside the engine | `llm`, `image` |
+| runtime | the model manager: loads and unloads models, decides swaps, holds conversations outside the engine | `llm`, `image` |
 | `server` | chat endpoints to the LLM, image endpoints to the image model, through the runtime | runtime |
 
 Each is a static library; `gpu` links nothing above it, so nothing model-specific can reach into it.
 
 ## Steps
 
-1. Split `core::EngineBase` into `gpu::Runtime` (weights and scratch buffers, pipelines, dispatch, encoders and
-   command buffers, telemetry, probes, the GEMV / GEMM wrappers, norms) and the LLM base (everything routed-expert).
-   The engines keep deriving from the LLM base, which derives from the runtime.
-2. The memory owner: one budget for the machine; residents (dense weights, scratch, the expert arena, KV caches,
-   parked conversations) take and return bytes by name. The arena sizes itself from what it is granted instead of
-   from the machine's free memory.
-3. The format-neutral tensor source, with GGUF behind it.
-4. Conversations outside the engine: a session parks into state the engine does not own, the engine is destroyed and
-   built again, the session restores into it (refused for another model or file). Tested as an LLM unloaded and
-   loaded again.
-5. The model manager and its swap path, with the LLM as the only model.
+1. Done (25645f9): `gpu::Runtime` (weights and scratch buffers, pipelines, dispatch, encoders and command buffers,
+   telemetry, probes, the GEMV / GEMM wrappers, norms, the dense SwiGLU FFN) split from `core::EngineBase`, which keeps
+   the routed-expert machinery and derives from it.
+2. Not needed for one model at a time: the expert arena sizes itself from the process's footprint and the memory
+   available when it is built (`arena_budget`), so a model loaded after another was unloaded gets what is free, and
+   conversations kept in memory are already subtracted. A memory owner would matter for two models resident at once.
+   The swap step checks that unloading gives the memory back.
+3. Moved to the image work: the format-neutral tensor source, with GGUF and safetensors behind it, and the weight
+   types out of `gguf`.
+4. Done: conversations outside the engine. `SessionPool::suspend()` parks the live conversation and lets go of the
+   engine; `resume(engine, identity)` rebinds the conversations to a new engine of the same model, or gives them up
+   for another identity. `e2e_reload` / `ds41_reload`: the next turn across an engine destroyed and built again
+   gives the same tokens and logits, bit for bit, reading only its new tokens.
+5. The model manager and its swap path, with the LLM as the only model; check that the footprint falls back after an
+   unload.
 6. The image model:
-   - safetensors reader;
+   - safetensors reader and the tensor source (step 3);
    - BF16 GEMM with F32 accumulation (first a `gemm_bench` check of the M5's `bfloat` support and speed);
    - the text encoder, the transformer, the VAE (convolutions), the scheduler;
    - each checked against the Diffusers pipeline's intermediate tensors at a fixed seed.
-7. The image endpoint (`/v1/images/generations`), progress per denoising step, the status page.
+7. The image endpoint (`/v1/images/generations`), progress per denoising step, the status page; which generation
+   parameters a request may set.
 
 ## Qwen-Image 2.1
 

@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <span>
 #include <unordered_set>
 #include <vector>
@@ -21,8 +22,9 @@ namespace mako::gen {
 // (between decode steps or prefill pieces) and queues again.
 class SessionPool {
 public:
+    // identity: the model and the options its state depends on (resume() keeps the conversations only for the same).
     SessionPool(Model& model, uint64_t budget_bytes, size_t max_sessions = 16,
-                std::chrono::milliseconds slice = std::chrono::milliseconds(1000));
+                std::chrono::milliseconds slice = std::chrono::milliseconds(1000), std::string identity = {});
 
     struct Pick {
         Session* session = nullptr;
@@ -55,6 +57,14 @@ public:
     uint64_t parked_bytes() const;
     uint64_t budget() const { return budget_; }
 
+    // Takes the engine away: waits for the turn (requests that come meanwhile wait for resume()), parks the
+    // conversation the engine holds, and lets go of the engine, which may then be destroyed. The conversations stay
+    // in memory.
+    void suspend();
+    // Gives the pool an engine again (a new one of the same model) and lets requests run. With another identity
+    // the conversations are given up.
+    void resume(Model& model, const std::string& identity);
+    bool suspended() const { return model_ == nullptr; }
     // The conversations as of the last change to them, and the requests waiting for a turn; any thread.
     struct Info {
         struct Conversation {
@@ -85,7 +95,8 @@ private:
     void give_turn();
     bool others_waiting();
 
-    Model& model_;
+    Model* model_;
+    std::string identity_;
     uint64_t budget_;
     size_t max_sessions_;
     std::chrono::milliseconds slice_;

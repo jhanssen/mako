@@ -4,9 +4,37 @@
 
 namespace mako::gen {
 
-SessionPool::SessionPool(Model& model, uint64_t budget_bytes, size_t max_sessions, std::chrono::milliseconds slice)
-    : model_(model), budget_(budget_bytes), max_sessions_(std::max<size_t>(1, max_sessions)), slice_(slice)
+SessionPool::SessionPool(Model& model, uint64_t budget_bytes, size_t max_sessions, std::chrono::milliseconds slice,
+                         std::string identity)
+    : model_(&model), identity_(std::move(identity)), budget_(budget_bytes),
+      max_sessions_(std::max<size_t>(1, max_sessions)), slice_(slice)
 {
+}
+
+void SessionPool::suspend()
+{
+    if (!model_)
+        return;
+    take_turn({});
+    if (live_)
+        live_->park();
+    live_ = nullptr;
+    model_ = nullptr;
+    snapshot();
+}
+
+void SessionPool::resume(Model& model, const std::string& identity)
+{
+    if (model_)
+        return;
+    if (identity != identity_)
+        slots_.clear();
+    for (Slot& s : slots_)
+        s.session->rebind(model);
+    model_ = &model;
+    identity_ = identity;
+    snapshot();
+    give_turn();
 }
 
 uint64_t SessionPool::parked_bytes() const
@@ -92,7 +120,7 @@ SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
     }
     Session* s = keep;
     if (!keep || fork_len > keep_len) {
-        slots_.push_back({std::make_unique<Session>(model_), next_index_++, 0, false});
+        slots_.push_back({std::make_unique<Session>(*model_), next_index_++, 0, false});
         s = slots_.back().session.get();
         if (fork && fork_len > keep_len) {
             make_live(fork);

@@ -63,7 +63,7 @@ class Session {
 public:
     // max_checkpoints beyond the engine's checkpoint_slots() use memory its budget did not reserve.
     explicit Session(Model& model) : Session(model, model.checkpoint_slots()) {}
-    Session(Model& model, size_t max_checkpoints) : e_(model), max_checkpoints_(max_checkpoints) {}
+    Session(Model& model, size_t max_checkpoints) : e_(&model), max_checkpoints_(max_checkpoints) {}
 
     // on_token gets each generated token once decided; returning false stops (Finish::cancelled).
     GenerateResult generate(std::span<const int32_t> prompt, const GenerateParams& p,
@@ -90,6 +90,9 @@ public:
     void park();
     void unpark();
     bool parked() const { return parked_.has_value(); }
+    // Moves a parked or empty session to another engine of the same model and options (the parked state is plain
+    // data): the old engine may be gone.
+    void rebind(Model& model);
     // Memory the session holds outside the engine: its parked context and its checkpoints (forks share theirs);
     // with `seen`, checkpoints already in it are not counted again.
     uint64_t bytes(std::unordered_set<const void*>* seen = nullptr) const;
@@ -113,7 +116,7 @@ private:
     // Keys only of positions before n.
     void cut_keys(size_t n);
 
-    Model& e_;
+    Model* e_;
     size_t max_checkpoints_;
     std::vector<int32_t> ctx_;
     std::vector<GenerateParams::PromptRows> keys_; // the input-row spans within ctx_ (their rows are not kept)
