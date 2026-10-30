@@ -7,9 +7,9 @@
 | `glm` | GLM-5.3-Flash, Maya-S-v2 IQ2_XXS | 96.5 GB | |
 | `ds` | DeepSeek-V4.1-Flash-1017, Maya-S IQ2_XXS with its Engram tables | 339 GB | ~25 tokens/s decode (~19 at 16-32K tokens of context), ~500-800 tokens/s prefill |
 | `ds-ista-xs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XS | 266 GB | ~34 tokens/s decode with `--miss-penalty 0.1`, the same perplexity as Maya-S on our prose and code texts |
-| `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS | 249 GB | |
+| `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS | 249 GB | ~33 tokens/s decode without the penalty (IQ2_XS: ~31), perplexity 3-5% higher than Maya-S; with the penalty unmeasured |
 
-Measurements and how they were taken: [performance.md](performance.md). The fastest setup above:
+Measurements and how they were taken: [performance.md](performance.md). The fastest setup measured:
 
 ```sh
 ./build/tools/mako_calibrate ~/models/ds-ista-xs/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf

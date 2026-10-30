@@ -59,8 +59,8 @@ tools/mako-download.sh glm
 | --- | --- | --- |
 | `glm` | GLM-5.3-Flash (Maya-S-v2) | 97 GB |
 | `ds` | DeepSeek-V4.1-Flash-1017 (Maya-S) | 339 GB |
-| `ds-ista-xs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XS, the fastest: ~34 tokens/s) | 266 GB |
-| `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XXS, the smallest) | 249 GB |
+| `ds-ista-xs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XS: ~34 tokens/s, as accurate as Maya-S) | 266 GB |
+| `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017 (ISTA IQ2_XXS: about as fast, a little less accurate) | 249 GB |
 
 Files go to `~/models/<set>`. The script downloads with the `hf` CLI when it's installed (and uses its saved login),
 otherwise with curl. It resumes interrupted downloads, checks every file's SHA-256 and, when done, prints the commands
