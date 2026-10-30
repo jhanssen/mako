@@ -39,8 +39,12 @@ Each is a static library; `gpu` links nothing above it, so nothing model-specifi
    - BF16 GEMM with F32 accumulation (first a `gemm_bench` check of the M5's `bfloat` support and speed);
    - the text encoder, the transformer, the VAE (convolutions), the scheduler;
    - each checked against the Diffusers pipeline's intermediate tensors at a fixed seed.
-7. The image endpoint (`/v1/images/generations`), progress per denoising step, the status page; which generation
-   parameters a request may set.
+7. The image endpoint, progress per denoising step, the status page. Requests (decided 2026-10-29):
+   - OpenAI's `/v1/images/generations` as is (`prompt`, `n`, `size`, `response_format`), so its clients work;
+   - extra fields that clients unaware of them leave out: `seed`, `steps`, `guidance`, `negative_prompt`, any size
+     in multiples of 32, later an input image for editing;
+   - presets by name (`presets.json`) for sets of them;
+   - defaults from the model's own recommendations (to be read from its pipeline code). No workflow graphs.
 
 ## Qwen-Image 2.1
 
