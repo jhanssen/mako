@@ -89,14 +89,13 @@ More on the models, and downloading by hand: [docs/models.md](docs/models.md).
 
 ## Docs
 
-| | |
-| --- | --- |
-| [Models](docs/models.md) | which to pick, downloads, tested hardware |
-| [Server](docs/server.md) | API coverage, remote access, image generation, clients |
-| [Options](docs/options.md) | memory, presets and environment variables, speed/accuracy trade-offs, drafters |
-| [Vision](docs/vision.md) | images as prompt input |
-| [Development](docs/development.md) | tools, tests, source layout |
-| [Architecture](docs/architecture.md), [Performance](docs/performance.md), [DeepSeek design](docs/dsv41-design.md) | how it works |
+- [Models](docs/models.md): which to pick, downloads, tested hardware
+- [Server](docs/server.md): API coverage, remote access, image generation, clients
+- [Options](docs/options.md): memory, presets and environment variables, speed/accuracy trade-offs, drafters
+- [Vision](docs/vision.md): images as prompt input
+- [Development](docs/development.md): tools, tests, source layout
+- How it works: [Architecture](docs/architecture.md), [Performance](docs/performance.md),
+  [DeepSeek design](docs/dsv41-design.md)
 
 ## License
 
