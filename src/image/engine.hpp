@@ -34,13 +34,15 @@ public:
     virtual uint32_t default_steps() const = 0;
     // The guidance scale with a negative prompt: the step's velocity is neg + scale * (pos - neg).
     virtual float default_guidance() const = 0;
+    // The negative prompt of requests that give none (unset: no guidance then).
+    virtual std::optional<std::string> default_negative() const { return std::nullopt; }
 
     struct Request {
         std::string prompt;
         uint32_t width = 1024, height = 1024; // multiples of 32
         uint32_t steps = 0;                   // 0: the model's default
         uint64_t seed = 0;
-        std::span<const float> noise; // instead of the seed's: [h * w][64]
+        std::span<const float> noise; // instead of the seed's: [h * w][latent_width()]
         std::optional<float> terminal; // the schedule's last noise level (0: not stretched); unset: the model's
         // What the image should not be: classifier-free guidance, a second transformer pass a step (unset: none).
         std::optional<std::string> negative;
@@ -52,23 +54,28 @@ public:
 
     // The transformer's text input for a prompt.
     virtual std::vector<float> prompt_embeddings(const std::string& prompt) = 0;
-    // A generation's text and latent grid (h x w tokens of 64), then step() for each denoising step: the velocity the
-    // transformer predicts for latents [h * w][64] at noise level sigma. Slots keep separate texts (1: the negative
+    // A generation's text and latent grid (h x w tokens of latent_width()), then step() for each denoising step: the
+    // velocity the transformer predicts for latents [h * w][latent_width()] at noise level sigma. Slots keep separate texts (1: the negative
     // prompt's) over the same grid.
     virtual void begin(std::span<const float> prompt, uint32_t h, uint32_t w, uint32_t slot = 0) = 0;
     virtual std::vector<float> step(std::span<const float> latents, float sigma, uint32_t slot = 0) = 0;
 
-    // The text encoder over token ids: rows [drop, n) of its last layer's output before the final norm ([n - drop][E]),
-    // or with taps, of the hidden states listed (0: the embeddings, i: layer i's output), [n - drop][taps][E].
-    std::vector<float> encode_text(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps = {});
+    // The text encoder over token ids: rows [drop, n) of its last layer's output before the final norm ([n - drop][E])
+    // or after it (normed), or with taps, of the hidden states listed (0: the embeddings, i: layer i's output),
+    // [n - drop][taps][E].
+    std::vector<float> encode_text(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps = {},
+                                   bool normed = false);
     uint32_t text_width() const { return tE_; }
 
-    // The VAE decoder: transformer latents [h * w][64] (normalized) to RGBA [16h][16w][4] in [-1, 1].
+    // The VAE decoder: transformer latents [h * w][latent_width()] (normalized) to RGBA [16h][16w][4] in [-1, 1].
     std::vector<float> decode(std::span<const float> latents, uint32_t h, uint32_t w);
+    // A transformer token's latent values: the VAE's channels times the pixels of its patch.
+    uint32_t latent_width() const { return lat_; }
 
     // The noise levels of `steps` denoising steps for an image of `tokens` latent tokens, then 0 (the schedule's
-    // shift, stretched to end at its terminal value).
-    std::vector<float> sigmas(uint32_t steps, uint32_t tokens, std::optional<float> terminal = std::nullopt) const;
+    // shift, stretched to end at its terminal value). A model's own schedule may have fewer.
+    virtual std::vector<float> sigmas(uint32_t steps, uint32_t tokens,
+                                      std::optional<float> terminal = std::nullopt) const;
 
     // Merges a LoRA into the transformer's weights for good: W += scale * (alpha / rank) * B A for each matrix it
     // adapts (rounded back to BF16). Keys as Diffusers, PEFT or ComfyUI name them; alpha from the adapter's .alpha
@@ -115,9 +122,10 @@ protected:
 
     static constexpr uint32_t kHeadDim = 128;
     static constexpr uint32_t kAttnRows = 64; // queries a threadgroup of the attention kernel
-    static constexpr uint32_t kLatent = 64;   // a transformer token's latent values
+    static constexpr uint32_t kLatent = 64;   // a transformer token's latent values (the Qwen-Image VAEs')
 
     std::optional<text::Tokenizer> tok_;
+    uint32_t lat_ = kLatent;
     struct Schedule {
         double base_seq = 256, max_seq = 4096, base_shift = 0.5, max_shift = 1.15, terminal = 0;
         std::optional<double> mu; // a fixed shift (distilled models) instead of one by image size
@@ -127,7 +135,17 @@ protected:
 private:
     struct TextLayer {
         Tensor attn_norm, q, k, v, o, q_norm, k_norm, ffn_norm, gate, up, down;
+        // A gated delta rule layer (Qwen3.5's linear attention): q | k | v in one matrix (q), its causal convolution,
+        // the output gate z, b | a for the update and decay, the decay's parameters; o its output, q_norm the gated
+        // norm's scale.
+        bool linear = false;
+        Tensor conv, z, ba, a_log, dt_bias;
     };
+    void load_text(const std::string& tdir);
+    // A gated delta rule layer and a gated attention layer (Qwen3.5) from xn, into y.
+    void text_linear(MTL::ComputeCommandEncoder*& enc, const TextLayer& L, MTL::Buffer* xn, MTL::Buffer* y, uint32_t T);
+    void text_gated_attention(MTL::ComputeCommandEncoder*& enc, const TextLayer& L, MTL::Buffer* xn, MTL::Buffer* y,
+                              uint32_t T, MTL::Buffer* cs);
     // Rows of the token embedding table (BF16, read from the file).
     void embed(std::span<const int32_t> ids, float* out) const;
 
@@ -138,7 +156,8 @@ private:
         uint32_t cin = 0, cout = 0, k = 3, kpad = 0;
     };
     struct Res {
-        Tensor g1, g2; // the RMS norms' scales
+        Tensor g1, g2; // the norms' scales (and with group norms, b1, b2 their biases)
+        Tensor b1, b2;
         Conv c1, c2, sc;
         bool shortcut = false;
     };
@@ -149,29 +168,42 @@ private:
         uint32_t cin = 0, cout = 0, ft = 1;
     };
     void load_vae();
+    void load_vae_flux2();
+    // A convolution (or a linear layer, as a 1x1), or several of one input's with their outputs side by side.
     Conv load_conv(const std::string& name, uint32_t k);
+    Conv load_conv(std::span<const std::string> names, uint32_t k);
     void conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* x, uint32_t h, uint32_t w, MTL::Buffer* y);
     // y = conv2(silu(norm2(conv1(silu(norm1(x)))))) + shortcut(x); t1, t2 scratch.
     void res_block(MTL::ComputeCommandEncoder*& enc, const Res& r, MTL::Buffer* x, uint32_t h, uint32_t w,
                    MTL::Buffer* y, MTL::Buffer* t1, MTL::Buffer* t2);
     void norm_silu(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, MTL::Buffer* y, uint32_t rows,
-                   uint32_t c);
+                   uint32_t c, const Tensor* b = nullptr);
+    // Group norm (32 groups) times g plus b over channels-last images, then SiLU when silu is set.
+    void group_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, const Tensor& b, MTL::Buffer* y,
+                    uint32_t rows, uint32_t c, bool silu);
 
     safetensors::Files text_files_, vae_files_;
     safetensors::Files::Ref embd_;
     std::vector<TextLayer> text_;
+    Tensor text_norm_;
     uint32_t tE_ = 0, tHeads_ = 0, tKv_ = 0;
     float tEps_ = 1e-6f, tTheta_ = 5e6f;
+    // Qwen3.5: zero-centred norms, attention heads tHead_ wide with an output gate and the first tRot_ values rotated,
+    // and the delta rule's key and value heads (of 128).
+    bool qwen35_ = false;
+    uint32_t tHead_ = kHeadDim, tRot_ = kHeadDim, tKeyHeads_ = 0, tValueHeads_ = 0;
 
     Conv post_quant_, conv_in_, conv_out_, qkv_, attn_proj_;
-    Tensor attn_g_, out_g_;
+    Tensor attn_g_, out_g_, attn_b_, out_b_;
     Res mid0_, mid1_;
     std::vector<Up> ups_;
+    // Each token latent value's mean and deviation (the VAE's per channel, or its batch norm's per token value).
     std::vector<float> lat_mean_, lat_std_;
     // The VAE's latent channels and the 2x2 patches a token packs (16 channels: Qwen-Image's 8x VAE), and whether its
     // up blocks have the duplicating shortcut (Qwen-Image 2.1's).
     uint32_t z_ = kLatent, patch_ = 1;
     bool residual_ = false;
+    bool flux2_ = false; // the FLUX.2 VAE: group norms, separate q, k, v, upsamplers' plain convolutions
 };
 
 // LoRA files and their scales, merged in order.

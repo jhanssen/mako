@@ -30,16 +30,17 @@
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
-// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's or Krea 2's directory (its files as
-// published), for /v1/images/generations: an image request waits for the chat requests in progress, then the LLM is
-// unloaded (its conversations kept in memory) and the image model loaded; the next chat request loads the LLM again.
+// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's, Krea 2's or MOSS-Image's directory (its
+// files as published), for /v1/images/generations: an image request waits for the chat requests in progress, then the
+// LLM is unloaded (its conversations kept in memory) and the image model loaded; the next chat request loads the LLM
+// again.
 // --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE), for requests that name none; a request's
 // "loras" names its own from those and the .safetensors files in --image-lora-dir (GET /v1/images/loras lists them),
 // and the image model is loaded again when they differ from the merged ones; --image-steps and --image-terminal set the
 // schedule (a 4-step distilled LoRA: --image-steps 4 --image-terminal 0); --image-text-encoder loads the text encoder
 // from another directory (the same model's weights, changed: e.g. refusal-ablated), --image-transformer the transformer
 // from another file or directory (e.g. a checkpoint with LoRAs merged); --image-guidance the guidance scale of requests
-// with a negative prompt that name none.
+// that name none (with a negative prompt, or for a model guided by default).
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "chat/template.hpp"
@@ -152,7 +153,8 @@ int main(int argc, char** argv)
                     "end repetition loops of N tokens or more in reasoning or answers (default 256; 0: off)",
                     so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
-            .option("--image-model", "DIR", "Qwen-Image 2.1's or Krea 2's files, for /v1/images/generations (swapped in)",
+            .option("--image-model", "DIR",
+                    "Qwen-Image 2.1's, Krea 2's or MOSS-Image's files, for /v1/images/generations (swapped in)",
                     image_model)
             .option("--image-lora", "FILE[:SCALE]", "merge a LoRA into the image model (repeatable)",
                     [&](const std::string& v) { so.image_loras.push_back(mako::image::parse_lora(v)); })
@@ -164,7 +166,7 @@ int main(int argc, char** argv)
                     image_transformer)
             .option("--image-steps", "N", "denoising steps of an image (default: the model's; 4 with a 4-step LoRA)",
                     so.image_steps)
-            .option("--image-guidance", "F", "guidance scale for negative prompts (default: the model's)",
+            .option("--image-guidance", "F", "guidance scale of requests that name none (default: the model's)",
                     [&](const std::string& v) { so.image_guidance = mako::app::Cli::parse<float>(v); })
             .option("--image-terminal", "F", "the schedule's last noise level (0: none, as few-step LoRAs want)",
                     [&](const std::string& v) { so.image_terminal = mako::app::Cli::parse<float>(v); })

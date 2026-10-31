@@ -77,10 +77,10 @@ tensors, the image models' from their configs; semantics were checked against th
 
 ## Image models
 
-Both run from their original files (BF16 safetensors and configs), not a GGUF: the published GGUFs hold only the
-transformer, as F16 (BF16 values below ~6.1e-5 lose bits there) or quantized. They share `image::Engine`: the Qwen3-VL
-text encoder, the VAE decoder, the flow-matching Euler schedule and the denoising loop. `Engine::open` picks the model
-from `model_index.json`.
+They run from their original files (BF16 safetensors and configs), not a GGUF: the published GGUFs hold only the
+transformer, as F16 (BF16 values below ~6.1e-5 lose bits there) or quantized. They share `image::Engine`: the text
+encoder (Qwen3-VL, or Qwen3.5's hybrid), the VAE decoder (Qwen-Image's or FLUX.2's), the flow-matching Euler schedule,
+the denoising loop with guidance, and LoRA merging. `Engine::open` picks the model from `model_index.json`.
 
 ### Qwen-Image 2.1
 
@@ -104,6 +104,23 @@ from `model_index.json`.
 - VAE: the first Qwen-Image's (16 channels, 8x), the transformer's tokens its 2x2 patches; causal 3D convolutions
   reduced to their last time tap.
 - Turbo (`is_distilled`): 8 steps, a fixed shift (mu 1.15), no guidance.
+
+### MOSS-Image
+
+- Transformer (5B): 42 single-stream blocks over [image, text], hidden 3072 (24 heads of 128), no biases, RMS norms
+  (plain scales) modulated by one timestep vector shared by every block (shift, scale, gate for attention and the
+  FFN), an FFN of 8192 with a bounded gated activation (4 tanh(g / 4) sigmoid(g) x 25 tanh(h / 25)), rotary positions
+  on four axes of 16 frequencies each (the image centred, after the text's length on the second axis; the text along
+  that axis), half-split rotation.
+- Text: Qwen3.5-9B's last hidden state (after its final norm) of the chat-templated prompt with thinking opened.
+  The encoder alternates three gated delta rule layers (a causal depthwise convolution over q / k / v, l2-normed
+  q and k, a per-head decay, a 128 x 128 state per value head; GLM's delta rule scan runs it with the decay on every
+  channel) with one attention layer (heads of 256, a sigmoid output gate, the first 64 values rotated). Two refiner
+  blocks (with biases) bring it to 3072 wide.
+- VAE: FLUX.2's small decoder: 32 channels, 8x, the transformer's tokens its 2x2 patches normalized by a batch norm's
+  statistics; group norms, a single-head mid attention.
+- Schedule: shift 5 on a linear grid, snapped to the 1000 training levels; 50 steps. Guidance 3 always, against an
+  empty negative prompt unless one is given, that pass skipping block 22, as the reference runs it.
 
 ## How the engines are built
 

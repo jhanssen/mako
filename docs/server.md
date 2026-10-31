@@ -2,7 +2,7 @@
 
 ```sh
 ./build/tools/mako_serve <first .gguf of the model> [--host 127.0.0.1] [--port 8080] [--ctx 131072] [--no-spec]
-                         [--model-id NAME] [--image-model <Qwen-Image 2.1 or Krea 2 dir>]
+                         [--model-id NAME] [--image-model <Qwen-Image 2.1, Krea 2 or MOSS-Image dir>]
 ```
 
 One request runs at a time on one session, so a conversation's next turn reuses the context the previous one left.
@@ -89,8 +89,8 @@ read from the SSD); later turns reuse it.
 
 ## Image generation
 
-`--image-model DIR` (Qwen-Image 2.1's or Krea 2's directory, its files as published; `model_index.json` says which)
-adds `POST /v1/images/generations`, OpenAI's image API:
+`--image-model DIR` (Qwen-Image 2.1's, Krea 2's or MOSS-Image's directory, its files as published;
+`model_index.json` says which) adds `POST /v1/images/generations`, OpenAI's image API:
 
 ```sh
 curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json' \
@@ -100,18 +100,20 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
 - Fields: `prompt` (required), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32 from 256, at most 2048x2048
   pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored), `output_format` (`png` or
   `jpeg`). `model`, `quality`, `style`, `background`, `moderation` and `user` are accepted and left alone: the
-  model's steps (Qwen-Image 2.1 40, Krea 2 Turbo 8), a random seed for each image (in the log).
+  model's steps (Qwen-Image 2.1 40, Krea 2 Turbo 8, MOSS-Image 50), a random seed for each image (in the log).
 - Extensions (more below): `negative_prompt` (what the image should not be) and `guidance_scale` (its strength; default
-  `--image-guidance F`, else the model's: Qwen-Image 2.1 4, Krea 2 Turbo 2). A negative prompt runs the transformer
-  twice a step, so the image takes about twice as long; without one, nothing changes. Qwen-Image follows it well
-  (scales 2 to 6 tried). Krea 2 Turbo was distilled to run without it: at 1.5-2 the negative prompt shows a little,
-  at 3 the image turns flat and oversaturated, at 5.5 it breaks.
+  `--image-guidance F`, else the model's: Qwen-Image 2.1 4, Krea 2 Turbo 2, MOSS-Image 3). A negative prompt runs the
+  transformer twice a step, so the image takes about twice as long; without one, nothing changes. Qwen-Image follows
+  it well (scales 2 to 6 tried). Krea 2 Turbo was distilled to run without it: at 1.5-2 the negative prompt shows a
+  little, at 3 the image turns flat and oversaturated, at 5.5 it breaks. MOSS-Image is always guided, as its
+  reference runs it: against an empty negative prompt when the request gives none, that pass skipping one block.
 - One model is in memory at a time. An image request waits for the chat requests in progress (chat requests that
   come meanwhile wait for it), then the LLM is unloaded, its conversations staying in memory, and the image model
   loaded (~5 s); the next chat request loads the LLM again (~10 s) and continues its conversation where it was. The
   status page shows which is loaded.
 - Time: Qwen-Image 2.1 ~13 s for 512x512, ~63 s for 1024x1024 (40 steps); Krea 2 Turbo ~5 s and ~23 s (8 steps);
-  slower as the Mac heats up; the log has each image's progress.
+  MOSS-Image ~32 s and ~145 s (50 steps, two passes each: 2.3 s a step cool, 3.4 s once warm); slower as the Mac heats
+  up; the log has each image's progress.
 - `tools/pi/scene-image` is a pi skill that turns the conversation into an image prompt and renders it through this
   endpoint (`ln -s "$PWD/tools/pi/scene-image" ~/.pi/agent/skills/`; then ask for an image of the scene, or
   `/skill:scene-image`). Its script saves to `~/Pictures/mako` (`MAKO_IMAGE_DIR`) and opens the image; `MAKO_URL`

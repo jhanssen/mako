@@ -7,7 +7,7 @@ one's options.
 
 - `mako_run` (GLM-5.3) and `ds_run` (DeepSeek-V4.1): run token ids through the engine; top logits, greedy or sampled
   tokens. `ds_run` also compares logits with a reference dump, measures decode widths and collects an imatrix.
-- `mako_image`: the image models (Qwen-Image 2.1, Krea 2) from the command line.
+- `mako_image`: the image models (Qwen-Image 2.1, Krea 2, MOSS-Image) from the command line.
 - `vision_run`, `vision_chat`: the vision encoder on an image, and a chat with images.
 - `prefill_sweep`: prefill timing over prompt lengths (`--parts` for the GPU time by part).
 - Inspection: `gguf_dump`, `tokenize`, `render_template`, `engram_rows`, `logit_compare`.
@@ -35,6 +35,7 @@ Tests whose model is not configured report as skipped. What each model variable 
 | `MAKO_DS41_MODEL` (DeepSeek-V4.1) | `ds41_*`, `dsv41`, its tokenizer, template and Engram tests. Optional: `MAKO_DS41_ENGRAM` (other Engram tables), `MAKO_DS41_DSPARK` (the drafter), `MAKO_DS41_ABLATION` |
 | `MAKO_QWEN_IMAGE`, `MAKO_QWEN_IMAGE_REF` | `image_*`, `safetensors` |
 | `MAKO_KREA2`, `MAKO_KREA2_TRANSFORMER`, `MAKO_KREA2_REF` | `krea_*` |
+| `MAKO_MOSS`, `MAKO_MOSS_REF` | `moss_*` |
 
 The image tests compare with reference tensors from the original pipeline (fp32 on the CPU), written by a Python
 script kept beside the model, not in this repository. `ctest -N -L <label>` lists a label's tests, `ctest
@@ -102,7 +103,7 @@ It does not cover long contexts; `prefill_sweep --parts` does.
 | `src/gen` | the model interface, generation session, session pool, sampling |
 | `src/text`, `src/chat` | tokenizer and streaming detokenizer; chat templates |
 | `src/vision` | images as input: decoding and preprocessing, the vision encoder and projector, prompts with images |
-| `src/image` | image generation: the shared engine, Qwen-Image 2.1, Krea 2 |
+| `src/image` | image generation: the shared engine, Qwen-Image 2.1, Krea 2, MOSS-Image |
 | `src/server` | the HTTP server: OpenAI and Anthropic APIs, model swaps |
 | `tools`, `bench`, `tests` | the programs above; microbenchmarks and `perf_check`; the ctest suite and its data |
 

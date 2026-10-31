@@ -48,6 +48,8 @@ set(MAKO_QWEN_IMAGE_REF "$ENV{MAKO_QWEN_IMAGE_REF}" CACHE PATH "Qwen-Image 2.1 r
 set(MAKO_KREA2 "$ENV{MAKO_KREA2}" CACHE PATH "Krea 2 directory (its safetensors) for its tests")
 set(MAKO_KREA2_TRANSFORMER "$ENV{MAKO_KREA2_TRANSFORMER}" CACHE FILEPATH "Krea 2 transformer checkpoint for its tests")
 set(MAKO_KREA2_REF "$ENV{MAKO_KREA2_REF}" CACHE PATH "Krea 2 reference tensors for its tests")
+set(MAKO_MOSS "$ENV{MAKO_MOSS}" CACHE PATH "MOSS-Image directory (its safetensors) for its tests")
+set(MAKO_MOSS_REF "$ENV{MAKO_MOSS_REF}" CACHE PATH "MOSS-Image reference tensors for its tests")
 set(MAKO_DS41_ENGRAM "$ENV{MAKO_DS41_ENGRAM}" CACHE FILEPATH "A GGUF with other Engram tables for DeepSeek-V4.1's tests (default: the model's own)")
 set(MAKO_DS41_ABLATION "$ENV{MAKO_DS41_ABLATION}" CACHE FILEPATH "An ablation file for DeepSeek-V4.1 (optional test input)")
 set(MAKO_DS41_DSPARK "$ENV{MAKO_DS41_DSPARK}" CACHE PATH "DeepSeek-V4.1's DSpark drafter directory (optional test input)")

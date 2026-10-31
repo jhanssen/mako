@@ -3,11 +3,13 @@
 #include "core/log.hpp"
 #include "gguf/read_pool.hpp"
 #include "image/krea2.hpp"
+#include "image/moss_image.hpp"
 #include "image/qwen_image.hpp"
 
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -112,6 +114,8 @@ std::unique_ptr<Engine> Engine::open(const std::string& dir, mtl::Context& ctx, 
         return std::make_unique<QwenImage>(dir, ctx, opts);
     if (cls == "Krea2Pipeline")
         return std::make_unique<Krea2>(dir, ctx, opts);
+    if (cls == "MOSSImagePipeline")
+        return std::make_unique<MossImage>(dir, ctx, opts);
     throw std::runtime_error(std::format("{}: an image model mako does not know ({})", dir, cls.empty() ? "?" : cls));
 }
 
@@ -120,65 +124,47 @@ Engine::Engine(const std::string& dir, mtl::Context& ctx, const Options& opts)
       text_files_(open_files(opts.text_encoder.empty() ? dir + "/text_encoder" : opts.text_encoder)),
       vae_files_(open_files(dir + "/vae"))
 {
-    // The language model's tensors, under the full model's prefix or the bare one's.
-    std::string p = "model.language_model.";
-    if (!text_files_.find(p + "embed_tokens.weight"))
-        p = "language_model.";
-    embd_ = text_files_.find(p + "embed_tokens.weight");
-    if (!embd_ || embd_.tensor->type != gguf::Type::BF16)
-        throw std::runtime_error("text encoder: embed_tokens missing or not BF16");
-    tE_ = uint32_t(embd_.tensor->dims[0]);
-    for (uint32_t i = 0;; ++i) {
-        const std::string l = std::format("{}layers.{}.", p, i);
-        if (!text_files_.find(l + "input_layernorm.weight"))
-            break;
-        TextLayer t;
-        t.attn_norm = upload(text_files_, l + "input_layernorm.weight", false);
-        t.q = upload(text_files_, l + "self_attn.q_proj.weight", true);
-        t.k = upload(text_files_, l + "self_attn.k_proj.weight", true);
-        t.v = upload(text_files_, l + "self_attn.v_proj.weight", true);
-        t.o = upload(text_files_, l + "self_attn.o_proj.weight", true);
-        t.q_norm = upload(text_files_, l + "self_attn.q_norm.weight", false);
-        t.k_norm = upload(text_files_, l + "self_attn.k_norm.weight", false);
-        t.ffn_norm = upload(text_files_, l + "post_attention_layernorm.weight", false);
-        t.gate = upload(text_files_, l + "mlp.gate_proj.weight", true);
-        t.up = upload(text_files_, l + "mlp.up_proj.weight", true);
-        t.down = upload(text_files_, l + "mlp.down_proj.weight", true);
-        text_.push_back(std::move(t));
-    }
-    if (text_.empty())
-        throw std::runtime_error("text encoder: no layers");
-    if (text_[0].q_norm.dims[0] != kHeadDim)
-        throw std::runtime_error("text encoder: heads not 128 wide");
-    tHeads_ = uint32_t(text_[0].q.dims[1] / kHeadDim);
-    tKv_ = uint32_t(text_[0].k.dims[1] / kHeadDim);
-    // eps and the rotary base from the encoder's config, where it has one beside the weights.
-    const std::string tdir = opts.text_encoder.empty() ? dir + "/text_encoder" : opts.text_encoder;
-    if (std::filesystem::exists(tdir + "/config.json")) {
-        auto j = read_json_file(tdir + "/config.json");
-        const auto& t = j.contains("text_config") ? j["text_config"] : j;
-        if (t.contains("rms_norm_eps") && t["rms_norm_eps"].is_number())
-            tEps_ = float(t["rms_norm_eps"].get_number());
-        if (t.contains("rope_theta") && t["rope_theta"].is_number())
-            tTheta_ = float(t["rope_theta"].get_number());
-        if (t.contains("rope_parameters") && t["rope_parameters"].contains("rope_theta"))
-            tTheta_ = float(t["rope_parameters"]["rope_theta"].get_number());
-    }
+    load_text(opts.text_encoder.empty() ? dir + "/text_encoder" : opts.text_encoder);
 
-    load_vae();
     const auto vj = read_json_file(dir + "/vae/config.json");
-    if (!vj.contains("latents_mean") || !vj.contains("latents_std"))
-        throw std::runtime_error("vae/config.json: no latents_mean / latents_std");
-    for (const auto& v : vj["latents_mean"].get_array())
-        lat_mean_.push_back(float(v.get_number()));
-    for (const auto& v : vj["latents_std"].get_array())
-        lat_std_.push_back(float(v.get_number()));
-    z_ = uint32_t(post_quant_.cin);
-    patch_ = z_ == kLatent ? 1 : z_ * 4 == kLatent ? 2 : 0;
-    if (!patch_ || lat_mean_.size() != z_ || lat_std_.size() != z_)
-        throw std::runtime_error(std::format("vae: {} latent channels, {} means, {} deviations", z_, lat_mean_.size(),
-                                             lat_std_.size()));
-    residual_ = vj.contains("is_residual") && vj["is_residual"].is_boolean() && vj["is_residual"].get_boolean();
+    flux2_ = vj.contains("_class_name") && vj["_class_name"].is_string() &&
+             vj["_class_name"].get_string() == "AutoencoderKLFlux2";
+    if (flux2_) {
+        // Tokens pack a 2x2 patch of the VAE's channels; its batch norm's statistics are per packed value.
+        load_vae_flux2();
+        z_ = post_quant_.cin;
+        patch_ = 2;
+        lat_ = z_ * 4;
+        double eps = 1e-4;
+        if (vj.contains("batch_norm_eps") && vj["batch_norm_eps"].is_number())
+            eps = vj["batch_norm_eps"].get_number();
+        lat_mean_ = floats(vae_files_, "bn.running_mean");
+        const auto var = floats(vae_files_, "bn.running_var");
+        if (lat_mean_.size() != lat_ || var.size() != lat_)
+            throw std::runtime_error(std::format("vae: batch norm over {} values, not {}", var.size(), lat_));
+        for (float v : var)
+            lat_std_.push_back(std::sqrt(v + float(eps)));
+    } else {
+        load_vae();
+        if (!vj.contains("latents_mean") || !vj.contains("latents_std"))
+            throw std::runtime_error("vae/config.json: no latents_mean / latents_std");
+        std::vector<float> mean, sd;
+        for (const auto& v : vj["latents_mean"].get_array())
+            mean.push_back(float(v.get_number()));
+        for (const auto& v : vj["latents_std"].get_array())
+            sd.push_back(float(v.get_number()));
+        z_ = uint32_t(post_quant_.cin);
+        patch_ = z_ == kLatent ? 1 : z_ * 4 == kLatent ? 2 : 0;
+        if (!patch_ || mean.size() != z_ || sd.size() != z_)
+            throw std::runtime_error(std::format("vae: {} latent channels, {} means, {} deviations", z_, mean.size(),
+                                                 sd.size()));
+        // Per token value: value (c * p + py) * p + px is channel c's.
+        for (uint32_t i = 0; i < kLatent; ++i) {
+            lat_mean_.push_back(mean[i / (patch_ * patch_)]);
+            lat_std_.push_back(sd[i / (patch_ * patch_)]);
+        }
+        residual_ = vj.contains("is_residual") && vj["is_residual"].is_boolean() && vj["is_residual"].get_boolean();
+    }
 
     const auto sj = read_json_file(dir + "/scheduler/scheduler_config.json");
     auto num = [&](const char* key, double& v) {
@@ -197,6 +183,94 @@ Engine::Engine(const std::string& dir, mtl::Context& ctx, const Options& opts)
     if (!t)
         throw std::runtime_error(t.error());
     tok_ = std::move(*t);
+}
+
+void Engine::load_text(const std::string& tdir)
+{
+    // eps, the rotary base and the model type from the encoder's config, where it has one beside the weights.
+    double rot_share = 1.0;
+    if (std::filesystem::exists(tdir + "/config.json")) {
+        auto j = read_json_file(tdir + "/config.json");
+        const auto& t = j.contains("text_config") ? j["text_config"] : j;
+        if (t.contains("rms_norm_eps") && t["rms_norm_eps"].is_number())
+            tEps_ = float(t["rms_norm_eps"].get_number());
+        if (t.contains("rope_theta") && t["rope_theta"].is_number())
+            tTheta_ = float(t["rope_theta"].get_number());
+        const bool rp = t.contains("rope_parameters");
+        if (rp && t["rope_parameters"].contains("rope_theta"))
+            tTheta_ = float(t["rope_parameters"]["rope_theta"].get_number());
+        qwen35_ = t.contains("model_type") && t["model_type"].is_string() &&
+                  t["model_type"].get_string().starts_with("qwen3_5");
+        if (qwen35_ && rp && t["rope_parameters"].contains("partial_rotary_factor"))
+            rot_share = t["rope_parameters"]["partial_rotary_factor"].get_number();
+    }
+    // The language model's tensors, under the full model's prefix or the bare one's.
+    std::string p = "model.language_model.";
+    if (!text_files_.find(p + "embed_tokens.weight"))
+        p = "language_model.";
+    embd_ = text_files_.find(p + "embed_tokens.weight");
+    if (!embd_ || embd_.tensor->type != gguf::Type::BF16)
+        throw std::runtime_error("text encoder: embed_tokens missing or not BF16");
+    tE_ = uint32_t(embd_.tensor->dims[0]);
+    // Qwen3.5 stores its norms' scales zero-centred.
+    auto norm_w = [&](const std::string& name) {
+        return qwen35_ ? upload_plus_one(text_files_, name) : upload(text_files_, name, false);
+    };
+    for (uint32_t i = 0;; ++i) {
+        const std::string l = std::format("{}layers.{}.", p, i);
+        if (!text_files_.find(l + "input_layernorm.weight"))
+            break;
+        TextLayer t;
+        t.attn_norm = norm_w(l + "input_layernorm.weight");
+        if (text_files_.find(l + "linear_attn.in_proj_qkv.weight")) {
+            const std::string a = l + "linear_attn.";
+            t.linear = true;
+            t.q = upload(text_files_, a + "in_proj_qkv.weight", true);
+            t.z = upload(text_files_, a + "in_proj_z.weight", true);
+            const std::string ba[2] = {a + "in_proj_b.weight", a + "in_proj_a.weight"};
+            t.ba = upload_rows(text_files_, ba);
+            t.conv = upload(text_files_, a + "conv1d.weight", false);
+            t.a_log = upload(text_files_, a + "A_log", false);
+            t.dt_bias = upload(text_files_, a + "dt_bias", false);
+            t.q_norm = upload(text_files_, a + "norm.weight", false);
+            t.o = upload(text_files_, a + "out_proj.weight", true);
+        } else {
+            t.q = upload(text_files_, l + "self_attn.q_proj.weight", true);
+            t.k = upload(text_files_, l + "self_attn.k_proj.weight", true);
+            t.v = upload(text_files_, l + "self_attn.v_proj.weight", true);
+            t.o = upload(text_files_, l + "self_attn.o_proj.weight", true);
+            t.q_norm = norm_w(l + "self_attn.q_norm.weight");
+            t.k_norm = norm_w(l + "self_attn.k_norm.weight");
+        }
+        t.ffn_norm = norm_w(l + "post_attention_layernorm.weight");
+        t.gate = upload(text_files_, l + "mlp.gate_proj.weight", true);
+        t.up = upload(text_files_, l + "mlp.up_proj.weight", true);
+        t.down = upload(text_files_, l + "mlp.down_proj.weight", true);
+        text_.push_back(std::move(t));
+    }
+    if (text_.empty())
+        throw std::runtime_error("text encoder: no layers");
+    if (text_files_.find(p + "norm.weight"))
+        text_norm_ = norm_w(p + "norm.weight");
+    const auto attn = std::ranges::find_if(text_, [](const TextLayer& t) { return !t.linear; });
+    if (attn == text_.end())
+        throw std::runtime_error("text encoder: no attention layer");
+    tHead_ = uint32_t(attn->q_norm.dims[0]);
+    if (tHead_ != kHeadDim && !(qwen35_ && tHead_ == 256))
+        throw std::runtime_error(std::format("text encoder: {}-wide heads", tHead_));
+    // Qwen3.5's queries carry an output gate per head: [heads][query, gate].
+    tHeads_ = uint32_t(attn->q.dims[1] / (tHead_ * (qwen35_ ? 2 : 1)));
+    tKv_ = uint32_t(attn->k.dims[1] / tHead_);
+    tRot_ = uint32_t(tHead_ * rot_share);
+    for (const TextLayer& t : text_)
+        if (t.linear) {
+            tValueHeads_ = uint32_t(t.a_log.dims[0]);
+            tKeyHeads_ = uint32_t((t.q.dims[1] - uint64_t(tValueHeads_) * 128) / 256);
+            if (t.q_norm.dims[0] != 128 || t.z.dims[1] != uint64_t(tValueHeads_) * 128 || !tKeyHeads_ ||
+                tValueHeads_ % tKeyHeads_ || t.conv.dims[0] > 8)
+                throw std::runtime_error("text encoder: delta rule heads not 128 wide");
+            break;
+        }
 }
 
 std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens, std::optional<float> terminal) const
@@ -223,12 +297,12 @@ std::vector<float> Engine::generate(const Request& r)
 {
     if (r.width % 32 || r.height % 32 || !r.width || !r.height)
         throw std::runtime_error("width and height must be multiples of 32");
-    const uint32_t h = r.height / 16, w = r.width / 16, N = h * w, steps = r.steps ? r.steps : default_steps();
+    const uint32_t h = r.height / 16, w = r.width / 16, N = h * w;
     const auto prompt = prompt_embeddings(r.prompt);
-    std::vector<float> x(uint64_t(N) * kLatent);
+    std::vector<float> x(uint64_t(N) * lat_);
     if (!r.noise.empty()) {
         if (r.noise.size() != x.size())
-            throw std::runtime_error("noise must be [h * w][64]");
+            throw std::runtime_error(std::format("noise must be [h * w][{}]", lat_));
         std::copy(r.noise.begin(), r.noise.end(), x.begin());
     } else {
         std::mt19937_64 rng(r.seed);
@@ -236,14 +310,16 @@ std::vector<float> Engine::generate(const Request& r)
         for (float& v : x)
             v = nd(rng);
     }
-    const auto sig = sigmas(steps, N, r.terminal);
+    const auto sig = sigmas(r.steps ? r.steps : default_steps(), N, r.terminal);
+    const uint32_t steps = uint32_t(sig.size() - 1);
     begin(prompt, h, w);
     const float scale = r.guidance.value_or(default_guidance());
-    if (r.negative)
-        begin(prompt_embeddings(*r.negative), h, w, 1);
+    const auto negative = r.negative ? r.negative : default_negative();
+    if (negative)
+        begin(prompt_embeddings(*negative), h, w, 1);
     for (uint32_t i = 0; i < steps; ++i) {
         auto v = step(x, sig[i]);
-        if (r.negative) {
+        if (negative) {
             const auto neg = step(x, sig[i], 1);
             for (size_t j = 0; j < v.size(); ++j)
                 v[j] = neg[j] + scale * (v[j] - neg[j]);
@@ -391,7 +467,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Bu
              MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
 }
 
-std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps)
+std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps,
+                                       bool normed)
 {
     const uint32_t T = uint32_t(ids.size()), E = tE_, kv = tKv_ * kHeadDim, qw = tHeads_ * kHeadDim;
     if (T <= drop)
@@ -414,17 +491,18 @@ std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t dr
     MTL::Buffer* vh = scratch("t_vh", uint64_t(tKv_) * k_pad * kHeadDim * 2);
     MTL::Buffer* att = scratch("t_att", uint64_t(T) * qw * 4);
     MTL::Buffer* y = scratch("t_y", uint64_t(T) * E * 4);
-    MTL::Buffer* cs = scratch("t_cs", uint64_t(T) * kHeadDim / 2 * 8);
+    const uint32_t pairs = tRot_ / 2;
+    MTL::Buffer* cs = scratch("t_cs", uint64_t(T) * pairs * 8);
     MTL::Buffer* out = scratch("t_out", uint64_t(T) * nt * E * 4);
     embed(ids, static_cast<float*>(x->contents()));
     // Text positions are the same on the three rotary axes, which makes the multi-axis rotation the plain one.
     auto* c = static_cast<float*>(cs->contents());
     for (uint32_t t = 0; t < T; ++t)
-        for (uint32_t i = 0; i < kHeadDim / 2; ++i) {
-            const float inv = 1.0f / std::pow(tTheta_, float(2 * i) / float(kHeadDim));
+        for (uint32_t i = 0; i < pairs; ++i) {
+            const float inv = 1.0f / std::pow(tTheta_, float(2 * i) / float(tRot_));
             const float ang = float(t) * inv;
-            c[(uint64_t(t) * kHeadDim / 2 + i) * 2] = std::cos(ang);
-            c[(uint64_t(t) * kHeadDim / 2 + i) * 2 + 1] = std::sin(ang);
+            c[(uint64_t(t) * pairs + i) * 2] = std::cos(ang);
+            c[(uint64_t(t) * pairs + i) * 2 + 1] = std::sin(ang);
         }
 
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
@@ -448,6 +526,18 @@ std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t dr
         const TextLayer& L = text_[il];
         cur_layer_ = il;
         norm(enc, x, &L.attn_norm, xn, T, E, E, tEps_);
+        if (qwen35_) {
+            if (L.linear)
+                text_linear(enc, L, xn, y, T);
+            else
+                text_gated_attention(enc, L, xn, y, T, cs);
+            add(enc, x, y, x, T * E);
+            norm(enc, x, &L.ffn_norm, xn, T, E, E, tEps_);
+            ffn_dense(enc, L.gate, L.up, L.down, xn, y, 0.0f, T);
+            add(enc, x, y, x, T * E);
+            tap(il + 1);
+            continue;
+        }
         proj(enc, L.q, xn, 0, q, 0, T);
         proj(enc, L.k, xn, 0, k, 0, T);
         proj(enc, L.v, xn, 0, v, 0, T);
@@ -464,45 +554,183 @@ std::vector<float> Engine::encode_text(std::span<const int32_t> ids, uint32_t dr
         add(enc, x, y, x, T * E);
         tap(il + 1);
     }
+    if (normed) {
+        if (!text_norm_.buf)
+            throw std::runtime_error("text encoder: no final norm");
+        norm(enc, x, &text_norm_, x, T, E, E, tEps_);
+    }
     enc->endEncoding();
     finish(cb);
     const auto* src = static_cast<const float*>((taps.empty() ? x : out)->contents());
     return std::vector<float>(src + uint64_t(drop) * nt * E, src + uint64_t(T) * nt * E);
 }
 
+void Engine::text_linear(MTL::ComputeCommandEncoder*& enc, const TextLayer& L, MTL::Buffer* xn, MTL::Buffer* y,
+                         uint32_t T)
+{
+    const uint32_t KH = tKeyHeads_, VH = tValueHeads_, width = (2 * KH + VH) * 128, vw = VH * 128;
+    MTL::Buffer* m = scratch("g_m", uint64_t(T) * width * 4);
+    MTL::Buffer* mc = scratch("g_mc", uint64_t(T) * width * 4);
+    MTL::Buffer* z = scratch("g_z", uint64_t(T) * vw * 4);
+    MTL::Buffer* ba = scratch("g_ba", uint64_t(T) * 2 * VH * 4);
+    MTL::Buffer* q = scratch("g_q", uint64_t(T) * vw * 4);
+    MTL::Buffer* k = scratch("g_k", uint64_t(T) * vw * 4);
+    MTL::Buffer* v = scratch("g_v", uint64_t(T) * vw * 4);
+    MTL::Buffer* g = scratch("g_g", uint64_t(T) * vw * 4);
+    MTL::Buffer* beta = scratch("g_beta", uint64_t(T) * VH * 4);
+    MTL::Buffer* o = scratch("g_o", uint64_t(T) * vw * 4);
+    // Each layer's own state, zeroed now: the GPU runs the layers after all are encoded.
+    MTL::Buffer* state = scratch(std::format("g_state{}", cur_layer_), uint64_t(VH) * 128 * 128 * 4);
+    std::memset(state->contents(), 0, state->length());
+    proj(enc, L.q, xn, 0, m, 0, T);
+    proj(enc, L.z, xn, 0, z, 0, T);
+    proj(enc, L.ba, xn, 0, ba, 0, T);
+    const uint32_t ca[3] = {width, uint32_t(L.conv.dims[0]), T};
+    enc->setComputePipelineState(pso("gdn_conv"));
+    enc->setBuffer(m, 0, 0);
+    enc->setBuffer(L.conv.buf, L.conv.off, 1);
+    enc->setBuffer(mc, 0, 2);
+    enc->setBytes(ca, sizeof(ca), 3);
+    enc->dispatchThreads(MTL::Size(width, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "gdn_conv");
+    struct {
+        uint32_t k_heads, v_heads, conv_width;
+        float eps;
+    } pa{KH, VH, width, 1e-6f};
+    enc->setComputePipelineState(pso("gdn_prep"));
+    enc->setBuffer(mc, 0, 0);
+    enc->setBuffer(ba, 0, 1);
+    enc->setBuffer(L.a_log.buf, L.a_log.off, 2);
+    enc->setBuffer(L.dt_bias.buf, L.dt_bias.off, 3);
+    for (uint32_t i = 0; i < 5; ++i)
+        enc->setBuffer(std::array{q, k, v, g, beta}[i], 0, 4 + i);
+    enc->setBytes(&pa, sizeof(pa), 9);
+    enc->dispatchThreadgroups(MTL::Size(VH, T, 1), MTL::Size(128, 1, 1));
+    after(enc, "gdn_prep");
+    // The delta rule with a decay per head: the per-channel scan with each head's decay on all of its channels.
+    const uint32_t sa[6] = {128, T, vw, vw, VH, 0};
+    enc->setComputePipelineState(pso("kda_scan"));
+    for (uint32_t i = 0; i < 7; ++i)
+        enc->setBuffer(std::array{q, k, v, g, beta, state, o}[i], 0, i);
+    enc->setBytes(sa, sizeof(sa), 7);
+    enc->setBuffer(state, 0, 8);
+    enc->dispatchThreadgroups(MTL::Size(VH, 4, 1), MTL::Size(128, 1, 1));
+    after(enc, "kda_scan");
+    const struct {
+        uint32_t heads;
+        float eps;
+    } ga{VH, tEps_};
+    enc->setComputePipelineState(pso("gated_rms"));
+    enc->setBuffer(o, 0, 0);
+    enc->setBuffer(z, 0, 1);
+    enc->setBuffer(L.q_norm.buf, L.q_norm.off, 2);
+    enc->setBytes(&ga, sizeof(ga), 3);
+    enc->dispatchThreadgroups(MTL::Size(VH, T, 1), MTL::Size(128, 1, 1));
+    after(enc, "gated_rms");
+    proj(enc, L.o, o, 0, y, 0, T);
+}
+
+void Engine::text_gated_attention(MTL::ComputeCommandEncoder*& enc, const TextLayer& L, MTL::Buffer* xn,
+                                  MTL::Buffer* y, uint32_t T, MTL::Buffer* cs)
+{
+    const uint32_t D = tHead_, H = tHeads_, KV = tKv_, qw = 2 * H * D, kw = KV * D;
+    const uint32_t q_pad = round_up(T, kAttnRows), k_pad = round_up(T, 128);
+    MTL::Buffer* q = scratch("a_q", uint64_t(T) * qw * 4);
+    MTL::Buffer* k = scratch("a_k", uint64_t(T) * kw * 4);
+    MTL::Buffer* v = scratch("a_v", uint64_t(T) * kw * 4);
+    MTL::Buffer* qh = scratch("a_qh", uint64_t(H) * q_pad * D * 2);
+    MTL::Buffer* kh = scratch("a_kh", uint64_t(KV) * k_pad * D * 2);
+    MTL::Buffer* vh = scratch("a_vh", uint64_t(KV) * k_pad * D * 2);
+    MTL::Buffer* att = scratch("a_att", uint64_t(T) * H * D * 4);
+    std::memset(qh->contents(), 0, qh->length());
+    std::memset(kh->contents(), 0, kh->length());
+    std::memset(vh->contents(), 0, vh->length());
+    proj(enc, L.q, xn, 0, q, 0, T);
+    proj(enc, L.k, xn, 0, k, 0, T);
+    proj(enc, L.v, xn, 0, v, 0, T);
+    struct HeadsPartialArgs {
+        uint32_t ld, col0, stride, dim, rot, n_pad;
+        float eps;
+    };
+    auto heads = [&](MTL::Buffer* x, const HeadsPartialArgs& a, const Tensor* w, uint32_t n, MTL::Buffer* out) {
+        enc->setComputePipelineState(pso("heads_partial"));
+        enc->setBuffer(x, 0, 0);
+        enc->setBuffer(cs, 0, 1);
+        enc->setBuffer(out, 0, 2);
+        enc->setBuffer(w ? w->buf : x, w ? w->off : 0, 3);
+        enc->setBytes(&a, sizeof(a), 4);
+        enc->dispatchThreadgroups(MTL::Size(T, n, 1), MTL::Size(D, 1, 1));
+        after(enc, "heads_partial");
+    };
+    heads(q, {qw, 0, 2 * D, D, tRot_, q_pad, tEps_}, &L.q_norm, H, qh);
+    heads(k, {kw, 0, D, D, tRot_, k_pad, tEps_}, &L.k_norm, KV, kh);
+    heads(v, {kw, 0, D, D, 0, k_pad, 0.0f}, nullptr, KV, vh);
+    const AttnArgs a{T, q_pad, T, k_pad, H, KV, 0, UINT32_MAX, H * D, 1.0f / std::sqrt(float(D))};
+    dispatch(enc, std::format("flash_attn_sg_{}_16x32_4", D), {qh, kh, vh, att}, &a, sizeof(a),
+             MTL::Size(q_pad / kAttnRows, H, 1), MTL::Size(128, 1, 1), false);
+    const uint32_t ga[5] = {H, D, qw, D, 2 * D};
+    dispatch(enc, "gate_heads", {att, q}, ga, sizeof(ga), MTL::Size(D, H, T), MTL::Size(64, 1, 1));
+    proj(enc, L.o, att, 0, y, 0, T);
+}
+
 Engine::Conv Engine::load_conv(const std::string& name, uint32_t k)
 {
-    const auto r = vae_files_.find(name + ".weight");
-    const auto rb = vae_files_.find(name + ".bias");
-    const size_t nd = r ? r.tensor->dims.size() : 0;
-    if (!r || !rb || r.tensor->type != gguf::Type::F32 || (nd != 4 && nd != 5))
-        throw std::runtime_error(name + ": missing, or not an F32 convolution");
+    return load_conv(std::span(&name, 1), k);
+}
+
+Engine::Conv Engine::load_conv(std::span<const std::string> names, uint32_t k)
+{
+    struct Part {
+        safetensors::Files::Ref r;
+        uint32_t cout, kt;
+    };
+    std::vector<Part> parts;
     Conv c;
     c.k = k;
-    c.cout = uint32_t(r.tensor->dims[nd - 1]);
-    c.cin = uint32_t(r.tensor->dims[nd - 2]);
-    // A causal 3D convolution over one frame sees only its last time tap (the earlier ones read the zero padding).
-    const uint32_t kt = nd == 5 ? uint32_t(r.tensor->dims[2]) : 1;
-    if (r.tensor->dims[0] != k || r.tensor->dims[1] != k)
-        throw std::runtime_error(name + ": unexpected kernel size");
+    for (const std::string& name : names) {
+        const auto r = vae_files_.find(name + ".weight");
+        const size_t nd = r ? r.tensor->dims.size() : 0;
+        if (!r || !vae_files_.find(name + ".bias") || r.tensor->type != gguf::Type::F32 ||
+            (nd != 2 && nd != 4 && nd != 5))
+            throw std::runtime_error(name + ": missing, or not an F32 convolution");
+        // A linear layer is a 1x1 convolution.
+        if (nd == 2 ? k != 1 : r.tensor->dims[0] != k || r.tensor->dims[1] != k)
+            throw std::runtime_error(name + ": unexpected kernel size");
+        const uint32_t cin = uint32_t(r.tensor->dims[nd - 2]);
+        if (c.cin && cin != c.cin)
+            throw std::runtime_error(name + ": input channels differ from the others'");
+        c.cin = cin;
+        // A causal 3D convolution over one frame sees only its last time tap (the earlier ones read the zero padding).
+        parts.push_back({r, uint32_t(r.tensor->dims[nd - 1]), nd == 5 ? uint32_t(r.tensor->dims[2]) : 1});
+        c.cout += parts.back().cout;
+    }
     const uint32_t cols = c.cin * k * k, kk = k * k;
     // 3x3: the unfolded rows padded for the direct GEMM; 1x1: the input's own rows (the staged GEMM where they are not
     // a multiple of 64).
     c.kpad = round_up(cols, k == 3 ? 64 : 32);
     // Half, as the activations it multiplies are (the direct GEMM reads it unstaged).
     c.w = reserve(uint64_t(c.cout) * c.kpad * 2, gguf::Type::F16, {c.kpad, c.cout});
+    c.b = reserve(uint64_t(c.cout) * 4, gguf::Type::F32, {c.cout});
     auto* dst = reinterpret_cast<__fp16*>(static_cast<char*>(c.w.buf->contents()) + c.w.off);
-    std::vector<float> row(uint64_t(cols) * kt);
-    for (uint32_t o = 0; o < c.cout; ++o) {
-        gguf::read_exact(r.file->fd(), row.data(), row.size() * 4, r.tensor->offset + uint64_t(o) * row.size() * 4);
-        for (uint32_t i = 0; i < c.kpad; ++i) {
-            float v = 0.0f;
-            if (i < cols)
-                v = row[(uint64_t(i / kk) * kt + kt - 1) * kk + i % kk];
-            dst[uint64_t(o) * c.kpad + i] = __fp16(v);
+    auto* bias = reinterpret_cast<float*>(static_cast<char*>(c.b.buf->contents()) + c.b.off);
+    uint32_t o0 = 0;
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+        const Part& p = parts[pi];
+        std::vector<float> row(uint64_t(cols) * p.kt);
+        for (uint32_t o = 0; o < p.cout; ++o) {
+            gguf::read_exact(p.r.file->fd(), row.data(), row.size() * 4,
+                             p.r.tensor->offset + uint64_t(o) * row.size() * 4);
+            for (uint32_t i = 0; i < c.kpad; ++i) {
+                float v = 0.0f;
+                if (i < cols)
+                    v = row[(uint64_t(i / kk) * p.kt + p.kt - 1) * kk + i % kk];
+                dst[uint64_t(o0 + o) * c.kpad + i] = __fp16(v);
+            }
         }
+        const auto b = floats(vae_files_, names[pi] + ".bias");
+        std::copy(b.begin(), b.end(), bias + o0);
+        o0 += p.cout;
     }
-    c.b = upload(vae_files_, name + ".bias", false);
     return c;
 }
 
@@ -549,6 +777,52 @@ void Engine::load_vae()
     conv_out_ = load_conv("decoder.conv_out", 3);
 }
 
+void Engine::load_vae_flux2()
+{
+    auto res = [&](const std::string& p) {
+        Res r;
+        r.g1 = upload(vae_files_, p + ".norm1.weight", false);
+        r.b1 = upload(vae_files_, p + ".norm1.bias", false);
+        r.g2 = upload(vae_files_, p + ".norm2.weight", false);
+        r.b2 = upload(vae_files_, p + ".norm2.bias", false);
+        r.c1 = load_conv(p + ".conv1", 3);
+        r.c2 = load_conv(p + ".conv2", 3);
+        if (vae_files_.find(p + ".conv_shortcut.weight")) {
+            r.sc = load_conv(p + ".conv_shortcut", 1);
+            r.shortcut = true;
+        }
+        return r;
+    };
+    post_quant_ = load_conv("post_quant_conv", 1);
+    conv_in_ = load_conv("decoder.conv_in", 3);
+    mid0_ = res("decoder.mid_block.resnets.0");
+    mid1_ = res("decoder.mid_block.resnets.1");
+    const std::string a = "decoder.mid_block.attentions.0.";
+    attn_g_ = upload(vae_files_, a + "group_norm.weight", false);
+    attn_b_ = upload(vae_files_, a + "group_norm.bias", false);
+    const std::string qkv[3] = {a + "to_q", a + "to_k", a + "to_v"};
+    qkv_ = load_conv(qkv, 1);
+    attn_proj_ = load_conv(a + "to_out.0", 1);
+    for (uint32_t i = 0;; ++i) {
+        const std::string p = std::format("decoder.up_blocks.{}", i);
+        if (!vae_files_.find(p + ".resnets.0.conv1.weight"))
+            break;
+        Up u;
+        for (uint32_t j = 0; vae_files_.find(std::format("{}.resnets.{}.conv1.weight", p, j)); ++j)
+            u.res.push_back(res(std::format("{}.resnets.{}", p, j)));
+        u.cin = u.res.front().c1.cin;
+        u.cout = u.res.back().c2.cout;
+        if (vae_files_.find(p + ".upsamplers.0.conv.weight")) {
+            u.up = true;
+            u.conv = load_conv(p + ".upsamplers.0.conv", 3);
+        }
+        ups_.push_back(std::move(u));
+    }
+    out_g_ = upload(vae_files_, "decoder.conv_norm_out.weight", false);
+    out_b_ = upload(vae_files_, "decoder.conv_norm_out.bias", false);
+    conv_out_ = load_conv("decoder.conv_out", 3);
+}
+
 void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* x, uint32_t h, uint32_t w,
                   MTL::Buffer* y)
 {
@@ -580,9 +854,35 @@ void Engine::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* 
     bias(enc, y, c.b, c.cout, rows);
 }
 
-void Engine::norm_silu(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, MTL::Buffer* y,
-                       uint32_t rows, uint32_t c)
+void Engine::group_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, const Tensor& b,
+                        MTL::Buffer* y, uint32_t rows, uint32_t c, bool silu)
 {
+    struct {
+        uint32_t rows, c, groups, chunk;
+        float eps;
+        uint32_t silu;
+    } a{rows, c, 32, 256, 1e-6f, silu ? 1u : 0u};
+    const uint32_t chunks = (rows + a.chunk - 1) / a.chunk;
+    MTL::Buffer* part = scratch("gn_part", uint64_t(chunks) * c * 8);
+    MTL::Buffer* stats = scratch("gn_stats", 32 * 8);
+    dispatch(enc, "gn_partial", {x, part}, &a, sizeof(a), MTL::Size(chunks, 1, 1), MTL::Size(c, 1, 1), false);
+    dispatch(enc, "gn_stats", {part, stats}, &a, sizeof(a), MTL::Size(32, 1, 1), MTL::Size(32, 1, 1));
+    enc->setComputePipelineState(pso("gn_apply"));
+    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(stats, 0, 1);
+    enc->setBuffer(g.buf, g.off, 2);
+    enc->setBuffer(b.buf, b.off, 3);
+    enc->setBuffer(y, 0, 4);
+    enc->setBytes(&a, sizeof(a), 5);
+    enc->dispatchThreads(MTL::Size(c, rows, 1), MTL::Size(std::min(c, 256u), 1, 1));
+    after(enc, "gn_apply");
+}
+
+void Engine::norm_silu(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, MTL::Buffer* y,
+                       uint32_t rows, uint32_t c, const Tensor* b)
+{
+    if (b)
+        return group_norm(enc, x, g, *b, y, rows, c, true);
     // x / ||x|| * sqrt(c) * g over each pixel's channels: an RMS norm (eps as the reference's 1e-12 on the norm).
     norm(enc, x, &g, y, rows, c, c, 1e-24f / float(c));
     unary(enc, "silu", y, rows * c);
@@ -592,9 +892,9 @@ void Engine::res_block(MTL::ComputeCommandEncoder*& enc, const Res& r, MTL::Buff
                        MTL::Buffer* y, MTL::Buffer* t1, MTL::Buffer* t2)
 {
     const uint32_t rows = h * w, cin = r.c1.cin, cout = r.c2.cout;
-    norm_silu(enc, x, r.g1, t1, rows, cin);
+    norm_silu(enc, x, r.g1, t1, rows, cin, flux2_ ? &r.b1 : nullptr);
     conv(enc, r.c1, t1, h, w, t2);
-    norm_silu(enc, t2, r.g2, t2, rows, cout);
+    norm_silu(enc, t2, r.g2, t2, rows, cout, flux2_ ? &r.b2 : nullptr);
     conv(enc, r.c2, t2, h, w, y);
     if (r.shortcut) {
         conv(enc, r.sc, x, h, w, t1);
@@ -606,8 +906,8 @@ void Engine::res_block(MTL::ComputeCommandEncoder*& enc, const Res& r, MTL::Buff
 
 std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, uint32_t w)
 {
-    if (latents.size() != uint64_t(h) * w * kLatent)
-        throw std::runtime_error("latents must be [h * w][64]");
+    if (latents.size() != uint64_t(h) * w * lat_)
+        throw std::runtime_error(std::format("latents must be [h * w][{}]", lat_));
     // The VAE's own latent image: a token's 2x2 patch spread over pixels where it packs one.
     const uint32_t lh = h * patch_, lw = w * patch_;
     // The largest image: the last up block's input, at the output's size, and the widest channels at its scale.
@@ -637,8 +937,9 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
             for (uint32_t ch = 0; ch < z_; ++ch)
                 for (uint32_t py = 0; py < p; ++py)
                     for (uint32_t px = 0; px < p; ++px) {
-                        const float v = latents[(uint64_t(y) * w + x) * kLatent + (ch * p + py) * p + px];
-                        lat[((uint64_t(y) * p + py) * lw + x * p + px) * z_ + ch] = v * lat_std_[ch] + lat_mean_[ch];
+                        const uint32_t i = (ch * p + py) * p + px;
+                        const float v = latents[(uint64_t(y) * w + x) * lat_ + i];
+                        lat[((uint64_t(y) * p + py) * lw + x * p + px) * z_ + ch] = v * lat_std_[i] + lat_mean_[i];
                     }
 
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
@@ -655,20 +956,30 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
     {
         // Single-head attention over the pixels, channels wide.
         const uint32_t n = hh * ww, c = qkv_.cin;
-        norm(enc, b, &attn_g_, t1, n, c, c, 1e-24f / float(c));
+        if (flux2_)
+            group_norm(enc, b, attn_g_, attn_b_, t1, n, c, false);
+        else
+            norm(enc, b, &attn_g_, t1, n, c, c, 1e-24f / float(c));
         conv(enc, qkv_, t1, hh, ww, t2); // [n][3c]: q, k, v
         MTL::Buffer* kc = scratch("v_k", uint64_t(n) * c * 4);
         MTL::Buffer* vt = scratch("v_vt", uint64_t(n) * c * 4);
-        MTL::Buffer* sc = scratch("v_s", uint64_t(n) * n * 4);
+        // Queries a pass, so the scores stay near 256 MB.
+        const uint32_t qn = std::min(n, std::max(256u, uint32_t((64ull << 20) / n) / 256 * 256));
+        MTL::Buffer* sc = scratch("v_s", uint64_t(qn) * n * 4);
         const TransposeArgs ka{n, c, 3 * c, c}, va{n, c, 3 * c, 2 * c};
         dispatch(enc, "copy_cols", {t2, kc}, &ka, sizeof(ka), MTL::Size(c, n, 1), MTL::Size(256, 1, 1));
         dispatch(enc, "transpose_f32", {t2, vt}, &va, sizeof(va), MTL::Size(c, n, 1), MTL::Size(256, 1, 1));
-        gemm_->encode(enc, gguf::Type::F32, c, n, n, kc, 0, halves(enc, t2, 0, n, c, 3 * c), 0, sc, 0);
-        after(enc, "vae scores");
-        const float sa[2] = {float(n), 1.0f / std::sqrt(float(c))};
-        dispatch(enc, "softmax_rows", {sc}, sa, sizeof(sa), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1), false);
-        gemm_->encode(enc, gguf::Type::F32, n, c, n, vt, 0, halves(enc, sc, 0, n, n, 0), 0, t1, 0);
-        after(enc, "vae pv");
+        for (uint32_t q0 = 0; q0 < n; q0 += qn) {
+            const uint32_t m = std::min(qn, n - q0);
+            gemm_->encode(enc, gguf::Type::F32, c, n, m, kc, 0, halves(enc, t2, uint64_t(q0) * 3 * c * 4, m, c, 3 * c),
+                          0, sc, 0);
+            after(enc, "vae scores");
+            const float sa[2] = {float(n), 1.0f / std::sqrt(float(c))};
+            dispatch(enc, "softmax_rows", {sc}, sa, sizeof(sa), MTL::Size(m, 1, 1), MTL::Size(256, 1, 1), false);
+            gemm_->encode(enc, gguf::Type::F32, n, c, m, vt, 0, halves(enc, sc, 0, m, n, 0), 0, t1,
+                          uint64_t(q0) * c * 4);
+            after(enc, "vae pv");
+        }
         conv(enc, attn_proj_, t1, hh, ww, a);
         add(enc, a, b, b, n * c);
     }
@@ -702,7 +1013,7 @@ std::vector<float> Engine::decode(std::span<const float> latents, uint32_t h, ui
         }
         probe(enc, "vae_up", int(&u - ups_.data()), x, uint64_t(hh) * ww * (u.up ? u.conv.cout : u.cout));
     }
-    norm_silu(enc, x, out_g_, t1, hh * ww, conv_out_.cin);
+    norm_silu(enc, x, out_g_, t1, hh * ww, conv_out_.cin, flux2_ ? &out_b_ : nullptr);
     conv(enc, conv_out_, t1, hh, ww, y);
     enc->endEncoding();
     finish(cb);

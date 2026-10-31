@@ -29,7 +29,7 @@ Runs mixture-of-experts models larger than your Mac's memory.
 - **Models:** GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017
 - **API:** OpenAI- and Anthropic-compatible (works with Claude Code)
 - **Speed:** DeepSeek-V4.1 decodes at ~25-34 tokens/s on a 128 GB M5 Max
-- **Optional:** image input, image generation (Qwen-Image 2.1, Krea 2)
+- **Optional:** image input, image generation (Qwen-Image 2.1, Krea 2, MOSS-Image)
 
 Early, but usable.
 

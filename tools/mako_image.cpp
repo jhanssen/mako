@@ -1,4 +1,4 @@
-// Text to image with Qwen-Image 2.1 or Krea 2 from their original files.
+// Text to image with Qwen-Image 2.1, Krea 2 or MOSS-Image from their original files.
 //   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--count N] [--rgb]
 //              [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR] [--transformer PATH]
 //              [--negative TEXT] [--guidance F]
@@ -47,7 +47,8 @@ int main(int argc, char** argv)
         .option("--transformer", "PATH", "another file or directory of the transformer's weights", transformer)
         .option("--negative", "TEXT", "what the image should not be (guidance: two passes a step)",
                 [&](const std::string& v) { negative = v; })
-        .option("--guidance", "F", "the guidance scale with --negative (default: the model's)",
+        .option("--guidance", "F",
+                "the guidance scale, with --negative or a model guided by default (default: the model's)",
                 [&](const std::string& v) { guidance = mako::app::Cli::parse<float>(v); })
         .option("--terminal", "F", "the schedule's last noise level (0: none)",
                 [&](const std::string& v) { terminal = mako::app::Cli::parse<float>(v); });
