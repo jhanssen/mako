@@ -1,6 +1,6 @@
 ---
 name: scene-image
-description: Render a picture of the current scene, character, place or moment from this conversation with the local mako image model (Qwen-Image), and show it. Use when the user asks for an image, illustration, picture or visual of what is being written, imagined or built in the session.
+description: Render a picture of the current scene, character, place or moment from this conversation with the local mako image model (Qwen-Image or Krea 2), and show it. Use when the user asks for an image, illustration, picture or visual of what is being written, imagined or built in the session.
 ---
 
 # Scene image
@@ -34,9 +34,22 @@ Turn what the conversation has established into one image prompt, render it with
    Do not `read` the image unless the user wants to talk about what is in it (it then goes to the model as image
    input, which needs mako started with `--mmproj`). If the user wants changes, adjust the prompt and render again.
 
-How strongly any LoRAs (styles, content) act is set where mako starts (`--image-lora FILE:SCALE`), not here: if the
-user says an effect is too weak or too strong, tell them to restart mako with a higher or lower SCALE (e.g. 1.2 or
-0.8).
+## LoRAs
 
-If the script fails, report its message: mako may not be running, may have no image model (`--image-model`), or may
-need an API key (`MAKO_API_KEY`).
+LoRAs are add-ons to the image model (a style, a kind of content, a faster schedule). `scripts/loras.sh` lists the
+ones mako has, by name; those marked "default" are what every render uses unless told otherwise, at the scale shown.
+
+- Without `--lora`, a render uses the defaults. With `--lora NAME[:SCALE]` (repeatable), it uses exactly the LoRAs
+  given and no others, so to add one to the defaults, pass the defaults too:
+  `scripts/render.sh --lora fast-4step:1 --lora watercolour:0.8 1024x1024 "<the prompt>"`.
+  `--no-loras` renders with none.
+- SCALE is the strength (1 when left out). If the user finds an effect too weak or too strong, raise or lower it by
+  0.2-0.3.
+- Keep a default that makes rendering fast (its name says so, e.g. "lightning", "4step", "turbo") whenever you pass
+  `--lora`: mako's step count is set for it, and without it images come out smeared.
+- Use a LoRA only when the user asks for it or its name clearly matches what they want. Once the user has chosen
+  LoRAs, pass the same ones on every later render in the conversation: nothing is remembered between renders.
+- A render with other LoRAs than the previous one first reloads the image model (a few seconds more).
+
+If a script fails, report its message: mako may not be running, may have no image model (`--image-model`), may
+need an API key (`MAKO_API_KEY`), or may not have a LoRA of that name (list them again).

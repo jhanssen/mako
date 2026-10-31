@@ -6,7 +6,7 @@
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
 //              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--image-model DIR]
 //              [--image-lora FILE[:SCALE] ...] [--image-steps N] [--image-terminal F] [--image-text-encoder DIR]
-//              [--image-transformer PATH] [--image-guidance F]
+//              [--image-transformer PATH] [--image-guidance F] [--image-lora-dir DIR]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -33,7 +33,9 @@
 // engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's or Krea 2's directory (its files as
 // published), for /v1/images/generations: an image request waits for the chat requests in progress, then the LLM is
 // unloaded (its conversations kept in memory) and the image model loaded; the next chat request loads the LLM again.
-// --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE); --image-steps and --image-terminal set the
+// --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE), for requests that name none; a request's
+// "loras" names its own from those and the .safetensors files in --image-lora-dir (GET /v1/images/loras lists them),
+// and the image model is loaded again when they differ from the merged ones; --image-steps and --image-terminal set the
 // schedule (a 4-step distilled LoRA: --image-steps 4 --image-terminal 0); --image-text-encoder loads the text encoder
 // from another directory (the same model's weights, changed: e.g. refusal-ablated), --image-transformer the transformer
 // from another file or directory (e.g. a checkpoint with LoRAs merged); --image-guidance the guidance scale of requests
@@ -94,7 +96,6 @@ int main(int argc, char** argv)
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1, park_gb = -1;
     std::string ablate, engram, dspark, imatrix, mmproj_path, image_model;
-    std::vector<std::pair<std::string, float>> image_loras;
     std::string image_text_encoder, image_transformer;
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
@@ -154,7 +155,9 @@ int main(int argc, char** argv)
             .option("--image-model", "DIR", "Qwen-Image 2.1's or Krea 2's files, for /v1/images/generations (swapped in)",
                     image_model)
             .option("--image-lora", "FILE[:SCALE]", "merge a LoRA into the image model (repeatable)",
-                    [&](const std::string& v) { image_loras.push_back(mako::image::parse_lora(v)); })
+                    [&](const std::string& v) { so.image_loras.push_back(mako::image::parse_lora(v)); })
+            .option("--image-lora-dir", "DIR", "a directory of LoRAs requests may name (GET /v1/images/loras)",
+                    so.image_lora_dir)
             .option("--image-text-encoder", "DIR", "another directory of the image model's text encoder weights",
                     image_text_encoder)
             .option("--image-transformer", "PATH", "another file or directory of the image model's transformer weights",
@@ -189,6 +192,10 @@ int main(int argc, char** argv)
                             k.size());
     if (so.host != "127.0.0.1" && so.host != "localhost" && so.host != "::1" && so.api_keys.empty()) {
         std::println(stderr, "--host {} serves beyond this machine: give an --api-key or --api-key-file", so.host);
+        return 2;
+    }
+    if (!so.image_lora_dir.empty() && (image_model.empty() || !std::filesystem::is_directory(so.image_lora_dir))) {
+        std::println(stderr, "--image-lora-dir needs --image-model and a directory");
         return 2;
     }
     const auto t_start = std::chrono::steady_clock::now();
@@ -341,9 +348,9 @@ int main(int argc, char** argv)
     };
     mako::server::Models::LoadImage load_image;
     if (!image_model.empty())
-        load_image = [&] {
+        load_image = [&](const mako::image::Loras& loras) {
             auto e = mako::image::Engine::open(image_model, ctx, {image_text_encoder, image_transformer});
-            for (const auto& [path, scale] : image_loras)
+            for (const auto& [path, scale] : loras)
                 e->add_lora(path, scale);
             return e;
         };

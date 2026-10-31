@@ -12,10 +12,13 @@
 #include <glaze/glaze.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <format>
 #include <print>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -125,6 +128,38 @@ void image_checks()
     check(an.images == std::vector<std::string>{"ABC", "DEF"}, "Anthropic image blocks (user, tool result), in order");
     check(!an.context.contains("QUJD") && an.context.contains(R"("type":"image")"),
           "Anthropic image blocks become image parts without their data");
+}
+
+void lora_checks()
+{
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / std::format("mako_lora_test_{}", getpid());
+    fs::create_directories(dir);
+    for (const char* f : {"b.safetensors", "a.safetensors", "style.safetensors", "notes.txt"})
+        std::ofstream(dir / f) << "x";
+    const mako::image::Loras defaults{{"/elsewhere/style.safetensors", 1.3f}};
+    const auto choices = mako::server::lora_choices(defaults, dir.string());
+    check(choices.size() == 3 && choices[0].name == "style" && choices[0].path == "/elsewhere/style.safetensors" &&
+              choices[0].scale == 1.3f && choices[1].name == "a" && !choices[1].scale && choices[2].name == "b",
+          "LoRA choices: start-up ones first (their name wins), then the directory's by name");
+    using mako::server::resolve_loras;
+    const auto got = resolve_loras(R"([{"name":"b","scale":-0.5},{"name":"style"}])", choices);
+    check(got == mako::image::Loras{{(dir / "b.safetensors").string(), -0.5f}, {"/elsewhere/style.safetensors", 1.0f}},
+          "a request's LoRAs: files and scales in order, scale 1 by default");
+    check(resolve_loras("[]", choices).empty(), "an empty list: no LoRAs");
+    for (const char* bad : {R"({"name":"a"})", R"([{"name":"../a"}])", R"([{"name":"notes"}])", R"([{"scale":1}])",
+                            R"([{"name":"a","scale":"1"}])", R"([{"name":"a","scale":11}])",
+                            R"([{"name":"a"},{"name":"a"}])"}) {
+        bool threw = false;
+        try {
+            resolve_loras(bad, choices);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        check(threw, std::format("LoRAs refused: {}", bad));
+    }
+    check(mako::server::lora_choices(defaults, "").size() == 1, "no directory: the start-up LoRAs only");
+    fs::remove_all(dir);
 }
 
 void budget_checks(const mako::text::Tokenizer& tok)
@@ -573,6 +608,7 @@ int main(int argc, char** argv)
 
     budget_checks(*tok);
     image_checks();
+    lora_checks();
     // Thinking controls: this template knows low and high only and always reasons.
     {
         using mako::server::BadRequest;

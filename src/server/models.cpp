@@ -55,7 +55,7 @@ Models::Lease<gen::Model> Models::llm()
     return Lease<gen::Model>(*this, *llm_model_, &Models::release_llm);
 }
 
-Models::Lease<image::Engine> Models::image()
+Models::Lease<image::Engine> Models::image(const image::Loras& loras)
 {
     if (!load_image_)
         throw std::runtime_error("this server has no image model (start it with --image-model)");
@@ -63,9 +63,15 @@ Models::Lease<image::Engine> Models::image()
     ++image_waiting_;
     cv_.wait(lock, [&] { return llm_out_ == 0 && !image_out_; });
     --image_waiting_;
+    if (image_ && image_loras_ != loras) {
+        resident_ = "none";
+        image_.reset();
+        log::info("other LoRAs asked for: loading the image model again");
+    }
     if (!image_) {
         const auto t0 = std::chrono::steady_clock::now();
-        if (llm_model_) {
+        const bool swap = llm_model_ != nullptr;
+        if (swap) {
             if (pool_)
                 pool_->suspend();
             std::lock_guard g(llm_mutex_);
@@ -74,13 +80,14 @@ Models::Lease<image::Engine> Models::image()
         }
         resident_ = "none";
         try {
-            image_ = load_image_();
+            image_ = load_image_(loras);
+            image_loras_ = loras;
         } catch (...) {
             cv_.notify_all();
             throw;
         }
         resident_ = "image";
-        log::info("the image model is loaded in {:.1f} s (the LLM unloaded)", secs_since(t0));
+        log::info("the image model is loaded in {:.1f} s{}", secs_since(t0), swap ? " (the LLM unloaded)" : "");
     }
     image_out_ = true;
     return Lease<image::Engine>(*this, *image_, &Models::release_image);

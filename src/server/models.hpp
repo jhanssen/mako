@@ -17,7 +17,8 @@ namespace mako::server {
 // The models a server runs, one resident at a time: the LLM, and an image model when one is given. A request leases
 // the one it needs. A lease of the image model waits until no LLM lease is out (LLM leases asked for meanwhile wait
 // for it), then parks the conversations (gen::SessionPool::suspend), unloads the LLM and loads the image model; the
-// next LLM lease loads the LLM again and gives the pool its conversations back.
+// next LLM lease loads the LLM again and gives the pool its conversations back. An image lease asking for other LoRAs
+// than the loaded model has merged loads it again with those.
 class Models {
 public:
     struct Llm {
@@ -25,7 +26,7 @@ public:
         core::EngineBase* base = nullptr; // the same engine, for its expert cache
     };
     using LoadLlm = std::function<Llm()>;
-    using LoadImage = std::function<std::unique_ptr<image::Engine>()>;
+    using LoadImage = std::function<std::unique_ptr<image::Engine>(const image::Loras&)>;
 
     // Loads the LLM; load_image may be empty (no image model).
     Models(LoadLlm load_llm, LoadImage load_image);
@@ -61,8 +62,8 @@ public:
         void (Models::*release_)();
     };
     Lease<gen::Model> llm();
-    // Throws std::runtime_error without an image model.
-    Lease<image::Engine> image();
+    // The image model with `loras` merged. Throws std::runtime_error without an image model.
+    Lease<image::Engine> image(const image::Loras& loras);
 
     // f(the LLM's engine) while the LLM is loaded; false (f not called) otherwise. Any thread.
     bool with_llm(const std::function<void(core::EngineBase&)>& f);
@@ -78,6 +79,7 @@ private:
     Llm llm_;
     gen::Model* llm_model_ = nullptr; // llm_.model's, or the fixed one; null while unloaded
     std::unique_ptr<image::Engine> image_;
+    image::Loras image_loras_; // merged into image_
     gen::SessionPool* pool_ = nullptr;
     std::string identity_;
     std::mutex mutex_; // the counts and what is loaded; held through a swap

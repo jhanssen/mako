@@ -115,12 +115,20 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
 - `tools/pi/scene-image` is a pi skill that turns the conversation into an image prompt and renders it through this
   endpoint (`ln -s "$PWD/tools/pi/scene-image" ~/.pi/agent/skills/`; then ask for an image of the scene, or
   `/skill:scene-image`). Its script saves to `~/Pictures/mako` (`MAKO_IMAGE_DIR`) and opens the image; `MAKO_URL`
-  and `MAKO_API_KEY` point it at the server.
+  and `MAKO_API_KEY` point it at the server. It lists the server's LoRAs and passes a request's `loras` when the user
+  wants them.
 - LoRAs: `--image-lora FILE[:SCALE]` (repeatable) merges each into the image model when it loads; Diffusers, PEFT and
   ComfyUI key names. `--image-steps N` and `--image-terminal F` set the schedule: a 4-step distilled LoRA such as
   lightx2v's Qwen-Image-2.1-Lightning takes `--image-steps 4 --image-terminal 0` (1024x1024 in ~7 s).
-- Not yet: condition images (edits, references; `/v1/images/edits`), image to image, and per-request seed, steps or
-  LoRAs.
+- Per-request LoRAs: `--image-lora-dir DIR` names a directory of `.safetensors` LoRAs (read on each request, so files
+  added later count). `GET /v1/images/loras` lists what a request can name: the `--image-lora` files first, with their
+  `default_scale`, then the directory's, each by its file name without `.safetensors` (a `--image-lora` name wins over
+  a directory file of the same name). A request's `loras`, e.g. `[{"name": "next-scene", "scale": 0.8}]` (scale 1 when
+  left out, -10 to 10), replaces the `--image-lora` set for that request; `[]` is none, no field the `--image-lora`
+  set. The steps stay the server's, so a set without a few-step LoRA that `--image-steps` was lowered for gives
+  smeared images. When the set differs from the one merged, the image model is loaded again first (Qwen-Image 2.1:
+  2.4 s without LoRAs, 3.8 s with two).
+- Not yet: condition images (edits, references; `/v1/images/edits`), image to image, and per-request seed or steps.
 - `--image-text-encoder DIR` takes the text encoder from another directory of safetensors (the same architecture
   with changed weights, such as a refusal-ablated one), leaving the model's own directory as published;
   `--image-transformer PATH` the transformer from another file or directory (such as a Krea 2 checkpoint with LoRAs

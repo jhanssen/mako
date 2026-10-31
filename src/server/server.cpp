@@ -1,6 +1,7 @@
 #include "server/server.hpp"
 
 #include "server/anthropic.hpp"
+#include "server/json.hpp"
 #include "server/openai.hpp"
 #include "server/protocol.hpp"
 #include "server/status.hpp"
@@ -20,7 +21,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <list>
 #include <memory>
 #include <format>
@@ -95,9 +98,12 @@ struct Server::Impl {
                const ErrorBody& error, const char* id_prefix, const MakeProtocol& make);
     void count_tokens(const httplib::Request& req, httplib::Response& res);
     // POST /v1/images/generations: OpenAI's fields (prompt, n, size, response_format b64_json, output_format png or
-    // jpeg; model, quality, style, background, moderation and user accepted and left alone); steps and the schedule's
-    // end from the options.
+    // jpeg; model, quality, style, background, moderation and user accepted and left alone); extensions
+    // negative_prompt, guidance_scale and loras (in place of the start-up LoRAs); steps and the schedule's end from
+    // the options.
     void images(const httplib::Request& req, httplib::Response& res);
+    // GET /v1/images/loras: the LoRAs requests can name, the start-up ones with their scales.
+    void loras(httplib::Response& res);
     // A request's images, sized when it is parsed and encoded when it runs.
     struct Images {
         std::vector<vision::Prepared> prepared;
@@ -524,6 +530,16 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             return fail(400, "guidance_scale must be a number from 0 to 30", "invalid_request_error");
         guidance = float(body["guidance_scale"].get_number());
     }
+    image::Loras loras = opts.image_loras;
+    if (body.contains("loras") && !body["loras"].is_null()) {
+        try {
+            std::string text;
+            (void)glz::write_json(body["loras"], text);
+            loras = resolve_loras(text, lora_choices(opts.image_loras, opts.image_lora_dir));
+        } catch (const std::exception& e) {
+            return fail(400, std::format("loras: {}", e.what()), "invalid_request_error");
+        }
+    }
     bool jpeg = false;
     if (body.contains("output_format") && body["output_format"].is_string()) {
         const std::string f = body["output_format"].get_string();
@@ -537,11 +553,15 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
     }
     const auto slot = std::shared_ptr<void>(nullptr, [this](void*) { --in_flight; });
     const std::string id = std::format("img-{}", next_id.fetch_add(1) + 1);
-    log::info("{}: {} image{} {}x{}{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height,
-              negative ? ", a negative prompt" : "");
+    std::string lora_names;
+    for (const auto& [path, scale] : loras)
+        lora_names += std::format("{}{} {:g}", lora_names.empty() ? ", LoRAs " : ", ",
+                                  std::filesystem::path(path).stem().string(), scale);
+    log::info("{}: {} image{} {}x{}{}{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height,
+              negative ? ", a negative prompt" : "", lora_names);
     std::string data = "[";
     try {
-        auto engine = models.image();
+        auto engine = models.image(loras);
         std::random_device rd;
         for (uint32_t i = 0; i < n; ++i) {
             image::Engine::Request r;
@@ -582,6 +602,24 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
                     "application/json");
 }
 
+void Server::Impl::loras(httplib::Response& res)
+{
+    if (!models.has_image()) {
+        res.status = 404;
+        res.set_content(error_body("this server has no image model (start it with --image-model)", "not_found_error"),
+                        "application/json");
+        return;
+    }
+    std::string data;
+    for (const auto& c : lora_choices(opts.image_loras, opts.image_lora_dir)) {
+        data += std::format(R"({}{{"name":{})", data.empty() ? "" : ",", json::quoted(c.name));
+        if (c.scale)
+            data += std::format(R"(,"default_scale":{:g})", *c.scale);
+        data += "}";
+    }
+    res.set_content(std::format(R"({{"object":"list","data":[{}]}})", data), "application/json");
+}
+
 void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& res)
 {
     try {
@@ -594,6 +632,59 @@ void Server::Impl::count_tokens(const httplib::Request& req, httplib::Response& 
         res.status = 400;
         res.set_content(anthropic_error(e.what(), "invalid_request_error"), "application/json");
     }
+}
+
+std::vector<LoraChoice> lora_choices(const image::Loras& defaults, const std::string& dir)
+{
+    namespace fs = std::filesystem;
+    std::vector<LoraChoice> out;
+    auto known = [&](const std::string& name) { return std::ranges::contains(out, name, &LoraChoice::name); };
+    for (const auto& [path, scale] : defaults) {
+        const std::string name = fs::path(path).stem().string();
+        if (!known(name))
+            out.push_back({name, path, scale});
+    }
+    if (dir.empty())
+        return out;
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec))
+        if (e.path().extension() == ".safetensors" && e.is_regular_file(ec))
+            files.push_back(e.path());
+    std::ranges::sort(files);
+    for (const auto& f : files)
+        if (!known(f.stem().string()))
+            out.push_back({f.stem().string(), f.string(), std::nullopt});
+    return out;
+}
+
+image::Loras resolve_loras(std::string_view json, const std::vector<LoraChoice>& choices)
+{
+    glz::generic v;
+    if (glz::read_json(v, json) || !v.is_array())
+        throw std::invalid_argument("an array of {\"name\", \"scale\"} objects");
+    image::Loras out;
+    std::vector<std::string> names;
+    for (auto& e : v.get_array()) {
+        if (!e.is_object() || !e.contains("name") || !e["name"].is_string())
+            throw std::invalid_argument("each entry needs a \"name\"");
+        const std::string name = e["name"].get_string();
+        const auto it = std::ranges::find(choices, name, &LoraChoice::name);
+        if (it == choices.end())
+            throw std::invalid_argument(std::format("no LoRA named \"{}\" (GET /v1/images/loras lists them)", name));
+        if (std::ranges::contains(names, name))
+            throw std::invalid_argument(std::format("\"{}\" named twice", name));
+        float scale = 1.0f;
+        if (e.contains("scale") && !e["scale"].is_null()) {
+            if (!e["scale"].is_number() || !std::isfinite(e["scale"].get_number()) ||
+                std::abs(e["scale"].get_number()) > 10)
+                throw std::invalid_argument(std::format("\"{}\": scale must be a number from -10 to 10", name));
+            scale = float(e["scale"].get_number());
+        }
+        names.push_back(name);
+        out.emplace_back(it->path, scale);
+    }
+    return out;
 }
 
 bool key_matches(const std::string& authorization, const std::string& x_api_key, const std::vector<std::string>& keys)
@@ -709,6 +800,9 @@ Server::Server(Models& models, const text::Tokenizer& tok, const chat::Template&
     const auto images = [this](const httplib::Request& req, httplib::Response& res) { impl_->images(req, res); };
     h.Post("/v1/images/generations", images);
     h.Post("/images/generations", images);
+    const auto loras = [this](const httplib::Request&, httplib::Response& res) { impl_->loras(res); };
+    h.Get("/v1/images/loras", loras);
+    h.Get("/images/loras", loras);
     h.Get("/v1/models", list_models);
     h.Get("/models", list_models);
     h.Get("/health", [](const httplib::Request&, httplib::Response& res) {

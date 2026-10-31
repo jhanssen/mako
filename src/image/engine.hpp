@@ -174,6 +174,9 @@ private:
     bool residual_ = false;
 };
 
+// LoRA files and their scales, merged in order.
+using Loras = std::vector<std::pair<std::string, float>>;
+
 // "FILE" or "FILE:SCALE" (the scale a number after the last colon). Throws std::invalid_argument.
 std::pair<std::string, float> parse_lora(const std::string& spec);
 

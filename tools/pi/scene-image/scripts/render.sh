@@ -1,13 +1,33 @@
 #!/bin/sh
 # Renders an image with mako's /v1/images/generations and saves it as a PNG.
-#   render.sh WIDTHxHEIGHT "prompt"
+#   render.sh [--lora NAME[:SCALE]]... [--no-loras] WIDTHxHEIGHT "prompt"
+# --lora (repeatable) renders with these LoRAs in place of the server's defaults; --no-loras with none.
 # MAKO_URL (default http://127.0.0.1:8080/v1), MAKO_API_KEY (when the server wants one), MAKO_IMAGE_DIR (default
 # ~/Pictures/mako), MAKO_IMAGE_OPEN=0 (not opened in the image viewer). Prints the saved file's path.
 set -eu
-if [ $# -ne 2 ]; then
-    echo "usage: render.sh WIDTHxHEIGHT \"prompt\"" >&2
+usage() {
+    echo "usage: render.sh [--lora NAME[:SCALE]]... [--no-loras] WIDTHxHEIGHT \"prompt\"" >&2
     exit 2
-fi
+}
+loras=
+while [ $# -gt 0 ]; do
+    case $1 in
+    --lora)
+        [ $# -ge 2 ] || usage
+        loras="$loras$2
+"
+        shift 2
+        ;;
+    --no-loras)
+        loras="
+"
+        shift
+        ;;
+    -*) usage ;;
+    *) break ;;
+    esac
+done
+[ $# -eq 2 ] || usage
 size=$1
 prompt=$2
 url=${MAKO_URL:-http://127.0.0.1:8080/v1}
@@ -16,9 +36,18 @@ mkdir -p "$dir"
 out="$dir/$(date +%Y%m%d-%H%M%S).png"
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-body=$(SIZE=$size PROMPT=$prompt python3 -c '
-import json, os
-print(json.dumps({"prompt": os.environ["PROMPT"], "size": os.environ["SIZE"], "n": 1, "response_format": "b64_json"}))')
+body=$(SIZE=$size PROMPT=$prompt LORAS=$loras python3 -c '
+import json, os, sys
+b = {"prompt": os.environ["PROMPT"], "size": os.environ["SIZE"], "n": 1, "response_format": "b64_json"}
+if os.environ["LORAS"]:
+    b["loras"] = []
+    for spec in filter(None, os.environ["LORAS"].split("\n")):
+        name, _, scale = spec.rpartition(":")
+        try:
+            b["loras"].append({"name": name, "scale": float(scale)} if name else {"name": spec})
+        except ValueError:
+            b["loras"].append({"name": spec})
+print(json.dumps(b))')
 status=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 1800 "$url/images/generations" \
     -H 'Content-Type: application/json' ${MAKO_API_KEY:+-H "Authorization: Bearer $MAKO_API_KEY"} -d "$body")
 OUT=$out STATUS=$status python3 - "$tmp" <<'PY'

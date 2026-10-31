@@ -58,10 +58,26 @@ struct ServerOptions {
     std::optional<float> image_terminal;
     // The guidance scale of requests with a negative prompt that name none (unset: the model's).
     std::optional<float> image_guidance;
+    // LoRAs: those merged for requests that name none, and a directory of .safetensors files requests may name too.
+    image::Loras image_loras;
+    std::string image_lora_dir;
     // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
     const vision::Mmproj* mmproj = nullptr;
     vision::Encoder* vision = nullptr;
 };
+
+// An image LoRA a request can name: its file name without .safetensors, its path, and for one given at start-up the
+// scale it is merged at by default.
+struct LoraChoice {
+    std::string name, path;
+    std::optional<float> scale;
+};
+// The start-up LoRAs (in their order), then the .safetensors files in `dir` by name (read now; empty: none). A
+// start-up LoRA's name wins over a file of the same name in `dir`.
+std::vector<LoraChoice> lora_choices(const image::Loras& defaults, const std::string& dir);
+// A request's "loras" value (JSON: an array of {"name", "scale" (default 1)}) as files and scales. Throws
+// std::invalid_argument naming the problem.
+image::Loras resolve_loras(std::string_view json, const std::vector<LoraChoice>& choices);
 
 // Whether a request's credentials (the Authorization or x-api-key header value) carry one of `keys`; each compared in
 // constant time.
