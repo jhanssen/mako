@@ -1,6 +1,8 @@
 #!/bin/sh
 # Renders an image with mako's /v1/images/generations and saves it as a PNG.
 #   render.sh [--model NAME] [--lora NAME[:SCALE]]... [--no-loras] [--steps N] WIDTHxHEIGHT "prompt"
+#   render.sh [options] --layout DRAFT     (MOSS-Image: a layout draft, see layout.py, as a file, - for standard input or
+#                                           the JSON itself; the size comes from the draft)
 # --model renders with that image model (default: the server's); --lora (repeatable) with these LoRAs in place of the
 # model's defaults; --no-loras with none; --steps N denoising steps (0: the model's own count; default: the model's
 # setting).
@@ -9,11 +11,13 @@
 set -eu
 usage() {
     echo "usage: render.sh [--model NAME] [--lora NAME[:SCALE]]... [--no-loras] [--steps N] WIDTHxHEIGHT \"prompt\"" >&2
+    echo "       render.sh [options] --layout DRAFT.json|-|'{...}'" >&2
     exit 2
 }
 loras=
 steps=
 model=
+layout=
 while [ $# -gt 0 ]; do
     case $1 in
     --lora)
@@ -25,6 +29,11 @@ while [ $# -gt 0 ]; do
     --model)
         [ $# -ge 2 ] || usage
         model=$2
+        shift 2
+        ;;
+    --layout)
+        [ $# -ge 2 ] || usage
+        layout=$2
         shift 2
         ;;
     --steps)
@@ -41,9 +50,16 @@ while [ $# -gt 0 ]; do
     *) break ;;
     esac
 done
-[ $# -eq 2 ] || usage
-size=$1
-prompt=$2
+if [ -n "$layout" ]; then
+    [ $# -eq 0 ] || usage
+    compiled=$(python3 "$(dirname "$0")/layout.py" "$layout")
+    size=$(printf '%s\n' "$compiled" | head -n 1)
+    prompt=$(printf '%s\n' "$compiled" | tail -n +2)
+else
+    [ $# -eq 2 ] || usage
+    size=$1
+    prompt=$2
+fi
 url=${MAKO_URL:-http://127.0.0.1:8080/v1}
 dir=${MAKO_IMAGE_DIR:-$HOME/Pictures/mako}
 mkdir -p "$dir"

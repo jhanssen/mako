@@ -667,6 +667,8 @@ void Server::Impl::image_model_list(httplib::Response& res)
         data += std::format(R"(,"family":{})", json::quoted(m.family));
         if (!m.description.empty())
             data += std::format(R"(,"description":{})", json::quoted(m.description));
+        if (!m.prompting.empty())
+            data += std::format(R"(,"prompting":{})", json::quoted(m.prompting));
         if (m.steps)
             data += std::format(R"(,"steps":{})", m.steps);
         if (m.guidance)

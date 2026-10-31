@@ -70,6 +70,8 @@ ImageModel load_image_model(const std::string& dir, const std::string& name)
             m.options.text_encoder = resolve(base, *v);
         if (auto v = str("description"))
             m.description = *v;
+        if (auto v = str("prompting"))
+            m.prompting = *v;
         if (auto v = str("lora_dir"))
             lora_dir = resolve(base, *v);
         if (auto v = num("steps")) {

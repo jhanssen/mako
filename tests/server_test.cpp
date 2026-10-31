@@ -142,7 +142,7 @@ void image_model_checks()
     std::ofstream(root / "a" / "model_index.json") << R"({"_class_name": "Krea2Pipeline"})";
     std::ofstream(root / "b" / "loras" / "x.safetensors") << "x";
     std::ofstream(root / "b" / "mako.json")
-        << R"({"model": "../a", "steps": 4, "guidance": 1.5, "terminal": 0, "loras": {"x": 0.5}, "description": "d"})";
+        << R"({"model": "../a", "steps": 4, "guidance": 1.5, "terminal": 0, "loras": {"x": 0.5}, "description": "d", "prompting": "p"})";
     std::ofstream(root / "c" / "mako.json") << R"({"model": "../a", "loras": {"missing": 1}})";
     const auto list = mako::server::image_models(root.string());
     check(list.size() == 2 && list[0].name == "a" && list[1].name == "b",
@@ -152,7 +152,7 @@ void image_model_checks()
         check(b.dir == fs::absolute(root / "a").lexically_normal().string() && b.steps == 4 && b.guidance == 1.5f &&
                   b.terminal == 0.0f && b.loras.size() == 1 && b.loras[0].second == 0.5f &&
                   b.lora_dir == fs::absolute(root / "b" / "loras").lexically_normal().string() &&
-                  b.key() == list[0].key() && b.family == "Krea 2" && b.description == "d",
+                  b.key() == list[0].key() && b.family == "Krea 2" && b.description == "d" && b.prompting == "p",
               "mako.json: the model it points at, its settings, its LoRAs from its loras/");
         check(list[0].lora_dir.empty() && list[0].loras.empty(), "a plain model directory: no LoRA directory");
     }

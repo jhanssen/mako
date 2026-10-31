@@ -106,15 +106,20 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   ```json
   {"model": "~/models/qwen-image-2.1", "text_encoder": "~/models/qwen-image-2.1-te-heretic",
    "transformer": "...", "lora_dir": "../qwen-image/loras", "loras": {"lightning-4step": 1.0},
-   "steps": 4, "terminal": 0, "guidance": 4, "description": "what it is good at, how to prompt it, its time"}
+   "steps": 4, "terminal": 0, "guidance": 4, "description": "what it is good at and its time",
+   "prompting": "how to write its prompts"}
   ```
 
   `text_encoder` and `transformer` take another copy of those weights (a refusal-ablated text encoder, a checkpoint
   with LoRAs merged); `loras` are merged for requests that name none (by name in `lora_dir`, default the directory's
   `loras/`); `steps` (0: the model's), `terminal` (the schedule's last noise level, 0: none, as few-step LoRAs want)
   and `guidance` set its defaults. The directory is read on each request: models and LoRAs added later count.
-- `GET /v1/images/models` lists the models: `id`, `family` (which model it is), `description`, `default`, `loaded`,
-  `steps` and `guidance` where set, and the default `loras` with their scales.
+- `GET /v1/images/models` lists the models: `id`, `family` (which model it is), `description`, `prompting`,
+  `default`, `loaded`, `steps` and `guidance` where set, and the default `loras` with their scales.
+- MOSS-Image also takes a layout as its prompt: compact JSON with a caption for the whole image and a box per
+  character, object or text (`{"summary": {"caption": ...}, "items": [{"label": "character", "caption": ...,
+  "bbox": [y0, x0, y1, x1]}, ...], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}`, boxes in pixels
+  from the image's centre). The skill's `render.sh --layout` builds it from boxes in pixels from the top-left.
 - Fields: `prompt` (required), `model` (a name from that list), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32
   from 256, at most 2048x2048 pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored),
   `output_format` (`png` or `jpeg`). `quality`, `style`, `background`, `moderation` and `user` are accepted and left

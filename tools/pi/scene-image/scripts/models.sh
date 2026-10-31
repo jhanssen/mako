@@ -1,6 +1,6 @@
 #!/bin/sh
 # Lists the image models mako can render with (GET /v1/images/models): a name per line, the default and the loaded one
-# marked, then each one's model family, description, steps and default LoRAs.
+# marked, then each one's model family, description, how to prompt it and default LoRAs.
 # MAKO_URL (default http://127.0.0.1:8080/v1), MAKO_API_KEY (when the server wants one).
 set -eu
 url=${MAKO_URL:-http://127.0.0.1:8080/v1}
@@ -22,6 +22,8 @@ for m in d["data"]:
     print(f"    {m.get('family', '')}")
     if "description" in m:
         print(f"    {m['description']}")
+    if "prompting" in m:
+        print(f"    prompting: {m['prompting']}")
     if m.get("loras"):
         print("    default LoRAs: " + ", ".join(f"{l['name']} {l['scale']:g}" for l in m["loras"]))
 PY

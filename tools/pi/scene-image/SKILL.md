@@ -17,8 +17,8 @@ Turn what the conversation has established into one image prompt, render it with
      length, style and colour, eye colour, skin, face, clothing piece by piece with its colour, fit and state,
      accessories, objects held), the same words each time so characters stay recognisable across images;
    - exactly where each subject is and what each part of the body is doing: standing, sitting or lying, which way
-     they face, where the hands and arms are, where they look, the expression; with several subjects, where each is
-     relative to the others and to the camera, and who is touching what;
+     they face, where the hands and arms are, where they look, the expression; with several subjects, see
+     "Placing several subjects" below;
    - what is visible and what is not: which parts of the subjects are in frame, what is in front of or behind them,
      what fills the foreground and the background;
    - the setting in particular things (not "a room" but the room's walls, floor, furniture, light sources), the time
@@ -51,6 +51,55 @@ Turn what the conversation has established into one image prompt, render it with
    Do not `read` the image unless the user wants to talk about what is in it (it then goes to the model as image
    input, which needs mako started with `--mmproj`). If the user wants changes, adjust the prompt and render again.
 
+## Placing several subjects
+
+Image models lose track of who is where unless the prompt pins it down. With two or more people (or animals,
+figures):
+
+- Give each a fixed handle used every time ("the tall woman", "the man in the grey coat"), never "he", "she" or
+  "they" where it could mean either.
+- One subject per sentence, starting with where it is in the frame from the camera's point of view: "On the left
+  of the frame, the tall woman ...", "In the right half, the man in the grey coat ...", "In the foreground ...",
+  "Behind her ...". Say left and right as the viewer sees them, never the subject's own left or right without
+  saying so.
+- State the arrangement in plain geometry: side by side, one behind the other, one above the other, how far apart,
+  who is higher or lower (standing, kneeling, sitting, lying), and which way each faces (toward the camera, away
+  from it, toward each other, in profile).
+- For every point of contact, name both body parts and both subjects: "the tall woman's right hand rests on the
+  man's left shoulder", "his back is against her chest", "their foreheads touch". Contact the prompt does not
+  state is left to chance.
+- Say what of each subject is in frame and what is hidden behind the other.
+- Then one sentence on the scene as a whole that repeats the arrangement in brief ("the two face each other across
+  the table, the woman on the left, the man on the right").
+- With a model that takes layouts (its prompting notes say so), give each subject its own box instead (see
+  "Layouts").
+
+## Layouts
+
+MOSS-Image models take a layout: a caption for the whole image and a box per character, object or text, which fixes
+where each one goes. Use one when the placement of several subjects matters or a render put them in the wrong
+places. Render a draft with `scripts/render.sh --model MODEL --layout DRAFT` (the image size comes from the draft),
+DRAFT being a file, `-` to read it from standard input (e.g. a heredoc), or the JSON itself as one argument:
+
+```json
+{"width": 1344, "height": 768,
+ "summary": {"caption": "<the whole image: setting, light, style, and the subjects and their arrangement in brief>"},
+ "items": [
+  {"label": "character", "caption": "<everything about this one: look, clothing, pose, expression, contact>",
+   "bbox": [80, 96, 640, 768]},
+  {"label": "character", "caption": "<the other one>", "bbox": [600, 64, 1260, 768]},
+  {"label": "object", "caption": "<a thing that matters>", "bbox": [520, 520, 820, 760]}
+ ]}
+```
+
+- `bbox` is `[left, top, right, bottom]` in pixels from the image's top-left corner; width and height are multiples
+  of 32. Boxes may overlap where subjects overlap or touch; a box is where the subject is, not a frame drawn around
+  it.
+- Each caption carries that subject's full description, and `summary.caption` the scene, with the same details in
+  agreement.
+- Labels: `character` for people and creatures, `object` for things, `text` (with `"text": "<the exact words>"`)
+  for lettering.
+
 ## Models
 
 `scripts/models.sh` lists the image models mako has: each one's name, which model it is, a description of what it is
@@ -62,7 +111,8 @@ good at, how its prompts should be written and how long it takes, and its defaul
   the user names wins. If none fits clearly, use the default and say which you used.
 - Keep the same model for the rest of the conversation, so characters and style stay consistent; change it only when
   the user asks or the material changes (a photograph after anime illustrations).
-- Write the prompt the way the chosen model's description says (prose, tags, prompt weights).
+- Write the prompt the way the chosen model's `prompting` notes say (prose, tags, prompt weights, layouts), on top
+  of the rules above.
 - Rendering with another model than the loaded one first loads it (a few seconds more).
 
 ## LoRAs
