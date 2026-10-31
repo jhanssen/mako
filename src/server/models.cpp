@@ -1,6 +1,6 @@
 #include "server/models.hpp"
 
-#include "core/log.hpp"
+#include "log/log.hpp"
 
 #include <chrono>
 #include <format>
@@ -17,12 +17,18 @@ double secs_since(std::chrono::steady_clock::time_point t)
 
 } // namespace
 
-Models::Models(LoadLlm load_llm, LoadImage load_image)
-    : load_llm_(std::move(load_llm)), load_image_(std::move(load_image)), llm_(load_llm_()), llm_model_(llm_.model.get())
+Models::Models(LoadLlm load_llm) : load_llm_(std::move(load_llm)), llm_(load_llm_()), llm_model_(llm_.model.get())
 {
+    lender_ = std::make_unique<memory::Lender>(memory::Lender::Hooks{
+        .lend = [this](const std::string& borrower) { lend(borrower); }, .returned = [this] { returned(); }});
 }
 
-Models::Models(gen::Model& fixed) : llm_model_(&fixed) {}
+Models::Models(gen::Model& fixed) : llm_model_(&fixed)
+{
+    lender_ = std::make_unique<memory::Lender>(memory::Lender::Hooks{
+        .lend = [](const std::string&) { throw std::runtime_error("this server's LLM is not unloaded for others"); },
+        .returned = [] {}});
+}
 
 Models::~Models() = default;
 
@@ -35,14 +41,16 @@ void Models::attach(gen::SessionPool& pool, std::string identity)
 Models::Lease<gen::Model> Models::llm()
 {
     std::unique_lock lock(mutex_);
-    cv_.wait(lock, [&] { return !image_out_ && image_waiting_ == 0; });
+    cv_.wait(lock, [&] { return lend_waiting_ == 0; });
+    if (lent_) {
+        log::info("asking for the memory back");
+        const auto t0 = std::chrono::steady_clock::now();
+        lender_->reclaim();
+        cv_.wait(lock, [&] { return !lent_; });
+        log::info("the memory is back ({:.1f} s)", secs_since(t0));
+    }
     if (!llm_model_) {
         resident_ = "none";
-        image_.reset();
-        {
-            std::lock_guard g(name_mutex_);
-            loaded_name_.clear();
-        }
         const auto t0 = std::chrono::steady_clock::now();
         log::info("loading the LLM again");
         Llm l = load_llm_();
@@ -60,52 +68,34 @@ Models::Lease<gen::Model> Models::llm()
     return Lease<gen::Model>(*this, *llm_model_, &Models::release_llm);
 }
 
-Models::Lease<image::Engine> Models::image(const ImageModel& model, const image::Loras& loras)
+void Models::lend(const std::string& borrower)
 {
-    if (!load_image_)
-        throw std::runtime_error("this server has no image model (start it with --image-model)");
+    if (!load_llm_)
+        throw std::runtime_error("this server's LLM is not unloaded for others");
     std::unique_lock lock(mutex_);
-    ++image_waiting_;
-    cv_.wait(lock, [&] { return llm_out_ == 0 && !image_out_; });
-    --image_waiting_;
-    std::string key = model.key();
-    for (const auto& [path, scale] : loras)
-        key += std::format("|{}:{}", path, scale);
-    if (image_ && image_key_ != key) {
-        resident_ = "none";
-        image_.reset();
-        {
-            std::lock_guard g(name_mutex_);
-            loaded_name_.clear();
-        }
-        log::info("{} asked for: loading it", model.name == image_name_ ? "other LoRAs" : "image model " + model.name);
+    ++lend_waiting_;
+    cv_.wait(lock, [&] { return llm_out_ == 0; });
+    --lend_waiting_;
+    if (llm_model_) {
+        if (pool_)
+            pool_->suspend();
+        std::lock_guard g(llm_mutex_);
+        llm_ = {};
+        llm_model_ = nullptr;
     }
-    if (!image_) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool swap = llm_model_ != nullptr;
-        if (swap) {
-            if (pool_)
-                pool_->suspend();
-            std::lock_guard g(llm_mutex_);
-            llm_ = {};
-            llm_model_ = nullptr;
-        }
-        resident_ = "none";
-        try {
-            image_ = load_image_(model, loras);
-            image_key_ = key;
-            image_name_ = model.name;
-            std::lock_guard g(name_mutex_);
-            loaded_name_ = model.name;
-        } catch (...) {
-            cv_.notify_all();
-            throw;
-        }
-        resident_ = "image";
-        log::info("image model {} loaded in {:.1f} s{}", model.name, secs_since(t0), swap ? " (the LLM unloaded)" : "");
+    lent_ = true;
+    resident_ = "lent";
+    log::info("the LLM unloaded for {}", borrower);
+}
+
+void Models::returned()
+{
+    {
+        std::lock_guard lock(mutex_);
+        lent_ = false;
+        resident_ = llm_model_ ? "llm" : "none";
     }
-    image_out_ = true;
-    return Lease<image::Engine>(*this, *image_, &Models::release_image);
+    cv_.notify_all();
 }
 
 void Models::release_llm()
@@ -117,15 +107,6 @@ void Models::release_llm()
     cv_.notify_all();
 }
 
-void Models::release_image()
-{
-    {
-        std::lock_guard lock(mutex_);
-        image_out_ = false;
-    }
-    cv_.notify_all();
-}
-
 bool Models::with_llm(const std::function<void(core::EngineBase&)>& f)
 {
     std::lock_guard g(llm_mutex_);
@@ -133,12 +114,6 @@ bool Models::with_llm(const std::function<void(core::EngineBase&)>& f)
         return false;
     f(*llm_.base);
     return true;
-}
-
-std::string Models::image_name()
-{
-    std::lock_guard g(name_mutex_);
-    return loaded_name_;
 }
 
 const char* Models::resident()

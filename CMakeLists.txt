@@ -20,22 +20,13 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 # Warnings fail the build (C++ and Metal); cmake --compile-no-warning-error turns that off for one configure.
 set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
-include(FetchContent)
-FetchContent_Declare(metal_cpp
-    URL https://developer.apple.com/metal/cpp/files/metal-cpp_26.zip
-    URL_HASH SHA256=4df3c078b9aadcb516212e9cb03004cbc5ce9a3e9c068fa3144d021db585a3a4
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(metal_cpp)
-
-add_library(metal_cpp INTERFACE)
-target_include_directories(metal_cpp SYSTEM INTERFACE ${metal_cpp_SOURCE_DIR})
-target_link_libraries(metal_cpp INTERFACE
-    "-framework Foundation" "-framework Metal" "-framework QuartzCore")
-
-include(cmake/llama_cpp_sources.cmake)
-include(cmake/gemv_kernels.cmake)
+# The Jinja engine's files come with mako-common's llama.cpp sources (set before it is added).
+include(cmake/jinja_files.cmake)
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/external/mako-common/CMakeLists.txt)
+    message(FATAL_ERROR "external/mako-common is missing: git submodule update --init")
+endif()
+add_subdirectory(external/mako-common)
 include(cmake/jinja.cmake)
-include(cmake/server_deps.cmake)
 
 add_subdirectory(src)
 add_subdirectory(bench)
@@ -43,17 +34,6 @@ add_subdirectory(tools)
 # Model-backed tests (ctest) need the first shard of the GGUF; without it they report as skipped.
 set(MAKO_MODEL "$ENV{MAKO_MODEL}" CACHE FILEPATH "First GGUF shard for the tests")
 set(MAKO_DS41_MODEL "$ENV{MAKO_DS41_MODEL}" CACHE FILEPATH "First DeepSeek-V4.1 GGUF shard for its tests")
-set(MAKO_QWEN_IMAGE "$ENV{MAKO_QWEN_IMAGE}" CACHE PATH "Qwen-Image 2.1 directory (its safetensors) for its tests")
-set(MAKO_QWEN_IMAGE_REF "$ENV{MAKO_QWEN_IMAGE_REF}" CACHE PATH "Qwen-Image 2.1 reference tensors for its tests")
-set(MAKO_KREA2 "$ENV{MAKO_KREA2}" CACHE PATH "Krea 2 directory (its safetensors) for its tests")
-set(MAKO_KREA2_TRANSFORMER "$ENV{MAKO_KREA2_TRANSFORMER}" CACHE FILEPATH "Krea 2 transformer checkpoint for its tests")
-set(MAKO_KREA2_REF "$ENV{MAKO_KREA2_REF}" CACHE PATH "Krea 2 reference tensors for its tests")
-set(MAKO_MOSS "$ENV{MAKO_MOSS}" CACHE PATH "MOSS-Image directory (its safetensors) for its tests")
-set(MAKO_MOSS_REF "$ENV{MAKO_MOSS_REF}" CACHE PATH "MOSS-Image reference tensors for its tests")
-set(MAKO_ANIMA "$ENV{MAKO_ANIMA}" CACHE PATH "Anima directory (its split files) for its tests")
-set(MAKO_ANIMA_TRANSFORMER "$ENV{MAKO_ANIMA_TRANSFORMER}" CACHE FILEPATH "Anima transformer file for its tests")
-set(MAKO_ANIMA_REF "$ENV{MAKO_ANIMA_REF}" CACHE PATH "Anima reference tensors for its tests")
-set(MAKO_T5_TOKENIZER "$ENV{MAKO_T5_TOKENIZER}" CACHE FILEPATH "T5 tokenizer.json for the unigram tokenizer test")
 set(MAKO_DS41_ENGRAM "$ENV{MAKO_DS41_ENGRAM}" CACHE FILEPATH "A GGUF with other Engram tables for DeepSeek-V4.1's tests (default: the model's own)")
 set(MAKO_DS41_ABLATION "$ENV{MAKO_DS41_ABLATION}" CACHE FILEPATH "An ablation file for DeepSeek-V4.1 (optional test input)")
 set(MAKO_DS41_DSPARK "$ENV{MAKO_DS41_DSPARK}" CACHE PATH "DeepSeek-V4.1's DSpark drafter directory (optional test input)")

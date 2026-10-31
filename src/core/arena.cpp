@@ -1,7 +1,7 @@
 #include "core/arena.hpp"
 
 #include "gguf/read_pool.hpp"
-#include "core/log.hpp"
+#include "log/log.hpp"
 
 #include <mach/mach.h>
 #include <sys/mman.h>

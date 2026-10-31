@@ -24,6 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          submodules: recursive
           ref: main
           fetch-depth: 0 # the tags, for the last nightly's commit
 

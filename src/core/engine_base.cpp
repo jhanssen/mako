@@ -3,7 +3,7 @@
 #include "gguf/read_pool.hpp"
 #include "quant/dequant.hpp"
 #include "quant/quantize.hpp"
-#include "core/log.hpp"
+#include "log/log.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>

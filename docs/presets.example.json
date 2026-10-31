@@ -3,12 +3,10 @@
     "description": "GLM-5.3-Flash, defaults",
     "model": "/path/to/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf"
   },
-  "glm-vision-image": {
-    "description": "GLM-5.3-Flash with images as input and image generation (an image model swapped in on request)",
+  "glm-vision": {
+    "description": "GLM-5.3-Flash with images as input",
     "model": "/path/to/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
-    "--mmproj": "/path/to/mmproj-BF16.gguf",
-    "--image-models": "/path/to/image-models",
-    "--image-model": "qwen-image"
+    "--mmproj": "/path/to/mmproj-BF16.gguf"
   },
   "glm-abl": {
     "description": "GLM-5.3-Flash with an ablation file (sites ffn_out, stream)",

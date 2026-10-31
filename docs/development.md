@@ -7,13 +7,12 @@ one's options.
 
 - `mako_run` (GLM-5.3) and `ds_run` (DeepSeek-V4.1): run token ids through the engine; top logits, greedy or sampled
   tokens. `ds_run` also compares logits with a reference dump, measures decode widths and collects an imatrix.
-- `mako_image`: the image models (Qwen-Image 2.1, Krea 2, MOSS-Image, Anima) from the command line.
 - `vision_run`, `vision_chat`: the vision encoder on an image, and a chat with images.
 - `prefill_sweep`: prefill timing over prompt lengths (`--parts` for the GPU time by part).
 - Inspection: `gguf_dump`, `tokenize`, `render_template`, `engram_rows`, `logit_compare`.
 - `ref_dump` and `ref_vision`: logits and image embeddings from the reference implementation, when CMake is given its
   checkout (`MAKO_REF_SRC`, `MAKO_REF_BUILD`; `ref_vision` needs its `mtmd` library built).
-- Python, in `tools/`: the generators of test data (`gen_*.py`), `make_ablation.py`, `gguf_retag.py`, `self_check.py`.
+- Python, in `tools/`: the generators of test data (`gen_*.py`; the unicode tables' in mako-common), `make_ablation.py`, `gguf_retag.py`, `self_check.py`.
 
 Programs generate through `gen::Session` (`src/gen/session.hpp`), for either model: it takes the whole prompt each
 time, keeps the longest prefix the engine already holds (continuing the current state, or restoring a checkpoint of
@@ -35,14 +34,9 @@ ctest has no effect. What each model variable enables:
 | (none) | `-L cpu` (no GPU either; what CI runs) and `-L kernels` (GPU kernels on random data) |
 | `MAKO_MODEL` (GLM-5.3) | `e2e_*`, the tokenizer, templates, GEMV/GEMM on real weights |
 | `MAKO_DS41_MODEL` (DeepSeek-V4.1) | `ds41_*`, `dsv41`, its tokenizer, template and Engram tests. Optional: `MAKO_DS41_ENGRAM` (other Engram tables), `MAKO_DS41_DSPARK` (the drafter), `MAKO_DS41_ABLATION` |
-| `MAKO_QWEN_IMAGE`, `MAKO_QWEN_IMAGE_REF` | `image_*`, `safetensors` |
-| `MAKO_KREA2`, `MAKO_KREA2_TRANSFORMER`, `MAKO_KREA2_REF` | `krea_*` |
-| `MAKO_MOSS`, `MAKO_MOSS_REF` | `moss_*` |
-| `MAKO_ANIMA`, `MAKO_ANIMA_TRANSFORMER`, `MAKO_ANIMA_REF` | `anima_*` |
-| `MAKO_T5_TOKENIZER` (a T5 `tokenizer.json`) | `unigram` |
 
-The image tests compare with reference tensors from the original pipeline (fp32 on the CPU), written by a Python
-script kept beside the model, not in this repository. `ctest -N -L <label>` lists a label's tests, `ctest
+mako-common (`external/mako-common`) has its own tests (`-L cpu`, `-L kernels`), built and run from its directory.
+`ctest -N -L <label>` lists a label's tests, `ctest
 --print-labels` the labels; `tests/CMakeLists.txt` says what each test checks.
 
 Which to run:
@@ -54,7 +48,7 @@ Which to run:
 | `src/server`, `src/gen` | `-L server` and `-L cpu` | the same, and `-L e2e` for `gen::Session` or the pool |
 | Tokenizer, templates | `-L tokenizer` | the same |
 | `src/vision` | `-L vision` | the same |
-| `src/image`, `src/kernels/image.metal`, `src/kernels/ops.metal` | `-L image` | the same, and `bench/perf_check` for the LLMs when a shared kernel or `src/gpu` changed |
+| mako-common (kernels, `src/gpu`, `src/mtl`) | its tests | `-L e2e` and `bench/perf_check` here, and mako-image's `-L image` |
 
 `tests/data/README.md` says how each data file was made. After an intended numerical change,
 `regress_test <model> --update` re-records `tests/data/regress_expected.txt`; review that diff.
@@ -96,19 +90,16 @@ It does not cover long contexts; `prefill_sweep --parts` does.
 
 | Path | Contents |
 | --- | --- |
-| `src/gguf`, `src/safetensors` | model file readers (GGUF, multi-file models; safetensors) |
-| `src/quant` | CPU dequantization and the dense re-quantizers |
-| `src/app` | command-line options: the environment, presets |
-| `src/mtl` | Metal context, GEMV/GEMM wrappers, ablation vectors, embedded shader libraries |
-| `src/kernels` | Metal kernels |
-| `src/gpu` | what any model's GPU code shares: buffers, pipelines, dispatch, command buffers, timing |
+| `external/mako-common` | shared with mako-image (a submodule): GGUF and safetensors readers, quantization, Metal context, GEMV/GEMM, the GPU runtime, the common kernels, tokenizers, command-line options and presets, logging, HTTP access checks, memory lending |
+| `src/app` | the dense re-quantization option |
+| `src/mtl` | ablation vectors |
+| `src/kernels` | the models' Metal kernels |
 | `src/core` | what the routed-expert LLMs share on top of it: expert arena, staging, routing, telemetry |
 | `src/glm`, `src/dsv41` | the GLM-5.3 and DeepSeek-V4.1 engines (DeepSeek's Engram tables too) |
 | `src/gen` | the model interface, generation session, session pool, sampling |
-| `src/text`, `src/chat` | tokenizer and streaming detokenizer; chat templates |
+| `src/text`, `src/chat` | streaming detokenizer; chat templates |
 | `src/vision` | images as input: decoding and preprocessing, the vision encoder and projector, prompts with images |
-| `src/image` | image generation: the shared engine, Qwen-Image 2.1, Krea 2, MOSS-Image, Anima |
-| `src/server` | the HTTP server: OpenAI and Anthropic APIs, model swaps |
+| `src/server` | the HTTP server: OpenAI and Anthropic APIs, lending the LLM's memory |
 | `tools`, `bench`, `tests` | the programs above; microbenchmarks and `perf_check`; the ctest suite and its data |
 
 `docs/architecture.md` says how the engines fit together.

@@ -52,49 +52,14 @@ struct ServerOptions {
     // the share of the experts it holds.
     std::function<CacheCounters()> cache_counters;
     double cache_gb = 0, resident = 0;
-    // Image models: a directory of model directories (read on each request; see ImageModel), and the one for requests
-    // that name none (a name there, or a model directory's path).
-    std::string image_models, image_model;
     // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
     const vision::Mmproj* mmproj = nullptr;
     vision::Encoder* vision = nullptr;
 };
 
-// An image LoRA a request can name: its file name without .safetensors, its path, and for one given at start-up the
-// scale it is merged at by default.
-struct LoraChoice {
-    std::string name, path;
-    std::optional<float> scale;
-};
-// The start-up LoRAs (in their order), then the .safetensors files in `dir` by name (read now; empty: none). A
-// start-up LoRA's name wins over a file of the same name in `dir`.
-std::vector<LoraChoice> lora_choices(const image::Loras& defaults, const std::string& dir);
-// What a LoRA is for: its trigger (words a prompt needs for it to act), a description and the scales it is meant for.
-// Each from NAME.json beside the file ({"trigger", "description", "scale_range": [low, high]}), else the trigger and
-// description from the file's metadata (trigger_word or modelspec.trigger_phrase; modelspec.description); empty when
-// neither has it.
-struct LoraNotes {
-    std::string trigger, description;
-    std::optional<std::pair<float, float>> scale_range;
-};
-LoraNotes lora_notes(const std::string& path);
-// A request's "loras" value (JSON: an array of {"name" (with or without .safetensors), "scale" (default 1)}) as files
-// and scales. Throws
-// std::invalid_argument naming the problem.
-image::Loras resolve_loras(std::string_view json, const std::vector<LoraChoice>& choices);
-
-// Whether a request's credentials (the Authorization or x-api-key header value) carry one of `keys`; each compared in
-// constant time.
-bool key_matches(const std::string& authorization, const std::string& x_api_key, const std::vector<std::string>& keys);
-// Without keys: whether a Host header names this machine's loopback (localhost, 127.0.0.1, [::1], with any port) or is
-// empty (a client that sends none).
-bool host_allowed(const std::string& host);
-// Without keys: whether an Origin header is absent or a loopback page (http(s)://localhost, 127.0.0.1 or [::1]).
-bool origin_allowed(const std::string& origin);
-
-// OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/images/generations (with
-// an image model: Models swaps it in and the LLM out), /v1/models, /health, and /v1/status (JSON) with /status (a
-// page showing it).
+// OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, tool calls), /v1/messages (Anthropic's),
+// /v1/models, /health, /v1/status (JSON) with /status (a page showing it), and /v1/memory/acquire (another process on
+// this machine borrowing the LLM's memory: Models).
 // Requests take turns generating (see ServerOptions::slice_ms), up to max_waiting waiting; each conversation keeps
 // its context between requests (see ServerOptions::park_bytes).
 class Server {

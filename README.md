@@ -29,7 +29,8 @@ Runs mixture-of-experts models larger than your Mac's memory.
 - **Models:** GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017
 - **API:** OpenAI- and Anthropic-compatible (works with Claude Code)
 - **Speed:** DeepSeek-V4.1 decodes at ~25-34 tokens/s on a 128 GB M5 Max
-- **Optional:** image input, image generation (Qwen-Image 2.1, Krea 2, MOSS-Image, Anima)
+- **Optional:** image input; image generation with [mako-image](https://github.com/jhanssen/mako-image), which can
+  borrow the LLM's memory on the same Mac
 
 Early, but usable.
 
@@ -45,9 +46,13 @@ Early, but usable.
 **1. Build** (or take `mako_serve` and `mako_calibrate` from the [nightly release](https://github.com/jhanssen/mako/releases/tag/nightly)):
 
 ```sh
+git clone --recurse-submodules https://github.com/jhanssen/mako && cd mako
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+(The shared code is [mako-common](https://github.com/jhanssen/mako-common), a submodule in `external/mako-common`:
+`git submodule update --init` in a clone made without `--recurse-submodules`.)
 
 **2. Download a model:**
 
@@ -90,7 +95,7 @@ More on the models, and downloading by hand: [docs/models.md](docs/models.md).
 ## Docs
 
 - [Models](docs/models.md): which to pick, downloads, tested hardware
-- [Server](docs/server.md): API coverage, remote access, image generation, clients
+- [Server](docs/server.md): API coverage, remote access, lending memory to an image server, clients
 - [Options](docs/options.md): memory, presets and environment variables, speed/accuracy trade-offs, drafters
 - [Vision](docs/vision.md): images as prompt input
 - [Development](docs/development.md): tools, tests, source layout

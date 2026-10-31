@@ -7,7 +7,7 @@ The expert cache takes what is available at startup within a margin (a quarter o
 
 ## Presets and the environment
 
-The tools (`mako_serve`, `mako_calibrate`, `mako_run`, `ds_run`, `prefill_sweep`, `mako_image`) take their options
+The tools (`mako_serve`, `mako_calibrate`, `mako_run`, `ds_run`, `prefill_sweep`) take their options
 from, lowest precedence first, environment variables, presets and the command line. `--help` lists each tool's options
 with their variables.
 

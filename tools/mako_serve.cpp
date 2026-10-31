@@ -4,8 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--image-models DIR]
-//              [--image-model NAME|DIR]
+//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -29,22 +28,18 @@
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
-// engine's prefill group) and queues again. --image-models: a directory of image model directories (Qwen-Image 2.1,
-// Krea 2, MOSS-Image, Anima; each its files as published, or a mako.json pointing at them with its settings and LoRAs:
-// server::ImageModel), for /v1/images/generations (GET /v1/images/models lists them; a request's "model" picks one);
-// --image-model the one for requests that name none (a name there, or a model directory; default: the first). An image
-// request waits for the chat requests in progress, then the LLM is unloaded (its conversations kept in memory) and the
-// image model loaded; the next chat request loads the LLM again. Another model or other LoRAs load it again.
+// engine's prefill group) and queues again. Another process on this machine (an image server) may borrow the LLM's
+// memory (POST /v1/memory/acquire): it waits for the chat requests in progress, then the LLM is unloaded (its
+// conversations kept in memory); the next chat request asks for the memory back and loads the LLM again.
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "chat/template.hpp"
-#include "core/log.hpp"
+#include "log/log.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
-#include "image/engine.hpp"
 #include "gguf/model_files.hpp"
 #include "mtl/context.hpp"
 #include "server/server.hpp"
@@ -146,10 +141,6 @@ int main(int argc, char** argv)
                     "end repetition loops of N tokens or more in reasoning or answers (default 256; 0: off)",
                     so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
-            .option("--image-models", "DIR",
-                    "a directory of image model directories, for /v1/images/generations (swapped in)", so.image_models)
-            .option("--image-model", "NAME|DIR", "the image model for requests that name none (default: the first)",
-                    so.image_model)
             .option("--image-max-tokens", "N", "scale larger images down to at most N prompt rows (16 or more)",
                     [&](const std::string& v) {
                         image_max_tokens = mako::app::Cli::parse<uint32_t>(v);
@@ -175,16 +166,6 @@ int main(int argc, char** argv)
     if (so.host != "127.0.0.1" && so.host != "localhost" && so.host != "::1" && so.api_keys.empty()) {
         std::println(stderr, "--host {} serves beyond this machine: give an --api-key or --api-key-file", so.host);
         return 2;
-    }
-    if (!so.image_models.empty() || !so.image_model.empty()) {
-        if (!so.image_models.empty() && !std::filesystem::is_directory(so.image_models)) {
-            std::println(stderr, "--image-models {}: not a directory", so.image_models);
-            return 2;
-        }
-        if (so.image_models.empty() && !std::filesystem::is_directory(so.image_model)) {
-            std::println(stderr, "--image-model {}: not a directory (or give --image-models)", so.image_model);
-            return 2;
-        }
     }
     const auto t_start = std::chrono::steady_clock::now();
     mako::log::info("reading {}", model_path);
@@ -274,7 +255,7 @@ int main(int argc, char** argv)
     }
     // Below this share of the experts resident, the cache is smaller than this Mac allows.
     const double expected_resident = deepseek ? 25 : 50;
-    // The LLM: loaded now, and again after an image request had it unloaded.
+    // The LLM: loaded now, and again after its memory was lent to another process (an image server).
     auto load_llm = [&]() -> mako::server::Models::Llm {
         mako::server::Models::Llm l;
         uint32_t n_embd = 0, n_layer = 0;
@@ -334,17 +315,9 @@ int main(int argc, char** argv)
         }
         return l;
     };
-    mako::server::Models::LoadImage load_image;
-    if (!so.image_models.empty() || !so.image_model.empty())
-        load_image = [&](const mako::server::ImageModel& m, const mako::image::Loras& loras) {
-            auto e = mako::image::Engine::open(m.dir, ctx, m.options);
-            for (const auto& [path, scale] : loras)
-                e->add_lora(path, scale);
-            return e;
-        };
     std::optional<mako::server::Models> models;
     try {
-        models.emplace(load_llm, load_image);
+        models.emplace(load_llm);
     } catch (const std::exception& e) {
         mako::log::error("{}", e.what());
         return 1;
@@ -376,13 +349,6 @@ int main(int argc, char** argv)
         mako::log::warn("little memory was free for the expert cache (a process that just exited may still be "
                         "returning its memory); decoding will read experts from the SSD often");
     {
-        if (models->has_image()) {
-            if (!so.image_models.empty())
-                for (const auto& m : mako::server::image_models(so.image_models))
-                    mako::log::info("image model {}: {}{}", m.name, m.dir, m.loras.empty() ? "" : " (with LoRAs)");
-            mako::log::info("image models: loaded for image requests, in place of the LLM; default {}",
-                            so.image_model.empty() ? "the first" : so.image_model);
-        }
         mako::server::Server server(*models, *tok, *tmpl, so);
         std::jthread stopper([&] {
             int sig = 0;
@@ -401,6 +367,6 @@ int main(int argc, char** argv)
             b.save_profile(b.default_profile(), true);
             mako::log::info("routing counts added to {}", b.default_profile().string());
         }))
-        mako::log::warn("--learn: the LLM was not loaded at the end (the image model was); no routing counts saved");
+        mako::log::warn("--learn: the LLM was not loaded at the end (its memory was lent); no routing counts saved");
     return 0;
 }

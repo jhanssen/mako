@@ -1,7 +1,7 @@
 # Third-party Jinja engine (MIT) for the GGUF chat templates. Its sources include a header for their assert macro only;
 # a two-line stand-in is generated for it. The JSON value it reads its context from (json.h) is mako's own
 # (src/chat/json), found ahead of the engine's directory.
-set(JINJA_DIR ${CMAKE_BINARY_DIR}/third_party/jinja) # from cmake/llama_cpp_sources.cmake
+set(JINJA_DIR ${CMAKE_BINARY_DIR}/third_party/jinja) # fetched by mako-common (cmake/jinja_files.cmake)
 file(WRITE ${JINJA_DIR}/ggml.h "#pragma once\n#include <cstdlib>\n#define GGML_ASSERT(x) do { if (!(x)) std::abort(); } while (0)\n")
 
 # tojson's text counts as the context's (where control tokens are not recognized): templates render tool definitions
