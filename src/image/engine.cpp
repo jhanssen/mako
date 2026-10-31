@@ -398,7 +398,8 @@ std::vector<float> Engine::generate(const Request& r)
     const uint32_t steps = uint32_t(sig.size() - 1);
     begin(prompt, h, w);
     const float scale = r.guidance.value_or(default_guidance());
-    const auto negative = r.negative ? r.negative : default_negative();
+    // At scale 1 the guided velocity is the prompt's own: no negative pass.
+    const auto negative = scale == 1.0f ? std::nullopt : r.negative ? r.negative : default_negative();
     if (negative)
         begin(prompt_embeddings(*negative), h, w, 1);
     for (uint32_t i = 0; i < steps; ++i) {

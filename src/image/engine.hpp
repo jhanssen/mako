@@ -54,7 +54,8 @@ public:
         uint64_t seed = 0;
         std::span<const float> noise; // instead of the seed's: [h * w][latent_width()]
         std::optional<float> terminal; // the schedule's last noise level (0: not stretched); unset: the model's
-        // What the image should not be: classifier-free guidance, a second transformer pass a step (unset: none).
+        // What the image should not be: classifier-free guidance, a second transformer pass a step (unset: none, or
+        // the model's own); none at scale 1.
         std::optional<std::string> negative;
         std::optional<float> guidance; // its scale (unset: the model's)
         std::function<void(uint32_t step, uint32_t steps)> progress;

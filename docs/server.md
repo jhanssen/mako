@@ -149,8 +149,9 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   that request; `[]` is none. A set without a few-step LoRA the model's `steps` were lowered for gives smeared images
   unless the request raises `steps` too. Formats: Diffusers, PEFT, ComfyUI and Kohya (`lora_unet_...`) names, whole
   bias differences (`diff_b`), adapters of fused matrices (MOSS-Image's `proj.qkv`). Tried: Qwen-Image's lightx2v
-  Lightning (4 steps, 1024x1024 in ~7 s), Next-Scene and Natural-Exposure stacked with it; five Krea 2 and two
-  MOSS-Image LoRAs load (their images not checked).
+  Lightning (4 steps, 1024x1024 in ~7 s), Next-Scene and Natural-Exposure stacked with it; lodestones' 8-step DMD
+  LoRAs for MOSS-Image SFT and Base (`steps` 8, `guidance` 1: 1024x1024 in ~14 s instead of ~145 s, clean); five
+  Krea 2 and two more MOSS-Image LoRAs load (their images not checked). Guidance 1 runs no negative pass.
 - Anima (circlestone-labs/Anima) as its repository lays it out: the directory holding `split_files/` (or
   `diffusion_models/`, `text_encoders/`, `vae/` directly) with `transformer` the checkpoint (e.g.
   `split_files/diffusion_models/anima-turbo-v1.1.safetensors`; a name with "turbo" is run as the distilled one), and
