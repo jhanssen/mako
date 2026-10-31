@@ -8,20 +8,34 @@ description: Render a picture of the current scene, character, place or moment f
 Turn what the conversation has established into one image prompt, render it with mako, and show the result.
 
 0. Pick the image model (see "Models" below) unless one is already in use in this conversation.
-1. Write one image prompt in English, 60-200 words, from the conversation so far, in full descriptive sentences
+1. Write one image prompt in English, 100-300 words, from the conversation so far, in full descriptive sentences
    rather than a list of keywords (the image models' text encoders are language models and read prose best; a
-   model whose description says it takes tags can have tags in front of the sentences):
-   - the subjects: who or what, with every visual detail the story has fixed (age, build, hair, skin, clothing,
-     colours, objects), the same way each time so characters stay recognisable across images;
-   - their pose, action and expression;
-   - the setting, time of day and weather;
-   - the composition and camera (wide shot, close-up, viewpoint, lens), the lighting and the mood;
+   model whose description says it takes tags can have tags in front of the sentences). The image model knows only
+   what the prompt says: anything left out is filled in by guess, usually with the most generic choice. Spell every
+   detail out, concretely and literally, even ones that seem obvious from the story:
+   - the subjects: who or what, how many, and every visual detail the story has fixed (age, build, height, hair
+     length, style and colour, eye colour, skin, face, clothing piece by piece with its colour, fit and state,
+     accessories, objects held), the same words each time so characters stay recognisable across images;
+   - exactly where each subject is and what each part of the body is doing: standing, sitting or lying, which way
+     they face, where the hands and arms are, where they look, the expression; with several subjects, where each is
+     relative to the others and to the camera, and who is touching what;
+   - what is visible and what is not: which parts of the subjects are in frame, what is in front of or behind them,
+     what fills the foreground and the background;
+   - the setting in particular things (not "a room" but the room's walls, floor, furniture, light sources), the time
+     of day and the weather;
+   - the composition and camera (wide shot, close-up, viewpoint, height, lens), the lighting (direction, colour,
+     hardness) and the mood;
    - the art style the user has asked for in this session; otherwise one that suits the material, stated plainly
      ("oil painting", "cinematic photograph", "watercolour", "editorial photography", ...);
    - no text or lettering in the image unless the user wants it; no list of things to avoid.
-   Say plainly what the image should show; vague or hedged wording gives vaguer images.
+   Do not summarize or soften what the user asked for: an abstraction ("an intimate moment", "a dramatic scene", "a
+   fantasy outfit") gives a generic image; say what is actually seen instead. Do not leave out a detail because it
+   was mentioned long ago or seems implied; if the user describes something, it belongs in the prompt in their
+   terms. Say plainly what the image should show; vague or hedged wording gives vaguer images.
    If the user asked for something specific ("the tavern from the first chapter", "portrait of the captain"), use
-   the details the conversation gives for it and leave out the rest.
+   every detail the conversation gives for it and leave out what does not belong to it. If the user says an image
+   came out wrong, find which detail the prompt left vague or missing, write it out more explicitly, and keep the
+   rest of the prompt the same.
 2. Pick a size: 1024x1024, or 1344x768 for a landscape or wide scene, 768x1344 for a standing figure or tall scene
    (each side a multiple of 32).
 3. Run, from this skill's directory:
