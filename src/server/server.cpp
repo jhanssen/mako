@@ -99,8 +99,8 @@ struct Server::Impl {
     void count_tokens(const httplib::Request& req, httplib::Response& res);
     // POST /v1/images/generations: OpenAI's fields (prompt, n, size, response_format b64_json, output_format png or
     // jpeg; model, quality, style, background, moderation and user accepted and left alone); extensions
-    // negative_prompt, guidance_scale and loras (in place of the start-up LoRAs); steps and the schedule's end from
-    // the options.
+    // negative_prompt, guidance_scale, loras (in place of the start-up LoRAs) and steps; the schedule's end from the
+    // options.
     void images(const httplib::Request& req, httplib::Response& res);
     // GET /v1/images/loras: the LoRAs requests can name, the start-up ones with their scales.
     void loras(httplib::Response& res);
@@ -530,6 +530,13 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             return fail(400, "guidance_scale must be a number from 0 to 30", "invalid_request_error");
         guidance = float(body["guidance_scale"].get_number());
     }
+    uint32_t steps = opts.image_steps;
+    if (body.contains("steps") && !body["steps"].is_null()) {
+        const auto& v = body["steps"];
+        if (!v.is_number() || v.get_number() < 0 || v.get_number() > 100 || v.get_number() != std::floor(v.get_number()))
+            return fail(400, "steps must be a whole number from 0 (the model's) to 100", "invalid_request_error");
+        steps = uint32_t(v.get_number());
+    }
     image::Loras loras = opts.image_loras;
     if (body.contains("loras") && !body["loras"].is_null()) {
         try {
@@ -569,7 +576,7 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             r.width = width;
             r.height = height;
             r.seed = (uint64_t(rd()) << 32) | rd();
-            r.steps = opts.image_steps;
+            r.steps = steps;
             r.terminal = opts.image_terminal;
             r.negative = negative;
             r.guidance = guidance;

@@ -45,8 +45,9 @@ ones mako has, by name; those marked "default" are what every render uses unless
   `--no-loras` renders with none.
 - SCALE is the strength (1 when left out). If the user finds an effect too weak or too strong, raise or lower it by
   0.2-0.3.
-- Keep a default that makes rendering fast (its name says so, e.g. "lightning", "4step", "turbo") whenever you pass
-  `--lora`: mako's step count is set for it, and without it images come out smeared.
+- A default that makes rendering fast (its name says so, e.g. "lightning", "4step", "turbo") goes with a low step
+  count that mako is set to. When you pass `--lora` or `--no-loras` without it, add `--steps 0` (the model's own
+  count, slower); otherwise the image comes out smeared.
 - Use a LoRA only when the user asks for it or its name clearly matches what they want. Once the user has chosen
   LoRAs, pass the same ones on every later render in the conversation: nothing is remembered between renders.
 - A render with other LoRAs than the previous one first reloads the image model (a few seconds more).

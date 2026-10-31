@@ -101,7 +101,7 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored), `output_format` (`png` or
   `jpeg`). `model`, `quality`, `style`, `background`, `moderation` and `user` are accepted and left alone: the
   model's steps (Qwen-Image 2.1 40, Krea 2 Turbo 8), a random seed for each image (in the log).
-- Extensions: `negative_prompt` (what the image should not be) and `guidance_scale` (its strength; default
+- Extensions (more below): `negative_prompt` (what the image should not be) and `guidance_scale` (its strength; default
   `--image-guidance F`, else the model's: Qwen-Image 2.1 4, Krea 2 Turbo 2). A negative prompt runs the transformer
   twice a step, so the image takes about twice as long; without one, nothing changes. Qwen-Image follows it well
   (scales 2 to 6 tried). Krea 2 Turbo was distilled to run without it: at 1.5-2 the negative prompt shows a little,
@@ -125,10 +125,12 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   `default_scale`, then the directory's, each by its file name without `.safetensors` (a `--image-lora` name wins over
   a directory file of the same name). A request's `loras`, e.g. `[{"name": "next-scene", "scale": 0.8}]` (scale 1 when
   left out, -10 to 10), replaces the `--image-lora` set for that request; `[]` is none, no field the `--image-lora`
-  set. The steps stay the server's, so a set without a few-step LoRA that `--image-steps` was lowered for gives
-  smeared images. When the set differs from the one merged, the image model is loaded again first (Qwen-Image 2.1:
+  set. A set without a few-step LoRA that `--image-steps` was lowered for gives smeared images unless the request
+  raises `steps` too. When the set differs from the one merged, the image model is loaded again first (Qwen-Image 2.1:
   2.4 s without LoRAs, 3.8 s with two).
-- Not yet: condition images (edits, references; `/v1/images/edits`), image to image, and per-request seed or steps.
+- `steps` (0 to 100; 0: the model's own) sets a request's denoising steps in place of `--image-steps`. The schedule's
+  end stays `--image-terminal` (Qwen-Image 2.1 at 40 steps with `--image-terminal 0`: clean).
+- Not yet: condition images (edits, references; `/v1/images/edits`), image to image, and a per-request seed.
 - `--image-text-encoder DIR` takes the text encoder from another directory of safetensors (the same architecture
   with changed weights, such as a refusal-ablated one), leaving the model's own directory as published;
   `--image-transformer PATH` the transformer from another file or directory (such as a Krea 2 checkpoint with LoRAs
