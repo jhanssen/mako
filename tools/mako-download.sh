@@ -135,12 +135,6 @@ EOF
 
 gb() { echo "$1" | awk '{ printf "%.1f GB", $1 / 1e9 }'; }
 echo "$model: $(echo "$files" | wc -l | tr -d ' ') files, $(gb $total), into $dir; $(gb $need) left to download"
-mkdir -p "$dir"
-free=$(($(df -k "$dir" | awk 'NR == 2 { print $4 }') * 1024))
-if [ $need -gt $free ]; then
-    echo "not enough space: $(gb $need) needed, $(gb $free) free on $dir" >&2
-    exit 1
-fi
 
 if [ $dry = 1 ]; then
     echo "$files" | while read -r repo path size sha; do
@@ -149,9 +143,17 @@ if [ $dry = 1 ]; then
     exit 0
 fi
 
+mkdir -p "$dir"
+free=$(($(df -k "$dir" | awk 'NR == 2 { print $4 }') * 1024))
+if [ $need -gt $free ]; then
+    echo "not enough space: $(gb $need) needed, $(gb $free) free on $dir" >&2
+    exit 1
+fi
+
 check() { # file sha; a mismatch renames it to <name>.bad
     echo "     checking SHA-256"
-    got=$(openssl dgst -sha256 -r "$1" | cut -d ' ' -f 1)
+    got=$(openssl dgst -sha256 -r "$1") || { echo "cannot compute the SHA-256 of $1" >&2; exit 1; }
+    got=${got%% *}
     if [ "$got" != "$2" ]; then
         bad=$dest.bad
         mv "$1" "$bad"
@@ -183,8 +185,9 @@ download() { # repo path size sha
             echo "get  ${dest##*/} ($(gb $3))"
             set -- "$@" "$url" "$part"
             if [ -n "${HF_TOKEN:-}" ]; then
-                curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -H "Authorization: Bearer $HF_TOKEN" \
-                    -o "$6" "$5"
+                # The token goes in through a config on standard input, not the command line (visible in ps).
+                printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+                    curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -K - -o "$6" "$5"
             else
                 curl -fL --retry 10 --retry-delay 5 --retry-all-errors -C - -o "$6" "$5"
             fi
@@ -222,25 +225,31 @@ bin=
 for b in "$here" "$here/../build/tools"; do
     [ -x "$b/mako_serve" ] && bin=$(cd "$b" && pwd)/ && break
 done
-extra=
-[ $vision = 1 ] && extra="$extra --mmproj $(dest_of "$(echo "$files" | awk '/mmproj/ { print $2 }')")"
-[ $dspark = 1 ] && extra="$extra --dspark $dir/dspark"
-[ $ablate = 1 ] && extra="$extra --ablate $(dest_of "$(echo "$files" | awk '/\.abl / { print $2 }')")"
-case $model in ds-ista-*) extra="$extra --miss-penalty 0.1" ;; esac
+# A word for the shell: quoted when it holds anything else than these characters.
+q() {
+    case $1 in
+    *[!A-Za-z0-9_./~:=+-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+    esac
+}
+# The extra options, for the command line and for the preset.
+extra= json=
+opt() { # name value
+    extra="$extra $1 $(q "$2")"
+    case $2 in
+    [0-9]*) json=$(printf '%s,\n    "%s": %s' "$json" "$1" "$2") ;;
+    *) json=$(printf '%s,\n    "%s": "%s"' "$json" "$1" "$2") ;;
+    esac
+}
+[ $vision = 1 ] && opt --mmproj "$(dest_of "$(echo "$files" | awk '/mmproj/ { print $2 }')")"
+[ $dspark = 1 ] && opt --dspark "$dir/dspark"
+[ $ablate = 1 ] && opt --ablate "$(dest_of "$(echo "$files" | awk '/\.abl / { print $2 }')")"
+case $model in ds-ista-*) opt --miss-penalty 0.1 ;; esac
 
 echo
 echo "done. Once per model (which experts start in memory):"
-echo "  ${bin}mako_calibrate $first"
+echo "  $(q "${bin}mako_calibrate") $(q "$first")"
 echo "then:"
-echo "  ${bin}mako_serve $first$extra --port 8080 --ctx 65536"
+echo "  $(q "${bin}mako_serve") $(q "$first")$extra --port 8080 --ctx 65536"
 echo "or as a preset (~/Library/Application Support/mako/presets.json, --preset $model):"
-printf '  "%s": {\n    "model": "%s"' "$model" "$first"
-set -- $extra
-while [ $# -ge 2 ]; do
-    case $2 in
-    [0-9]*) printf ',\n    "%s": %s' "$1" "$2" ;;
-    *) printf ',\n    "%s": "%s"' "$1" "$2" ;;
-    esac
-    shift 2
-done
-printf '\n  }\n'
+printf '  "%s": {\n    "model": "%s"%s\n  }\n' "$model" "$first" "$json"

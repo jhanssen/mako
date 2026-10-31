@@ -546,6 +546,19 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
     const uint32_t arena_rows = uint32_t(arena_->usage().size());
     auto* indirect = static_cast<uint32_t*>(scratch("mind", uint64_t(arena_rows) * kMaxDecodeTokens * 36)->contents());
     size_t served = 0;
+    // On an error the GPU must not wait for layers that will never be served: they run on whatever slots they find,
+    // and the step's results are dropped with the exception.
+    struct Release {
+        EngineBase& e;
+        bool ok = false;
+        ~Release()
+        {
+            if (ok || e.pending_moe_.empty())
+                return;
+            e.ready_->setSignaledValue(e.pending_moe_.back().value);
+            e.pending_moe_.clear();
+        }
+    } release{*this};
     for (const auto [il, v, T, predicted] : pending_moe_) {
         if (!block && routed_->signaledValue() < v)
             break;
@@ -587,7 +600,10 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
                 if (std::ranges::find(want, sel[t * 16 + j]) == want.end())
                     want.push_back(sel[t * 16 + j]);
         std::vector<int32_t> got(want.size());
-        arena_->ensure(il, want, got.data());
+        if (!arena_->ensure(il, want, got.data()))
+            throw std::runtime_error(std::format("layer {}: the {} experts of {} tokens do not fit the arena's free "
+                                                 "slots (a larger --arena-gb, or fewer tokens per step)",
+                                                 il, want.size(), T));
         last_step_.ensure_ms += ms_since(t_ensure);
         auto slot_of = [&](int e) { return got[std::ranges::find(want, e) - want.begin()]; };
         uint32_t* ind = indirect + uint64_t(il) * kMaxDecodeTokens * 9;
@@ -623,6 +639,7 @@ void EngineBase::serve_moe(MTL::CommandBuffer* cb, bool block)
         ready_->setSignaledValue(v);
     }
     pending_moe_.erase(pending_moe_.begin(), pending_moe_.begin() + ptrdiff_t(served));
+    release.ok = true;
 }
 
 void EngineBase::note_resident()
@@ -989,7 +1006,11 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
             posp[u] = int32_t(row++);
         }
     }
-    const uint32_t brows = std::min(rows, kBatchRows);
+    // A batch holds kBatchRows rows, or one expert's rows where it has more.
+    uint32_t most = 0;
+    for (int e : order)
+        most = std::max(most, uint32_t(users[e].size()));
+    const uint32_t brows = std::min(rows, std::max(kBatchRows, most));
     MTL::Buffer* xb = scratch("p_xb", uint64_t(brows) * E * 2); // half, for the GEMMs
     MTL::Buffer* gb = scratch("p_gb", uint64_t(brows) * nff * 4);
     MTL::Buffer* ub = scratch("p_ub", uint64_t(brows) * nff * 4);
@@ -1067,6 +1088,24 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         std::vector<int32_t> slots;
     };
     std::deque<InFlight> inflight;
+    // On an error: the batches still running finish before their slots are unpinned.
+    struct Unwind {
+        ExpertArena& arena;
+        uint32_t il;
+        std::deque<InFlight>& inflight;
+        bool ok = false;
+        ~Unwind()
+        {
+            if (ok)
+                return;
+            for (InFlight& f : inflight) {
+                f.cb->waitUntilCompleted();
+                f.cb->release();
+            }
+            inflight.clear();
+            arena.unpin(il);
+        }
+    } unwind{*arena_, il, inflight};
     auto commit = [&](size_t b0, size_t b1) {
         if (b0 == b1)
             return;
@@ -1104,10 +1143,12 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     if (stager_) {
         // Misses from staging, read ahead of this layer: batches as their experts arrive, each slot released when
         // the GPU work that reads it completes.
-        Stager* st = stager_.get();
+        const std::shared_ptr<Stager> st = stager_;
         for (size_t i = n_resident; i < order.size();) {
             size_t j = i + 1;
-            while (j < order.size() && j - i < kExpertsPerCommit && rows_of(i, j + 1) <= kBatchRows)
+            // A batch takes no more slots than the ring has: they are released only after it is committed.
+            const size_t most = std::min<size_t>(kExpertsPerCommit, st->slots());
+            while (j < order.size() && j - i < most && rows_of(i, j + 1) <= kBatchRows)
                 ++j;
             std::vector<int64_t> jobs;
             for (size_t m = i; m < j; ++m) {
@@ -1158,6 +1199,8 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     // This layer's slots are only touched again after the group's work is drained.
     for (InFlight& f : inflight)
         committed.push_back(f.cb);
+    inflight.clear();
+    unwind.ok = true;
     arena_->unpin(il);
 
     const CombineArgs ca{E, k};

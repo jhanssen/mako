@@ -76,10 +76,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           NAME: ${{ steps.changed.outputs.name }}
+        # The release is replaced in place (assets, then its tag and notes), so a failed run leaves the last one.
         run: |
-          gh release delete nightly --cleanup-tag --yes || true
-          gh release create nightly --prerelease --target "$(git rev-parse HEAD)" \
-            --title "Nightly $(date -u +%Y-%m-%d) ($(git rev-parse --short=7 HEAD))" \
-            --notes "Built from $(git rev-parse HEAD) on main; the archive unpacks to ${NAME}/. Unsigned: after downloading with a browser, run \`xattr -dr com.apple.quarantine ${NAME}\` once (see README.md in the archive)." \
-            out/mako-nightly-macos-arm64.tar.gz out/mako-nightly-macos-arm64.tar.gz.sha256 \
-            out/mako-nightly-macos-arm64-dSYM.tar.gz
+          title="Nightly $(date -u +%Y-%m-%d) ($(git rev-parse --short=7 HEAD))"
+          notes="Built from $(git rev-parse HEAD) on main; the archive unpacks to ${NAME}/. Unsigned: after downloading with a browser, run \`xattr -dr com.apple.quarantine ${NAME}\` once (see README.md in the archive)."
+          files=(out/mako-nightly-macos-arm64.tar.gz out/mako-nightly-macos-arm64.tar.gz.sha256
+                 out/mako-nightly-macos-arm64-dSYM.tar.gz)
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly "${files[@]}" --clobber
+            git tag -f nightly HEAD
+            git push -f origin refs/tags/nightly
+            gh release edit nightly --prerelease --title "$title" --notes "$notes"
+          else
+            gh release create nightly --prerelease --target "$(git rev-parse HEAD)" --title "$title" --notes "$notes" \
+              "${files[@]}"
+          fi

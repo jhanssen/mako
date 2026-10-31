@@ -36,6 +36,7 @@ private:
     Tensor img_in_, txt_norm_, txt_in1_, txt_in2_, t_lin1_, t_lin2_, mod_, out_lin_, proj_out_;
     std::vector<Block> blocks_;
     static constexpr uint32_t kDim = 4096, kHeads = 32, kTimeDim = 256;
+    static constexpr uint32_t kMaxPrompt = 1024; // tokens after the system part
     static constexpr float kEps = 1e-6f;
     static constexpr const char* kSystem = "Comprehend and analyze the provided prompt.";
     uint32_t drop_ = 0;

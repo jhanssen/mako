@@ -226,7 +226,7 @@ protected:
     std::vector<uint32_t> resident_seen_;  // the counts already passed on
     std::vector<uint32_t> resident_calls_; // per arena row, steps since then
     void note_resident();
-    std::unique_ptr<Stager> stager_;
+    std::shared_ptr<Stager> stager_; // also held by the completion handlers of command buffers that read it
     uint64_t stage_bytes_ = 3ull << 30;
 
     RouteOverride route_override_;

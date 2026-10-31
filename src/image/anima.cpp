@@ -258,9 +258,11 @@ std::vector<std::pair<std::string, float>> Anima::weighted(const std::string& pr
         return out;
     };
     std::vector<std::pair<std::string, float>> out;
-    auto parse = [&](auto& self, const std::string& s, float weight) -> void {
+    // Nesting deeper than kMaxDepth is text (each level copies the string, and the weights compound).
+    constexpr int kMaxDepth = 16;
+    auto parse = [&](auto& self, const std::string& s, float weight, int depth) -> void {
         for (std::string x : groups(s)) {
-            if (x.size() >= 2 && x.front() == '(' && x.back() == ')') {
+            if (x.size() >= 2 && x.front() == '(' && x.back() == ')' && depth < kMaxDepth) {
                 x = x.substr(1, x.size() - 2);
                 float w = weight * 1.1f;
                 if (const size_t colon = x.rfind(':'); colon != std::string::npos && colon > 0) {
@@ -269,18 +271,18 @@ std::vector<std::pair<std::string, float>> Anima::weighted(const std::string& pr
                     num = a == std::string::npos ? "" : num.substr(a, b - a + 1);
                     char* end = nullptr;
                     const double v = num.empty() ? 0 : std::strtod(num.c_str(), &end);
-                    if (!num.empty() && end && *end == '\0') {
-                        w = float(v);
+                    if (!num.empty() && end && *end == '\0' && std::isfinite(v)) {
+                        w = float(std::clamp(v, -100.0, 100.0));
                         x = x.substr(0, colon);
                     }
                 }
-                self(self, x, w);
+                self(self, x, w, depth + 1);
             } else {
                 out.emplace_back(x, weight);
             }
         }
     };
-    parse(parse, text, 1.0f);
+    parse(parse, text, 1.0f, 0);
     for (auto& [s, w] : out) {
         std::string u;
         for (size_t i = 0; i < s.size(); ++i)

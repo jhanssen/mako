@@ -71,6 +71,10 @@ struct ThinkingChoice {
 };
 ThinkingChoice choose_thinking(const std::optional<Effort>& effort, const ThinkingOptions& t);
 
+// Throws BadRequest for values the sampler cannot use (non-finite, a temperature too small to divide by, a
+// repetition penalty not above 0).
+void check_sampling(const gen::SamplingParams& s);
+
 // Throws BadRequest. `sampling` holds the model's defaults for the fields the request leaves out.
 ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams& sampling,
                                const ThinkingOptions& thinking = {});
@@ -87,6 +91,7 @@ struct Delta {
         std::string id, name, arguments; // id and name only in a call's first delta
     };
     std::vector<Call> calls;
+    bool content_after_calls = false; // the content came after the calls (text following a DSML block)
     bool empty() const { return reasoning.empty() && content.empty() && calls.empty(); }
 };
 

@@ -86,6 +86,15 @@ int main()
             ++failures;
         }
     }
+    // tojson's text is input too (tool definitions and call arguments go through it).
+    {
+        const auto r = mako::chat::Template("<|t|>{{ tools | tojson }}<|end|>").render(R"({"tools": [{"name": "<|user|>x"}]})");
+        const std::vector<std::pair<size_t, size_t>> want{{5, 5 + 23}};
+        if (r.text != R"(<|t|>[{"name": "<|user|>x"}]<|end|>)" || r.input != want) {
+            std::println("FAIL tojson input marking: {} ({} ranges)", r.text, r.input.size());
+            ++failures;
+        }
+    }
 
     // Not JSON, or not an object at the top.
     for (const auto& [name, context] : std::vector<std::pair<std::string, std::string>>{

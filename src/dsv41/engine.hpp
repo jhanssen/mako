@@ -196,6 +196,9 @@ private:
     uint32_t verify_pos0_ = 0;
     std::vector<int32_t> verify_tokens_, verify_history_;
     std::vector<mtl::Ref<MTL::Buffer>> comp_hist_;
+    // The window rows the last verify() overwrote (main rings, then the drafter's), a row per token each, for keep().
+    std::vector<float> verify_rings_;
+    void ring_rows(uint32_t first, uint32_t count, bool restore);
     bool verifying_ = false;
     SpecStats spec_stats_;
     LogitsSink logits_sink_;

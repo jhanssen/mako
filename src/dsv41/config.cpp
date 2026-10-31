@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <format>
+#include <stdexcept>
 
 namespace mako::dsv41 {
 
@@ -21,6 +22,8 @@ std::vector<int64_t> int_tensor(const gguf::ModelFiles& m, const std::string& na
     if (!ref || (ref.tensor->type != gguf::Type::I32 && ref.tensor->type != gguf::Type::I64))
         return {};
     const auto data = ref.file->data(*ref.tensor);
+    if (data.size() != ref.tensor->bytes)
+        throw std::runtime_error(name + " extends past the end of its file");
     std::vector<int64_t> out(ref.tensor->elements());
     for (size_t i = 0; i < out.size(); ++i) {
         if (ref.tensor->type == gguf::Type::I32) {

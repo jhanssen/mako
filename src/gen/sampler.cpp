@@ -34,6 +34,8 @@ void Sampler::distribution(const float* logits)
         if (q >= std::min(p_.min_p, 1.0f) && q > 0.0f)
             cand_.emplace_back(q, int32_t(i));
     }
+    if (cand_.empty()) // non-finite logits after the penalties: the most likely token
+        cand_.emplace_back(1.0f, int32_t(std::ranges::max_element(work_) - work_.begin()));
     auto desc = [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
     if (p_.top_k > 0 && p_.top_k < cand_.size()) {
         std::ranges::nth_element(cand_, cand_.begin() + p_.top_k, desc);

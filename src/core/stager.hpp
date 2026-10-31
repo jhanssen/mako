@@ -30,6 +30,7 @@ public:
     Stager& operator=(const Stager&) = delete;
 
     bool ok() const { return slots_ > 0; }
+    uint32_t slots() const { return slots_; }
     uint64_t bytes() const { return buf_ ? buf_->length() : 0; }
 
     // Starts reading `plan`: per arena row (layer), the experts to read, in the order they will be taken. Any

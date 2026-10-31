@@ -368,7 +368,8 @@ std::vector<float> Engine::sigmas(uint32_t steps, uint32_t tokens, std::optional
         const float t = steps == 1 ? 1.0f : float(1.0 + (1.0 / steps - 1.0) * double(i) / double(steps - 1));
         s[i] = float(std::exp(mu) / (std::exp(mu) + (1.0 / double(t) - 1.0)));
     }
-    if (term > 0 && steps > 0) {
+    // Nothing to stretch when the last sigma is 1 (one step): the scale would be 0.
+    if (term > 0 && steps > 0 && s.back() < 1.0f) {
         const float scale = (1.0f - s.back()) / (1.0f - float(term));
         for (float& v : s)
             v = 1.0f - (1.0f - v) / scale;

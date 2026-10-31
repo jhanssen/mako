@@ -352,7 +352,8 @@ ChatRequest parse_messages_request(std::string_view body, const gen::SamplingPar
     if (b.top_p)
         s.top_p = float(*b.top_p);
     if (b.top_k)
-        s.top_k = uint32_t(std::max(0.0, *b.top_k));
+        s.top_k = uint32_t(std::clamp(*b.top_k, 0.0, 4e9));
+    check_sampling(s);
     r.gen.seed = (uint64_t(std::random_device{}()) << 32) | std::random_device{}();
     r.gen.max_tokens = b.max_tokens ? uint32_t(std::clamp(*b.max_tokens, 1.0, 4e9)) : 0;
     r.max_tokens_given = r.gen.max_tokens > 0;
@@ -387,7 +388,7 @@ public:
         std::string s;
         if (show_reasoning_ && !d.reasoning.empty())
             s += append("thinking", "thinking_delta", "thinking", d.reasoning);
-        if (!d.content.empty())
+        if (!d.content.empty() && !d.content_after_calls)
             s += append("text", "text_delta", "text", d.content);
         for (const auto& c : d.calls) {
             if (!c.id.empty()) {
@@ -400,16 +401,19 @@ public:
                            std::format(R"({{"type":"content_block_delta","index":{},"delta":{{"type":"input_json_delta","partial_json":{}}}}})",
                                        index_, json::quoted(c.arguments)));
         }
+        if (!d.content.empty() && d.content_after_calls)
+            s += append("text", "text_delta", "text", d.content);
         return s;
     }
 
     std::string end(End e, const OutputParser& p, const gen::GenerateResult& r) override
     {
         std::string s = close();
+        // The final usage, as the whole message's (message_start's counted the prompt before any of it was reused).
         s += event("message_delta",
-                   std::format(R"({{"type":"message_delta","delta":{{"stop_reason":"{}","stop_sequence":{}}},"usage":{{"output_tokens":{}}}}})",
+                   std::format(R"({{"type":"message_delta","delta":{{"stop_reason":"{}","stop_sequence":{}}},"usage":{{"input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}})",
                                stop_reason(e), e == End::stop_sequence ? json::quoted(p.stop_matched()) : "null",
-                               r.tokens.size()));
+                               r.prompt_tokens - r.reused_tokens, r.reused_tokens, r.tokens.size()));
         return s + event("message_stop", R"({"type":"message_stop"})");
     }
 

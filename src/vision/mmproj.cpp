@@ -64,6 +64,9 @@ std::expected<Mmproj, std::string> open_mmproj(const std::string& path)
     if (!m.n_embd || !m.n_head || m.n_embd % m.n_head || !m.n_ff || !m.n_layer || !m.out_embd || !m.prep.patch ||
         !m.prep.merge || m.eps <= 0.0f)
         return std::unexpected(std::format("{}: incomplete vision metadata", path));
+    // The kernels merge 2x2 patches (GLM) or 3x3 (DeepSeek).
+    if (m.prep.merge != (m.prep.kind == Projector::glm5v ? 2u : 3u))
+        return std::unexpected(std::format("{}: unsupported patch merge {}", path, m.prep.merge));
     if (m.prep.kind == Projector::glm5v && (!m.prep.min_pixels || !m.prep.max_pixels))
         return std::unexpected(std::format("{}: no image pixel range", path));
     return m;

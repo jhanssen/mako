@@ -2,6 +2,7 @@
 // intended, and an assistant turn written by the template parses back into the same reasoning, answer and tool
 // calls (streamed increments adding up to the whole); stop strings cut the answer.
 //   server_test <model.gguf>
+//   server_test --no-model       (the checks that need no model: API keys, Host and Origin, sampling values)
 #include "chat/template.hpp"
 #include "gguf/gguf.hpp"
 #include "server/anthropic.hpp"
@@ -13,8 +14,9 @@
 #include <glaze/glaze.hpp>
 
 #include <filesystem>
-#include <fstream>
 #include <format>
+#include <fstream>
+#include <limits>
 #include <print>
 #include <string>
 #include <vector>
@@ -405,6 +407,25 @@ int main(int argc, char** argv)
                   !origin_allowed("null") && !origin_allowed("file://"),
               "other Origins refused without a key");
     }
+    {
+        using mako::server::check_sampling, mako::server::BadRequest;
+        const auto refused = [](mako::gen::SamplingParams s) {
+            try {
+                check_sampling(s);
+                return false;
+            } catch (const BadRequest&) {
+                return true;
+            }
+        };
+        check(!refused({}) && !refused({.temperature = 0.0f}) && !refused({.temperature = 0.6f, .top_p = 0.95f}),
+              "sampling: the defaults, greedy and ordinary values pass");
+        check(refused({.temperature = 1e-30f}) && refused({.repetition_penalty = 0.0f}) &&
+                  refused({.repetition_penalty = -1.0f}) && refused({.presence_penalty = 1e30f}) &&
+                  refused({.top_p = std::numeric_limits<float>::infinity()}),
+              "sampling: values the sampler cannot use are refused");
+    }
+    if (std::string_view(argv[1]) == "--no-model")
+        return failures ? 1 : 0;
     if (!std::filesystem::exists(argv[1])) {
         std::println("model {} not found: skipped", argv[1]);
         return failures ? 1 : 77;

@@ -91,7 +91,7 @@ int main(int argc, char** argv)
     }
     mako::mtl::Context ctx;
     mako::dsv41::Options opts;
-    opts.max_ctx = 256;
+    opts.max_ctx = 512; // past the window ring for the speculative checks
     mako::dsv41::Engine engine(*m, *cfg, opts, ctx);
     const uint32_t E = cfg->n_embd, NL = cfg->n_layer, V = cfg->n_vocab;
     const std::vector<int32_t> ids = {0, 671, 6102, 294, 8760, 344, 11111, 16, 455, 6102,
@@ -269,38 +269,44 @@ int main(int argc, char** argv)
 
     // Speculative verification: rows of a verify() against the same tokens step by step, and keep()'s rollback
     // (continuing after it as if the rejected tokens had never run), with the next position odd and even (a
-    // ratio-2 compressor's pair open or closed).
+    // ratio-2 compressor's pair open or closed), before the window ring wraps and after (where the rejected tokens'
+    // rows overwrote ones still in the window).
     {
         engine.set_ablation(std::nullopt);
-        const uint32_t at = 10; // verify ids[at .. at + width) after a prefill of the ones before
-        // The reference: the same prefill, then step by step.
-        Run steps;
-        steps.logits.resize(ids.size());
-        engine.reset();
-        engine.prefill(std::span<const int32_t>(ids).first(at));
-        for (size_t i = at; i < ids.size(); ++i)
-            steps.logits[i] = engine.step(ids[i]);
-        for (const uint32_t width : {2u, 4u, 5u}) {
-            for (const uint32_t keep : {1u, 2u}) {
-                engine.reset();
-                engine.prefill(std::span<const int32_t>(ids).first(at));
-                std::vector<int32_t> run_ids(ids.begin() + at, ids.begin() + at + width);
-                for (uint32_t i = keep; i < width; ++i)
-                    run_ids[i] = 9 + int32_t(i); // rejected drafts
-                const auto rows = engine.verify(run_ids);
-                double kv = 0;
-                for (uint32_t i = 0; i < keep; ++i)
-                    kv += kl(steps.logits[at + i], std::vector<float>(rows.begin() + uint64_t(i) * V,
-                                                                      rows.begin() + uint64_t(i + 1) * V));
-                engine.keep(keep);
-                double kc = 0;
-                for (size_t i = at + keep; i < ids.size(); ++i)
-                    kc += kl(steps.logits[i], engine.step(ids[i]));
-                kc /= double(ids.size() - at - keep);
-                check(engine.position() == ids.size() && kv / keep < 0.02 && kc < 0.02,
-                      std::format("verify of {} keeping {} (next position {}): rows vs steps KL {:.1e}, continuing "
-                                  "after the rollback KL {:.1e}",
-                                  width, keep, at + keep, kv / keep, kc));
+        const uint32_t W = engine.config().sliding_window;
+        std::vector<int32_t> seq;
+        while (seq.size() < W + 20)
+            seq.insert(seq.end(), ids.begin(), ids.end());
+        for (const uint32_t at : {10u, W + 3}) { // verify seq[at .. at + width) after a prefill of the ones before
+            const size_t end = at + 12;
+            // The reference: the same prefill, then step by step.
+            std::vector<std::vector<float>> steps(end);
+            engine.reset();
+            engine.prefill(std::span<const int32_t>(seq).first(at));
+            for (size_t i = at; i < end; ++i)
+                steps[i] = engine.step(seq[i]);
+            for (const uint32_t width : {2u, 4u, 5u}) {
+                for (const uint32_t keep : {1u, 2u}) {
+                    engine.reset();
+                    engine.prefill(std::span<const int32_t>(seq).first(at));
+                    std::vector<int32_t> run_ids(seq.begin() + at, seq.begin() + at + width);
+                    for (uint32_t i = keep; i < width; ++i)
+                        run_ids[i] = 9 + int32_t(i); // rejected drafts
+                    const auto rows = engine.verify(run_ids);
+                    double kv = 0;
+                    for (uint32_t i = 0; i < keep; ++i)
+                        kv += kl(steps[at + i], std::vector<float>(rows.begin() + uint64_t(i) * V,
+                                                                   rows.begin() + uint64_t(i + 1) * V));
+                    engine.keep(keep);
+                    double kc = 0;
+                    for (size_t i = at + keep; i < end; ++i)
+                        kc += kl(steps[i], engine.step(seq[i]));
+                    kc /= double(end - at - keep);
+                    check(engine.position() == end && kv / keep < 0.02 && kc < 0.02,
+                          std::format("verify of {} keeping {} (next position {}): rows vs steps KL {:.1e}, "
+                                      "continuing after the rollback KL {:.1e}",
+                                      width, keep, at + keep, kv / keep, kc));
+                }
             }
         }
     }

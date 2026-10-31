@@ -9,7 +9,10 @@
 
 #include <httplib.h>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -19,6 +22,7 @@
 #include <format>
 #include <fstream>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -101,6 +105,21 @@ private:
 };
 
 // A chat completion's raw body (streamed or whole).
+// A port nothing listens on now (the kernel's choice).
+int free_port()
+{
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(a);
+    if (fd < 0 || bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
+        getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len) != 0)
+        throw std::runtime_error("no free port");
+    close(fd);
+    return ntohs(a.sin_port);
+}
+
 std::string chat(int port, const std::string& text, bool streamed = true)
 {
     httplib::Client cli("127.0.0.1", port);
@@ -172,7 +191,7 @@ int main(int argc, char** argv)
     model.script.push_back(tok->eot());
 
     mako::server::ServerOptions opts;
-    opts.port = 18734;
+    opts.port = free_port(); // two build trees' tests may run at once
     opts.model_id = "m";
     opts.slice_ms = 60000; // a waiting request waits for the whole of the one generating
     mako::server::Models models(model);
@@ -183,7 +202,7 @@ int main(int argc, char** argv)
 
     // A prompt read for 7 s: a comment after 5 s of silence, before the answer, and a progress line in the log.
     model.prefill_ms = 7000;
-    const std::filesystem::path log_path = std::filesystem::temp_directory_path() / "mako_server_http_test.log";
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() / std::format("mako_server_http_test.{}.log", getpid());
     std::fflush(stderr);
     const int saved_err = dup(2);
     const int log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);

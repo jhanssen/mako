@@ -143,8 +143,15 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         throw std::runtime_error("more than 16 experts per token");
     if (opts_.indexer_top_k)
         cfg_.indexer_top_k = opts_.indexer_top_k;
-    if (!cfg_.indexer_select_tail || cfg_.indexer_top_k % cfg_.indexer_kpool != 0)
+    if (!cfg_.indexer_select_tail || !cfg_.indexer_kpool || !cfg_.indexer_top_k ||
+        cfg_.indexer_top_k % cfg_.indexer_kpool != 0)
         throw std::runtime_error("unsupported indexer configuration");
+    // What the kernels are written for: the router's 512 experts (2 rows a threadgroup), KDA heads of 128, a
+    // convolution history of at most 7.
+    if (cfg_.n_expert > 512 || cfg_.n_expert % 2 || cfg_.kda_head_dim != 128 || cfg_.conv_kernel < 2 ||
+        cfg_.conv_kernel > 8)
+        throw std::runtime_error(std::format("unsupported geometry: {} experts, KDA heads of {}, convolution of {}",
+                                             cfg_.n_expert, cfg_.kda_head_dim, cfg_.conv_kernel));
 
     token_embd_ = model_.find("token_embd.weight");
     if (!token_embd_ || !quant::can_dequant(token_embd_.tensor->type))

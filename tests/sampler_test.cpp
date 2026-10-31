@@ -132,6 +132,16 @@ int main()
         const auto rh = histogram(n, kDraws, [&] { return r.sample(logits.data()); });
         check(max_diff(rh, softmax(rp, 1.0f)) < kTol, "repetition penalty");
     }
+    {
+        // A temperature whose inverse overflows leaves no finite weight: the most likely token, not an empty draw.
+        Sampler s({.temperature = 1e-40f}, uint32_t(n), 13);
+        check(s.sample(logits.data()) == 0, "a vanishing temperature samples the most likely token");
+        Sampler r({.temperature = 1.0f, .repetition_penalty = 0.0f}, uint32_t(n), 14);
+        r.accept(0);
+        r.accept(4);
+        const int32_t t = r.sample(logits.data());
+        check(t >= 0 && t < int32_t(n), "a zero repetition penalty still samples a token");
+    }
     std::println("{}", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
 }

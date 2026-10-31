@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <format>
 #include <random>
 #include <variant>
@@ -308,6 +309,20 @@ ThinkingChoice choose_thinking(const std::optional<Effort>& effort, const Thinki
     return {.reasoning_effort = *e};
 }
 
+void check_sampling(const gen::SamplingParams& s)
+{
+    for (const float v : {s.temperature, s.top_p, s.min_p, s.presence_penalty, s.frequency_penalty,
+                          s.repetition_penalty})
+        if (!std::isfinite(v))
+            throw BadRequest("sampling parameters must be finite");
+    if (s.temperature > 0 && s.temperature < 1e-3f)
+        throw BadRequest("temperature must be 0 (greedy) or at least 0.001");
+    if (s.repetition_penalty <= 0 || s.repetition_penalty > 100)
+        throw BadRequest("repetition_penalty must be in (0, 100]");
+    if (std::abs(s.presence_penalty) > 100 || std::abs(s.frequency_penalty) > 100)
+        throw BadRequest("presence_penalty and frequency_penalty must be within -100..100");
+}
+
 ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams& sampling,
                                const ThinkingOptions& thinking)
 {
@@ -424,7 +439,7 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
     if (b.top_p)
         s.top_p = float(*b.top_p);
     if (b.top_k)
-        s.top_k = uint32_t(std::max(0.0, *b.top_k));
+        s.top_k = uint32_t(std::clamp(*b.top_k, 0.0, 4e9));
     if (b.min_p)
         s.min_p = float(*b.min_p);
     if (b.presence_penalty)
@@ -433,6 +448,7 @@ ChatRequest parse_chat_request(std::string_view body, const gen::SamplingParams&
         s.frequency_penalty = float(*b.frequency_penalty);
     if (b.repetition_penalty)
         s.repetition_penalty = float(*b.repetition_penalty);
+    check_sampling(s);
     r.gen.seed = b.seed ? uint64_t(*b.seed) : (uint64_t(std::random_device{}()) << 32) | std::random_device{}();
     r.gen.max_tokens = 0;
     if (const auto& mt = b.max_completion_tokens ? b.max_completion_tokens : b.max_tokens) {
@@ -500,9 +516,11 @@ OutputParser::~OutputParser() = default;
 void OutputParser::require_call(const std::string& name)
 {
     require_ = true;
-    if (dsml_form_)
-        forced_ = tok_.encode(std::string(kDsmlCalls) + "\n" + std::string(kDsmlInvoke) + (name.empty() ? "" : name + "\">"),
-                              true);
+    if (dsml_form_) {
+        const std::string head = std::string(kDsmlCalls) + "\n" + std::string(kDsmlInvoke);
+        const std::pair<size_t, size_t> client{head.size(), head.size() + name.size()}; // the tool's name
+        forced_ = tok_.encode(head + (name.empty() ? "" : name + "\">"), std::span(&client, 1));
+    }
     name_tokens_ = name.empty() ? std::vector<int32_t>{} : tok_.encode(name, false);
     named_has_args_ = false;
     for (const auto& t : tools_->defs.get_array()) {
@@ -815,6 +833,7 @@ void OutputParser::parse_dsml(Delta& out)
             if (!dsml_.empty()) {
                 const std::string tail = std::move(dsml_);
                 dsml_.clear();
+                out.content_after_calls = !out.calls.empty() && out.content.empty();
                 text(tail, out);
             }
             return;

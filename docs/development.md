@@ -22,11 +22,13 @@ the state taken before an earlier prompt's last token), samples, drafts and stop
 ## Tests
 
 ```sh
-cmake -S . -B build -DMAKO_MODEL=<GLM-5.3 .gguf> -DMAKO_DS41_MODEL=<DeepSeek .gguf>   # or the same environment variables
+cmake -S . -B build -DMAKO_MODEL=<GLM-5.3 .gguf> -DMAKO_DS41_MODEL=<DeepSeek .gguf>
 ctest --test-dir build --output-on-failure -L <label>
 ```
 
-Tests whose model is not configured report as skipped. What each model variable enables:
+Tests whose model is not configured report as skipped. The paths are fixed when CMake configures: the same
+environment variables work only for a build directory that has not set them yet, and setting them when running
+ctest has no effect. What each model variable enables:
 
 | Variable | Tests |
 | --- | --- |

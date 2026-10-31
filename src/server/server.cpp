@@ -450,8 +450,13 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
             board.arrived(id, prompt.size());
             const OnBoard on_board{board, id};
             const auto begin = [&] { return !shared->gen.cancelled() && write(proto->begin(uint32_t(prompt.size()))); };
-            if (!generate(id, prompt, *shared, parser, [&](const Delta& d) { return write(proto->delta(d)); }, stopped,
-                          images.get(), begin, r, out, [&] { keepalive(); }))
+            // A delta the protocol does not send (hidden reasoning) still keeps the stream alive and notices a close.
+            const auto on_delta = [&](const Delta& d) {
+                const std::string s = proto->delta(d);
+                return s.empty() ? keepalive() : write(s);
+            };
+            if (!generate(id, prompt, *shared, parser, on_delta, stopped, images.get(), begin, r, out,
+                          [&] { keepalive(); }))
                 return false; // gave up while waiting
             const End e = out.loop_keep ? End::stop : end_of(r, parser, stopped);
             log_result(id, r, end_name(e), out.conv);
@@ -488,6 +493,9 @@ std::string base64(std::span<const uint8_t> in)
 
 } // namespace
 
+// Image prompts' text encoders and caches grow with the prompt.
+constexpr size_t kMaxImagePrompt = 16384;
+
 void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
 {
     auto fail = [&](int status, const std::string& message, const char* type) {
@@ -502,6 +510,8 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
     if (!body.contains("prompt") || !body["prompt"].is_string() || body["prompt"].get_string().empty())
         return fail(400, "prompt is required", "invalid_request_error");
     const std::string prompt = body["prompt"].get_string();
+    if (prompt.size() > kMaxImagePrompt)
+        return fail(400, std::format("prompt is longer than {} bytes", kMaxImagePrompt), "invalid_request_error");
     uint32_t n = 1, width = 1024, height = 1024;
     if (body.contains("n")) {
         if (!body["n"].is_number() || body["n"].get_number() < 1 || body["n"].get_number() > 4)
@@ -535,6 +545,9 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
         if (!body["negative_prompt"].is_string())
             return fail(400, "negative_prompt must be a string", "invalid_request_error");
         negative = body["negative_prompt"].get_string();
+        if (negative->size() > kMaxImagePrompt)
+            return fail(400, std::format("negative_prompt is longer than {} bytes", kMaxImagePrompt),
+                        "invalid_request_error");
     }
     if (body.contains("guidance_scale") && !body["guidance_scale"].is_null()) {
         if (!body["guidance_scale"].is_number() || body["guidance_scale"].get_number() < 0 ||

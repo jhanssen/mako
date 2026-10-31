@@ -89,7 +89,11 @@ def main():
     m = machine()
     code, commit = run(["git", "-C", str(root), "describe", "--always", "--dirty"])
     commit = commit.strip() if code == 0 else "?"
-    env = dict(os.environ, MAKO_MODEL=str(Path(a.model).resolve()))
+    # The tests take the model from the build's configuration (fixed when CMake configures), not the environment.
+    model = str(Path(a.model).resolve())
+    code, out = run(["cmake", "-S", str(root), "-B", str(build), f"-DMAKO_MODEL={model}"])
+    if code != 0:
+        sys.exit(f"configuring {build} with the model failed:\n{out}")
 
     log("running the tests...")
     wait_for_memory(log)
@@ -97,8 +101,15 @@ def main():
     if a.quick:
         ctest += ["-L", "tokenizer|sampler|server"]
     started = time.time()
-    _, out = run(ctest, env=env, timeout=3600)
-    tests = re.findall(r"Test\s+#\d+: (\S+) \.+\s*(\*{3}\w+|Passed|\w+)\s+([\d.]+) sec", out)
+    try:
+        _, out = run(ctest, timeout=3600)
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        out += "\n(ctest stopped after 3600 s)\n"
+    # The result is everything between the dots and the time: Passed, ***Failed, ***Skipped, ***Timeout,
+    # ***Exception: SegFault, Subprocess aborted***Exception:, ...
+    tests = [(n, " ".join(r.replace("*", " ").split()).rstrip(":"), t)
+             for n, r, t in re.findall(r"Test\s+#\d+: (\S+) \.+\s*(.*?)\s+([\d.]+) sec", out)]
     failed_output = out[out.find("The following tests FAILED"):] if "The following tests FAILED" in out else ""
     tests_s = time.time() - started
 
@@ -127,7 +138,7 @@ def main():
              f"macOS {m['macos']}, GPU wired limit {m['wired_limit_mb'] if m['wired_limit_mb'] not in ('0', '?') else 'default'}",
              "", "| test | result | seconds |", "|---|---|---|"]
     for name, result, secs in tests:
-        lines.append(f"| {name} | {result.strip('*')} | {secs} |")
+        lines.append(f"| {name} | {result} | {secs} |")
     if not tests:
         lines.append("| (no test results) | | |")
     passed = sum(1 for _, r, _ in tests if r == "Passed")

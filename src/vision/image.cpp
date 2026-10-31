@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <memory>
 #include <stdexcept>
 
@@ -130,11 +131,26 @@ Rgb8 decode_image(std::span<const std::byte> data)
     Cf<CGImageSourceRef> src(cf ? CGImageSourceCreateWithData(cf.get(), nullptr) : nullptr);
     if (!src || CGImageSourceGetCount(src.get()) < 1)
         throw std::runtime_error("not an image ImageIO can read");
+    // The size from the header, before anything is decoded.
+    if (Cf<CFDictionaryRef> props(CGImageSourceCopyPropertiesAtIndex(src.get(), 0, nullptr)); props) {
+        int64_t w = 0, h = 0;
+        const auto get = [&](CFStringRef key, int64_t& v) {
+            const auto n = static_cast<CFNumberRef>(CFDictionaryGetValue(props.get(), key));
+            if (n)
+                CFNumberGetValue(n, kCFNumberSInt64Type, &v);
+        };
+        get(kCGImagePropertyPixelWidth, w);
+        get(kCGImagePropertyPixelHeight, h);
+        if (w * h > kMaxPixels)
+            throw std::runtime_error(std::format("{}x{} is more than {} pixels", w, h, kMaxPixels));
+    }
     Cf<CGImageRef> img(CGImageSourceCreateImageAtIndex(src.get(), 0, nullptr));
     if (!img)
         throw std::runtime_error("cannot decode the image");
     if (CGImageGetWidth(img.get()) == 0 || CGImageGetHeight(img.get()) == 0)
         throw std::runtime_error("empty image");
+    if (uint64_t(CGImageGetWidth(img.get())) * CGImageGetHeight(img.get()) > uint64_t(kMaxPixels))
+        throw std::runtime_error(std::format("the image is more than {} pixels", kMaxPixels));
     Rgb8 out;
     if (!copy_samples(img.get(), out))
         draw_rgb(img.get(), out);

@@ -72,7 +72,9 @@ std::string QwenImage::templated(const std::string& prompt)
 
 std::vector<float> QwenImage::prompt_embeddings(const std::string& prompt)
 {
-    const auto ids = tok_->encode(templated(prompt), true);
+    auto ids = tok_->encode(templated(prompt), true);
+    if (ids.size() > drop_ + kMaxPrompt) // cut at the end, as the reference's tokenizer does
+        ids.resize(drop_ + kMaxPrompt);
     return encode_text(ids, drop_);
 }
 

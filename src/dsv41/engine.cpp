@@ -157,7 +157,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         load_importance(opts_.dense_imatrix);
     const auto t_load = Clock::now();
     if (cfg_.head_dim != 512 || cfg_.n_head != 64 || cfg_.n_rot != 64 || cfg_.hc != 4 || cfg_.n_head * cfg_.head_dim != cfg_.o_groups * 4096 ||
-        cfg_.indexer_dim != 128 || cfg_.n_expert_used > 16)
+        cfg_.indexer_dim != 128 || cfg_.n_expert_used > 16 || cfg_.n_expert > 512 || cfg_.n_expert % 2)
         throw std::runtime_error("unsupported DeepSeek-V4.1 geometry");
     if (cfg_.gating != 4)
         throw std::runtime_error(std::format("expert gating function {} (only sqrt(softplus), 4)", cfg_.gating));
@@ -1501,6 +1501,7 @@ const std::vector<float>& Engine::verify(std::span<const int32_t> tokens)
     verify_pos0_ = pos_;
     verify_tokens_.assign(tokens.begin(), tokens.end());
     verify_history_ = engram_history_;
+    ring_rows(0, uint32_t(tokens.size()), false);
     verifying_ = true;
     struct Reset {
         bool& v;
@@ -1516,6 +1517,30 @@ const std::vector<float>& Engine::verify(std::span<const int32_t> tokens)
     return logits_all_;
 }
 
+// Copies the window rows of verify tokens first .. first + count (ring slot (verify_pos0_ + t) % window) out to
+// verify_rings_, or back. The GPU is idle between calls, and the rings are shared memory.
+void Engine::ring_rows(uint32_t first, uint32_t count, bool restore)
+{
+    const uint32_t D = cfg_.head_dim, W = cfg_.sliding_window, T = uint32_t(verify_tokens_.size());
+    std::vector<MTL::Buffer*> rings;
+    for (const auto& b : ring_)
+        rings.push_back(b.get());
+    if (drafter_)
+        for (const auto& b : drafter_->rings)
+            rings.push_back(b.get());
+    if (!restore)
+        verify_rings_.resize(uint64_t(rings.size()) * T * D);
+    for (size_t r = 0; r < rings.size(); ++r)
+        for (uint32_t t = first; t < first + count; ++t) {
+            float* row = static_cast<float*>(rings[r]->contents()) + uint64_t((verify_pos0_ + t) % W) * D;
+            float* saved = verify_rings_.data() + (uint64_t(r) * T + t) * D;
+            if (restore)
+                std::memcpy(row, saved, uint64_t(D) * 4);
+            else
+                std::memcpy(saved, row, uint64_t(D) * 4);
+        }
+}
+
 void Engine::keep(uint32_t n)
 {
     const uint32_t T = uint32_t(verify_tokens_.size());
@@ -1524,6 +1549,7 @@ void Engine::keep(uint32_t n)
     if (n == T)
         return;
     pos_ = verify_pos0_ + n;
+    ring_rows(n, T - n, true); // the rejected tokens' window rows back to the positions a ring-length before
     engram_history_ = engram_->advance(verify_history_, std::span<const int32_t>(verify_tokens_).first(n));
     // A ratio-2 compressor whose pair is open (the next position odd) holds the first token's (k, g): the state the
     // verify left after token n - 1.

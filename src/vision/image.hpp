@@ -16,7 +16,8 @@ struct Rgb8 {
 // Decodes an image file (PNG, JPEG, and the other formats ImageIO reads) to its stored samples, without colour
 // management: alpha dropped (not composited), grey replicated, 16-bit samples reduced to their high byte, palette
 // entries looked up. Formats outside that (float or packed samples, CMYK, ...) are drawn into device RGB instead.
-// Throws std::runtime_error.
+// Throws std::runtime_error, also for images of more than kMaxPixels.
+constexpr int64_t kMaxPixels = int64_t(8192) * 8192;
 Rgb8 decode_image(std::span<const std::byte> data);
 
 // Bicubic resampling (a = -0.5) in two separable passes, horizontal first, each with 22-bit fixed-point weights

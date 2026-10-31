@@ -481,7 +481,16 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
         loads.emplace_back(experts[i], victim);
         ++stats_.misses;
     }
-    read_into(layer, loads);
+    try {
+        read_into(layer, loads);
+    } catch (...) { // the slots hold parts of the experts: empty again
+        for (const auto& [e, s] : loads) {
+            table[e] = -1;
+            owner[s] = -1;
+            pinned_[layer][s] = 0;
+        }
+        throw;
+    }
     return true;
 }
 
@@ -558,17 +567,30 @@ void ExpertArena::prefetch_loop(std::stop_token st)
         for (int p = 0; p < 3; ++p)
             for (uint64_t off = 0; off < L[p].bytes; off += kReadChunk)
                 chunks.push_back({p, off, std::min(kReadChunk, L[p].bytes - off)});
-        pf_readers_->run(chunks.size(), [&](size_t i) {
-            const Chunk& c = chunks[i];
-            const Part& p = L[c.part];
-            const auto [buf, off] = regions_[job.layer][c.part].at(uint32_t(job.slot));
-            gguf::read_exact(p.fd, static_cast<char*>(buf->contents()) + off + c.off, c.bytes,
-                             p.file_off + uint64_t(job.expert) * p.bytes + c.off);
-        });
+        bool read = true;
+        try {
+            pf_readers_->run(chunks.size(), [&](size_t i) {
+                const Chunk& c = chunks[i];
+                const Part& p = L[c.part];
+                const auto [buf, off] = regions_[job.layer][c.part].at(uint32_t(job.slot));
+                gguf::read_exact(p.fd, static_cast<char*>(buf->contents()) + off + c.off, c.bytes,
+                                 p.file_off + uint64_t(job.expert) * p.bytes + c.off);
+            });
+        } catch (const std::exception& e) {
+            // A read ahead is only a guess: the slot goes back to empty, and a step that needs the expert reads it
+            // (and reports the error).
+            log::warn("reading expert {} of layer {} ahead: {}", job.expert, job.layer, e.what());
+            read = false;
+        }
         {
             std::lock_guard lock(pf_m_);
-            loading_[job.layer][job.slot] = 2;
-            pf_done_.push_back(job);
+            if (read) {
+                loading_[job.layer][job.slot] = 2;
+                pf_done_.push_back(job);
+            } else {
+                loading_[job.layer][job.slot] = 0;
+                slot_expert_[job.layer][job.slot] = -1;
+            }
             --pf_active_;
         }
         pf_cv_.notify_all();

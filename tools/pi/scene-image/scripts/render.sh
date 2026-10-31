@@ -63,7 +63,7 @@ fi
 url=${MAKO_URL:-http://127.0.0.1:8080/v1}
 dir=${MAKO_IMAGE_DIR:-$HOME/Pictures/mako}
 mkdir -p "$dir"
-out="$dir/$(date +%Y%m%d-%H%M%S).png"
+base="$dir/$(date +%Y%m%d-%H%M%S)"
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 body=$(SIZE=$size PROMPT=$prompt LORAS=$loras STEPS=$steps MODEL=$model python3 -c '
@@ -87,7 +87,7 @@ if os.environ["LORAS"]:
 print(json.dumps(b))')
 status=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 1800 "$url/images/generations" \
     -H 'Content-Type: application/json' ${MAKO_API_KEY:+-H "Authorization: Bearer $MAKO_API_KEY"} -d "$body")
-OUT=$out STATUS=$status python3 - "$tmp" <<'PY'
+out=$(BASE=$base STATUS=$status python3 - "$tmp" <<'PY'
 import base64, json, os, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -95,8 +95,21 @@ except Exception:
     sys.exit(f"mako answered HTTP {os.environ['STATUS']} with no JSON")
 if os.environ["STATUS"] != "200" or "data" not in d:
     sys.exit(f"mako: HTTP {os.environ['STATUS']}: {d.get('error', {}).get('message', d)}")
-open(os.environ["OUT"], "wb").write(base64.b64decode(d["data"][0]["b64_json"]))
+png = base64.b64decode(d["data"][0]["b64_json"])
+# Renders finishing in the same second each get a file of their own.
+for i in range(1, 1000):
+    path = os.environ["BASE"] + (f"-{i}" if i > 1 else "") + ".png"
+    try:
+        with open(path, "xb") as f:
+            f.write(png)
+        break
+    except FileExistsError:
+        continue
+else:
+    sys.exit(f"no free name for {os.environ['BASE']}.png")
+print(path)
 PY
+)
 if [ "${MAKO_IMAGE_OPEN:-1}" != 0 ]; then
     open "$out"
 fi

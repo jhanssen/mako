@@ -35,8 +35,9 @@ def main():
     if not isinstance(d, dict):
         fail("the draft must be a JSON object")
     w, h = d.get("width"), d.get("height")
-    if not (isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0 and w % 32 == 0 and h % 32 == 0):
-        fail("width and height must be positive multiples of 32")
+    if not (isinstance(w, int) and isinstance(h, int) and w >= 256 and h >= 256 and w % 32 == 0 and h % 32 == 0
+            and w * h <= 2048 * 2048):
+        fail("width and height must be multiples of 32 from 256, at most 2048x2048 pixels (as the server takes)")
     s = d.get("summary")
     if not isinstance(s, dict) or not isinstance(s.get("caption"), str) or not s["caption"].strip():
         fail("summary.caption must describe the whole image")

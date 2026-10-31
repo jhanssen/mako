@@ -64,8 +64,8 @@ storage for `/v1/status`.
 `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf`, GLM-5.3's `mmproj-BF16.gguf`; ~1 GB, loaded before the expert cache is
 sized. Images come as OpenAI `image_url` parts with a `data:` URL (base64) or Anthropic `image` blocks with base64
 data (in user messages and in `tool_result` content); URLs are not fetched. PNG, JPEG and the other formats ImageIO
-reads. Each image becomes its rows in the prompt (652 for a 1024x1024 image with DeepSeek, 1369 with GLM; DeepSeek
-at most 1024, GLM at most 8000); the last 8 encoded images are kept, so a conversation that sends the same image
+reads, of at most 8192x8192 pixels' worth. Each image becomes its rows in the prompt (652 for a 1024x1024 image with
+DeepSeek, 1369 with GLM; DeepSeek at most 1024, GLM at most 8000); the last 8 encoded images are kept, so a conversation that sends the same image
 again does not encode it again, and its prompt prefix is reused only up to an image that differs. Without
 `--mmproj` a request with an image gets HTTP 400. `--image-max-tokens N` scales larger images down to at most N
 rows (encoding and prefill grow with the rows, GLM's encoder faster than linearly: its 3200x2400 at the default
@@ -120,7 +120,8 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   character, object or text (`{"summary": {"caption": ...}, "items": [{"label": "character", "caption": ...,
   "bbox": [y0, x0, y1, x1]}, ...], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}`, boxes in pixels
   from the image's centre). The skill's `render.sh --layout` builds it from boxes in pixels from the top-left.
-- Fields: `prompt` (required), `model` (a name from that list), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32
+- Fields: `prompt` (required, at most 16384 bytes, as is `negative_prompt`; Qwen-Image reads the first 1024 tokens),
+  `model` (a name from that list), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32
   from 256, at most 2048x2048 pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored),
   `output_format` (`png` or `jpeg`; a PNG carries how it was made in text chunks: `parameters`, the prompt, negative
   prompt, steps, CFG scale, seed, size, model and LoRAs as image tools commonly read them, and `mako`, the same as
