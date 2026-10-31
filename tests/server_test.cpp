@@ -159,6 +159,26 @@ void lora_checks()
         check(threw, std::format("LoRAs refused: {}", bad));
     }
     check(mako::server::lora_choices(defaults, "").size() == 1, "no directory: the start-up LoRAs only");
+    {
+        const std::string header =
+            R"({"__metadata__":{"trigger_word":"from metadata","modelspec.description":"meta description"}})";
+        std::ofstream f(dir / "c.safetensors", std::ios::binary);
+        const uint64_t n = header.size();
+        f.write(reinterpret_cast<const char*>(&n), 8);
+        f << header;
+    }
+    std::ofstream(dir / "a.json") << R"({"trigger":"Next Scene:","description":"a later moment","scale_range":[0.6,1.2]})";
+    std::ofstream(dir / "c.json") << R"({"description":"sidecar description","scale_range":[2,1]})";
+    std::ofstream(dir / "b.json") << "not json";
+    using mako::server::lora_notes;
+    const auto a = lora_notes((dir / "a.safetensors").string()), c = lora_notes((dir / "c.safetensors").string()),
+               b = lora_notes((dir / "b.safetensors").string());
+    check(a.trigger == "Next Scene:" && a.description == "a later moment" &&
+              a.scale_range == std::pair(0.6f, 1.2f),
+          "LoRA notes from a sidecar");
+    check(c.trigger == "from metadata" && c.description == "sidecar description" && !c.scale_range,
+          "LoRA notes: the sidecar's fields first, the metadata's for the rest");
+    check(b.trigger.empty() && b.description.empty(), "LoRA notes: a bad sidecar and a bad file give none");
     fs::remove_all(dir);
 }
 

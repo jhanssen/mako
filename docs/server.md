@@ -123,7 +123,12 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
 - Per-request LoRAs: `--image-lora-dir DIR` names a directory of `.safetensors` LoRAs (read on each request, so files
   added later count). `GET /v1/images/loras` lists what a request can name: the `--image-lora` files first, with their
   `default_scale`, then the directory's, each by its file name without `.safetensors` (a `--image-lora` name wins over
-  a directory file of the same name). A request's `loras`, e.g. `[{"name": "next-scene", "scale": 0.8}]` (scale 1 when
+  a directory file of the same name), with a `trigger` (words a prompt needs for the LoRA to act) and a `description`
+  where known, and a recommended `scale_range`: from `NAME.json` beside the file (`{"trigger": "...", "description":
+  "...", "scale_range": [0.8, 1.4]}`), else the trigger and description from the file's metadata (`trigger_word` or
+  `modelspec.trigger_phrase`; `modelspec.description`). Few files carry these (of four
+  Qwen-Image LoRAs tried, one has a trigger). The trigger is not added to prompts: where it goes differs. A request's
+  `loras`, e.g. `[{"name": "next-scene", "scale": 0.8}]` (scale 1 when
   left out, -10 to 10), replaces the `--image-lora` set for that request; `[]` is none, no field the `--image-lora`
   set. A set without a few-step LoRA that `--image-steps` was lowered for gives smeared images unless the request
   raises `steps` too. When the set differs from the one merged, the image model is loaded again first (Qwen-Image 2.1:

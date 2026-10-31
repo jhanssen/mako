@@ -7,6 +7,7 @@
 #include "server/status.hpp"
 #include "server/status_page.hpp"
 #include "image/png.hpp"
+#include "safetensors/safetensors.hpp"
 #include "core/log.hpp"
 #include "gen/loop_guard.hpp"
 #include "gen/pool.hpp"
@@ -24,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <list>
 #include <memory>
 #include <format>
@@ -622,6 +624,13 @@ void Server::Impl::loras(httplib::Response& res)
         data += std::format(R"({}{{"name":{})", data.empty() ? "" : ",", json::quoted(c.name));
         if (c.scale)
             data += std::format(R"(,"default_scale":{:g})", *c.scale);
+        const auto notes = lora_notes(c.path);
+        if (!notes.trigger.empty())
+            data += std::format(R"(,"trigger":{})", json::quoted(notes.trigger));
+        if (!notes.description.empty())
+            data += std::format(R"(,"description":{})", json::quoted(notes.description));
+        if (notes.scale_range)
+            data += std::format(R"(,"scale_range":[{:g},{:g}])", notes.scale_range->first, notes.scale_range->second);
         data += "}";
     }
     res.set_content(std::format(R"({{"object":"list","data":[{}]}})", data), "application/json");
@@ -663,6 +672,49 @@ std::vector<LoraChoice> lora_choices(const image::Loras& defaults, const std::st
         if (!known(f.stem().string()))
             out.push_back({f.stem().string(), f.string(), std::nullopt});
     return out;
+}
+
+LoraNotes lora_notes(const std::string& path)
+{
+    LoraNotes n;
+    const auto sidecar = std::filesystem::path(path).replace_extension(".json");
+    if (std::ifstream in(sidecar); in) {
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        glz::generic v;
+        if (glz::read_json(v, text) || !v.is_object()) {
+            log::warn("{}: not a JSON object; its notes left out", sidecar.string());
+        } else {
+            if (v.contains("trigger") && v["trigger"].is_string())
+                n.trigger = v["trigger"].get_string();
+            if (v.contains("description") && v["description"].is_string())
+                n.description = v["description"].get_string();
+            if (v.contains("scale_range")) {
+                auto& r = v["scale_range"];
+                if (r.is_array() && r.get_array().size() == 2 && r[0].is_number() && r[1].is_number() &&
+                    r[0].get_number() <= r[1].get_number())
+                    n.scale_range = {float(r[0].get_number()), float(r[1].get_number())};
+                else
+                    log::warn("{}: scale_range is not [low, high]; left out", sidecar.string());
+            }
+        }
+    }
+    if (!n.trigger.empty() && !n.description.empty())
+        return n;
+    auto f = safetensors::File::open(path);
+    if (!f)
+        return n;
+    const auto& m = f->metadata();
+    auto first = [&](std::initializer_list<const char*> keys) -> std::string {
+        for (const char* k : keys)
+            if (auto it = m.find(k); it != m.end() && !it->second.empty())
+                return it->second;
+        return {};
+    };
+    if (n.trigger.empty())
+        n.trigger = first({"trigger_word", "modelspec.trigger_phrase"});
+    if (n.description.empty())
+        n.description = first({"modelspec.description"});
+    return n;
 }
 
 image::Loras resolve_loras(std::string_view json, const std::vector<LoraChoice>& choices)

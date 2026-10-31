@@ -1,6 +1,6 @@
 #!/bin/sh
 # Lists the LoRAs mako's image model can render with (GET /v1/images/loras): a name per line, the server's defaults
-# marked with the scale they are merged at.
+# marked with the scale they are merged at, then each one's trigger, recommended scales and description when known.
 # MAKO_URL (default http://127.0.0.1:8080/v1), MAKO_API_KEY (when the server wants one).
 set -eu
 url=${MAKO_URL:-http://127.0.0.1:8080/v1}
@@ -20,4 +20,10 @@ if not d["data"]:
     print("(no LoRAs)")
 for l in d["data"]:
     print(l["name"] + (f"  (default, scale {l['default_scale']:g})" if "default_scale" in l else ""))
+    if "trigger" in l:
+        print(f"    trigger: {l['trigger']}")
+    if "scale_range" in l:
+        print(f"    scales: {l['scale_range'][0]:g} to {l['scale_range'][1]:g}")
+    if "description" in l:
+        print(f"    {l['description']}")
 PY

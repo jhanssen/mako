@@ -43,13 +43,17 @@ ones mako has, by name; those marked "default" are what every render uses unless
   given and no others, so to add one to the defaults, pass the defaults too:
   `scripts/render.sh --lora fast-4step:1 --lora watercolour:0.8 1024x1024 "<the prompt>"`.
   `--no-loras` renders with none.
-- SCALE is the strength (1 when left out). If the user finds an effect too weak or too strong, raise or lower it by
-  0.2-0.3.
+- SCALE is the strength (1 when left out). Where the list gives a LoRA's scales, start in the middle of that range
+  and stay within it. If the user finds an effect too weak or too strong, raise or lower it by 0.2-0.3.
 - A default that makes rendering fast (its name says so, e.g. "lightning", "4step", "turbo") goes with a low step
   count that mako is set to. When you pass `--lora` or `--no-loras` without it, add `--steps 0` (the model's own
   count, slower); otherwise the image comes out smeared.
 - Use a LoRA only when the user asks for it or its name clearly matches what they want. Once the user has chosen
   LoRAs, pass the same ones on every later render in the conversation: nothing is remembered between renders.
+- A LoRA listed with a trigger acts only when the prompt contains it: work the trigger into the prompt, word for word
+  (at the start if it ends in a colon, like "Next Scene:", else within the sentence where it fits). A description
+  says what the LoRA is for. A LoRA with neither may still need words the list does not show; tell the user so if
+  its effect does not show.
 - A render with other LoRAs than the previous one first reloads the image model (a few seconds more).
 
 If a script fails, report its message: mako may not be running, may have no image model (`--image-model`), may
