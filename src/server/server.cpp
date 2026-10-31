@@ -104,8 +104,12 @@ struct Server::Impl {
     // negative_prompt, guidance_scale, loras (in place of the start-up LoRAs) and steps; the schedule's end from the
     // options.
     void images(const httplib::Request& req, httplib::Response& res);
-    // GET /v1/images/loras: the LoRAs requests can name, the start-up ones with their scales.
-    void loras(httplib::Response& res);
+    // GET /v1/images/loras[?model=NAME]: the LoRAs requests can name for a model, its default ones with their scales.
+    void loras(const httplib::Request& req, httplib::Response& res);
+    // GET /v1/images/models: the image models requests can name.
+    void image_model_list(httplib::Response& res);
+    // The model named (empty: the default). Throws BadRequest for a name it does not know.
+    ImageModel image_model(const std::string& name) const;
     // A request's images, sized when it is parsed and encoded when it runs.
     struct Images {
         std::vector<vision::Prepared> prepared;
@@ -520,7 +524,13 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
         return fail(400, "response_format: only b64_json (images are not stored)", "invalid_request_error");
     // Extensions: a negative prompt (classifier-free guidance) and its scale.
     std::optional<std::string> negative;
-    std::optional<float> guidance = opts.image_guidance;
+    ImageModel model;
+    try {
+        model = image_model(body.contains("model") && body["model"].is_string() ? body["model"].get_string() : "");
+    } catch (const std::exception& e) {
+        return fail(400, e.what(), "invalid_request_error");
+    }
+    std::optional<float> guidance = model.guidance;
     if (body.contains("negative_prompt") && !body["negative_prompt"].is_null()) {
         if (!body["negative_prompt"].is_string())
             return fail(400, "negative_prompt must be a string", "invalid_request_error");
@@ -532,19 +542,19 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             return fail(400, "guidance_scale must be a number from 0 to 30", "invalid_request_error");
         guidance = float(body["guidance_scale"].get_number());
     }
-    uint32_t steps = opts.image_steps;
+    uint32_t steps = model.steps;
     if (body.contains("steps") && !body["steps"].is_null()) {
         const auto& v = body["steps"];
         if (!v.is_number() || v.get_number() < 0 || v.get_number() > 100 || v.get_number() != std::floor(v.get_number()))
             return fail(400, "steps must be a whole number from 0 (the model's) to 100", "invalid_request_error");
         steps = uint32_t(v.get_number());
     }
-    image::Loras loras = opts.image_loras;
+    image::Loras loras = model.loras;
     if (body.contains("loras") && !body["loras"].is_null()) {
         try {
             std::string text;
             (void)glz::write_json(body["loras"], text);
-            loras = resolve_loras(text, lora_choices(opts.image_loras, opts.image_lora_dir));
+            loras = resolve_loras(text, lora_choices(model.loras, model.lora_dir));
         } catch (const std::exception& e) {
             return fail(400, std::format("loras: {}", e.what()), "invalid_request_error");
         }
@@ -566,11 +576,11 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
     for (const auto& [path, scale] : loras)
         lora_names += std::format("{}{} {:g}", lora_names.empty() ? ", LoRAs " : ", ",
                                   std::filesystem::path(path).stem().string(), scale);
-    log::info("{}: {} image{} {}x{}{}{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height,
-              negative ? ", a negative prompt" : "", lora_names);
+    log::info("{}: {} image{} {}x{} with {}{}{}, waiting for the image model", id, n, n > 1 ? "s" : "", width, height,
+              model.name, negative ? ", a negative prompt" : "", lora_names);
     std::string data = "[";
     try {
-        auto engine = models.image(loras);
+        auto engine = models.image(model, loras);
         std::random_device rd;
         for (uint32_t i = 0; i < n; ++i) {
             image::Engine::Request r;
@@ -579,7 +589,7 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
             r.height = height;
             r.seed = (uint64_t(rd()) << 32) | rd();
             r.steps = steps;
-            r.terminal = opts.image_terminal;
+            r.terminal = model.terminal;
             r.negative = negative;
             r.guidance = guidance;
             auto last = std::chrono::steady_clock::now();
@@ -611,16 +621,83 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
                     "application/json");
 }
 
-void Server::Impl::loras(httplib::Response& res)
+ImageModel Server::Impl::image_model(const std::string& name) const
+{
+    if (!opts.image_models.empty() && (!name.empty() || !std::filesystem::is_directory(opts.image_model))) {
+        const std::string want = name.empty() ? opts.image_model : name;
+        auto list = image_models(opts.image_models);
+        if (want.empty() && !list.empty()) // no default named: the first
+            return list.front();
+        for (auto& m : list)
+            if (m.name == want)
+                return m;
+        throw BadRequest(std::format("no image model named \"{}\" (GET /v1/images/models lists them)", want));
+    }
+    const std::string dir = opts.image_model;
+    const std::string own = std::filesystem::path(dir).lexically_normal().filename().string();
+    if (!name.empty() && name != own)
+        throw BadRequest(std::format("no image model named \"{}\" (this server has only {})", name, own));
+    return load_image_model(dir, own);
+}
+
+void Server::Impl::image_model_list(httplib::Response& res)
 {
     if (!models.has_image()) {
         res.status = 404;
-        res.set_content(error_body("this server has no image model (start it with --image-model)", "not_found_error"),
+        res.set_content(error_body("this server has no image models (start it with --image-models)", "not_found_error"),
                         "application/json");
         return;
     }
+    std::vector<ImageModel> list;
+    if (!opts.image_models.empty())
+        list = image_models(opts.image_models);
+    std::string def, loaded = models.image_name();
+    try {
+        const ImageModel d = image_model("");
+        def = d.name;
+        if (!std::ranges::contains(list, d.name, &ImageModel::name))
+            list.insert(list.begin(), d);
+    } catch (const std::exception& e) {
+        log::warn("the default image model: {}", e.what());
+    }
     std::string data;
-    for (const auto& c : lora_choices(opts.image_loras, opts.image_lora_dir)) {
+    for (const ImageModel& m : list) {
+        data += std::format(R"({}{{"id":{},"object":"model","default":{},"loaded":{})", data.empty() ? "" : ",",
+                            json::quoted(m.name), m.name == def, m.name == loaded);
+        data += std::format(R"(,"family":{})", json::quoted(m.family));
+        if (!m.description.empty())
+            data += std::format(R"(,"description":{})", json::quoted(m.description));
+        if (m.steps)
+            data += std::format(R"(,"steps":{})", m.steps);
+        if (m.guidance)
+            data += std::format(R"(,"guidance":{:g})", *m.guidance);
+        std::string l;
+        for (const auto& [path, scale] : m.loras)
+            l += std::format(R"({}{{"name":{},"scale":{:g}}})", l.empty() ? "" : ",",
+                             json::quoted(std::filesystem::path(path).stem().string()), scale);
+        data += std::format(R"(,"loras":[{}]}})", l);
+    }
+    res.set_content(std::format(R"({{"object":"list","data":[{}]}})", data), "application/json");
+}
+
+void Server::Impl::loras(const httplib::Request& req, httplib::Response& res)
+{
+    if (!models.has_image()) {
+        res.status = 404;
+        res.set_content(error_body("this server has no image models (start it with --image-models)", "not_found_error"),
+                        "application/json");
+        return;
+    }
+    ImageModel model;
+    try {
+        model = image_model(req.has_param("model") ? req.get_param_value("model") : "");
+    } catch (const std::exception& e) {
+        res.status = 400;
+        res.set_content(error_body(e.what(), "invalid_request_error"), "application/json");
+        return;
+    }
+    std::string data;
+    for (const auto& c : lora_choices(model.loras, model.lora_dir)) {
         data += std::format(R"({}{{"name":{})", data.empty() ? "" : ",", json::quoted(c.name));
         if (c.scale)
             data += std::format(R"(,"default_scale":{:g})", *c.scale);
@@ -861,9 +938,12 @@ Server::Server(Models& models, const text::Tokenizer& tok, const chat::Template&
     const auto images = [this](const httplib::Request& req, httplib::Response& res) { impl_->images(req, res); };
     h.Post("/v1/images/generations", images);
     h.Post("/images/generations", images);
-    const auto loras = [this](const httplib::Request&, httplib::Response& res) { impl_->loras(res); };
+    const auto loras = [this](const httplib::Request& req, httplib::Response& res) { impl_->loras(req, res); };
     h.Get("/v1/images/loras", loras);
     h.Get("/images/loras", loras);
+    const auto image_list = [this](const httplib::Request&, httplib::Response& res) { impl_->image_model_list(res); };
+    h.Get("/v1/images/models", image_list);
+    h.Get("/images/models", image_list);
     h.Get("/v1/models", list_models);
     h.Get("/models", list_models);
     h.Get("/health", [](const httplib::Request&, httplib::Response& res) {

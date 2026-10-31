@@ -445,6 +445,27 @@ std::vector<float> Krea2::step(std::span<const float> latents, float sigma, uint
     return std::vector<float>(o, o + uint64_t(N) * kLatent);
 }
 
+float* Krea2::lora_cpu(const std::string& module, uint32_t& rows, uint32_t& cols)
+{
+    if (module != "txtfusion.projector" && module != "text_fusion.projector")
+        return nullptr;
+    rows = 1;
+    cols = 12;
+    return projector_;
+}
+
+Engine::Tensor* Krea2::lora_bias(const std::string& module)
+{
+    return module == "first"         ? &img_in_b_
+           : module == "tmlp.0"      ? &t1_b_
+           : module == "tmlp.2"      ? &t2_b_
+           : module == "tproj.1"     ? &tproj_b_
+           : module == "txtmlp.1"    ? &txt1_b_
+           : module == "txtmlp.3"    ? &txt2_b_
+           : module == "last.linear" ? &out_b_
+                                     : nullptr;
+}
+
 Engine::LoraTarget Krea2::lora_target(const std::string& module)
 {
     // Diffusers names as the original checkpoint's.

@@ -145,6 +145,23 @@ constexpr float kWanStd[16] = {2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2
 
 } // namespace
 
+std::string Engine::family(const std::string& dir)
+{
+    if (!std::filesystem::exists(dir + "/model_index.json"))
+        return Anima::detect(dir) ? "Anima" : "";
+    try {
+        const auto j = read_json_file(dir + "/model_index.json");
+        const std::string cls = j.contains("_class_name") && j["_class_name"].is_string() ? j["_class_name"].get_string()
+                                                                                         : "";
+        return cls == "QwenImage21Pipeline" ? "Qwen-Image 2.1"
+               : cls == "Krea2Pipeline"     ? "Krea 2"
+               : cls == "MOSSImagePipeline" ? "MOSS-Image"
+                                            : "";
+    } catch (const std::exception&) {
+        return "";
+    }
+}
+
 std::unique_ptr<Engine> Engine::open(const std::string& dir, mtl::Context& ctx, const Options& opts)
 {
     // Single-file parts in their own directories (diffusion_models/, text_encoders/, vae/): Anima's layout.
@@ -1131,6 +1148,7 @@ uint32_t Engine::add_lora(const std::string& path, float scale)
         const gguf::Tensor *a = nullptr, *b = nullptr, *alpha = nullptr;
     };
     std::map<std::string, Pair> mods;
+    std::map<std::string, const gguf::Tensor*> bias_diffs;
     std::vector<std::string> unknown;
     static constexpr std::pair<const char*, int> kSuffixes[] = {
         {".lora.down.weight", 0}, {".lora.up.weight", 1},  {".lora_down.weight", 0},       {".lora_up.weight", 1},
@@ -1138,9 +1156,14 @@ uint32_t Engine::add_lora(const std::string& path, float scale)
         {".alpha", 2}};
     for (const auto& t : file->tensors()) {
         std::string_view name = t.name;
-        for (const char* p : {"base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer."})
+        for (const char* p : {"base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer.",
+                              "lora_unet_"})
             if (name.starts_with(p))
                 name.remove_prefix(std::strlen(p));
+        if (name.ends_with(".diff_b")) {
+            bias_diffs[std::string(name.substr(0, name.size() - 7))] = &t;
+            continue;
+        }
         bool known = false;
         for (const auto& [suffix, role] : kSuffixes)
             if (name.ends_with(suffix)) {
@@ -1152,15 +1175,74 @@ uint32_t Engine::add_lora(const std::string& path, float scale)
         if (!known)
             unknown.push_back(t.name);
     }
-    for (const auto& [m, p] : mods)
-        if (!p.a || !p.b || !lora_target(m).w)
+    // Kohya's names: the module path with underscores for its dots; which underscores were dots, tried until one names
+    // a weight.
+    auto dotted = [&](const std::string& m, auto&& found) -> std::string {
+        if (m.find('.') != std::string::npos || found(m))
+            return m;
+        std::vector<size_t> at;
+        for (size_t i = 0; i < m.size(); ++i)
+            if (m[i] == '_')
+                at.push_back(i);
+        if (at.size() > 16)
+            return m;
+        for (uint32_t bits = 1; bits < (1u << at.size()); ++bits) {
+            std::string c = m;
+            for (size_t i = 0; i < at.size(); ++i)
+                if (bits >> i & 1)
+                    c[at[i]] = '.';
+            if (found(c))
+                return c;
+        }
+        return m;
+    };
+    {
+        std::map<std::string, Pair> renamed;
+        for (auto& [m, p] : mods)
+            renamed[dotted(m, [&](const std::string& c) {
+                uint32_t r = 0, k = 0;
+                return lora_target(c).w != nullptr || lora_cpu(c, r, k) != nullptr;
+            })] = p;
+        mods = std::move(renamed);
+        std::map<std::string, const gguf::Tensor*> rb;
+        for (auto& [m, t] : bias_diffs)
+            rb[dotted(m, [&](const std::string& c) { return lora_bias(c) != nullptr; })] = t;
+        bias_diffs = std::move(rb);
+    }
+    for (const auto& [m, p] : mods) {
+        uint32_t r = 0, k = 0;
+        if (!p.a || !p.b || (!lora_target(m).w && !lora_cpu(m, r, k)))
             unknown.push_back(m);
+    }
+    for (const auto& [m, t] : bias_diffs) {
+        const Tensor* b = lora_bias(m);
+        if (!b || b->type != gguf::Type::F32 || t->elements() != b->dims[0])
+            unknown.push_back(m + ".diff_b");
+    }
     if (!unknown.empty())
         throw std::runtime_error(std::format("{}: {} keys {} does not adapt, e.g. {}", path, unknown.size(), name(),
                                              unknown.front()));
     uint32_t done = 0, rank_seen = 0;
     for (const auto& [m, p] : mods) {
         const LoraTarget tg = lora_target(m);
+        if (!tg.w) { // a small matrix on the CPU: W += s * B A there
+            uint32_t rows = 0, k = 0;
+            float* w = lora_cpu(m, rows, k);
+            const uint32_t rank = uint32_t(p.a->dims[1]);
+            if (p.a->dims[0] != k || p.b->dims[0] != rank || p.b->dims[1] != rows)
+                throw std::runtime_error(std::format("{}: {} does not fit the weight it adapts", path, m));
+            const double a = p.alpha ? read_floats(*file, *p.alpha).front() : alpha.value_or(double(rank));
+            const auto av = read_floats(*file, *p.a), bv = read_floats(*file, *p.b);
+            for (uint32_t i = 0; i < rows; ++i)
+                for (uint32_t j = 0; j < k; ++j) {
+                    double sum = 0;
+                    for (uint32_t r = 0; r < rank; ++r)
+                        sum += double(bv[uint64_t(i) * rank + r]) * av[uint64_t(r) * k + j];
+                    w[uint64_t(i) * k + j] += float(double(scale) * a / double(rank) * sum);
+                }
+            ++done;
+            continue;
+        }
         const uint32_t k = uint32_t(tg.w->dims[0]), rank = uint32_t(p.a->dims[1]);
         // A is [rank][k] and B [rows][rank] (row-major), so their contiguous dimensions come first here.
         if (p.a->dims[0] != k || p.b->dims[0] != rank || p.b->dims[1] != tg.rows || tg.w->type != gguf::Type::BF16)
@@ -1188,9 +1270,17 @@ uint32_t Engine::add_lora(const std::string& path, float scale)
         ++done;
         rank_seen = rank;
     }
+    for (const auto& [m, t] : bias_diffs) {
+        const Tensor* b = lora_bias(m);
+        auto* dst = reinterpret_cast<float*>(static_cast<char*>(b->buf->contents()) + b->off);
+        const auto d = read_floats(*file, *t);
+        for (size_t i = 0; i < d.size(); ++i)
+            dst[i] += scale * d[i];
+        ++done;
+    }
     if (!done)
         throw std::runtime_error(path + ": no LoRA weights in it");
-    log::info("LoRA {}: {} matrices adapted (rank {}, alpha {}), scale {}", path, done, rank_seen,
+    log::info("LoRA {}: {} tensors adapted (rank {}, alpha {}), scale {}", path, done, rank_seen,
               alpha ? std::format("{}", *alpha) : std::string("= rank"), scale);
     return done;
 }

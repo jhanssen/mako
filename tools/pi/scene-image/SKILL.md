@@ -1,14 +1,16 @@
 ---
 name: scene-image
-description: Render a picture of the current scene, character, place or moment from this conversation with the local mako image model (Qwen-Image or Krea 2), and show it. Use when the user asks for an image, illustration, picture or visual of what is being written, imagined or built in the session.
+description: Render a picture of the current scene, character, place or moment from this conversation with one of the local mako image models, and show it. Use when the user asks for an image, illustration, picture or visual of what is being written, imagined or built in the session.
 ---
 
 # Scene image
 
 Turn what the conversation has established into one image prompt, render it with mako, and show the result.
 
+0. Pick the image model (see "Models" below) unless one is already in use in this conversation.
 1. Write one image prompt in English, 60-200 words, from the conversation so far, in full descriptive sentences
-   rather than a list of keywords (the image model's text encoder is a language model and reads prose best):
+   rather than a list of keywords (the image models' text encoders are language models and read prose best; a
+   model whose description says it takes tags can have tags in front of the sentences):
    - the subjects: who or what, with every visual detail the story has fixed (age, build, hair, skin, clothing,
      colours, objects), the same way each time so characters stay recognisable across images;
    - their pose, action and expression;
@@ -25,19 +27,35 @@ Turn what the conversation has established into one image prompt, render it with
 3. Run, from this skill's directory:
 
    ```sh
-   scripts/render.sh WIDTHxHEIGHT "<the prompt>"
+   scripts/render.sh --model MODEL WIDTHxHEIGHT "<the prompt>"
    ```
 
-   It prints the path of the PNG it saved. It takes from about 10 seconds to a minute or two; meanwhile mako has the
-   chat model unloaded, and this conversation continues as before once it is back.
+   It prints the path of the PNG it saved. It takes from a few seconds to a few minutes (the model's description
+   gives its time); meanwhile mako has the chat model unloaded, and this conversation continues as before once it is
+   back.
 4. The script opens the image in the Mac's image viewer. Reply with its path and the prompt used, in a line or two.
    Do not `read` the image unless the user wants to talk about what is in it (it then goes to the model as image
    input, which needs mako started with `--mmproj`). If the user wants changes, adjust the prompt and render again.
 
+## Models
+
+`scripts/models.sh` lists the image models mako has: each one's name, which model it is, a description of what it is
+good at, how its prompts should be written and how long it takes, and its default LoRAs; one is marked "default"
+(used without `--model`) and one "loaded" (rendering with it needs no reload).
+
+- Pick by what the user asks for and by the descriptions: the style (anime and illustration, photograph, painting),
+  what the image must contain (legible text, a layout), the kind of content, and the time the user will wait. A model
+  the user names wins. If none fits clearly, use the default and say which you used.
+- Keep the same model for the rest of the conversation, so characters and style stay consistent; change it only when
+  the user asks or the material changes (a photograph after anime illustrations).
+- Write the prompt the way the chosen model's description says (prose, tags, prompt weights).
+- Rendering with another model than the loaded one first loads it (a few seconds more).
+
 ## LoRAs
 
-LoRAs are add-ons to the image model (a style, a kind of content, a faster schedule). `scripts/loras.sh` lists the
-ones mako has, by name; those marked "default" are what every render uses unless told otherwise, at the scale shown.
+LoRAs are add-ons to an image model (a style, a kind of content, a faster schedule), each model with its own.
+`scripts/loras.sh MODEL` lists the chosen model's, by name; those marked "default" are what every render with it
+uses unless told otherwise, at the scale shown.
 
 - Without `--lora`, a render uses the defaults. With `--lora NAME[:SCALE]` (repeatable), it uses exactly the LoRAs
   given and no others, so to add one to the defaults, pass the defaults too:
@@ -54,7 +72,8 @@ ones mako has, by name; those marked "default" are what every render uses unless
   (at the start if it ends in a colon, like "Next Scene:", else within the sentence where it fits). A description
   says what the LoRA is for. A LoRA with neither may still need words the list does not show; tell the user so if
   its effect does not show.
-- A render with other LoRAs than the previous one first reloads the image model (a few seconds more).
+- A render with other LoRAs than the previous one first reloads the image model (a few seconds more). LoRAs do not
+  carry over to another model: list the new model's and choose again.
 
-If a script fails, report its message: mako may not be running, may have no image model (`--image-model`), may
-need an API key (`MAKO_API_KEY`), or may not have a LoRA of that name (list them again).
+If a script fails, report its message: mako may not be running, may have no image models (`--image-models`), may
+need an API key (`MAKO_API_KEY`), or may not have a model or LoRA of that name (list them again).

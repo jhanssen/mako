@@ -3,6 +3,7 @@
 #include "core/log.hpp"
 
 #include <chrono>
+#include <format>
 #include <stdexcept>
 
 namespace mako::server {
@@ -38,6 +39,10 @@ Models::Lease<gen::Model> Models::llm()
     if (!llm_model_) {
         resident_ = "none";
         image_.reset();
+        {
+            std::lock_guard g(name_mutex_);
+            loaded_name_.clear();
+        }
         const auto t0 = std::chrono::steady_clock::now();
         log::info("loading the LLM again");
         Llm l = load_llm_();
@@ -55,7 +60,7 @@ Models::Lease<gen::Model> Models::llm()
     return Lease<gen::Model>(*this, *llm_model_, &Models::release_llm);
 }
 
-Models::Lease<image::Engine> Models::image(const image::Loras& loras)
+Models::Lease<image::Engine> Models::image(const ImageModel& model, const image::Loras& loras)
 {
     if (!load_image_)
         throw std::runtime_error("this server has no image model (start it with --image-model)");
@@ -63,10 +68,17 @@ Models::Lease<image::Engine> Models::image(const image::Loras& loras)
     ++image_waiting_;
     cv_.wait(lock, [&] { return llm_out_ == 0 && !image_out_; });
     --image_waiting_;
-    if (image_ && image_loras_ != loras) {
+    std::string key = model.key();
+    for (const auto& [path, scale] : loras)
+        key += std::format("|{}:{}", path, scale);
+    if (image_ && image_key_ != key) {
         resident_ = "none";
         image_.reset();
-        log::info("other LoRAs asked for: loading the image model again");
+        {
+            std::lock_guard g(name_mutex_);
+            loaded_name_.clear();
+        }
+        log::info("{} asked for: loading it", model.name == image_name_ ? "other LoRAs" : "image model " + model.name);
     }
     if (!image_) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -80,14 +92,17 @@ Models::Lease<image::Engine> Models::image(const image::Loras& loras)
         }
         resident_ = "none";
         try {
-            image_ = load_image_(loras);
-            image_loras_ = loras;
+            image_ = load_image_(model, loras);
+            image_key_ = key;
+            image_name_ = model.name;
+            std::lock_guard g(name_mutex_);
+            loaded_name_ = model.name;
         } catch (...) {
             cv_.notify_all();
             throw;
         }
         resident_ = "image";
-        log::info("the image model is loaded in {:.1f} s{}", secs_since(t0), swap ? " (the LLM unloaded)" : "");
+        log::info("image model {} loaded in {:.1f} s{}", model.name, secs_since(t0), swap ? " (the LLM unloaded)" : "");
     }
     image_out_ = true;
     return Lease<image::Engine>(*this, *image_, &Models::release_image);
@@ -118,6 +133,12 @@ bool Models::with_llm(const std::function<void(core::EngineBase&)>& f)
         return false;
     f(*llm_.base);
     return true;
+}
+
+std::string Models::image_name()
+{
+    std::lock_guard g(name_mutex_);
+    return loaded_name_;
 }
 
 const char* Models::resident()

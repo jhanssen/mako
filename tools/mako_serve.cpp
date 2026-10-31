@@ -4,9 +4,8 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--image-model DIR]
-//              [--image-lora FILE[:SCALE] ...] [--image-steps N] [--image-terminal F] [--image-text-encoder DIR]
-//              [--image-transformer PATH] [--image-guidance F] [--image-lora-dir DIR]
+//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--image-models DIR]
+//              [--image-model NAME|DIR]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -30,17 +29,12 @@
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
-// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's, Krea 2's, MOSS-Image's or Anima's
-// directory (its files as published), for /v1/images/generations: an image request waits for the chat requests in
-// progress, then the LLM is unloaded (its conversations kept in memory) and the image model loaded; the next chat
-// request loads the LLM again.
-// --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE), for requests that name none; a request's
-// "loras" names its own from those and the .safetensors files in --image-lora-dir (GET /v1/images/loras lists them),
-// and the image model is loaded again when they differ from the merged ones; --image-steps and --image-terminal set the
-// schedule (a 4-step distilled LoRA: --image-steps 4 --image-terminal 0); --image-text-encoder loads the text encoder
-// from another directory (the same model's weights, changed: e.g. refusal-ablated), --image-transformer the transformer
-// from another file or directory (e.g. a checkpoint with LoRAs merged); --image-guidance the guidance scale of requests
-// that name none (with a negative prompt, or for a model guided by default).
+// engine's prefill group) and queues again. --image-models: a directory of image model directories (Qwen-Image 2.1,
+// Krea 2, MOSS-Image, Anima; each its files as published, or a mako.json pointing at them with its settings and LoRAs:
+// server::ImageModel), for /v1/images/generations (GET /v1/images/models lists them; a request's "model" picks one);
+// --image-model the one for requests that name none (a name there, or a model directory; default: the first). An image
+// request waits for the chat requests in progress, then the LLM is unloaded (its conversations kept in memory) and the
+// image model loaded; the next chat request loads the LLM again. Another model or other LoRAs load it again.
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "chat/template.hpp"
@@ -96,8 +90,7 @@ int main(int argc, char** argv)
     };
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1, park_gb = -1;
-    std::string ablate, engram, dspark, imatrix, mmproj_path, image_model;
-    std::string image_text_encoder, image_transformer;
+    std::string ablate, engram, dspark, imatrix, mmproj_path;
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
@@ -153,23 +146,10 @@ int main(int argc, char** argv)
                     "end repetition loops of N tokens or more in reasoning or answers (default 256; 0: off)",
                     so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
-            .option("--image-model", "DIR",
-                    "an image model's files (Qwen-Image 2.1, Krea 2, MOSS-Image, Anima), for /v1/images/generations",
-                    image_model)
-            .option("--image-lora", "FILE[:SCALE]", "merge a LoRA into the image model (repeatable)",
-                    [&](const std::string& v) { so.image_loras.push_back(mako::image::parse_lora(v)); })
-            .option("--image-lora-dir", "DIR", "a directory of LoRAs requests may name (GET /v1/images/loras)",
-                    so.image_lora_dir)
-            .option("--image-text-encoder", "DIR", "another directory of the image model's text encoder weights",
-                    image_text_encoder)
-            .option("--image-transformer", "PATH", "another file or directory of the image model's transformer weights",
-                    image_transformer)
-            .option("--image-steps", "N", "denoising steps of an image (default: the model's; 4 with a 4-step LoRA)",
-                    so.image_steps)
-            .option("--image-guidance", "F", "guidance scale of requests that name none (default: the model's)",
-                    [&](const std::string& v) { so.image_guidance = mako::app::Cli::parse<float>(v); })
-            .option("--image-terminal", "F", "the schedule's last noise level (0: none, as few-step LoRAs want)",
-                    [&](const std::string& v) { so.image_terminal = mako::app::Cli::parse<float>(v); })
+            .option("--image-models", "DIR",
+                    "a directory of image model directories, for /v1/images/generations (swapped in)", so.image_models)
+            .option("--image-model", "NAME|DIR", "the image model for requests that name none (default: the first)",
+                    so.image_model)
             .option("--image-max-tokens", "N", "scale larger images down to at most N prompt rows (16 or more)",
                     [&](const std::string& v) {
                         image_max_tokens = mako::app::Cli::parse<uint32_t>(v);
@@ -196,9 +176,15 @@ int main(int argc, char** argv)
         std::println(stderr, "--host {} serves beyond this machine: give an --api-key or --api-key-file", so.host);
         return 2;
     }
-    if (!so.image_lora_dir.empty() && (image_model.empty() || !std::filesystem::is_directory(so.image_lora_dir))) {
-        std::println(stderr, "--image-lora-dir needs --image-model and a directory");
-        return 2;
+    if (!so.image_models.empty() || !so.image_model.empty()) {
+        if (!so.image_models.empty() && !std::filesystem::is_directory(so.image_models)) {
+            std::println(stderr, "--image-models {}: not a directory", so.image_models);
+            return 2;
+        }
+        if (so.image_models.empty() && !std::filesystem::is_directory(so.image_model)) {
+            std::println(stderr, "--image-model {}: not a directory (or give --image-models)", so.image_model);
+            return 2;
+        }
     }
     const auto t_start = std::chrono::steady_clock::now();
     mako::log::info("reading {}", model_path);
@@ -349,9 +335,9 @@ int main(int argc, char** argv)
         return l;
     };
     mako::server::Models::LoadImage load_image;
-    if (!image_model.empty())
-        load_image = [&](const mako::image::Loras& loras) {
-            auto e = mako::image::Engine::open(image_model, ctx, {image_text_encoder, image_transformer});
+    if (!so.image_models.empty() || !so.image_model.empty())
+        load_image = [&](const mako::server::ImageModel& m, const mako::image::Loras& loras) {
+            auto e = mako::image::Engine::open(m.dir, ctx, m.options);
             for (const auto& [path, scale] : loras)
                 e->add_lora(path, scale);
             return e;
@@ -390,8 +376,13 @@ int main(int argc, char** argv)
         mako::log::warn("little memory was free for the expert cache (a process that just exited may still be "
                         "returning its memory); decoding will read experts from the SSD often");
     {
-        if (models->has_image())
-            mako::log::info("image model {}: loaded for image requests, in place of the LLM", image_model);
+        if (models->has_image()) {
+            if (!so.image_models.empty())
+                for (const auto& m : mako::server::image_models(so.image_models))
+                    mako::log::info("image model {}: {}{}", m.name, m.dir, m.loras.empty() ? "" : " (with LoRAs)");
+            mako::log::info("image models: loaded for image requests, in place of the LLM; default {}",
+                            so.image_model.empty() ? "the first" : so.image_model);
+        }
         mako::server::Server server(*models, *tok, *tmpl, so);
         std::jthread stopper([&] {
             int sig = 0;

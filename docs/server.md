@@ -2,7 +2,7 @@
 
 ```sh
 ./build/tools/mako_serve <first .gguf of the model> [--host 127.0.0.1] [--port 8080] [--ctx 131072] [--no-spec]
-                         [--model-id NAME] [--image-model <image model dir>]
+                         [--model-id NAME] [--image-models DIR] [--image-model NAME]
 ```
 
 One request runs at a time on one session, so a conversation's next turn reuses the context the previous one left.
@@ -89,38 +89,70 @@ read from the SSD); later turns reuse it.
 
 ## Image generation
 
-`--image-model DIR` (Qwen-Image 2.1's, Krea 2's or MOSS-Image's directory, its files as published,
-`model_index.json` saying which; or Anima's, below) adds `POST /v1/images/generations`, OpenAI's image API:
+`--image-models DIR` adds `POST /v1/images/generations`, OpenAI's image API, with the image models in DIR, one
+directory each (named by it); `--image-model NAME` is the one for requests that name none (default: the first by
+name; or a model directory's path, alone without `--image-models`):
 
 ```sh
 curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json' \
-  -d '{"prompt": "a misty harbour town at dawn", "size": "1024x1024"}' | jq -r '.data[0].b64_json' | base64 -d > out.png
+  -d '{"prompt": "a misty harbour town at dawn", "size": "1024x1024", "model": "qwen-image"}' \
+  | jq -r '.data[0].b64_json' | base64 -d > out.png
 ```
 
-- Fields: `prompt` (required), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32 from 256, at most 2048x2048
-  pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored), `output_format` (`png` or
-  `jpeg`). `model`, `quality`, `style`, `background`, `moderation` and `user` are accepted and left alone: the
-  model's steps (Qwen-Image 2.1 40, Krea 2 Turbo 8, MOSS-Image 50, Anima Turbo 10, Anima 30), a random seed for each
-  image (in the log).
-- Extensions (more below): `negative_prompt` (what the image should not be) and `guidance_scale` (its strength; default
-  `--image-guidance F`, else the model's: Qwen-Image 2.1 4, Krea 2 Turbo 2, MOSS-Image 3, Anima 4). A negative prompt
-  runs the transformer twice a step, so the image takes about twice as long; without one, nothing changes.
-  Qwen-Image follows it well (scales 2 to 6 tried). Krea 2 Turbo was distilled to run without it: at 1.5-2 the
-  negative prompt shows a little, at 3 the image turns flat and oversaturated, at 5.5 it breaks. MOSS-Image is always
-  guided, as its reference runs it: against an empty negative prompt when the request gives none, that pass skipping
-  one block.
-  Anima (not Turbo) is guided by default against its model card's negative prompt without the score tags the card
-  advises against for it ("worst quality, low quality, artist name, blurry, jpeg artifacts, chromatic aberration").
+- A model directory holds the model's files as published (Qwen-Image 2.1, Krea 2, MOSS-Image: `model_index.json`
+  says which; Anima: below), or a `mako.json` pointing at them, with its settings (every field optional, paths
+  relative to the directory or from `~/`):
+
+  ```json
+  {"model": "~/models/qwen-image-2.1", "text_encoder": "~/models/qwen-image-2.1-te-heretic",
+   "transformer": "...", "lora_dir": "../qwen-image/loras", "loras": {"lightning-4step": 1.0},
+   "steps": 4, "terminal": 0, "guidance": 4, "description": "what it is good at, how to prompt it, its time"}
+  ```
+
+  `text_encoder` and `transformer` take another copy of those weights (a refusal-ablated text encoder, a checkpoint
+  with LoRAs merged); `loras` are merged for requests that name none (by name in `lora_dir`, default the directory's
+  `loras/`); `steps` (0: the model's), `terminal` (the schedule's last noise level, 0: none, as few-step LoRAs want)
+  and `guidance` set its defaults. The directory is read on each request: models and LoRAs added later count.
+- `GET /v1/images/models` lists the models: `id`, `family` (which model it is), `description`, `default`, `loaded`,
+  `steps` and `guidance` where set, and the default `loras` with their scales.
+- Fields: `prompt` (required), `model` (a name from that list), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32
+  from 256, at most 2048x2048 pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored),
+  `output_format` (`png` or `jpeg`). `quality`, `style`, `background`, `moderation` and `user` are accepted and left
+  alone: the model's steps (Qwen-Image 2.1 40, Krea 2 Turbo 8, MOSS-Image 50, Anima Turbo 10, Anima 30), a random
+  seed for each image (in the log).
+- Extensions: `steps` (0 to 100; 0: the model's own), `negative_prompt` (what the image should not be) and
+  `guidance_scale` (its strength; default the model directory's, else the model's: Qwen-Image 2.1 4, Krea 2 Turbo 2,
+  MOSS-Image 3, Anima 4), and `loras` (below). A negative prompt runs the transformer twice a step, so the image takes
+  about twice as long; without one, nothing changes. Qwen-Image follows it well (scales 2 to 6 tried). Krea 2 Turbo
+  was distilled to run without it: at 1.5-2 the negative prompt shows a little, at 3 the image turns flat and
+  oversaturated, at 5.5 it breaks. MOSS-Image is always guided, as its reference runs it: against an empty negative
+  prompt when the request gives none, that pass skipping one block. Anima (not Turbo) is guided by default against
+  its model card's negative prompt without the score tags the card advises against for it ("worst quality, low
+  quality, artist name, blurry, jpeg artifacts, chromatic aberration").
 - One model is in memory at a time. An image request waits for the chat requests in progress (chat requests that
   come meanwhile wait for it), then the LLM is unloaded, its conversations staying in memory, and the image model
-  loaded (~5 s); the next chat request loads the LLM again (~10 s) and continues its conversation where it was. The
-  status page shows which is loaded.
+  loaded (~3-5 s); the next chat request loads the LLM again (~10 s) and continues its conversation where it was.
+  A request for another image model or other LoRAs than the loaded ones loads those first. The status page shows
+  which is loaded.
 - Time: Qwen-Image 2.1 ~13 s for 512x512, ~63 s for 1024x1024 (40 steps); Krea 2 Turbo ~5 s and ~23 s (8 steps);
   MOSS-Image ~32 s and ~145 s (50 steps, two passes each: 2.3 s a step cool, 3.4 s once warm); Anima Turbo 4.5 s for
   1024x1024 (10 steps), Anima Aesthetic 27 s (30 steps, two passes each); slower as the Mac heats up; the log has
   each image's progress.
-- Anima (circlestone-labs/Anima) as its repository lays it out: `--image-model` the directory holding `split_files/`
-  (or `diffusion_models/`, `text_encoders/`, `vae/` directly), `--image-transformer` the checkpoint (e.g.
+- LoRAs: `GET /v1/images/loras?model=NAME` (default: the default model) lists what a request can name for a model:
+  its default ones first, with their `default_scale`, then its LoRA directory's, each by its file name without
+  `.safetensors`, with a `trigger` (words a prompt needs for the LoRA to act), a `description` and a recommended
+  `scale_range` where known: from `NAME.json` beside the file (`{"trigger": "...", "description": "...",
+  "scale_range": [0.8, 1.4]}`), else the trigger and description from the file's metadata (`trigger_word` or
+  `modelspec.trigger_phrase`; `modelspec.description`). Few files carry these (of four Qwen-Image LoRAs tried, one has
+  a trigger). The trigger is not added to prompts: where it goes differs. A request's `loras`, e.g.
+  `[{"name": "next-scene", "scale": 0.8}]` (scale 1 when left out, -10 to 10), replaces the model's default set for
+  that request; `[]` is none. A set without a few-step LoRA the model's `steps` were lowered for gives smeared images
+  unless the request raises `steps` too. Formats: Diffusers, PEFT, ComfyUI and Kohya (`lora_unet_...`) names, whole
+  bias differences (`diff_b`), adapters of fused matrices (MOSS-Image's `proj.qkv`). Tried: Qwen-Image's lightx2v
+  Lightning (4 steps, 1024x1024 in ~7 s), Next-Scene and Natural-Exposure stacked with it; five Krea 2 and two
+  MOSS-Image LoRAs load (their images not checked).
+- Anima (circlestone-labs/Anima) as its repository lays it out: the directory holding `split_files/` (or
+  `diffusion_models/`, `text_encoders/`, `vae/` directly) with `transformer` the checkpoint (e.g.
   `split_files/diffusion_models/anima-turbo-v1.1.safetensors`; a name with "turbo" is run as the distilled one), and
   the two tokenizers it does not ship, in `tokenizers/` beside it:
   `hf download Qwen/Qwen3-0.6B-Base tokenizer.json --local-dir DIR/tokenizers/qwen3` and
@@ -129,32 +161,10 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   is not implemented).
 - `tools/pi/scene-image` is a pi skill that turns the conversation into an image prompt and renders it through this
   endpoint (`ln -s "$PWD/tools/pi/scene-image" ~/.pi/agent/skills/`; then ask for an image of the scene, or
-  `/skill:scene-image`). Its script saves to `~/Pictures/mako` (`MAKO_IMAGE_DIR`) and opens the image; `MAKO_URL`
-  and `MAKO_API_KEY` point it at the server. It lists the server's LoRAs and passes a request's `loras` when the user
-  wants them.
-- LoRAs: `--image-lora FILE[:SCALE]` (repeatable) merges each into the image model when it loads; Diffusers, PEFT and
-  ComfyUI key names. `--image-steps N` and `--image-terminal F` set the schedule: a 4-step distilled LoRA such as
-  lightx2v's Qwen-Image-2.1-Lightning takes `--image-steps 4 --image-terminal 0` (1024x1024 in ~7 s).
-- Per-request LoRAs: `--image-lora-dir DIR` names a directory of `.safetensors` LoRAs (read on each request, so files
-  added later count). `GET /v1/images/loras` lists what a request can name: the `--image-lora` files first, with their
-  `default_scale`, then the directory's, each by its file name without `.safetensors` (a `--image-lora` name wins over
-  a directory file of the same name), with a `trigger` (words a prompt needs for the LoRA to act) and a `description`
-  where known, and a recommended `scale_range`: from `NAME.json` beside the file (`{"trigger": "...", "description":
-  "...", "scale_range": [0.8, 1.4]}`), else the trigger and description from the file's metadata (`trigger_word` or
-  `modelspec.trigger_phrase`; `modelspec.description`). Few files carry these (of four
-  Qwen-Image LoRAs tried, one has a trigger). The trigger is not added to prompts: where it goes differs. A request's
-  `loras`, e.g. `[{"name": "next-scene", "scale": 0.8}]` (a name from that list, `.safetensors` optional; scale 1 when
-  left out, -10 to 10), replaces the `--image-lora` set for that request; `[]` is none, no field the `--image-lora`
-  set. A set without a few-step LoRA that `--image-steps` was lowered for gives smeared images unless the request
-  raises `steps` too. When the set differs from the one merged, the image model is loaded again first (Qwen-Image 2.1:
-  2.4 s without LoRAs, 3.8 s with two).
-- `steps` (0 to 100; 0: the model's own) sets a request's denoising steps in place of `--image-steps`. The schedule's
-  end stays `--image-terminal` (Qwen-Image 2.1 at 40 steps with `--image-terminal 0`: clean).
+  `/skill:scene-image`). It lists the models and picks one by their descriptions, lists the chosen model's LoRAs and
+  passes them when the user wants them. Its script saves to `~/Pictures/mako` (`MAKO_IMAGE_DIR`) and opens the image;
+  `MAKO_URL` and `MAKO_API_KEY` point it at the server.
 - Not yet: condition images (edits, references; `/v1/images/edits`), image to image, and a per-request seed.
-- `--image-text-encoder DIR` takes the text encoder from another directory of safetensors (the same architecture
-  with changed weights, such as a refusal-ablated one), leaving the model's own directory as published;
-  `--image-transformer PATH` the transformer from another file or directory (such as a Krea 2 checkpoint with LoRAs
-  merged, in the original single-file names). Krea 2's LoRA names are mapped (original and Diffusers) but untried.
 
 ## Thinking
 

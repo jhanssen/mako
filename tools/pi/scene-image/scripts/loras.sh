@@ -1,12 +1,17 @@
 #!/bin/sh
-# Lists the LoRAs mako's image model can render with (GET /v1/images/loras): a name per line, the server's defaults
-# marked with the scale they are merged at, then each one's trigger, recommended scales and description when known.
+# Lists the LoRAs an image model can render with (GET /v1/images/loras): a name per line, the model's defaults marked
+# with the scale they are merged at, then each one's trigger, recommended scales and description when known.
+#   loras.sh [MODEL]   (default: the server's default model)
 # MAKO_URL (default http://127.0.0.1:8080/v1), MAKO_API_KEY (when the server wants one).
 set -eu
 url=${MAKO_URL:-http://127.0.0.1:8080/v1}
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-status=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 30 "$url/images/loras" \
+query=
+if [ $# -ge 1 ]; then
+    query="?model=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1")"
+fi
+status=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 30 "$url/images/loras$query" \
     ${MAKO_API_KEY:+-H "Authorization: Bearer $MAKO_API_KEY"})
 STATUS=$status python3 - "$tmp" <<'PY'
 import json, os, sys

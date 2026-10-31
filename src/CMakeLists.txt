@@ -46,7 +46,7 @@ add_library(mako_chat STATIC chat/template.cpp)
 target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_chat PRIVATE jinja_engine)
 
-add_library(mako_server STATIC server/anthropic.cpp server/models.cpp server/openai.cpp server/server.cpp
+add_library(mako_server STATIC server/anthropic.cpp server/image_models.cpp server/models.cpp server/openai.cpp server/server.cpp
             server/status.cpp)
 target_link_libraries(mako_server PUBLIC mako_glm mako_text mako_chat mako_vision mako_imagegen
                       PRIVATE glaze_headers httplib_headers)

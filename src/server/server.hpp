@@ -52,15 +52,9 @@ struct ServerOptions {
     // the share of the experts it holds.
     std::function<CacheCounters()> cache_counters;
     double cache_gb = 0, resident = 0;
-    // Image generation: steps of an image (0: the model's), and the schedule's last noise level (0: not stretched;
-    // unset: the model's).
-    uint32_t image_steps = 0;
-    std::optional<float> image_terminal;
-    // The guidance scale of requests with a negative prompt that name none (unset: the model's).
-    std::optional<float> image_guidance;
-    // LoRAs: those merged for requests that name none, and a directory of .safetensors files requests may name too.
-    image::Loras image_loras;
-    std::string image_lora_dir;
+    // Image models: a directory of model directories (read on each request; see ImageModel), and the one for requests
+    // that name none (a name there, or a model directory's path).
+    std::string image_models, image_model;
     // Image input (both or neither): the projector file and its encoder; requests with images are refused without.
     const vision::Mmproj* mmproj = nullptr;
     vision::Encoder* vision = nullptr;

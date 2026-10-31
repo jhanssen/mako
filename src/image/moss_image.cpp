@@ -401,6 +401,8 @@ Engine::LoraTarget MossImage::lora_target(const std::string& module)
     if (std::sscanf(module.c_str(), "layers.%u.%n", &i, &used) == 1 && used > 0 && i < blocks_.size()) {
         Block& B = blocks_[i];
         const std::string_view rest = std::string_view(module).substr(size_t(used));
+        if (rest == "proj.qkv")
+            return {&B.q, 0, 3 * kDim};
         if (rest == "proj.q")
             return {&B.q, 0, kDim};
         if (rest == "proj.k")

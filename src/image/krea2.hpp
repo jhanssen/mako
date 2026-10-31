@@ -29,6 +29,8 @@ public:
 
 protected:
     LoraTarget lora_target(const std::string& module) override;
+    Tensor* lora_bias(const std::string& module) override;
+    float* lora_cpu(const std::string& module, uint32_t& rows, uint32_t& cols) override;
 
 private:
     // Attention (q, k, v and the output gate fused) and a SwiGLU MLP (gate, up fused), RMS norms with their scales + 1.

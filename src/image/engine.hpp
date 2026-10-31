@@ -28,6 +28,8 @@ class Engine : public gpu::Runtime {
 public:
     // The model in `dir`, by the pipeline model_index.json names. Throws on a model it does not know.
     static std::unique_ptr<Engine> open(const std::string& dir, mtl::Context& ctx, const Options& opts = {});
+    // Which model open() would load from `dir` ("" if none it knows), without loading it.
+    static std::string family(const std::string& dir);
 
     virtual ~Engine() = default;
 
@@ -86,9 +88,10 @@ public:
                                       std::optional<float> terminal = std::nullopt) const;
 
     // Merges a LoRA into the transformer's weights for good: W += scale * (alpha / rank) * B A for each matrix it
-    // adapts (rounded back to BF16). Keys as Diffusers, PEFT or ComfyUI name them; alpha from the adapter's .alpha
-    // tensors, else its PEFT config in the metadata, else the rank. Returns the matrices adapted; throws on a file
-    // it cannot use (keys it does not know are an error).
+    // adapts (rounded back to BF16), b += scale * diff_b for whole bias differences. Keys as Diffusers, PEFT or
+    // ComfyUI name them, or Kohya's (lora_unet_ and the module path with underscores); alpha from the adapter's .alpha
+    // tensors, else its PEFT config in the metadata, else the rank. Returns the tensors adapted; throws on a file it
+    // cannot use (keys it does not know are an error).
     uint32_t add_lora(const std::string& path, float scale = 1.0f);
     const text::Tokenizer& tokenizer() const { return *tok_; }
 
@@ -105,6 +108,10 @@ protected:
     };
     // `module` with the file's prefixes stripped (transformer., diffusion_model., ...).
     virtual LoraTarget lora_target(const std::string& module) = 0;
+    // The F32 bias of `module`, for an adapter's whole bias difference (null: none).
+    virtual Tensor* lora_bias(const std::string&) { return nullptr; }
+    // A small matrix of `module` the model keeps on the CPU, [rows][cols] floats (null: none).
+    virtual float* lora_cpu(const std::string&, uint32_t& /*rows*/, uint32_t& /*cols*/) { return nullptr; }
 
     Tensor upload(const safetensors::Files& files, const std::string& name, bool matrix);
     // BF16 (or F32, rounded to BF16) matrices of one width, their rows one after another in one tensor.

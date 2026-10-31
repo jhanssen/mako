@@ -1,23 +1,30 @@
 #!/bin/sh
 # Renders an image with mako's /v1/images/generations and saves it as a PNG.
-#   render.sh [--lora NAME[:SCALE]]... [--no-loras] [--steps N] WIDTHxHEIGHT "prompt"
-# --lora (repeatable) renders with these LoRAs in place of the server's defaults; --no-loras with none; --steps N
-# denoising steps (0: the model's own count; default: the server's).
+#   render.sh [--model NAME] [--lora NAME[:SCALE]]... [--no-loras] [--steps N] WIDTHxHEIGHT "prompt"
+# --model renders with that image model (default: the server's); --lora (repeatable) with these LoRAs in place of the
+# model's defaults; --no-loras with none; --steps N denoising steps (0: the model's own count; default: the model's
+# setting).
 # MAKO_URL (default http://127.0.0.1:8080/v1), MAKO_API_KEY (when the server wants one), MAKO_IMAGE_DIR (default
 # ~/Pictures/mako), MAKO_IMAGE_OPEN=0 (not opened in the image viewer). Prints the saved file's path.
 set -eu
 usage() {
-    echo "usage: render.sh [--lora NAME[:SCALE]]... [--no-loras] [--steps N] WIDTHxHEIGHT \"prompt\"" >&2
+    echo "usage: render.sh [--model NAME] [--lora NAME[:SCALE]]... [--no-loras] [--steps N] WIDTHxHEIGHT \"prompt\"" >&2
     exit 2
 }
 loras=
 steps=
+model=
 while [ $# -gt 0 ]; do
     case $1 in
     --lora)
         [ $# -ge 2 ] || usage
         loras="$loras$2
 "
+        shift 2
+        ;;
+    --model)
+        [ $# -ge 2 ] || usage
+        model=$2
         shift 2
         ;;
     --steps)
@@ -43,9 +50,11 @@ mkdir -p "$dir"
 out="$dir/$(date +%Y%m%d-%H%M%S).png"
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-body=$(SIZE=$size PROMPT=$prompt LORAS=$loras STEPS=$steps python3 -c '
+body=$(SIZE=$size PROMPT=$prompt LORAS=$loras STEPS=$steps MODEL=$model python3 -c '
 import json, os, sys
 b = {"prompt": os.environ["PROMPT"], "size": os.environ["SIZE"], "n": 1, "response_format": "b64_json"}
+if os.environ["MODEL"]:
+    b["model"] = os.environ["MODEL"]
 if os.environ["STEPS"]:
     try:
         b["steps"] = int(os.environ["STEPS"])
