@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/runtime.hpp"
+#include "image/png.hpp"
 #include "safetensors/safetensors.hpp"
 #include "text/tokenizer.hpp"
 
@@ -62,6 +63,9 @@ public:
     };
     // Text to image: RGBA [height][width][4] in [-1, 1].
     std::vector<float> generate(const Request& r);
+    // What generate() makes of r (its steps, guidance and negative prompt in effect), for the image's metadata; the
+    // caller adds the model's name and LoRAs.
+    Provenance provenance(const Request& r) const;
 
     // The transformer's text input for a prompt.
     virtual std::vector<float> prompt_embeddings(const std::string& prompt) = 0;

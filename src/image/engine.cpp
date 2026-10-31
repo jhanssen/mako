@@ -418,6 +418,22 @@ std::vector<float> Engine::generate(const Request& r)
     return decode(x, h, w);
 }
 
+Provenance Engine::provenance(const Request& r) const
+{
+    Provenance p;
+    p.prompt = r.prompt;
+    p.width = r.width;
+    p.height = r.height;
+    p.seed = r.seed;
+    p.steps = r.steps ? r.steps : default_steps();
+    p.guidance = r.guidance.value_or(default_guidance());
+    if (p.guidance != 1.0f)
+        p.negative = r.negative ? r.negative : default_negative();
+    if (!p.negative)
+        p.guidance = 1.0f;
+    return p;
+}
+
 Engine::Tensor Engine::upload_rows(const safetensors::Files& files, std::span<const std::string> names)
 {
     uint64_t rows = 0, k = 0;

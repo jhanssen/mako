@@ -2,7 +2,10 @@
 
 #include <ImageIO/ImageIO.h>
 
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <format>
 #include <fstream>
 #include <stdexcept>
 
@@ -22,7 +25,91 @@ template <typename T> struct Cf {
     Cf& operator=(const Cf&) = delete;
 };
 
+uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu)
+{
+    static const auto table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t v = i;
+            for (int k = 0; k < 8; ++k)
+                v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            t[i] = v;
+        }
+        return t;
+    }();
+    for (size_t i = 0; i < n; ++i)
+        c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c;
+}
+
+// An iTXt chunk: keyword, uncompressed, no language, UTF-8 text.
+std::vector<uint8_t> itxt(const std::string& key, const std::string& text)
+{
+    std::vector<uint8_t> data(key.begin(), key.end());
+    for (uint8_t b : {0, 0, 0, 0, 0})
+        data.push_back(b);
+    data.insert(data.end(), text.begin(), text.end());
+    std::vector<uint8_t> chunk;
+    const uint32_t n = uint32_t(data.size());
+    for (int s = 24; s >= 0; s -= 8)
+        chunk.push_back(uint8_t(n >> s));
+    const size_t type = chunk.size();
+    for (char c : std::string("iTXt"))
+        chunk.push_back(uint8_t(c));
+    chunk.insert(chunk.end(), data.begin(), data.end());
+    const uint32_t crc = ~crc32(chunk.data() + type, chunk.size() - type);
+    for (int s = 24; s >= 0; s -= 8)
+        chunk.push_back(uint8_t(crc >> s));
+    return chunk;
+}
+
+std::string json_string(const std::string& s)
+{
+    std::string o = "\"";
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\')
+            o += {'\\', char(c)};
+        else if (c == '\n')
+            o += "\\n";
+        else if (c < 0x20)
+            o += std::format("\\u{:04x}", c);
+        else
+            o += char(c);
+    }
+    return o + "\"";
+}
+
 } // namespace
+
+std::vector<uint8_t> with_provenance(std::vector<uint8_t> png, const Provenance& p)
+{
+    // IEND: the last 12 bytes (length 0, type, CRC).
+    if (png.size() < 20 || std::memcmp(png.data() + png.size() - 8, "IEND", 4) != 0)
+        throw std::runtime_error("with_provenance: not a PNG ending in IEND");
+    std::string params = p.prompt;
+    if (p.negative)
+        params += "\nNegative prompt: " + *p.negative;
+    params += std::format("\nSteps: {}, Sampler: Euler, CFG scale: {:g}, Seed: {}, Size: {}x{}, Model: {}", p.steps,
+                          p.guidance, p.seed, p.width, p.height, p.model);
+    std::string loras;
+    for (const auto& [name, scale] : p.loras)
+        loras += std::format("{}{{\"name\":{},\"scale\":{:g}}}", loras.empty() ? "" : ",", json_string(name), scale);
+    if (!p.loras.empty()) {
+        params += ", Lora: ";
+        for (size_t i = 0; i < p.loras.size(); ++i)
+            params += std::format("{}{}:{:g}", i ? " " : "", p.loras[i].first, p.loras[i].second);
+    }
+    const std::string json = std::format(
+        "{{\"prompt\":{},\"negative_prompt\":{},\"model\":{},\"steps\":{},\"guidance\":{:g},\"sampler\":\"euler\","
+        "\"seed\":{},\"width\":{},\"height\":{},\"loras\":[{}]}}",
+        json_string(p.prompt), p.negative ? json_string(*p.negative) : "null", json_string(p.model), p.steps,
+        p.guidance, p.seed, p.width, p.height, loras);
+    std::vector<uint8_t> chunks = itxt("parameters", params);
+    const auto m = itxt("mako", json);
+    chunks.insert(chunks.end(), m.begin(), m.end());
+    png.insert(png.end() - 12, chunks.begin(), chunks.end());
+    return png;
+}
 
 std::vector<uint8_t> to_rgba8(std::span<const float> rgba)
 {

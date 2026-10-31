@@ -604,7 +604,14 @@ void Server::Impl::images(const httplib::Request& req, httplib::Response& res)
                           steps, s / step, s / step * (steps - step));
             };
             const auto img = engine->generate(r);
-            const auto bytes = image::encode_png(image::to_rgba8(img), width, height, false, jpeg);
+            auto bytes = image::encode_png(image::to_rgba8(img), width, height, false, jpeg);
+            if (!jpeg) {
+                image::Provenance prov = engine->provenance(r);
+                prov.model = model.name;
+                for (const auto& [path, scale] : loras)
+                    prov.loras.emplace_back(std::filesystem::path(path).stem().string(), scale);
+                bytes = image::with_provenance(std::move(bytes), prov);
+            }
             log::info("{}: image {} of {} in {:.1f} s (seed {})", id, i + 1, n,
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), r.seed);
             data += std::format(R"({}{{"b64_json":"{}"}})", i ? "," : "", base64(bytes));

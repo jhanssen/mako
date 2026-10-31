@@ -16,6 +16,7 @@
 #include "mtl/context.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <format>
 #include <optional>
 #include <print>
@@ -88,7 +89,13 @@ int main(int argc, char** argv)
                 path = dot == std::string::npos ? std::format("{}-{}", out, n)
                                                 : std::format("{}-{}{}", out.substr(0, dot), n, out.substr(dot));
             }
-            mako::image::write_file(path, mako::image::encode_png(mako::image::to_rgba8(img), width, height, rgb));
+            mako::image::Provenance prov = engine.provenance(r);
+            prov.model = std::filesystem::path(pos[0]).lexically_normal().filename().string();
+            for (const auto& [lp, scale] : loras)
+                prov.loras.emplace_back(std::filesystem::path(lp).stem().string(), scale);
+            mako::image::write_file(path, mako::image::with_provenance(
+                                              mako::image::encode_png(mako::image::to_rgba8(img), width, height, rgb),
+                                              prov));
             mako::log::info("{}x{}, {} steps in {:.1f} s: {}", width, height, steps ? steps : engine.default_steps(),
                             gen / 1e3, path);
         }

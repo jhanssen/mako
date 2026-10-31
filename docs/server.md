@@ -122,7 +122,9 @@ curl -s localhost:8080/v1/images/generations -H 'Content-Type: application/json'
   from the image's centre). The skill's `render.sh --layout` builds it from boxes in pixels from the top-left.
 - Fields: `prompt` (required), `model` (a name from that list), `n` (1-4), `size` (`WIDTHxHEIGHT` in multiples of 32
   from 256, at most 2048x2048 pixels; `auto`: 1024x1024), `response_format` (`b64_json` only: images are not stored),
-  `output_format` (`png` or `jpeg`). `quality`, `style`, `background`, `moderation` and `user` are accepted and left
+  `output_format` (`png` or `jpeg`; a PNG carries how it was made in text chunks: `parameters`, the prompt, negative
+  prompt, steps, CFG scale, seed, size, model and LoRAs as image tools commonly read them, and `mako`, the same as
+  JSON). `quality`, `style`, `background`, `moderation` and `user` are accepted and left
   alone: the model's steps (Qwen-Image 2.1 40, Krea 2 Turbo 8, MOSS-Image 50, Anima Turbo 10, Anima 30), a random
   seed for each image (in the log).
 - Extensions: `steps` (0 to 100; 0: the model's own), `negative_prompt` (what the image should not be) and
