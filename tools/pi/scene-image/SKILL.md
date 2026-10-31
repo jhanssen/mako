@@ -64,9 +64,13 @@ uses unless told otherwise, at the scale shown.
   `--no-loras` renders with none.
 - SCALE is the strength (1 when left out). Where the list gives a LoRA's scales, start in the middle of that range
   and stay within it. If the user finds an effect too weak or too strong, raise or lower it by 0.2-0.3.
-- A default that makes rendering fast (its name says so, e.g. "lightning", "4step", "turbo") goes with a low step
-  count that mako is set to. When you pass `--lora` or `--no-loras` without it, add `--steps 0` (the model's own
-  count, slower); otherwise the image comes out smeared.
+- A model's default LoRAs are part of how it is set up (a speed LoRA such as "dmd", "lightning", "4step", "turbo"
+  goes with the low step count and guidance the model is set to); the LoRAs you added are the user's choices. When
+  the user asks to remove LoRAs, remove the ones you added and keep the defaults: pass the defaults alone as
+  `--lora`, or leave `--lora` out if only defaults remain. Use `--no-loras` only when the user asks to drop the
+  defaults too, and then, if a default was a speed LoRA, switch to the same model's folder without it instead (its
+  description says which, e.g. `moss-sft` for `moss-sft-dmd`): without it the low step count gives soft, smeared
+  images.
 - Use a LoRA only when the user asks for it or its name clearly matches what they want. Once the user has chosen
   LoRAs, pass the same ones on every later render in the conversation: nothing is remembered between renders.
 - A LoRA listed with a trigger acts only when the prompt contains it: work the trigger into the prompt, word for word
