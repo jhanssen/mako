@@ -604,3 +604,55 @@ kernel void situ_rows(device const float* hg [[buffer(0)]], device float* m [[bu
     const float h = r[gid.x], g = r[n + gid.x];
     m[uint64_t(gid.y) * n + gid.x] = 4.0f * precise::tanh(g / 4.0f) / (1.0f + exp(-g)) * (25.0f * precise::tanh(h / 25.0f));
 }
+
+// Anima (Cosmos's transformer): layer norms with a shift and a scale, and the exact GELU.
+
+struct LnAffineArgs {
+    uint n;
+    float eps;
+};
+
+// y = layer_norm(x) * (1 + scale) + shift over each row (no learned weights); one threadgroup per row.
+kernel void ln_affine(device const float* x [[buffer(0)]], device const float* scale [[buffer(1)]],
+                      device const float* shift [[buffer(2)]], device float* y [[buffer(3)]],
+                      constant LnAffineArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device const float* xr = x + uint64_t(row) * a.n;
+    device float* yr = y + uint64_t(row) * a.n;
+    float s = 0.0f;
+    for (uint i = tid; i < a.n; i += TG)
+        s += xr[i];
+    const float mean = tg_sum(s, scratch, tid) / float(a.n);
+    float v = 0.0f;
+    for (uint i = tid; i < a.n; i += TG) {
+        const float d = xr[i] - mean;
+        v += d * d;
+    }
+    const float inv = rsqrt(tg_sum(v, scratch, tid) / float(a.n) + a.eps);
+    for (uint i = tid; i < a.n; i += TG)
+        yr[i] = (xr[i] - mean) * inv * (1.0f + scale[i]) + shift[i];
+}
+
+// erf, max error ~1.2e-7 (Chebyshev fit of erfc).
+static float erf_fit(float x)
+{
+    const float z = fabs(x), t = 1.0f / (1.0f + 0.5f * z);
+    const float r =
+        t * exp(-z * z - 1.26551223f +
+                t * (1.00002368f +
+                     t * (0.37409196f +
+                          t * (0.09678418f +
+                               t * (-0.18628806f +
+                                    t * (0.27886807f +
+                                         t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
+    return x >= 0.0f ? 1.0f - r : r - 1.0f;
+}
+
+// x = x / 2 * (1 + erf(x / sqrt 2)).
+kernel void gelu_erf(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]])
+{
+    if (i < n)
+        x[i] = 0.5f * x[i] * (1.0f + erf_fit(x[i] * 0.70710678f));
+}

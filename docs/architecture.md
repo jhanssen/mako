@@ -80,7 +80,11 @@ tensors, the image models' from their configs; semantics were checked against th
 They run from their original files (BF16 safetensors and configs), not a GGUF: the published GGUFs hold only the
 transformer, as F16 (BF16 values below ~6.1e-5 lose bits there) or quantized. They share `image::Engine`: the text
 encoder (Qwen3-VL, or Qwen3.5's hybrid), the VAE decoder (Qwen-Image's or FLUX.2's), the flow-matching Euler schedule,
-the denoising loop with guidance, and LoRA merging. `Engine::open` picks the model from `model_index.json`.
+the denoising loop with guidance, and LoRA merging. `Engine::open` picks the model from `model_index.json`, or takes
+Anima's single-file layout (`diffusion_models/`, `text_encoders/`, `vae/`). The text encoders' BF16 GEMMs also
+multiply what rounding their activations to bfloat left out (a second GEMM): the first token's outlier channels grow
+to thousands and cancel in the last layers, and with activations in bfloat alone its final state came out a few
+percent off.
 
 ### Qwen-Image 2.1
 
@@ -121,6 +125,22 @@ the denoising loop with guidance, and LoRA merging. `Engine::open` picks the mod
   statistics; group norms, a single-head mid attention.
 - Schedule: shift 5 on a linear grid, snapped to the 1000 training levels; 50 steps. Guidance 3 always, against an
   empty negative prompt unless one is given, that pass skipping block 22, as the reference runs it.
+
+### Anima
+
+- Transformer (2B, Cosmos-Predict2's): 28 blocks, hidden 2048 (16 heads of 128), each self-attention over the image
+  (3D rotary positions: of 64 pairs, 22 for time, 21 each for rows and columns, bases 10000 x 4^(42/40) for the
+  image's axes), cross-attention to the text (512 rows or more, zero padded) and a GELU MLP of 8192, each after a
+  layer norm modulated by the timestep: per block and part, a down and up projection of the normed embedding plus
+  one shared low-rank term. Patches of 2x2 of the 16-channel latent (a zero padding-mask channel dropped).
+- Text: Qwen3-0.6B's final hidden states of the prompt as it is; an adapter (6 blocks, 1024 wide, heads of 64) whose
+  queries are the prompt's T5 tokens (SentencePiece unigram, `text::Unigram`) attends to them. ComfyUI's prompt
+  weights (`(text:1.5)`, `(text)` 1.1, nested, `\(` literal) split the prompt into parts tokenized apart; a part's
+  weight scales its rows of the adapter's output.
+- VAE: the first Qwen-Image VAE in its original names (mapped onto the Diffusers layout's), its latent statistics
+  built in.
+- Schedule: shift 3 over 1000 levels, steps evenly spaced from the top; Euler. Turbo (the file name says so): 10
+  steps, no guidance; the others 30 at guidance 4 against the model card's negative prompt without its score tags.
 
 ## How the engines are built
 

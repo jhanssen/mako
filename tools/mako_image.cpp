@@ -1,4 +1,4 @@
-// Text to image with Qwen-Image 2.1, Krea 2 or MOSS-Image from their original files.
+// Text to image with Qwen-Image 2.1, Krea 2, MOSS-Image or Anima from their original files.
 //   mako_image <model dir> <prompt> [-o out.png] [--width N] [--height N] [--steps N] [--seed N] [--count N] [--rgb]
 //              [--lora FILE[:SCALE] ...] [--terminal F] [--text-encoder DIR] [--transformer PATH]
 //              [--negative TEXT] [--guidance F]

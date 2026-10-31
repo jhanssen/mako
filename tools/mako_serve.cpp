@@ -30,10 +30,10 @@
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
 // expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
-// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's, Krea 2's or MOSS-Image's directory (its
-// files as published), for /v1/images/generations: an image request waits for the chat requests in progress, then the
-// LLM is unloaded (its conversations kept in memory) and the image model loaded; the next chat request loads the LLM
-// again.
+// engine's prefill group) and queues again. --image-model: Qwen-Image 2.1's, Krea 2's, MOSS-Image's or Anima's
+// directory (its files as published), for /v1/images/generations: an image request waits for the chat requests in
+// progress, then the LLM is unloaded (its conversations kept in memory) and the image model loaded; the next chat
+// request loads the LLM again.
 // --image-lora merges LoRAs into the image model (repeatable, FILE:SCALE), for requests that name none; a request's
 // "loras" names its own from those and the .safetensors files in --image-lora-dir (GET /v1/images/loras lists them),
 // and the image model is loaded again when they differ from the merged ones; --image-steps and --image-terminal set the
@@ -154,7 +154,7 @@ int main(int argc, char** argv)
                     so.loop_guard)
             .option("--mmproj", "FILE", "the model's vision projector, for images in requests", mmproj_path)
             .option("--image-model", "DIR",
-                    "Qwen-Image 2.1's, Krea 2's or MOSS-Image's files, for /v1/images/generations (swapped in)",
+                    "an image model's files (Qwen-Image 2.1, Krea 2, MOSS-Image, Anima), for /v1/images/generations",
                     image_model)
             .option("--image-lora", "FILE[:SCALE]", "merge a LoRA into the image model (repeatable)",
                     [&](const std::string& v) { so.image_loras.push_back(mako::image::parse_lora(v)); })

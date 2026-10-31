@@ -37,7 +37,7 @@ add_library(mako_safetensors STATIC safetensors/safetensors.cpp)
 target_include_directories(mako_safetensors PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_safetensors PUBLIC mako_gguf PRIVATE glaze_headers)
 
-add_library(mako_imagegen STATIC image/engine.cpp image/qwen_image.cpp image/krea2.cpp image/moss_image.cpp image/png.cpp)
+add_library(mako_imagegen STATIC image/engine.cpp image/qwen_image.cpp image/krea2.cpp image/moss_image.cpp image/anima.cpp image/png.cpp)
 target_include_directories(mako_imagegen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_imagegen PUBLIC mako_gpu mako_safetensors mako_text PRIVATE glaze_headers "-framework ImageIO"
                       "-framework CoreGraphics" "-framework CoreFoundation")
@@ -87,5 +87,5 @@ target_include_directories(mako_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_vision PUBLIC mako_gguf mako_mtl PRIVATE "-framework ImageIO" "-framework CoreGraphics"
                       "-framework CoreFoundation")
 
-add_library(mako_text STATIC text/stream.cpp text/tokenizer.cpp)
+add_library(mako_text STATIC text/stream.cpp text/tokenizer.cpp text/unigram.cpp)
 target_link_libraries(mako_text PUBLIC mako_gguf PRIVATE glaze_headers)

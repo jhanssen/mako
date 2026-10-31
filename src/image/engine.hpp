@@ -30,6 +30,14 @@ public:
     static std::unique_ptr<Engine> open(const std::string& dir, mtl::Context& ctx, const Options& opts = {});
 
     virtual ~Engine() = default;
+
+    // A model's parts where they are not laid out as Diffusers has them under one directory: a file or directory
+    // each, the scheduler's config and the VAE's (config.json beside it) optional, the text encoder's rotary base
+    // where it has no config (0: its default).
+    struct Parts {
+        std::string text_encoder, vae, scheduler, tokenizer;
+        float text_theta = 0;
+    };
     virtual const char* name() const = 0;
     virtual uint32_t default_steps() const = 0;
     // The guidance scale with a negative prompt: the step's velocity is neg + scale * (pos - neg).
@@ -87,6 +95,8 @@ public:
 protected:
     // dir's text encoder (or opts.text_encoder), VAE, scheduler and tokenizer (processor/ or tokenizer/).
     Engine(const std::string& dir, mtl::Context& ctx, const Options& opts);
+    Engine(const Parts& parts, mtl::Context& ctx, const Options& opts);
+    static Parts diffusers_parts(const std::string& dir, const Options& opts);
 
     // The weight a LoRA module adapts: its matrix and the rows it has there (fused matrices share one).
     struct LoraTarget {
@@ -169,6 +179,8 @@ private:
     };
     void load_vae();
     void load_vae_flux2();
+    // A VAE tensor's name in the file (the Diffusers layout's, or the original one's).
+    std::string vk(const std::string& name) const;
     // A convolution (or a linear layer, as a 1x1), or several of one input's with their outputs side by side.
     Conv load_conv(const std::string& name, uint32_t k);
     Conv load_conv(std::span<const std::string> names, uint32_t k);
@@ -204,6 +216,7 @@ private:
     uint32_t z_ = kLatent, patch_ = 1;
     bool residual_ = false;
     bool flux2_ = false; // the FLUX.2 VAE: group norms, separate q, k, v, upsamplers' plain convolutions
+    bool wan_ = false;   // the first Qwen-Image VAE in its original names
 };
 
 // LoRA files and their scales, merged in order.
