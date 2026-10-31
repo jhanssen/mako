@@ -57,8 +57,9 @@ LoRAs are add-ons to an image model (a style, a kind of content, a faster schedu
 `scripts/loras.sh MODEL` lists the chosen model's, by name; those marked "default" are what every render with it
 uses unless told otherwise, at the scale shown.
 
-- Without `--lora`, a render uses the defaults. With `--lora NAME[:SCALE]` (repeatable), it uses exactly the LoRAs
-  given and no others, so to add one to the defaults, pass the defaults too:
+- Without `--lora`, a render uses the model's defaults: leave `--lora` out unless you change them. With
+  `--lora NAME[:SCALE]` (repeatable), it uses exactly the LoRAs given and no others, so to add one to the defaults,
+  pass the defaults too:
   `scripts/render.sh --lora fast-4step:1 --lora watercolour:0.8 1024x1024 "<the prompt>"`.
   `--no-loras` renders with none.
 - SCALE is the strength (1 when left out). Where the list gives a LoRA's scales, start in the middle of that range
