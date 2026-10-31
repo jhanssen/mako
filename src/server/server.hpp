@@ -84,7 +84,8 @@ struct LoraNotes {
     std::optional<std::pair<float, float>> scale_range;
 };
 LoraNotes lora_notes(const std::string& path);
-// A request's "loras" value (JSON: an array of {"name", "scale" (default 1)}) as files and scales. Throws
+// A request's "loras" value (JSON: an array of {"name" (with or without .safetensors), "scale" (default 1)}) as files
+// and scales. Throws
 // std::invalid_argument naming the problem.
 image::Loras resolve_loras(std::string_view json, const std::vector<LoraChoice>& choices);
 

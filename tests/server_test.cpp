@@ -143,11 +143,12 @@ void lora_checks()
               choices[0].scale == 1.3f && choices[1].name == "a" && !choices[1].scale && choices[2].name == "b",
           "LoRA choices: start-up ones first (their name wins), then the directory's by name");
     using mako::server::resolve_loras;
-    const auto got = resolve_loras(R"([{"name":"b","scale":-0.5},{"name":"style"}])", choices);
+    const auto got = resolve_loras(R"([{"name":"b","scale":-0.5},{"name":"style.safetensors"}])", choices);
     check(got == mako::image::Loras{{(dir / "b.safetensors").string(), -0.5f}, {"/elsewhere/style.safetensors", 1.0f}},
-          "a request's LoRAs: files and scales in order, scale 1 by default");
+          "a request's LoRAs: files and scales in order, scale 1 by default, names with or without .safetensors");
     check(resolve_loras("[]", choices).empty(), "an empty list: no LoRAs");
-    for (const char* bad : {R"({"name":"a"})", R"([{"name":"../a"}])", R"([{"name":"notes"}])", R"([{"scale":1}])",
+    for (const char* bad : {R"({"name":"a"})", R"([{"name":"../a"}])", R"([{"name":"../a.safetensors"}])",
+                            R"([{"name":"notes"}])", R"([{"name":"a"},{"name":"a.safetensors"}])", R"([{"scale":1}])",
                             R"([{"name":"a","scale":"1"}])", R"([{"name":"a","scale":11}])",
                             R"([{"name":"a"},{"name":"a"}])"}) {
         bool threw = false;

@@ -727,7 +727,9 @@ image::Loras resolve_loras(std::string_view json, const std::vector<LoraChoice>&
     for (auto& e : v.get_array()) {
         if (!e.is_object() || !e.contains("name") || !e["name"].is_string())
             throw std::invalid_argument("each entry needs a \"name\"");
-        const std::string name = e["name"].get_string();
+        std::string name = e["name"].get_string();
+        if (name.ends_with(".safetensors"))
+            name.resize(name.size() - std::string_view(".safetensors").size());
         const auto it = std::ranges::find(choices, name, &LoraChoice::name);
         if (it == choices.end())
             throw std::invalid_argument(std::format("no LoRA named \"{}\" (GET /v1/images/loras lists them)", name));
