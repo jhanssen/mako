@@ -31,6 +31,9 @@ struct GenerateParams {
         uint64_t key = 0;
     };
     std::vector<PromptRows> input_rows;
+    // Sets the rows of the input-row spans that end past `reused` (the prompt tokens the context keeps) once that is
+    // known; spans within it are not read. Without it every span's rows must be set.
+    std::function<void(size_t reused, std::span<PromptRows> rows)> fill_rows;
     // Asked before each token is chosen (after the previous one reached on_token), with that position's logits
     // (n_vocab): a token >= 0 is taken instead of sampling, and a draft is kept only if it matches. -1: sample.
     std::function<int32_t(const float* logits)> forced;

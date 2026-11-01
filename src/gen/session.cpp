@@ -226,9 +226,15 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     rewind(common);
     res.reused_tokens = uint32_t(ctx_.size());
     // The engine reads the rows only while the prompt runs.
+    std::vector<GenerateParams::PromptRows> given = p.input_rows;
+    if (p.fill_rows)
+        p.fill_rows(ctx_.size(), given);
     std::vector<InputRows> rows;
-    for (const auto& r : p.input_rows)
+    for (const auto& r : given) {
+        if (!r.rows.rows && r.rows.pos + r.rows.count > ctx_.size())
+            throw std::logic_error("input rows the prompt reads are missing");
         rows.push_back(r.rows);
+    }
     e_->set_input_rows(rows);
     struct Unset {
         Model& e;

@@ -107,9 +107,9 @@ struct Server::Impl {
     // The rendered prompt with each image placeholder expanded to its image's rows (the images decoded and sized,
     // not yet encoded). Throws BadRequest without a projector.
     std::vector<int32_t> expand(ChatRequest& cr, std::vector<int32_t> prompt, Images& images) const;
-    // Encodes the images (or takes them from the cache) and points the request's input rows at them; the outputs
-    // are kept alive in `held`. In the request's turn.
-    void encode_images(Images& images, ChatRequest& cr,
+    // Encodes the images that end past the first `reused` prompt tokens (or takes them from the cache) and points
+    // their rows at them; the outputs are kept alive in `held`. In the request's turn.
+    void encode_images(const Images& images, size_t reused, std::span<gen::GenerateParams::PromptRows> rows,
                        std::vector<std::shared_ptr<const vision::Encoder::Output>>& held);
     std::list<std::pair<uint64_t, std::shared_ptr<const vision::Encoder::Output>>> image_cache; // recent first
     struct Outcome {
@@ -164,11 +164,14 @@ std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> 
     return std::move(out.tokens);
 }
 
-void Server::Impl::encode_images(Images& images, ChatRequest& cr,
+void Server::Impl::encode_images(const Images& images, size_t reused,
+                                 std::span<gen::GenerateParams::PromptRows> rows,
                                  std::vector<std::shared_ptr<const vision::Encoder::Output>>& held)
 {
     constexpr size_t kCached = 8;
     for (size_t i = 0; i < images.prepared.size(); ++i) {
+        if (rows[i].rows.pos + rows[i].rows.count <= reused)
+            continue;
         const uint64_t key = images.keys[i];
         auto it = std::ranges::find(image_cache, key, &decltype(image_cache)::value_type::first);
         std::shared_ptr<const vision::Encoder::Output> out;
@@ -184,12 +187,11 @@ void Server::Impl::encode_images(Images& images, ChatRequest& cr,
         image_cache.emplace_front(key, out);
         if (image_cache.size() > kCached)
             image_cache.pop_back();
-        if (out->rows != images.rows[i].rows.count)
+        if (out->rows != rows[i].rows.count)
             throw std::runtime_error("image rows differ from their placeholders");
-        images.rows[i].rows.rows = out->embd.data();
+        rows[i].rows.rows = out->embd.data();
         held.push_back(std::move(out));
     }
-    cr.gen.input_rows = images.rows;
 }
 
 bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& prompt, ChatRequest& cr,
@@ -263,8 +265,10 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
             return false;
         board.started(id);
         if (images && !images->prepared.empty()) {
-            encode_images(*images, cr, held);
-            p.input_rows = cr.gen.input_rows;
+            p.input_rows = images->rows;
+            p.fill_rows = [&](size_t reused, std::span<gen::GenerateParams::PromptRows> rows) {
+                encode_images(*images, reused, rows, held);
+            };
         }
         return true;
     };
