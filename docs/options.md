@@ -20,7 +20,8 @@ with their variables.
 
 `--preset NAME` applies a named set of options from `~/Library/Application Support/mako/presets.json` (`--presets
 FILE` for another file; `MAKO_PRESET` and `MAKO_PRESETS` when the command line names none); `presets.example.json`
-here has examples for both models.
+here has examples for both models. mako-image's programs read the same file, and their variables start with
+`MAKO_IMAGE_` instead (`MAKO_IMAGE_PORT`, `MAKO_IMAGE_PRESET`), so the two servers' settings stay apart.
 
 - Each `"--flag": value` entry becomes that option (`true`: the flag alone, `false`: left out), inserted where
   `--preset` stands, so later options override it and presets stack.
