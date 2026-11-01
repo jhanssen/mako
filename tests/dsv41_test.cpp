@@ -302,7 +302,10 @@ int main(int argc, char** argv)
                     for (size_t i = at + keep; i < end; ++i)
                         kc += kl(steps[i], engine.step(seq[i]));
                     kc /= double(end - at - keep);
-                    check(engine.position() == end && kv / keep < 0.02 && kc < 0.02,
+                    // Past the ring the rejected tokens' rows would sit in the window: the rollback restores
+                    // them exactly (KL 0; left in, 4e-4 to 2e-3).
+                    const double kc_max = at > W ? 1e-5 : 0.02;
+                    check(engine.position() == end && kv / keep < 0.02 && kc < kc_max,
                           std::format("verify of {} keeping {} (next position {}): rows vs steps KL {:.1e}, "
                                       "continuing after the rollback KL {:.1e}",
                                       width, keep, at + keep, kv / keep, kc));
