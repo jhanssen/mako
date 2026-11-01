@@ -2,21 +2,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint TG = 256;
-
-// Sum of `v` over a threadgroup of TG threads; every thread gets the total.
-static float tg_sum(float v, threadgroup float* scratch, uint tid)
-{
-    v = simd_sum(v);
-    if (tid % 32 == 0)
-        scratch[tid / 32] = v;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint lane = tid % 32;
-    float total = lane < TG / 32 ? scratch[lane] : 0.0f;
-    total = simd_sum(total);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return total;
-}
+#include "rows.h"
 
 static float tg_max(float v, threadgroup float* scratch, uint tid)
 {
@@ -30,35 +16,6 @@ static float tg_max(float v, threadgroup float* scratch, uint tid)
     m = simd_max(m);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return m;
-}
-
-static float sigmoidf(float x) { return 1.0f / (1.0f + exp(-x)); }
-
-struct NormArgs {
-    uint n;       // row length
-    uint wn;      // weight length (the weight repeats every wn elements); 0: no weight
-    float eps;
-    uint ystride; // rms_norm: y row stride in elements (0: n)
-};
-
-// y = x / sqrt(mean(x^2) + eps) * w (w of n, or none when wn is 0), one threadgroup per row; n a multiple of 4.
-kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
-                     device float* y [[buffer(2)]], constant NormArgs& a [[buffer(3)]],
-                     uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
-{
-    threadgroup float scratch[TG / 32];
-    device const float4* xr = reinterpret_cast<device const float4*>(x + uint64_t(row) * a.n);
-    device float4* yr = reinterpret_cast<device float4*>(y + uint64_t(row) * (a.ystride ? a.ystride : a.n));
-    device const float4* w4 = reinterpret_cast<device const float4*>(w);
-    const uint n4 = a.n / 4;
-    float s = 0.0f;
-    for (uint i = tid; i < n4; i += TG) {
-        const float4 v = xr[i];
-        s += dot(v, v);
-    }
-    const float inv = rsqrt(tg_sum(s, scratch, tid) / float(a.n) + a.eps);
-    for (uint i = tid; i < n4; i += TG)
-        yr[i] = xr[i] * inv * (a.wn ? w4[i] : float4(1.0f));
 }
 
 // y = (x - mean) / sqrt(var + eps) * w + b, one threadgroup per row.
@@ -681,68 +638,6 @@ kernel void l2_norm(device float* x [[buffer(0)]], constant L2Args& a [[buffer(1
         xr[i] *= scale;
 }
 
-struct ScanArgs {
-    uint head_dim;   // 128
-    uint tokens;
-    uint qkv_stride; // q, k, v elements between tokens
-    uint inner;      // g and o elements between tokens
-    uint heads;      // beta elements between tokens
-    uint snap;       // nonzero: also write the state after this many tokens to snap_state (for a rollback)
-};
-
-// One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
-//   S[i][:] *= exp(g[i]); delta[j] = (v[j] - sum_i S[i][j] k[i]) * beta
-//   S[i][j] += k[i] * delta[j];   o[j] = sum_i S[i][j] q[i] / sqrt(head_dim)
-// Threadgroups (heads, head_dim / 32) of 128 threads for rows j0..j0+31 of a head's M (rows are independent: row j
-// needs only the shared q, k, g and its own v[j]); four threads per row, each holding columns lane, lane + 4, ...
-// of it in registers for all the tokens. head_dim must be 128.
-kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
-                     device const float* v [[buffer(2)]], device const float* g [[buffer(3)]],
-                     device const float* beta [[buffer(4)]], device float* state [[buffer(5)]],
-                     device float* o [[buffer(6)]], constant ScanArgs& a [[buffer(7)]],
-                     device float* snap_state [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
-                     uint2 tid2 [[thread_position_in_threadgroup]])
-{
-    constexpr uint D = 128, ROWS = 32, LANES = 4, N = D / LANES;
-    threadgroup float qs[D], ks[D], eg[D];
-    const uint tid = tid2.x, h = tg.x, j0 = tg.y * ROWS, row = tid / LANES, lane = tid % LANES;
-    const uint base = h * D;
-    device float* Mg = state + uint64_t(h) * D * D + uint64_t(j0 + row) * D;
-    float M[N];
-    for (uint n = 0; n < N; ++n)
-        M[n] = Mg[lane + n * LANES];
-    for (uint t = 0; t < a.tokens; ++t) {
-        const uint64_t qo = uint64_t(t) * a.qkv_stride + base, go = uint64_t(t) * a.inner + base;
-        qs[tid] = q[qo + tid];
-        ks[tid] = k[qo + tid];
-        eg[tid] = exp(g[go + tid]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float sum = 0.0f;
-        for (uint n = 0; n < N; ++n) {
-            M[n] *= eg[lane + n * LANES];
-            sum += M[n] * ks[lane + n * LANES];
-        }
-        sum = quad_sum(sum);
-        const float delta = (v[qo + j0 + row] - sum) * beta[t * a.heads + h];
-        float out = 0.0f;
-        for (uint n = 0; n < N; ++n) {
-            M[n] += ks[lane + n * LANES] * delta;
-            out += M[n] * qs[lane + n * LANES];
-        }
-        out = quad_sum(out);
-        if (lane == 0)
-            o[go + j0 + row] = out * rsqrt(float(D));
-        if (t + 1 == a.snap) {
-            device float* Ss = snap_state + uint64_t(h) * D * D + uint64_t(j0 + row) * D;
-            for (uint n = 0; n < N; ++n)
-                Ss[lane + n * LANES] = M[n];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint n = 0; n < N; ++n)
-        Mg[lane + n * LANES] = M[n];
-}
-
 struct PrepArgs {
     uint channels;   // per projection (heads * head_dim)
     uint kernel_len; // conv taps, the last one multiplies the current token (at most 8)
@@ -972,31 +867,6 @@ kernel void store_half(device const float* x [[buffer(0)]], device half* y [[buf
         y[i] = half(x[i]);
 }
 
-struct SwigluArgs {
-    uint n;
-    float limit;   // <= 0: no clamp
-};
-
-// y = silu(min(g, limit)) * clamp(u, -limit, limit); g and u are [rows][n].
-template <typename T>
-kernel void swiglu(device const float* gt [[buffer(0)]], device const float* up [[buffer(1)]],
-                   device T* y [[buffer(2)]], constant SwigluArgs& a [[buffer(3)]],
-                   uint i [[thread_position_in_grid]])
-{
-    if (i >= a.n)
-        return;
-    float g = gt[i], u = up[i];
-    if (a.limit > 0.0f) {
-        g = min(g, a.limit);
-        u = clamp(u, -a.limit, a.limit);
-    }
-    y[i] = T(g * sigmoidf(g) * u);
-}
-template [[host_name("swiglu")]] kernel void swiglu<float>(device const float*, device const float*, device float*,
-                                                          constant SwigluArgs&, uint);
-template [[host_name("swiglu_half")]] kernel void swiglu<half>(device const float*, device const float*, device half*,
-                                                              constant SwigluArgs&, uint);
-
 struct Swiglu2Args {
     uint n0, n1;
     float limit0, limit1;
@@ -1156,13 +1026,6 @@ kernel void moe_combine_rows(device const float* x [[buffer(0)]], device const i
     for (uint e = 0; e < a.n_used; ++e)
         acc += w[t * 16 + e] * x[uint64_t(pos[t * 16 + e]) * a.n + i];
     y[uint64_t(t) * a.n + i] = acc;
-}
-
-kernel void add(device const float* x [[buffer(0)]], device const float* z [[buffer(1)]],
-                device float* y [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]])
-{
-    if (i < n)
-        y[i] = x[i] + z[i];
 }
 
 // R[h] = x for every stream h.
@@ -1372,21 +1235,6 @@ kernel void idx_select(device const float* score [[buffer(0)]], constant SelectA
         list[kept_total * a.kpool + (c - tail0)] = c;
     if (tid == 0)
         count[j] = kept_total * a.kpool + (a.n_kv - tail0);
-}
-
-// y[t * ldy + i] = x[t * n + i]; grid (n, rows).
-kernel void copy_rows(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint2& a [[buffer(2)]],
-                      uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x < a.x)
-        y[uint64_t(gid.y) * a.y + gid.x] = x[uint64_t(gid.y) * a.x + gid.x];
-}
-
-kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                     constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]])
-{
-    if (i < n)
-        y[i] = x[i];
 }
 
 struct AblateArgs {
