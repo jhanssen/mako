@@ -238,25 +238,35 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
                 return rb->forced(logits, nv);
             return parser.forced();
         };
-    // A line every kProgressEvery or more while a long prompt is read.
+    // A line every kProgressEvery or more while a long prompt is read, and one when it is done if any was logged.
     struct Reading {
-        std::chrono::steady_clock::time_point start, last;
-        size_t from = 0;
+        std::chrono::steady_clock::time_point start, last, seen;
+        size_t from = 0, total = 0, logged = 0;
         bool started = false;
     } reading;
     cr.gen.progress = [&](size_t read, size_t total) {
         const auto now = std::chrono::steady_clock::now();
         if (!reading.started) {
-            reading = {now, now, read, true};
+            reading = {now, now, now, read, total, 0, true};
             return;
         }
+        reading.seen = now;
         if (now - reading.last < kProgressEvery || read <= reading.from)
             return;
         reading.last = now;
+        reading.logged = read;
         const double s = std::chrono::duration<double>(now - reading.start).count();
         const double rate = double(read - reading.from) / s;
         log::info("{}: prompt read {} of {} tokens ({:.0f}%), {:.0f} tok/s, ~{:.0f} s left", id, read, total,
                   100.0 * read / total, rate, double(total - read) / rate);
+    };
+    const auto read_done = [&] {
+        if (!reading.logged || reading.logged >= reading.total)
+            return;
+        const double s = std::chrono::duration<double>(reading.seen - reading.start).count();
+        log::info("{}: prompt read {} of {} tokens (100%), {:.0f} tok/s", id, reading.total, reading.total,
+                  double(reading.total - reading.from) / s);
+        reading.logged = reading.total;
     };
     bool client_gone = false;
     gen::SessionPool::Pick pick;
@@ -290,8 +300,10 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
         ++generated;
         if (generated == 1 || generated % 64 == 0) {
             pool.snapshot();
-            if (generated == 1)
+            if (generated == 1) {
+                read_done();
                 board.decoding(id, cache());
+            }
             else
                 board.cache(cache());
         }
