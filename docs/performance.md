@@ -69,6 +69,38 @@ per speculative step (~1.95 tokens): GPU kernels ~36 ms, expert reads 10-19 ms (
 Since then a two-token step costs ~34 ms after 21.9K tokens (MTP drafts, Open). The big GEMVs already run at ~400
 GB/s of the 553 GB/s measured (614 GB/s specified); the estimated bandwidth floor is ~20 ms/step.
 
+Where the step goes (2026-11-08, 963-token prompt, 128 tokens, every expert resident, 23.1 ms/token, GPU 22.9; M5
+Max, 40 cores). The tensors read a token: dense 6.8 GB (Q6_K 6.26, F32 0.34, Q8_0 0.20) and 8 of 288 experts in 42
+layers 2.4 GB, 9.52 GB in all: 16.1 ms at the 590 GB/s the Q8_0, Q6_K and F32 GEMVs stream at in `gemv_bench`.
+Leaving dispatch groups out (`MAKO_REPEAT=<label substrings>:0`, which also runs the step without the multi-GEMV
+dispatches and the fused router: 24.3 ms against 22.9 merged; one thermal-gated run each, noise ~0.2 ms):
+
+| Left out | Saved | Its bytes at 590 GB/s |
+| --- | ---: | ---: |
+| routed experts (`expert`) | 6.2 ms | 4.05 ms |
+| KDA q/k/v (`gemv Q6_K 4096x8192`) | 5.2 | 4.75 |
+| MLA projections and attention, 11 layers | 2.9 | 1.92 |
+| KDA output (`gemv Q6_K 8192x4096`) | 2.2 | 1.58 |
+| shared experts (`gemv Q6_K 4096x2048,gemv Q6_K 2048x4096`) | 2.2 | 1.47 |
+| hyper-connection steps (`hc_step`, 90 dispatches) | 1.9 | 0.23 |
+| routing (`moe_route`, 42) | 1.5 | |
+| KDA scan, prep, conv, gate, norms | 1.4 | |
+| small Q8_0 projections (`gemv Q8_0`) | 1.1 | 0.36 |
+| output head | 1.1 | 0.88 |
+| rms_norm, swiglu, moe_combine | 0.2 | |
+| every small kernel above at once | 4.3 | |
+
+The groups overlap (their sum is more than the step), so the all-at-once run gives the small kernels' cost: 4.3 ms;
+the GEMVs' excess over the memory rate is the other ~3.9 (~2.5 with the merged dispatches). In isolation
+(`bench/hc_bench`, `bench/route_bench`) the hyper-connection step costs 12.2 us, 14.8 between 34 MB GEMVs (32
+threadgroups is the best of 8-64; its phase A 5.7 us, the one-threadgroup phase B 5.6), and the route dispatch adds
+11-13 us over the expert dispatch that follows it, fused into the router GEMV or not; the in-step costs above are 20
+and 36 us a dispatch, the rest the dependent chain. Expert dispatches at their real size (`gemv_bench`, 8 experts a
+dispatch): IQ2_XXS 410 GB/s, IQ2_S 401, IQ3_XXS 499, against 533 / 464 / 580 streaming at 64 experts and 588 for
+Q8_0; the fixed cost a dispatch from the two points 9.5 / 7.7 / 6.7 us against Q8_0's 4.7. Reading the grids from
+constant memory instead of filling a threadgroup table leaves IQ2_XXS and IQ3_XXS at the same rates, so the fixed
+cost is not the table fill.
+
 Dense re-quantization at load (`mako_run --dense-quant q5_k|q4_k`, or `MAKO_DENSE_QUANT`; every Q6_K and Q8_0
 dense matrix, from the stored Q6_K rows, unweighted), 512-token parity prompt against the reference (`regress_test
 parity`; the stored weights' decode numbers are the passing test's):
@@ -156,7 +188,9 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
     buffer, the embedding row gathered on the GPU): the remaining CPU gap between steps, ~0.2-0.3 ms.
   - Trimming dependent memory round trips inside the small kernels (loads issued before the waits they do not
     depend on, e.g. hc_step_norm's phase B reading R before the parts): ~0.8 us a round trip, ~1 ms across the
-    ~400 small dispatches at most.
+    ~400 small dispatches at most. `bench/hc_bench` (2026-11-08): hc_step_norm 12.2 us alone, 14.8 between 34 MB
+    GEMVs, ~20 in the step; phase A 5.7 us and the one-threadgroup phase B 5.6, so a shorter chain in B is worth
+    ~5 us of 90 dispatches, ~0.5 ms.
   - The IQ2_XXS kernel's ~9 us fixed cost a dispatch (the grid table into threadgroup memory before the first
     weight loads): issue the first weight loads before the table build. ~0.3 ms.
   - Several sequences a step (continuous batching in the server) for parallel agent requests: throughput, not
@@ -214,7 +248,8 @@ the sections below take it to ~25 by default.
 - Decode misses (~9 a step on Maya-S and 6-7 on ISTA IQ2_XS in the A/B runs above; 15-40 before read-ahead and the
   larger cache). Untried: experts pinned resident by their decode request rate (an EMA per route,
   the top share of each layer) beside the decayed score; another engine pins half of each layer for GLM-5.3 and has
-  it off for this model, unmeasured.
+  it off for this model, unmeasured. The trace replay (2026-11-08, above) puts the decayed score near the best of
+  its variants; a weaker profile seed (0.3x) is the one it favours.
 - Engram rows are read before the step's command buffer is made (`read_raw`, synchronous), both tables at once,
   though their consumers are layers 1 and 14. Decode's input reads are ~0.3 ms a step (telemetry), the most overlap
   can return there; prefill's are unmeasured: a group of 8192 tokens reads 393,216 rows with one `pread` each,
@@ -226,17 +261,12 @@ the sections below take it to ~25 by default.
 - The GPU waits once per layer for all its misses. Gating each miss's gate/up on its own bytes and its down on the
   rest would overlap compute with the remaining reads, but a miss's compute is tens of us against ~1 ms of reading:
   well under 1 ms a step (estimated).
-- Resident-expert GEMVs (planned 2026-10-26, bit-identical work only; ceiling ~2-3 ms a step, uncertain). The
-  resident-expert section runs at ~400 GB/s against ~560 for Q8_0 on the same bytes. Two measurements decide it:
-  1. `bench/chain_bench`: a mode for what a MoE layer's event signal and encoder boundary cost a step (40 a step).
-  2. `bench/gemv_bench`: the indexed IQ2_XXS (gate/up, 5120 x 2304) and IQ3_XXS (down, 2304 x 5120) kernels at
-     DeepSeek's shapes, 6 experts a dispatch (plus the merged job dispatch): streaming rate and fixed cost a
-     dispatch, against Q8_0 on the same shapes. GLM's shapes gave IQ2_XXS 527 GB/s + ~9 us a dispatch. The down rows
-     are 2304 wide: 72 blocks of 32, one a lane, is three passes of a simdgroup with 8 of 32 lanes busy in the
-     third (75% lane use; inferred from the kernel's layout, not measured).
-  If the bench shows >= 100 GB/s of headroom: kernels for those shapes (e.g. lanes over the 2304-wide rows without
-  the idle pass, the IQ2_XXS fixed cost), each checked bit-identical with `--logits-out` over per-position decode
-  and A/B timed (three pairs, no telemetry, equal misses); expected 1-2 ms. Below that: record the numbers and stop.
+- Resident-expert GEMVs (planned 2026-10-26; measured 2026-11-08 with `gemv_bench` and `route_bench`): the event
+  signal and encoder boundary after a layer's routing cost 8 us a layer, ~0.3 ms a step. At 6 experts a dispatch
+  IQ2_XXS 5120x2304 runs at 404 GB/s (539 streaming at 48, 11 us fixed a dispatch), IQ3_XXS 2304x5120 at 437 (495
+  streaming: the 2304-wide rows' idle lanes, 7.3 us fixed), Q8_0 at 564-580 (588 streaming, 4.7 us fixed). The
+  headroom at the real sizes is ~1.7 ms a step in all, so a kernel at Q8_0's rate and fixed cost would save that
+  much at most. Lanes over the 2304-wide rows without the idle pass: ~0.3 ms; not built.
 - DSpark (opt-in, `--dspark DIR`): greedy output identical to plain decoding (verify up to 8 tokens runs the decode
   path); measured before read-ahead (2026-10-25): 19.8 -> 22.5 tok/s on code (93% of drafts kept), 23.5 -> 22.8 on
   a story (70%), its 8 GB costing the cache ~9%. Draft rounds take ~11 ms (the reference engine's ~2.4). Measured groundwork (positions 600-900 of a prose text, 94.5 GB cache): a step of 1 / 2 / 4 /
@@ -263,6 +293,32 @@ the sections below take it to ~25 by default.
 
 Weights read per token: ~8.5 GB dense + ~2.5 GB routed experts = ~11 GB, ~19.6 ms at 560 GB/s; GPU compute is
 ~28-30 ms. A step issues ~1800 dispatches; a tiny dependent dispatch costs ~2 us, so ~3.6 ms is launch overhead.
+
+2026-11-08 (300-token prompt, 128 greedy steps, `ds_run --gen 128 --no-spec --telemetry parts`, 93.4 GB cache, 41.4
+ms a step, GPU 38.8, 8.2 misses): the tensors read a token are dense 8.1 GB (Q8_0 7.6; the Engram tables' rows
+aside) and 6 of 384 experts in 40 layers 2.5 GB, 11.1 GB, 18.8 ms at 590 GB/s. Parts a step: resident experts 9.75
+ms (4.14 GB with the shared experts: 7.0 at the rate), attention output 6.22 (3.06 GB: 5.2), attention q/kv 4.83
+(2.08 GB: 3.5), miss experts 3.82, router and routing 2.44 (0.3 GB: 0.5), attention core 2.17, hc and norm 1.49,
+Engram 0.64, compressor 0.28, combine and hc post 0.36. The parts sum to 32.0 against 38.8 of GPU time; the 6.8 ms
+between them is the waits for the SSD. `bench/route_bench` at this model's shapes: the router GEMV 15 us, the route
+15 more over the expert dispatch that follows it, the event signal after the routing 8 us a layer (the encoder
+boundary itself nothing): ~0.3 ms a step for the signals, so most of the router part's 61 us a layer is the chain
+and the part timestamps' inflation of small parts.
+
+Knobs measured the same day (45 s pause before each run, the thermal state nominal before it, the arms' order
+alternated). `--dense-quant q6_k`, a 6144-token prompt with a staged 2048-token tail then 300 steps: 41.8 / 42.0 ->
+39.2 / 39.2 ms a step (11.0 / 11.1 -> 10.8 misses: the cache gained 0.9 GB), the 2048-token prefill unchanged, but
+the 2048 tokens as steps of 8: 37.9 / 38.7 -> 40.4 / 40.7 s (+6%, the Q6_K multi-token path) and the load 10.4 ->
+18-19 s; the quality cost is the table above; the default stays Q8_0. Read-ahead, 300-token prompt then 300 steps:
+the defaults (`--prefetch 4 --prefetch-ahead 2`) 36.4 / 36.5 ms a step at 6.4 misses, against `--prefetch 0` 37.5 /
+37.6 (8.9 misses), 2: 37.6 / 37.3 (7.6), 3: 36.9 / 36.7 (6.9), 6: 36.7 / 36.6 (7.4), `--prefetch-ahead 1` 36.9 /
+37.0 (6.0: fewer misses, more waiting for reads in flight), 3: 36.9 / 36.8 (7.7). Eviction policy:
+`MAKO_ARENA_TRACE=file` records every ensure, touch and read-ahead with the initial residency and scores, and
+`tools/arena_replay` replays the arena's policy and variants over it. The replay's own baseline comes out 8.7 misses
+a step on the short prompt's trace against 6.4 recorded (the read-ahead's asynchronous publishing is not modelled)
+and 11.35 against 11.11 on the long one's; half-lives of 64-1024 steps, no decay, least recently used and reads ahead
+ignored come out within -7% and +30% of it, the profile seed at 0.3x -15% / -5% on the two traces, at 3-10x +25-70%.
+Nothing changed; a live A/B of the 0.3x seed is the one candidate.
 
 Dense re-quantization at load (`ds_run --dense-quant`, 1300 positions against the reference):
 

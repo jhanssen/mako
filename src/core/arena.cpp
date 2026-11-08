@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <exception>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <numeric>
@@ -149,6 +150,9 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     order_.assign(nl, {});
     usage_.assign(nl, std::vector<uint64_t>(n_expert, 0));
     evicted_at_.assign(nl, std::vector<uint64_t>(n_expert, 0));
+    n_used_ = n_used;
+    if (const char* p = std::getenv("MAKO_ARENA_TRACE"))
+        trace_ = std::fopen(p, "wb");
     // The profile only seeds the scores (a tenth of a use per count), so the session's recent routing soon
     // outweighs it.
     score_.assign(nl, std::vector<double>(n_expert, 0.0));
@@ -293,6 +297,8 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
 
 ExpertArena::~ExpertArena()
 {
+    if (trace_)
+        std::fclose(trace_);
     if (pf_thread_.joinable()) {
         pf_thread_.request_stop();
         pf_cv_.notify_all();
@@ -347,6 +353,7 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
 
 void ExpertArena::touch(uint32_t layer, std::span<const int> experts)
 {
+    trace('T', layer, experts, 0);
     static const double decay = std::exp2(-1.0 / 256);
     for (double& c : score_[layer])
         c *= decay;
@@ -431,6 +438,7 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
     }
     if (size_t(std::ranges::count(taken, 0)) < misses)
         return false;
+    trace('E', layer, experts, uint32_t(misses));
     ++clock_;
     // Each use adds 1; scores halve every 256 calls, so usage long past counts for little. (Measured on GLM-5.3:
     // leaving prefill out of the scores, or one update per prefill group, raised steady decode misses ~20%.)
@@ -521,6 +529,7 @@ void ExpertArena::prefetch(uint32_t layer, std::span<const int> experts)
     const uint32_t n_slots = slots_[layer];
     std::lock_guard lock(pf_m_);
     std::vector<char> taken(pinned_[layer]);
+    trace('P', layer, experts, 0);
     if (tails_[layer].bytes && !tails_[layer].mem)
         std::fill(taken.begin() + regions_[layer][0].split, taken.end(), 1);
     for (uint32_t s = 0; s < n_slots; ++s)
@@ -765,6 +774,38 @@ bool ExpertArena::reclaim()
             read_into(l, loads, true);
     }
     return all;
+}
+
+// The trace: "MAKOTRC1", n_layer, n_expert, n_used (u32); per layer its slot count (u32), the expert in each slot
+// (i32, -1 free) and the n_expert eviction scores (f32) as they stand at the first record; then records of a kind
+// byte ('E' ensure, 'T' touch, 'P' prefetch), layer, count and misses (u16) and the experts (u16).
+void ExpertArena::trace(char kind, uint32_t layer, std::span<const int> experts, uint32_t misses)
+{
+    if (!trace_)
+        return;
+    static std::mutex m;
+    std::lock_guard lock(m);
+    auto put = [&](const void* p, size_t n) { std::fwrite(p, 1, n, trace_); };
+    if (!trace_started_) {
+        trace_started_ = true;
+        put("MAKOTRC1", 8);
+        const uint32_t hdr[3] = {uint32_t(layers_.size()), n_expert_, n_used_};
+        put(hdr, sizeof(hdr));
+        for (size_t l = 0; l < layers_.size(); ++l) {
+            const uint32_t ns = uint32_t(slot_expert_[l].size());
+            put(&ns, 4);
+            put(slot_expert_[l].data(), size_t(ns) * 4);
+            const std::vector<float> s(score_[l].begin(), score_[l].end());
+            put(s.data(), s.size() * 4);
+        }
+    }
+    const uint16_t h[3] = {uint16_t(layer), uint16_t(experts.size()), uint16_t(misses)};
+    put(&kind, 1);
+    put(h, sizeof(h));
+    for (int e : experts) {
+        const uint16_t v = uint16_t(e);
+        put(&v, 2);
+    }
 }
 
 } // namespace mako::core

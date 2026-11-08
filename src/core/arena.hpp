@@ -7,6 +7,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -190,7 +191,11 @@ private:
     std::vector<std::vector<uint64_t>> last_use_;   // [layer][slot]
     std::vector<std::vector<char>> pinned_;         // [layer][slot]
     uint64_t clock_ = 0;
+    uint32_t n_used_ = 0;
     Stats stats_;
+    std::FILE* trace_ = nullptr; // MAKO_ARENA_TRACE: every ensure, touch and prefetch, for tools/arena_replay
+    bool trace_started_ = false;
+    void trace(char kind, uint32_t layer, std::span<const int> experts, uint32_t misses);
     std::unique_ptr<gguf::ReadPool> readers_;
 
     // Reads ahead: jobs (layer, expert, slot) done in order by one thread with its own readers. loading_ marks
