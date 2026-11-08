@@ -4,7 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--no-spin-wait] [--no-keepalive]
+//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--no-spin-wait] [--no-keepalive] [--no-page-cache]
 //              [--lookup-draft N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
@@ -90,7 +90,7 @@ int main(int argc, char** argv)
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
-    bool prefill_skip = true, spin_wait = true, keepalive = true;
+    bool prefill_skip = true, spin_wait = true, keepalive = true, page_cache = true;
     std::optional<mako::gguf::Type> dense_quant;
     const auto args =
         mako::app::Cli("mako_serve", "<model.gguf>", 1, 1)
@@ -123,6 +123,8 @@ int main(int argc, char** argv)
                   so.speculative)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   spin_wait)
+            .flag("--page-cache", "expert misses read through the page cache, so recently evicted experts return at memory speed (default on)",
+                  page_cache)
             .flag("--keepalive", "while idle, a small GPU kernel a second keeps the weights mapped (default on)", keepalive)
             .option("--lookup-draft", "N", "draft from repeats of the context matching N tokens or more (default 4; 0: off)",
                     so.lookup_match)
@@ -282,6 +284,7 @@ int main(int argc, char** argv)
             opts.prefetch_k = prefetch_k;
             opts.prefill_skip = prefill_skip;
             opts.spin_wait = spin_wait;
+            opts.page_cache = page_cache;
             opts.keepalive = keepalive;
             opts.prefetch_ahead = prefetch_ahead;
             opts.dense_imatrix = imatrix;
@@ -305,6 +308,7 @@ int main(int argc, char** argv)
             opts.stage_gb = stage_gb;
             opts.mtp = so.speculative;
             opts.spin_wait = spin_wait;
+            opts.page_cache = page_cache;
             opts.keepalive = keepalive;
             auto e = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
             so.prefill_piece = opts.prefill_group;

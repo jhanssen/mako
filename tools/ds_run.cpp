@@ -87,6 +87,8 @@ int main(int argc, char** argv)
             .flag("--spec", "speculative decoding in --gen (with --dspark; default on)", spec)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   opts.spin_wait)
+            .flag("--page-cache", "expert misses read through the page cache, so recently evicted experts return at memory speed (default on)",
+                  opts.page_cache)
             .option("--lookup-draft", "N", "--gen: draft from repeats of the context matching N tokens or more (default 4; 0: off)",
                     lookup_match)
             .option("--dspark", "DIR", "the drafter (dspark.json and dspark.bin)", opts.dspark)
@@ -290,10 +292,24 @@ int main(int argc, char** argv)
                     token = int32_t(std::ranges::max_element(l) - l.begin());
                 }
                 const auto st = engine.arena().stats();
-                std::println("then {} steps: {:.1f} ms a step, {:.1f} misses a step", tail_decode,
+                std::println("then {} steps: {:.1f} ms a step, {:.1f} misses a step, {:.1f} ms reading a step, {:.0f}% of the "
+                             "bytes at memory speed",
+                             tail_decode,
                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count() /
                                  double(tail_decode),
-                             double(st.misses - st1.misses) / double(tail_decode));
+                             double(st.misses - st1.misses) / double(tail_decode),
+                             (st.read_ms - st1.read_ms) / double(tail_decode),
+                             st.read_bytes > st1.read_bytes
+                                 ? 100.0 * double(st.cached_bytes - st1.cached_bytes) / double(st.read_bytes - st1.read_bytes)
+                                 : 0.0);
+                if (const double m = double(st.misses - st1.misses); m > 0) {
+                    auto pct = [&](uint64_t a, uint64_t b) { return 100.0 * double(a - b) / m; };
+                    std::println("  misses by evictions since the expert left: <512 {:.0f}%, <1024 {:.0f}%, <2048 {:.0f}%, "
+                                 "<4096 {:.0f}%, more {:.0f}%, never resident {:.0f}%",
+                                 pct(st.remiss[0], st1.remiss[0]), pct(st.remiss[1], st1.remiss[1]),
+                                 pct(st.remiss[2], st1.remiss[2]), pct(st.remiss[3], st1.remiss[3]),
+                                 pct(st.remiss[4], st1.remiss[4]), pct(st.never_resident, st1.never_resident));
+                }
                 st1 = st;
             }
             engine.restore(cp);

@@ -148,6 +148,7 @@ ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<Laye
     slots_.assign(nl, 0);
     order_.assign(nl, {});
     usage_.assign(nl, std::vector<uint64_t>(n_expert, 0));
+    evicted_at_.assign(nl, std::vector<uint64_t>(n_expert, 0));
     // The profile only seeds the scores (a tenth of a use per count), so the session's recent routing soon
     // outweighs it.
     score_.assign(nl, std::vector<double>(n_expert, 0.0));
@@ -311,7 +312,7 @@ ExpertArena::~ExpertArena()
     }
 }
 
-void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads)
+void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads, bool bulk)
 {
     const auto t0 = Clock::now();
     const LayerParts& L = layers_[layer];
@@ -325,14 +326,20 @@ void ExpertArena::read_into(uint32_t layer, std::span<const std::pair<int, int32
         for (int p = 0; p < 3; ++p)
             for (uint64_t off = 0; off < L[p].bytes; off += kReadChunk)
                 chunks.push_back({i, p, off, std::min(kReadChunk, L[p].bytes - off)});
+    std::atomic<uint64_t> cached{0};
     readers_->run(chunks.size(), [&](size_t i) {
         const Chunk& c = chunks[i];
         const auto [e, s] = loads[c.load];
         const Part& p = L[c.part];
         const Region& r = regions_[layer][c.part];
         const auto [buf, off] = r.at(uint32_t(s));
-        gguf::read_exact(p.fd, static_cast<char*>(buf->contents()) + off + c.off, c.bytes, p.file_off + uint64_t(e) * p.bytes + c.off);
+        const auto c0 = Clock::now();
+        gguf::read_exact(bulk ? p.bulk_fd : p.fd, static_cast<char*>(buf->contents()) + off + c.off, c.bytes,
+                         p.file_off + uint64_t(e) * p.bytes + c.off);
+        if (std::chrono::duration<double, std::micro>(Clock::now() - c0).count() < 120)
+            cached.fetch_add(c.bytes, std::memory_order_relaxed);
     });
+    stats_.cached_bytes += cached.load();
     stats_.read_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     for (const Part& p : L)
         stats_.read_bytes += loads.size() * p.bytes;
@@ -376,7 +383,7 @@ void ExpertArena::prefill()
             slot_expert_[l][s] = e;
             table[l * n_expert_ + e] = int32_t(s);
         }
-        read_into(l, loads);
+        read_into(l, loads, true);
     }
     stats_.prefill_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     stats_.read_ms = 0;
@@ -468,8 +475,16 @@ bool ExpertArena::ensure(uint32_t layer, std::span<const int> experts, int32_t* 
             if (us < uv || (us == uv && last[s] < last[victim]))
                 victim = int32_t(s);
         }
-        if (owner[victim] >= 0)
+        if (owner[victim] >= 0) {
             table[owner[victim]] = -1;
+            evicted_at_[layer][owner[victim]] = ++evictions_;
+        }
+        if (const uint64_t at = evicted_at_[layer][experts[i]]; at == 0)
+            ++stats_.never_resident;
+        else {
+            const uint64_t ago = evictions_ - at;
+            ++stats_.remiss[ago < 512 ? 0 : ago < 1024 ? 1 : ago < 2048 ? 2 : ago < 4096 ? 3 : 4];
+        }
         owner[victim] = experts[i];
         table[experts[i]] = victim;
         prefetched_slot_[layer][victim] = 0;
@@ -530,8 +545,10 @@ void ExpertArena::prefetch(uint32_t layer, std::span<const int> experts)
         }
         if (victim < 0)
             return;
-        if (owner[victim] >= 0)
+        if (owner[victim] >= 0) {
             table[owner[victim]] = -1;
+            evicted_at_[layer][owner[victim]] = ++evictions_;
+        }
         owner[victim] = e;
         last[victim] = clock_;
         taken[victim] = 1;
@@ -745,7 +762,7 @@ bool ExpertArena::reclaim()
             loads.emplace_back(e, int32_t(s));
         }
         if (!loads.empty())
-            read_into(l, loads);
+            read_into(l, loads, true);
     }
     return all;
 }

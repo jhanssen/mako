@@ -101,7 +101,7 @@ void Stager::work(std::stop_token st)
             for (int p = 0; p < 3; ++p) {
                 const ExpertArena::Part& part = arena_.part(job.layer, p);
                 for (uint64_t c = 0; c < part.bytes; c += kReadChunk)
-                    gguf::read_exact(part.fd, static_cast<char*>(buf_->contents()) + off + c,
+                    gguf::read_exact(part.bulk_fd, static_cast<char*>(buf_->contents()) + off + c,
                                      std::min(kReadChunk, part.bytes - c),
                                      part.file_off + uint64_t(job.expert) * part.bytes + c);
                 off += (part.bytes + kAlign - 1) / kAlign * kAlign;

@@ -44,6 +44,7 @@ struct Options {
     // budget uses this RAM size and a proportionally smaller GPU working set.
     double simulate_ram_gb = 0;
     bool spin_wait = true; // gpu::Runtime::set_spin_wait
+    bool page_cache = true; // expert misses through the page cache (EngineBase::set_page_cache)
     bool keepalive = false; // gpu::Runtime::set_keepalive (a server's engine: on)
 };
 

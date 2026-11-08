@@ -29,6 +29,7 @@ struct Options {
     core::Telemetry telemetry = core::Telemetry::off;
     double simulate_ram_gb = 0;
     bool spin_wait = true; // gpu::Runtime::set_spin_wait
+    bool page_cache = true; // expert misses through the page cache (EngineBase::set_page_cache)
     bool keepalive = false; // gpu::Runtime::set_keepalive (a server's engine: on)
     // The DSpark drafter (a directory with dspark.json and dspark.bin); empty: none. Drafts are offered while each
     // one's confidence is at least draft_conf and the product of theirs at least draft_cum, at most max_drafts.

@@ -152,6 +152,7 @@ struct Engine::Drafter {
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : EngineBase(model, ctx, opts.telemetry), cfg_(cfg), opts_(opts)
 {
+    set_page_cache(opts_.page_cache);
     dense_quant_ = opts_.dense_quant;
     if (!opts_.dense_imatrix.empty())
         load_importance(opts_.dense_imatrix);

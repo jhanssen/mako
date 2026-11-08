@@ -162,6 +162,9 @@ protected:
     // The ring's limit in GB (0: no staging; < 0: MAKO_STAGE_GB, else 3). Call in the derived constructor before
     // init_runtime().
     void set_staging_limit(double gb);
+    // Misses and reads ahead go through the page cache (default), so an expert evicted and wanted again soon comes
+    // back at memory speed; off: every expert read bypasses it. Before the experts tensors are opened.
+    void set_page_cache(bool on) { page_cache_ = on; }
     // For a prefill: scratch beyond 256 MB takes the memory of lendable arena slots meanwhile; at the end the scratch
     // buffers allocated since go and the slots are read again (unless memory pressure holds them).
     class ScratchLoan {
@@ -195,7 +198,11 @@ protected:
     Dims dims_;
     Routing routing_;
     std::vector<char> layer_mla_; // telemetry: the layer's attention counts as MLA (else KDA)
-    std::map<std::string, int> nocache_fds_; // shard path -> descriptor for expert reads
+    struct ShardFds {
+        int cached = -1, bulk = -1; // ExpertArena::Part::fd and bulk_fd; equal when the page cache is not used
+    };
+    std::map<std::string, ShardFds> expert_fds_; // shard path -> descriptors for expert reads
+    bool page_cache_ = true;
     std::unique_ptr<LockedMemory> simulated_; // before arena_: released after it
     // macOS memory-pressure level (0 normal, 1 warning, 2 critical), set from a dispatch source; applied between
     // steps by apply_pressure(), which lends the arena's lendable slots under pressure and takes them back after.

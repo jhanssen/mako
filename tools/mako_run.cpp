@@ -133,6 +133,8 @@ int main(int argc, char** argv)
             .flag("--spec", "speculative decoding with the MTP block (default off)", spec)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   opts.spin_wait)
+            .flag("--page-cache", "expert misses read through the page cache, so recently evicted experts return at memory speed (default on)",
+                  opts.page_cache)
             .option("--temp", "T", "sampling temperature (default 0: greedy)", sample(gp.sampling.temperature))
             .option("--top-k", "K", "sampling top-k", sample(gp.sampling.top_k))
             .option("--top-p", "P", "sampling top-p", sample(gp.sampling.top_p))

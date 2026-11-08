@@ -137,8 +137,11 @@ EngineBase::~EngineBase()
         dispatch_release(pressure_queue_);
     }
     arena_.reset();
-    for (auto& [path, fd] : nocache_fds_)
-        ::close(fd);
+    for (auto& [path, fds] : expert_fds_) {
+        if (fds.cached != fds.bulk)
+            ::close(fds.cached);
+        ::close(fds.bulk);
+    }
 }
 
 void EngineBase::init_runtime(ArenaInit init)
@@ -425,15 +428,21 @@ ExpertArena::Part EngineBase::expert(const std::string& name, bool prefill)
         throw std::runtime_error(std::format("{}: type {} has no prefill GEMM (experts: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, "
                                              "IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, F16, F32)",
                                              name, gguf::traits(t.type).name));
-    auto [it, fresh] = nocache_fds_.try_emplace(ref.file->path(), -1);
+    auto [it, fresh] = expert_fds_.try_emplace(ref.file->path());
     if (fresh) {
-        it->second = ::open(ref.file->path().c_str(), O_RDONLY);
-        if (it->second < 0)
-            throw std::runtime_error(std::format("open {}: {}", ref.file->path(), std::strerror(errno)));
-        ::fcntl(it->second, F_NOCACHE, 1);
+        auto open_shard = [&] {
+            const int fd = ::open(ref.file->path().c_str(), O_RDONLY);
+            if (fd < 0)
+                throw std::runtime_error(std::format("open {}: {}", ref.file->path(), std::strerror(errno)));
+            return fd;
+        };
+        it->second.bulk = open_shard();
+        ::fcntl(it->second.bulk, F_NOCACHE, 1);
+        it->second.cached = page_cache_ ? open_shard() : it->second.bulk;
     }
     ExpertArena::Part e;
-    e.fd = it->second;
+    e.fd = it->second.cached;
+    e.bulk_fd = it->second.bulk;
     e.file_off = t.offset;
     e.bytes = t.bytes / dims_.n_expert;
     e.type = t.type;

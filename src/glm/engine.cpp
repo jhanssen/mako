@@ -129,6 +129,7 @@ struct Engine::Layer {
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
     : EngineBase(model, ctx, opts.telemetry), cfg_(cfg), opts_(opts)
 {
+    set_page_cache(opts_.page_cache);
     const auto t_load = Clock::now();
     dims_ = {cfg_.n_embd, cfg_.n_layer, cfg_.hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, cfg_.rms_eps,
              cfg_.n_expert, cfg_.n_expert_used, cfg_.n_ff_exp};

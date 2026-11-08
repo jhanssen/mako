@@ -4,6 +4,10 @@
 
 The expert cache takes what is available at startup within a margin (a quarter of RAM from 96 GB up, 40% below).
 `--arena-gb N` fixes its size; `--stage-gb N` limits the ring a prompt's missing experts are read ahead into.
+`--page-cache` (default on; `--no-page-cache` to bypass it): a step's expert misses and reads ahead go through the
+OS page cache, so an expert evicted from the expert cache and wanted again soon comes back at memory speed when RAM is
+left over beyond it (performance.md: -12% a step with 19 GB left over, nothing measurable when the expert cache takes
+what is free); filling the expert cache and a prompt's staged reads bypass the page cache either way.
 
 ## Waiting for the GPU
 

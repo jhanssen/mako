@@ -56,7 +56,10 @@ private:
 class ExpertArena {
 public:
     struct Part {
-        int fd = -1;              // F_NOCACHE descriptor of the shard
+        int fd = -1;              // descriptor for misses and reads ahead: through the page cache, so an expert evicted
+                                  // and wanted again soon comes back at memory speed
+        int bulk_fd = -1;         // F_NOCACHE descriptor for the bulk reads (filling the arena, staging), which would
+                                  // only push useful pages out of the cache; may equal fd
         uint64_t file_off = 0;    // expert 0's bytes in the file
         uint64_t bytes = 0;       // one expert's bytes
         gguf::Type type = gguf::Type::F32;
@@ -77,6 +80,10 @@ public:
     };
     struct Stats {
         uint64_t hits = 0, misses = 0, read_bytes = 0;
+        uint64_t cached_bytes = 0; // of read_bytes: chunks back in under 120 us, the page cache's, not the SSD's
+        // Misses by how many evictions (any layer) ago the expert was evicted: under 512, 1024, 2048, 4096, more;
+        // never_resident: not evicted before (never resident, or prefilled out at load).
+        uint64_t remiss[5] = {0, 0, 0, 0, 0}, never_resident = 0;
         double read_ms = 0, prefill_ms = 0;
         uint64_t prefetched = 0, prefetch_used = 0; // experts read ahead; of those, selected before eviction
         double prefetch_wait_ms = 0;                // ensure() waiting for a read ahead still in flight
@@ -155,7 +162,7 @@ public:
     const std::vector<std::vector<uint64_t>>& usage() const { return usage_; }
 
 private:
-    void read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads); // (expert, slot)
+    void read_into(uint32_t layer, std::span<const std::pair<int, int32_t>> loads, bool bulk = false); // (expert, slot)
 
     std::vector<LayerParts> layers_;
     std::vector<std::array<Region, 3>> regions_;
@@ -163,6 +170,8 @@ private:
     std::vector<uint32_t> slots_;              // per layer
     std::vector<std::vector<int32_t>> order_;  // per layer, experts in prefill order
     std::vector<std::vector<uint64_t>> usage_;
+    std::vector<std::vector<uint64_t>> evicted_at_; // [layer][expert]: evictions_ when it was last evicted, 0 never
+    uint64_t evictions_ = 0;
     std::vector<std::vector<double>> score_;   // decayed usage, seeded from the profile: the least scored resident is evicted
     uint64_t bytes_ = 0;
     std::vector<std::pair<void*, uint64_t>> chunks_;
