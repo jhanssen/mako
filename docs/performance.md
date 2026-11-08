@@ -34,6 +34,7 @@ evening in both arms, so single runs or runs hours apart are not comparable.
 | Independent GEMVs of one input in one dispatch (`mako_mul_mv_jobs`: a job table of GPU addresses, each job its format's kernel over its own threadgroups, 4 simdgroups a threadgroup, every row summed as before): KDA q/k/v + f_a/g_a + beta; routed gate + up + the shared gate/up, both swiglus (`swiglu2`), routed down + shared down; MLA q_a + kv_a + the indexer's key, gate and weights, then q_b + the indexer's query | 24.8-25.3 -> 23.1 ms/token (three A/B pairs, 43.3 tok/s); tokens identical, e2e tests unchanged. ~8 us a merged-away dispatch: one ramp-up and tail for the group, the IQ2_XXS fixed cost once, the small Q6_K and Q8_0 GEMVs hidden under the large ones |
 | Decode GEMVs row-invariant (a token's bits the same whether it runs alone or with up to 7 others, for batching several sequences): Q6_K always through mako's 1- and 2-token kernel with multiply-add fusion off (1 token used the per-format kernel, which the 2-token kernel did not match); the short-row kernel to 8 tokens. `gemv_rows` checks every format through the plain, multi-GEMV and indexed paths | no speculative decoding 23.1 -> 23.2 ms/token, speculative ~19.8 -> ~20.05 (three and four clean runs; within their spread); e2e tests unchanged |
 | The step's wait for the GPU spins on the command buffer's status, at most 250 ms, before blocking (`--spin-wait`, default on) | with drafts, every expert resident: 31.5 / 31.4 / 31.4 -> 31.3 / 31.4 / 31.4 ms/step (three A/B pairs, 128 tokens after a 557-token prompt): nothing measurable. perf_check decode -0.6%, prefill -1.4% for the whole 2026-11-08 set of changes against 73edbb1 |
+| mako's own IQ2_S decode kernel for the 34 IQ2_S down projections (mako-common: the per-format kernel's layout and summation order, the grid as half4 pairs in constant memory, the signs by negation; the IQ2_XXS and IQ3_XXS kernels read their grids the same way now, with no threadgroup table) | `gemv_bench 2048 4096`: 401 -> 446 GB/s at 8 experts a dispatch, 455 -> 531 at 64; bit-identical to the per-format kernel (gemv_own, gemv_rows). Decode 23.1 / 22.9 / 23.0 -> 22.8 / 22.8 / 22.7 ms/token (three A/B pairs, 300 tokens after a 963-token prompt, every expert resident). IQ2_XXS (410 / 515 GB/s) and IQ3_XXS (500 / 571) are unchanged by their grids' move, so their fixed cost a dispatch is not the table fill |
 
 Where a short-prompt decode step goes (2026-10-26, 789-token prompt, 128 tokens, every expert resident, 25.0
 ms/token; ~9.6 GB read a token, ~17.4 ms at 553 GB/s). Each line is the step time saved by leaving those dispatches
@@ -182,8 +183,6 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
   - More independent GEMVs in one dispatch (`mako_mul_mv_jobs`): f_b + g_b (rows of 128: the job kernel needs the
     short-row kernel as a job type), the MLA per-head k_b and v_b with their neighbours, hc_mean + the output norm.
     ~0.3 ms.
-  - An IQ2_S decode kernel at the IQ3_XXS kernel's rate (463 -> ~580 GB/s on the 34 down projections): ~0.5 ms;
-    the IQ3_XXS rewrite was not bit-identical (compiler fusion), so expect a re-baseline.
   - Sampling on the GPU with the next step encoded and committed before this one ends (the token read from a
     buffer, the embedding row gathered on the GPU): the remaining CPU gap between steps, ~0.2-0.3 ms.
   - Trimming dependent memory round trips inside the small kernels (loads issued before the waits they do not
@@ -191,8 +190,8 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
     ~400 small dispatches at most. `bench/hc_bench` (2026-11-08): hc_step_norm 12.2 us alone, 14.8 between 34 MB
     GEMVs, ~20 in the step; phase A 5.7 us and the one-threadgroup phase B 5.6, so a shorter chain in B is worth
     ~5 us of 90 dispatches, ~0.5 ms.
-  - The IQ2_XXS kernel's ~9 us fixed cost a dispatch (the grid table into threadgroup memory before the first
-    weight loads): issue the first weight loads before the table build. ~0.3 ms.
+  - The IQ2_XXS kernel's ~10 us fixed cost a dispatch (Q8_0's is 4.7): not the grid table's fill, since the grid
+    read from constant memory (landed 2026-11-08) leaves it unchanged. Unexplained; ~0.4 ms at Q8_0's.
   - Several sequences a step (continuous batching in the server) for parallel agent requests: throughput, not
     latency; the kernels take T <= 8 rows already, the KDA/MLA state and the session API do not.
   - An exact top-k head from a low-bit sketch (bounded error per row from the quantization residual and ||x||)
@@ -204,6 +203,7 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
 
 | Change | Effect |
 | --- | --- |
+| mako's own IQ2_S decode kernel (mako-common; the 8 layers whose gate and up experts are IQ2_S, 346 MiB a token) and the i-quant grids in constant memory | `gemv_bench 5120 2304 iq2_s`: 425 GB/s at 6 experts a dispatch, 541 at 48 (the per-format kernel ~400 / 455). 36.5 / 37.0 -> 36.2 / 36.0 ms a step (two A/B pairs, 300 steps after a 300-token prompt, 6.4 misses a step in both arms): within this measurement's ~0.5 ms spread, consistent in direction |
 | Shared runtime with GLM (arena, decode MoE with CPU-served misses, MoE prefill) | decode 21 tok/s on a short prompt at first run (46.9 ms/step, 14.5 ms of it reading ~13 missing experts) |
 | One T-token layer path for decode and prefill; attention reads window and compressed keys in place | prefill working: 1300 tokens 111 tok/s before tuning |
 | Attention through matmul2d (half operands staged in threadgroup memory, float accumulation) | attention section 2.5 s -> 0.83 s on 1300 tokens; prefill 130 tok/s; KL vs the reference unchanged (0.0061) |
