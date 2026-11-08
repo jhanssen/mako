@@ -43,6 +43,8 @@ struct Options {
     // Nonzero: behave as on a Mac with this much RAM (GB): the difference is locked before loading, and the memory
     // budget uses this RAM size and a proportionally smaller GPU working set.
     double simulate_ram_gb = 0;
+    bool spin_wait = true; // gpu::Runtime::set_spin_wait
+    bool keepalive = false; // gpu::Runtime::set_keepalive (a server's engine: on)
 };
 
 // Decode, one token per step. Dense weights are resident; routed experts live in an expert arena, and the ones

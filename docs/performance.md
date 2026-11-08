@@ -464,8 +464,12 @@ Residency sets (`MTLResidencySet` with the arena's buffers) did not help:
 | `requestResidency` only (set not attached to the queue) | ~355 ms | normal |
 | set attached to the command queue, with or without `requestResidency`, with or without the arena's `mlock` | - | the first request timed out (> 90 s) |
 
-Not pursued: a keep-alive (touching the arena about once a second while idle) would likely remove the ~0.35 s, but adds
-a periodic GPU wake-up and its management for a cost paid only after pauses. Left as it is.
+A keepalive removes it (2026-11-08, `bench/idle_bench`, GLM-5.3 with a 27 GB arena while another process held 34 GB;
+the step after 10 s idle, two runs each): nothing 281 / 294 ms, an empty one-threadgroup kernel a second 279 / 305
+(it is not the queue that goes cold), a kernel a second reading one word per 1 MiB of the resident weights and the
+arena's buffers 78 / 80 ms, the warm step's 79; per 64 KiB and per 16 KiB the same. That kernel ran 0.3 ms of GPU a
+second for 24 GB (~1.5 ms for a full arena). `mako_serve` runs it while no request is generating (`--no-keepalive`
+turns it off; `gpu::Runtime::set_keepalive`).
 
 ## Apple10 (M5) versus Apple9 (M3/M4)
 

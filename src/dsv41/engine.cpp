@@ -302,6 +302,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
 
     load_.dense_ms = ms_since(t_load);
     set_staging_limit(opts_.stage_gb);
+    set_spin_wait(opts_.spin_wait);
     ArenaInit init;
     for (const auto& L : layers_)
         init.parts.push_back(L->experts);
@@ -314,6 +315,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     init.simulate_ram_gb = opts_.simulate_ram_gb;
     init.expert_counts = opts_.expert_counts;
     init_runtime(std::move(init));
+    set_keepalive(opts_.keepalive);
 }
 
 Engine::~Engine() = default;

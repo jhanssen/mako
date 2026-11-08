@@ -131,6 +131,8 @@ int main(int argc, char** argv)
             .option("--top", "K", "top logits to print (default 5)", top)
             .option("--ctx", "N", "the context length in tokens", opts.max_ctx)
             .flag("--spec", "speculative decoding with the MTP block (default off)", spec)
+            .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
+                  opts.spin_wait)
             .option("--temp", "T", "sampling temperature (default 0: greedy)", sample(gp.sampling.temperature))
             .option("--top-k", "K", "sampling top-k", sample(gp.sampling.top_k))
             .option("--top-p", "P", "sampling top-p", sample(gp.sampling.top_p))

@@ -129,6 +129,7 @@ void EngineBase::end_staging()
 
 EngineBase::~EngineBase()
 {
+    set_keepalive(false); // before the arena it reads goes
     if (pressure_src_) {
         dispatch_source_cancel(pressure_src_);
         dispatch_sync_f(pressure_queue_, nullptr, [](void*) {}); // a running handler finishes first
@@ -240,6 +241,16 @@ void EngineBase::init_runtime(ArenaInit init)
     cb->commit();
     cb->waitUntilCompleted();
     arena_plan_.warm_ms = ms_since(t0);
+    {
+        // What the idle keepalive reads a word of: the resident weights and the arena's fixed buffers (its lendable
+        // slots come and go).
+        std::vector<MTL::Buffer*> bufs;
+        for (const auto& b : weight_chunks_)
+            bufs.push_back(b.get());
+        for (const auto& b : arena_->buffers())
+            bufs.push_back(b.get());
+        keepalive_buffers(std::move(bufs));
+    }
 
     load_.prefill_ms = arena_->stats().prefill_ms;
     load_.warm_ms = arena_plan_.warm_ms;

@@ -28,6 +28,8 @@ struct Options {
     std::string expert_counts;     // routing profile; empty: the model's default one when it exists
     core::Telemetry telemetry = core::Telemetry::off;
     double simulate_ram_gb = 0;
+    bool spin_wait = true; // gpu::Runtime::set_spin_wait
+    bool keepalive = false; // gpu::Runtime::set_keepalive (a server's engine: on)
     // The DSpark drafter (a directory with dspark.json and dspark.bin); empty: none. Drafts are offered while each
     // one's confidence is at least draft_conf and the product of theirs at least draft_cum, at most max_drafts.
     std::string dspark;

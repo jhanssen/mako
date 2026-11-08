@@ -5,6 +5,17 @@
 The expert cache takes what is available at startup within a margin (a quarter of RAM from 96 GB up, 40% below).
 `--arena-gb N` fixes its size; `--stage-gb N` limits the ring a prompt's missing experts are read ahead into.
 
+## Waiting for the GPU
+
+`--spin-wait` (default on; `--no-spin-wait` to block instead): the thread that runs a step spins on the command
+buffer's status until the GPU finishes it, at most 250 ms, then blocks. A blocking wait's thread wake costs ~0.5 ms a
+step, the whole CPU gap between steps; spinning holds a core for the step's GPU time instead.
+
+`--keepalive` (`mako_serve`, default on; `--no-keepalive` turns it off): while no request is generating, a kernel a
+second reads one word per MiB of the resident weights and the expert cache, which keeps the GPU's mappings of them.
+Without it the first step after a few seconds idle took ~0.3 s instead of the usual tens of ms (performance.md); the
+kernel costs ~1.5 ms of GPU a second.
+
 ## Presets and the environment
 
 The tools (`mako_serve`, `mako_calibrate`, `mako_run`, `ds_run`, `prefill_sweep`) take their options

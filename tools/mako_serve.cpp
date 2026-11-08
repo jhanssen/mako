@@ -4,7 +4,7 @@
 //              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
-//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N]
+//              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--no-spin-wait] [--no-keepalive]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -89,7 +89,7 @@ int main(int argc, char** argv)
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
-    bool prefill_skip = true;
+    bool prefill_skip = true, spin_wait = true, keepalive = true;
     std::optional<mako::gguf::Type> dense_quant;
     const auto args =
         mako::app::Cli("mako_serve", "<model.gguf>", 1, 1)
@@ -120,6 +120,9 @@ int main(int argc, char** argv)
             .option("--max-waiting", "N", "requests that may wait before new ones are refused", so.max_waiting)
             .flag("--spec", "speculative decoding (GLM-5.3's MTP block, DeepSeek-V4.1 with --dspark; default on)",
                   so.speculative)
+            .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
+                  spin_wait)
+            .flag("--keepalive", "while idle, a small GPU kernel a second keeps the weights mapped (default on)", keepalive)
             .option("--dspark", "DIR", "DeepSeek-V4.1's drafter (dspark.json and dspark.bin)", dspark)
             .option("--engram", "FILE", "DeepSeek-V4.1: the Engram tables of another GGUF (default: the model's own)",
                     engram)
@@ -275,6 +278,8 @@ int main(int argc, char** argv)
             opts.miss_penalty = miss_penalty;
             opts.prefetch_k = prefetch_k;
             opts.prefill_skip = prefill_skip;
+            opts.spin_wait = spin_wait;
+            opts.keepalive = keepalive;
             opts.prefetch_ahead = prefetch_ahead;
             opts.dense_imatrix = imatrix;
             opts.dense_quant = dense_quant;
@@ -296,6 +301,8 @@ int main(int argc, char** argv)
             opts.park_gb = park_gb;
             opts.stage_gb = stage_gb;
             opts.mtp = so.speculative;
+            opts.spin_wait = spin_wait;
+            opts.keepalive = keepalive;
             auto e = std::make_unique<mako::glm::Engine>(*model, *cfg, opts, ctx);
             so.prefill_piece = opts.prefill_group;
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;

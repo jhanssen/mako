@@ -84,6 +84,8 @@ int main(int argc, char** argv)
             .option("-n", "N", "then N greedy tokens", gen)
             .option("--gen", "N", "N greedy tokens through a generation session after the ids", session_n)
             .flag("--spec", "speculative decoding in --gen (with --dspark; default on)", spec)
+            .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
+                  opts.spin_wait)
             .option("--dspark", "DIR", "the drafter (dspark.json and dspark.bin)", opts.dspark)
             .option("--max-drafts", "N", "drafts a step at most", opts.max_drafts)
             .option("--draft-conf", "F", "the confidence a draft needs", opts.draft_conf)
