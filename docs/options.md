@@ -8,13 +8,13 @@ The expert cache takes what is available at startup within a margin (a quarter o
 ## Waiting for the GPU
 
 `--spin-wait` (default on; `--no-spin-wait` to block instead): the thread that runs a step spins on the command
-buffer's status until the GPU finishes it, at most 250 ms, then blocks. A blocking wait's thread wake costs ~0.5 ms a
-step, the whole CPU gap between steps; spinning holds a core for the step's GPU time instead.
+buffer's status until the GPU finishes it, at most 250 ms, then blocks. Measured 0.1-0.4 ms a step on DeepSeek-V4.1
+and nothing on GLM-5.3 (performance.md); spinning holds a core for the step's GPU time.
 
 `--keepalive` (`mako_serve`, default on; `--no-keepalive` turns it off): while no request is generating, a kernel a
 second reads one word per MiB of the resident weights and the expert cache, which keeps the GPU's mappings of them.
-Without it the first step after a few seconds idle took ~0.3 s instead of the usual tens of ms (performance.md); the
-kernel costs ~1.5 ms of GPU a second.
+Without it the first step after a few seconds idle took ~0.37 s with a 75 GB expert cache instead of the usual tens
+of ms (performance.md); the kernel costs ~0.3 ms of GPU a second per 24 GB.
 
 ## Presets and the environment
 
