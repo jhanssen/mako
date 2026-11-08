@@ -228,6 +228,15 @@ protected:
     void note_resident();
     std::shared_ptr<Stager> stager_; // also held by the completion handlers of command buffers that read it
     uint64_t stage_bytes_ = 3ull << 30;
+    // After a staged prefill: the experts its last kTailRows rows selected (per arena row, the last row's first),
+    // read ahead by prefetch_tail() when the first step after it starts. Staging leaves the arena as the steps shaped
+    // it, and the steps after a long prompt first miss on what its last rows used.
+    static constexpr uint32_t kTailRows = 8;
+    std::vector<std::vector<int>> tail_sel_;
+    bool tail_pending_ = false;
+    // Called at the start of a decode step (the prefill's scratch loans are back, the GPU idle): nothing when no
+    // staged prefill came before. Results are unchanged.
+    void prefetch_tail();
 
     RouteOverride route_override_;
     LoadStats load_;

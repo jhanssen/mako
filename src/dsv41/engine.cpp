@@ -876,6 +876,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
     if (pos_ + G > opts_.max_ctx)
         throw std::runtime_error("context full");
     apply_pressure();
+    if (G <= kMaxDecodeTokens)
+        prefetch_tail();
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, chunk = std::min(opts_.prefill_chunk, G);
     // MoE with GPU routing and served misses, no expert GEMMs; rows taking input rows route in moe_prefill (bias_vl).
     bool decode = G <= kMaxDecodeTokens;

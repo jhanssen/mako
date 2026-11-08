@@ -890,6 +890,7 @@ void Engine::decode_tokens(std::span<const int32_t> tokens)
     if (T == 0 || T > kMaxDecodeTokens || (T > 1 && (probe_ || stream_override_ || route_override_)))
         throw std::runtime_error("bad decode step");
     apply_pressure();
+    prefetch_tail();
     if (pos_ + T > opts_.max_ctx)
         throw std::runtime_error("context full");
     for (int32_t token : tokens)
