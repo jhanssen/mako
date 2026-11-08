@@ -179,6 +179,11 @@ the KDA q/k/v projections (2.8 GB of the 7.1), would cost less quality; neither 
   per-step time read as per token (fixed: it now reports steps and tokens run a step). A gate that stops drafting
   below break-even would matter only for requests whose acceptance falls under a third; the server logs each
   request's share of drafts kept, so look there before building one.
+  A second draft from the block run once more on its own output (`Engine::mtp_draft_chain`, counted by `mako_run
+  --mtp-stats`, 2026-11-08, 300 greedy tokens): after a matching first guess it matches the greedy token 71% of the
+  time on code (first guess 94%), 46% on a story (70%), 27% on the long test text (72%). A three-token step at ~41 ms
+  (the third token costing what the second does, ~9 ms) would give 15.7 ms a token on code against 16.6 with one
+  draft, and 20.2 / 21.5 against 18.9 / 18.8 on the two prose texts: not built.
 - Decode at ~23.2 ms/token, the weights ~16.3 ms of it. Not built, by expected gain:
   - More independent GEMVs in one dispatch (`mako_mul_mv_jobs`): f_b + g_b (rows of 128: the job kernel needs the
     short-row kernel as a job type), the MLA per-head k_b and v_b with their neighbours, hc_mean + the output norm.

@@ -72,6 +72,10 @@ public:
     // Tells the next-token block that the token after position() - 1 is `next`: refills its attention cache there
     // (the last draft may have assumed another token). No-op without the block or at position 0.
     void mtp_seed(int32_t next) override;
+    // The block's guess for the token after its own last guess `draft`: it runs once more, at the next position,
+    // from its own final hidden state and draft's embedding (a second draft from a block trained for one; mako_run
+    // --mtp-stats measures how often it holds). The cache row it writes is overwritten by the next draft.
+    int32_t mtp_draft_chain(int32_t draft);
     // The logits behind the last draft (valid until the next one).
     std::span<const float> mtp_logits();
     bool has_mtp() const override { return layers_.size() > cfg_.n_layer; }
@@ -128,7 +132,8 @@ public:
 private:
     struct Layer;
 
-    int32_t mtp_run(std::span<const int32_t> next, uint32_t row0);
+    int32_t mtp_run(std::span<const int32_t> next, uint32_t row0, bool chain = false);
+    uint32_t mtp_last_pos_ = 0, mtp_last_row_ = 0; // the last mtp_run's last position and hidden row
     void kda(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
              uint32_t T);
     void mla(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,

@@ -1181,18 +1181,18 @@ void Engine::load_positions(uint32_t pos, std::span<const std::byte> data)
 
 // The next-token block over the last step's hidden rows row0.. (positions last_pos0_ + row0..), each followed by
 // next[i]; returns the guess after the last.
-int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)
+int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0, bool chain)
 {
     const uint32_t T = uint32_t(next.size());
     if (!has_mtp() || pos_ == 0)
         return -1;
-    if (T == 0 || row0 + T > last_tokens_)
+    if (T == 0 || (!chain && row0 + T > last_tokens_) || (chain && T != 1))
         throw std::runtime_error("next-token block: more tokens than the last step had");
     for (int32_t token : next)
         if (token < 0 || uint32_t(token) >= cfg_.n_vocab)
             throw std::runtime_error("token out of range");
     const Layer& L = *layers_[cfg_.n_layer];
-    const uint32_t E = cfg_.n_embd, il = cfg_.n_layer, pos = last_pos0_ + row0;
+    const uint32_t E = cfg_.n_embd, il = cfg_.n_layer, pos = chain ? mtp_last_pos_ + 1 : last_pos0_ + row0;
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     const uint64_t rows = kMaxDecodeTokens;
     MTL::Buffer* e = scratch("mtp_e", rows * E * 4);
@@ -1217,11 +1217,12 @@ int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)
     cur_layer_ = cfg_.n_layer;
     MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
     // Row i: [enorm(embedding of next[i]); hnorm(the step's post-norm hidden state row row0 + i, still in "xn")]
-    // -> eh_proj, at the step's position row0 + i.
-    MTL::Buffer* h = scratch("xn", rows * E * 4);
+    // -> eh_proj, at the step's position row0 + i. Chained: the block's own last hidden row (still in r) instead.
+    MTL::Buffer* h = chain ? r : scratch("xn", rows * E * 4);
     for (uint32_t i = 0; i < T; ++i) {
+        const uint32_t hrow = chain ? mtp_last_row_ : row0 + i;
         norm(enc, e, &L.enorm, cat, 1, E, E, cfg_.rms_eps, uint64_t(i) * E * 4, uint64_t(i) * 2 * E * 4);
-        norm(enc, h, &L.hnorm, cat, 1, E, E, cfg_.rms_eps, uint64_t(row0 + i) * E * 4, uint64_t(2 * i + 1) * E * 4);
+        norm(enc, h, &L.hnorm, cat, 1, E, E, cfg_.rms_eps, uint64_t(hrow) * E * 4, uint64_t(2 * i + 1) * E * 4);
     }
     gemv(enc, L.eh_proj, cat, 0, r, 0, 1, T);
     norm(enc, r, &L.attn_norm, xn, T, E, E, cfg_.rms_eps);
@@ -1238,8 +1239,16 @@ int32_t Engine::mtp_run(std::span<const int32_t> next, uint32_t row0)
     finish(cb);
     const auto* l = static_cast<const float*>(lg->contents());
     const int32_t draft = int32_t(std::max_element(l, l + cfg_.n_vocab) - l);
+    mtp_last_pos_ = pos + T - 1;
+    mtp_last_row_ = T - 1;
     pool->release();
     return draft;
+}
+
+int32_t Engine::mtp_draft_chain(int32_t draft)
+{
+    const int32_t t[1] = {draft};
+    return mtp_run(t, 0, true);
 }
 
 // Prompt processing: chunks of tokens go through each layer together (projections as GEMMs, the sequential parts

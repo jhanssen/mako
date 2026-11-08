@@ -311,8 +311,10 @@ int main(int argc, char** argv)
         std::println(stderr, "the model has no next-token block");
         return 1;
     }
-    int32_t draft = -1;
-    int mtp_hits = 0, mtp_tries = 0;
+    int32_t draft = -1, draft2 = -1; // the block's guess for the token after the next, and chained once more
+    int32_t d2_wait = -1;            // the chained guess the next greedy token decides, and whether the first held
+    bool d2_cond = false;
+    int mtp_hits = 0, mtp_tries = 0, mtp2_hits = 0, mtp2_tries = 0, mtp2c_hits = 0, mtp2c_tries = 0;
     if (batched) {
         if (!dump_dir.empty() || !logits_dir.empty())
             engine.set_logits_sink([&](uint32_t pos, const float* lg) {
@@ -326,8 +328,10 @@ int main(int argc, char** argv)
         telemetry.prefill(engine.last_prefill(), uint32_t(ids.size()));
         std::println("prefill {} tokens in {:.0f} ms ({:.1f} tok/s), chunks of {}  top{}", ids.size(), ms,
                      ids.size() / ms * 1e3, opts.prefill_chunk, show(logits));
-        if (mtp_stats)
+        if (mtp_stats) {
             draft = engine.mtp_draft(top_k(logits, 1)[0]);
+            draft2 = engine.mtp_draft_chain(draft);
+        }
     }
     for (size_t i = 0; i < (batched || use_session ? 0 : ids.size()); ++i) {
         auto t = std::chrono::steady_clock::now();
@@ -345,8 +349,10 @@ int main(int argc, char** argv)
         std::println("pos {:4} in {:7} {:7.0f} ms  top{}", i, ids[i],
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(),
                      show(logits));
-        if (mtp_stats)
+        if (mtp_stats) {
             draft = engine.mtp_draft(i + 1 < ids.size() ? ids[i + 1] : top_k(logits, 1)[0]);
+            draft2 = engine.mtp_draft_chain(draft);
+        }
     }
     std::string gen;
     std::vector<int32_t> gen_ids;
@@ -382,13 +388,27 @@ int main(int argc, char** argv)
         logits = engine.step(next);
         telemetry.step(engine.last_step());
         if (mtp_stats) {
-            // draft guessed the token after `next`, which is now the greedy one
+            // draft guessed the token after `next`, which is now the greedy one; d2_wait, chained from the draft
+            // before that one, guessed it too
             const int after = top_k(logits, 1)[0];
+            if (d2_wait >= 0 && g + 1 < n_gen) {
+                ++mtp2_tries;
+                mtp2_hits += d2_wait == after;
+                if (d2_cond) {
+                    ++mtp2c_tries;
+                    mtp2c_hits += d2_wait == after;
+                }
+            }
+            bool hit = false;
             if (draft >= 0 && g + 1 < n_gen) {
                 ++mtp_tries;
-                mtp_hits += draft == after;
+                hit = draft == after;
+                mtp_hits += hit;
             }
+            d2_wait = draft2; // guessed the token after `after`
+            d2_cond = hit;
             draft = engine.mtp_draft(after);
+            draft2 = engine.mtp_draft_chain(draft);
         }
         std::println("gen {:4} in {:7} {:7.0f} ms  top{}", g, next,
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(),
@@ -399,8 +419,11 @@ int main(int argc, char** argv)
     const auto& st = engine.stats();
     std::println("greedy: {}", gen);
     if (mtp_stats)
-        std::println("next-token block: {} of {} guesses matched the greedy token ({:.1f}%)", mtp_hits, mtp_tries,
-                     100.0 * mtp_hits / std::max(1, mtp_tries));
+        std::println("next-token block: {} of {} guesses matched the greedy token ({:.1f}%); chained once more: {} of {} "
+                     "({:.1f}%), {} of {} after a matching first guess ({:.1f}%)",
+                     mtp_hits, mtp_tries, 100.0 * mtp_hits / std::max(1, mtp_tries), mtp2_hits, mtp2_tries,
+                     100.0 * mtp2_hits / std::max(1, mtp2_tries), mtp2c_hits, mtp2c_tries,
+                     100.0 * mtp2c_hits / std::max(1, mtp2c_tries));
     std::println("text: {}{}", tok->decode(ids), tok->decode(gen_ids));
     if (opts.telemetry != mako::core::Telemetry::off)
         std::print("\n{}", telemetry.markdown());
