@@ -524,6 +524,33 @@ int main(int argc, char** argv)
               std::format("logits as without a session: continued KL {:.2e}, restored KL {:.2e}, again KL {:.2e}",
                           kl_cont, kl_branch, kl_to(l_branch, l_again)));
 
+        // An edited last message: after a reply and a next turn read, a prompt that keeps the reply but changes the
+        // turn after it restores the checkpoint taken where the reply ended, reading only the edited turn; its
+        // logits are those of the same tokens run without a session (the reply's as decode steps), bit for bit.
+        {
+            session.clear();
+            r = session.generate(prompt, greedy_p);
+            const size_t reply_end = session.context().size(); // the reply's last token is not stepped yet
+            std::vector<int32_t> turn(session.context().begin(), session.context().end());
+            turn.push_back(r.tokens.back());
+            const size_t reply_tokens = turn.size();
+            std::vector<int32_t> edited = turn;
+            turn.insert(turn.end(), {13, 785, 6722, 315, 220, 16, 13});
+            edited.insert(edited.end(), {13, 576, 1052, 374, 264, 1273, 13});
+            const auto rt = session.generate(turn, zero);
+            const auto re = session.generate(edited, zero);
+            const auto l_edited = engine.logits();
+            engine.reset();
+            as_session(prompt);
+            for (size_t i = prompt.size(); i < reply_end; ++i)
+                engine.step(edited[i]);
+            const double kl_edited = kl_to(as_session(std::span(edited).subspan(reply_end)), l_edited);
+            check(rt.reused_tokens == reply_end && re.reused_tokens == reply_end && kl_edited == 0,
+                  std::format("an edited last message restores where the reply ended ({} of {} tokens kept; the "
+                              "next turn kept {}), KL {:.2e}",
+                              re.reused_tokens, reply_tokens, rt.reused_tokens, kl_edited));
+        }
+
         // Reading a prompt cancelled between groups keeps the groups read; the next request continues from there,
         // with the logits of an uninterrupted read.
         {
@@ -711,6 +738,22 @@ int main(int argc, char** argv)
             check(pa2.index == pa.index && !pa2.forked && ra2.reused_tokens >= fa.size() + ra.tokens.size() - 1,
                   std::format("the first continues in place ({} tokens reused, its prompt and reply {})",
                               ra2.reused_tokens, fa.size() + ra.tokens.size()));
+            // The same prompt again (another try at the last turn) and an edited last message rewind the same
+            // conversation, to its checkpoints before the prompt's last token and where the reply ended; neither forks.
+            mako::gen::GenerateResult rr, re;
+            mako::gen::SessionPool::Pick pr, pe;
+            uint64_t h3 = 0, h4 = 0;
+            fp.generate(fa2, fparams(h3), {}, rr, pr);
+            std::vector<int32_t> edited(fa2.begin(), fa2.begin() + fa.size() + ra.tokens.size());
+            edited.insert(edited.end(), {13, 576, 1052, 374, 264});
+            fp.generate(edited, fparams(h4), {}, re, pe);
+            check(pr.index == pa.index && !pr.forked && rr.reused_tokens == fa2.size() - 1,
+                  std::format("the same prompt again rewinds the conversation ({} of {} reused)", rr.reused_tokens,
+                              fa2.size()));
+            check(pe.index == pa.index && !pe.forked && re.reused_tokens >= fa.size() + ra.tokens.size() - 1 &&
+                      re.reused_tokens < edited.size() - 1,
+                  std::format("an edited last message rewinds it to where the reply ended ({} reused of {})",
+                              re.reused_tokens, edited.size()));
         }
 
         // A budget of nothing: B's turn gives A's context up.

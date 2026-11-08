@@ -60,8 +60,9 @@ struct GenerateResult {
 
 // A conversation's context on an engine. Each generate() gets the whole prompt (earlier turns included); the
 // longest prefix the engine already holds is kept, from the current state or from a checkpoint of the recurrent
-// state taken before the last token of an earlier prompt (the same prompt again, or a chat template that rewrites
-// the last answer, diverges there).
+// state: one taken before the last token of an earlier prompt (the same prompt again, or a chat template that
+// rewrites the last answer, diverges there), one where its reply ended (a prompt whose last message was edited
+// diverges there, after the reply).
 class Session {
 public:
     // max_checkpoints beyond the engine's checkpoint_slots() use memory its budget did not reserve.
@@ -77,9 +78,9 @@ public:
     void clear();
 
     // How a prompt relates to this session's context. keep: the leading tokens it can keep in place, its whole
-    // context when the prompt continues it or its latest checkpoint when the prompt diverges after that (another try
-    // at the last turn). fork: else an earlier checkpoint within the shared part, which a new session can start
-    // from (fork()) leaving this one as it is. 0: none.
+    // context when the prompt continues it or one of the last turn's checkpoints (the three newest) when the prompt
+    // diverges after that (an edited last message, another try at the last turn). fork: else an earlier checkpoint,
+    // or the fork point's, which a new session can start from (fork()) leaving this one as it is. 0: none.
     struct Match {
         size_t keep = 0, fork = 0;
     };
@@ -87,9 +88,9 @@ public:
     // A parked session holding src's context up to its checkpoint at pos: the engine holds src's context (src is
     // live) and gives the positions before pos.
     void fork(const Session& src, size_t pos);
-    // Takes the context out of the engine (another session is about to use it), keeping the latest checkpoint and
-    // the one at the fork point only, and puts it back; generate() needs it in. Parking a session the engine no
-    // longer holds forgets its context.
+    // Takes the context out of the engine (another session is about to use it), keeping the last turn's three
+    // checkpoints and the fork point's only, and puts it back; generate() needs it in. Parking a session the engine
+    // no longer holds forgets its context.
     void park();
     void unpark();
     bool parked() const { return parked_.has_value(); }

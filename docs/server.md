@@ -141,7 +141,10 @@ A cut in the middle of a calculation can leave the answer wrong.
   expert still resident), `--conversations` their number (default 16); the least recently used is given up first. A
   conversation keeps a checkpoint where its first user turn starts (after the system prompt and tools); a new
   conversation that starts the same way begins from a copy of it and reads only the rest (sharing that checkpoint),
-  the other conversation left as it is (the same tokens and logits as reading it all, bit for bit).
+  the other conversation left as it is (the same tokens and logits as reading it all, bit for bit). It also keeps one
+  where each reply ended, so a request that edits the last user message (or appends to it) reads only that message,
+  not the reply before it. A conversation holds its last turn's three checkpoints (before its prompt's last token,
+  where its reply ended, where the reply before it ended), parked too (GLM-5.3: ~150 MB each).
 - Requests take turns: one generates at a time, and while others wait it gives the engine up every `--slice-ms`
   (default 1000) at a decode step or between pieces of its prompt (cut at multiples of the engine's prefill group,
   4096 tokens for GLM-5.3 and 8192 for DeepSeek-V4.1, so a long read yields every few seconds), then queues again.

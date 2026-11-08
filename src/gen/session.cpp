@@ -69,13 +69,22 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
         m.keep = common;
         return m;
     }
-    size_t best = 0, latest = 0;
+    // The last turn's checkpoints rewind this session: where its reply ended, before its prompt's last token (another
+    // try at it) and where the reply before it ended (an edited last message), the three newest. An older one, or
+    // the fork point's, starts another session from there.
+    size_t best = 0;
+    bool best_fork = false;
+    std::vector<size_t> at;
     for (const Saved& sv : saved_) {
-        latest = std::max<size_t>(latest, sv.cp->pos);
-        if (sv.cp->pos <= common)
-            best = std::max<size_t>(best, sv.cp->pos);
+        at.push_back(sv.cp->pos);
+        if (sv.cp->pos <= common && sv.cp->pos >= best) {
+            best = sv.cp->pos;
+            best_fork = sv.fork;
+        }
     }
-    (best == latest ? m.keep : m.fork) = best;
+    std::ranges::sort(at, std::greater<>());
+    const bool last_turn = best > 0 && !best_fork && (at.size() < 3 || best >= at[2]);
+    (last_turn ? m.keep : m.fork) = best;
     return m;
 }
 
@@ -103,14 +112,19 @@ void Session::park()
         mtp_next_ = -1;
         return;
     }
-    Parked p{std::make_shared<const Model::Checkpoint>(e_->checkpoint()), e_->save_positions(uint32_t(ctx_.size()))};
+    // The parked state is the checkpoint where the reply ended, when one was taken.
+    const auto at_end = std::ranges::find_if(saved_, [&](const Saved& s) { return s.cp->pos == ctx_.size(); });
+    Parked p{at_end != saved_.end() ? at_end->cp : std::make_shared<const Model::Checkpoint>(e_->checkpoint()),
+             e_->save_positions(uint32_t(ctx_.size()))};
     parked_ = std::move(p);
-    // The newest checkpoint stays (another try at the last prompt) and the fork point's; the parked state continues
-    // the context.
-    size_t newest = 0;
+    // The last turn's checkpoints stay (the three newest: where its reply ended, which the parked state shares;
+    // before its prompt's last token; where the reply before it ended) and the fork point's.
+    std::vector<size_t> at;
     for (const Saved& sv : saved_)
-        newest = std::max<size_t>(newest, sv.cp->pos);
-    std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos != newest && !s.fork; });
+        at.push_back(sv.cp->pos);
+    std::ranges::sort(at, std::greater<>());
+    const size_t keep_from = at.size() > 3 ? at[2] : 0;
+    std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos < keep_from && !s.fork; });
 }
 
 void Session::rebind(Model& model)
@@ -400,6 +414,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             token = next >= 0 ? next : choose(rows.data() + uint64_t(kept) * nv);
         }
         res.decode_ms = ms_since(t_decode);
+        save_checkpoint(); // where the reply ended
         return res;
     }
     int32_t draft = spec ? e_->mtp_draft(token) : -1;
@@ -444,6 +459,7 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         }
     }
     res.decode_ms = ms_since(t_decode);
+    save_checkpoint(); // where the reply ended
     return res;
 }
 
