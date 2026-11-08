@@ -546,6 +546,8 @@ int main(int argc, char** argv)
         const auto& st = engine.last_prefill();
         std::println("  GPU {:.0f} ms, making experts resident {:.0f} ms (reads {:.0f} ms, {} misses, {:.1f} GB)", st.gpu_ms,
                      st.ensure_ms, st.read_ms, st.misses, st.read_bytes / 1e9);
+        std::println("  inputs {:.0f} ms, of it Engram {:.0f} ms ({} rows{})", st.prep_ms, st.engram_ms, st.engram_rows,
+                     st.engram_unique ? std::format(", {} distinct", st.engram_unique) : "");
         double at = 0, ff = 0, hit = 0, miss = 0;
         for (const auto& l : st.layers)
             at += l.attn_ms, ff += l.ffn_ms, hit += l.hit_ms, miss += l.miss_ms;

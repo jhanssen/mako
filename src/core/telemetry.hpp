@@ -49,6 +49,8 @@ struct StepStats {
     uint32_t tokens = 1; // run in the step (a drafted step runs its drafts too, kept or not)
     double wall_ms = 0, encode_ms = 0, gpu_ms = 0;
     double prep_ms = 0;       // CPU work before encoding (inputs read from files)
+    double engram_ms = 0;     // of it, hashing and reading the Engram rows (DeepSeek-V4.1)
+    uint64_t engram_rows = 0, engram_unique = 0; // rows looked up, and distinct ones (counted with telemetry on)
     double route_wait_ms = 0; // CPU waiting for the GPU's routing results
     double ensure_ms = 0;     // CPU making selected experts resident, misses read included
     double read_ms = 0;

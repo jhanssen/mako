@@ -836,6 +836,10 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
         run(tokens.subspan(g0, n), bool(logits_sink_), opts_.prefill_skip ? pos_ + uint32_t(tokens.size() - g0) : 0);
         layer_done_ = {};
         total.ensure_ms += last_step_.ensure_ms;
+        total.prep_ms += last_step_.prep_ms;
+        total.engram_ms += last_step_.engram_ms;
+        total.engram_rows += last_step_.engram_rows;
+        total.engram_unique += last_step_.engram_unique;
         for (size_t l = 0; l < total.layers.size() && l < last_step_.layers.size(); ++l) {
             total.layers[l].attn_ms += last_step_.layers[l].attn_ms;
             total.layers[l].ffn_ms += last_step_.layers[l].ffn_ms;
@@ -914,6 +918,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
     MTL::Buffer* eg_raw = scratch("ds_eg_raw", eg_rows * engram_->row_bytes());
     MTL::Buffer* eg = scratch("ds_eg", eg_rows * eg_dim * 4);
     {
+        const auto t_eg = Clock::now();
         std::vector<int64_t> rows(eg_rows);
         // Positions taking input rows (an image) have no Engram rows, and n-grams reaching back to them are cut there.
         std::vector<int32_t> hashed(tokens.begin(), tokens.end());
@@ -923,6 +928,14 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits, uint32_t prom
         engram_->hash(hashed, engram_history_, rows);
         engram_->read_raw(rows, static_cast<uint8_t*>(eg_raw->contents()), *engram_pool_);
         engram_history_ = engram_->advance(engram_history_, hashed);
+        last_step_.engram_ms = ms_since(t_eg);
+        last_step_.engram_rows = eg_rows;
+        if (tel_ != core::Telemetry::off) {
+            std::vector<int64_t> u(rows);
+            std::ranges::sort(u);
+            const auto [first, last] = std::ranges::unique(u);
+            last_step_.engram_unique = uint64_t(first - u.begin()) - (u.empty() || u[0] >= 0 ? 0 : 1);
+        }
     }
 
     MTL::Buffer* xg = scratch("ds_xg", uint64_t(G) * E * 4);
