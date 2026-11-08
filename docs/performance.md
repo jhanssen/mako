@@ -318,7 +318,9 @@ the defaults (`--prefetch 4 --prefetch-ahead 2`) 36.4 / 36.5 ms a step at 6.4 mi
 a step on the short prompt's trace against 6.4 recorded (the read-ahead's asynchronous publishing is not modelled)
 and 11.35 against 11.11 on the long one's; half-lives of 64-1024 steps, no decay, least recently used and reads ahead
 ignored come out within -7% and +30% of it, the profile seed at 0.3x -15% / -5% on the two traces, at 3-10x +25-70%.
-Nothing changed; a live A/B of the 0.3x seed is the one candidate.
+Live, the seed at 0.03x against 0.1x (two pairs each): short prompt 36.3 / 36.1 -> 37.3 / 37.2 ms a step (6.4 -> 7.8
+misses), long prompt 41.6 / 41.9 -> 41.0 / 41.1 (11.0 -> 9.5): the weaker prior helps once the session's own routing
+has filled the scores and hurts before it has; the replay had the short prompt's direction wrong. Unchanged.
 
 Dense re-quantization at load (`ds_run --dense-quant`, 1300 positions against the reference):
 
