@@ -84,7 +84,9 @@ down. Baselines live in `~/Library/Application Support/mako/perf/`, one per mode
 Run it before committing a change to `src/kernels`, `src/core`, `src/glm` or `src/dsv41`. On the M5 Max, against its
 own baseline, every share agreed within 0.1 point, so a flagged part is worth a look even when the total is under the
 threshold (the `kda_prep` regression fixed in `ce60b6e` moved GLM's prefill only 3.6%, and was flagged by its part).
-It does not cover long contexts; `prefill_sweep --parts` does.
+The default prompt is 4096 tokens; `--prompt N` up to ~48K (the file is three source files) takes its own baseline
+(`--baseline FILE`), for regressions that show only at long contexts (`kda_prep`'s was ~5% of a 20K prefill).
+`prefill_sweep --parts` gives the GPU time by part over prompt lengths.
 
 ## Layout
 

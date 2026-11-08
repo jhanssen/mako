@@ -440,9 +440,9 @@ both estimates beforehand; isolated benchmarks (`gemv_bench`) are the better gui
 - Several sequences a step (continuous batching) for several agents at once: dense weights read once for all of
   them, experts by routing overlap; the row-invariant GEMVs keep each sequence's result independent of the batch.
   The largest throughput gain and the largest change (KDA/MLA state per sequence, the session API, the scheduler).
-- `bench/perf_check` covers ~5-6K-token prompts; a long-context run (`--prompt 20000` exists; it needs a longer
-  `bench/data/perf_prompt.txt`) would catch regressions that show only there (the `kda_prep` one was ~5% of a 20K
-  prefill).
+- `bench/perf_check`'s default run covers a 4096-token prompt; its prompt file now holds ~48K tokens, so a long-context
+  baseline (`--prompt 20000 --baseline FILE --save`) can be kept beside it, for regressions that show only there (the
+  `kda_prep` one was ~5% of a 20K prefill). None is saved yet.
 
 ## Both models: the first GPU work after a few seconds idle (2026-10-26)
 
