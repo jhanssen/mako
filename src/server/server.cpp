@@ -57,7 +57,12 @@ void log_result(const std::string& id, const gen::GenerateResult& r, const char*
               "({:.1f} tok/s, {:.1f} ms/token){}, {}; {}",
                  id, r.prompt_tokens, r.reused_tokens, read, r.prefill_ms, rate(read, r.prefill_ms), n, r.decode_ms,
                  rate(n, r.decode_ms), r.decode_ms / double(std::max<size_t>(n, 1)),
-                 r.drafts ? std::format(", {:.0f}% of drafts kept", 100.0 * r.accepted / r.drafts) : "", finish, conv);
+                 r.drafts ? std::format(", {:.0f}% of drafts kept{}", 100.0 * r.accepted / r.drafts,
+                                        r.lookup_drafts ? std::format(" ({} of {} from the context)", r.lookup_accepted,
+                                                                      r.lookup_drafts)
+                                                        : "")
+                          : "",
+                 finish, conv);
 }
 
 } // namespace
@@ -208,6 +213,7 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
     const uint32_t room = max_context - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
     cr.gen.speculative = opts.speculative;
+    cr.gen.lookup_match = opts.lookup_match;
     // The reasoning budget, cut to leave a capped reply room to answer.
     uint32_t budget = cr.reasoning_budget.value_or(opts.reasoning_budget);
     if (cr.max_tokens_given && cr.gen.max_tokens >= 1024) {

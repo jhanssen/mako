@@ -41,6 +41,7 @@ void Session::clear()
     ctx_.clear();
     keys_.clear();
     saved_.clear();
+    lookup_.clear();
     mtp_next_ = -1;
 }
 
@@ -117,6 +118,7 @@ void Session::park()
     Parked p{at_end != saved_.end() ? at_end->cp : std::make_shared<const Model::Checkpoint>(e_->checkpoint()),
              e_->save_positions(uint32_t(ctx_.size()))};
     parked_ = std::move(p);
+    lookup_.clear();
     // The last turn's checkpoints stay (the three newest: where its reply ended, which the parked state shares;
     // before its prompt's last token; where the reply before it ended) and the fork point's.
     std::vector<size_t> at;
@@ -178,6 +180,7 @@ void Session::rewind(size_t keep)
     cut_keys(ctx_.size());
     // Checkpoints past the divergence would describe tokens that are about to be overwritten.
     std::erase_if(saved_, [&](const Saved& s) { return s.cp->pos > keep; });
+    lookup_.clear(); // its index, too
     mtp_next_ = -1;
 }
 
@@ -367,13 +370,22 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
         return f >= 0 ? f : sampler.sample(logits);
     };
     int32_t token = choose(lp.data());
-    if (p.speculative && e_->has_drafter()) {
-        // Each round: drafts after `token`, then token and the drafts in one verify; drafts are kept up to the first
-        // the sampler rejects (it then gives the token in its place), and after the last kept the trunk's next.
+    const bool lookup = p.speculative && p.lookup_match && e_->can_verify();
+    if (p.speculative && (e_->has_drafter() || lookup)) {
+        // Each round: drafts after `token` (a repeat of the context when one matches, else the engine's drafter),
+        // then token and the drafts in one verify; drafts are kept up to the first the sampler rejects (it then
+        // gives the token in its place), and after the last kept the trunk's next.
         while (p.max_tokens > 0 && emit(token)) {
             if (p.yield)
                 p.yield();
-            std::vector<int32_t> drafts = e_->draft(token);
+            std::vector<int32_t> drafts;
+            bool from_lookup = false;
+            if (lookup) {
+                drafts = lookup_.propose(ctx_, token, p.lookup_match);
+                from_lookup = !drafts.empty();
+            }
+            if (!from_lookup && e_->has_drafter())
+                drafts = e_->draft(token);
             const uint32_t room = std::min<uint32_t>(e_->max_context() - e_->position(),
                                                      p.max_tokens - uint32_t(res.tokens.size()) + 1);
             if (drafts.size() + 1 > room)
@@ -388,6 +400,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             run.insert(run.end(), drafts.begin(), drafts.end());
             const std::vector<float>& rows = e_->verify(run);
             res.drafts += uint32_t(drafts.size());
+            if (from_lookup)
+                res.lookup_drafts += uint32_t(drafts.size());
             uint32_t kept = 0;
             int32_t next = -1;
             bool more = true;
@@ -409,6 +423,10 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
             }
             e_->keep(kept + 1);
             ctx_.insert(ctx_.end(), run.begin(), run.begin() + kept + 1);
+            if (from_lookup) {
+                lookup_.outcome(kept);
+                res.lookup_accepted += kept;
+            }
             if (!more)
                 break;
             token = next >= 0 ? next : choose(rows.data() + uint64_t(kept) * nv);

@@ -8,6 +8,8 @@
 //   penalty  the miss penalty at 0.1: KL bounded and fewer misses than without (over the first 300 steps)
 //   q6k      dense weights re-quantized to Q6_K: KL bounded, through prefill and the first 300 steps
 //   dspark   with the drafter (a directory; skipped without one): greedy output with drafts equals it without
+//   lookup   drafts from repeats of the context (a prompt that repeats its start, so the model goes on repeating):
+//            greedy output equals it without, most drafts come from the context and are kept
 //   pool     two conversations on two threads taking turns on one engine at every step (with the drafter when
 //            given): each request's tokens and logits as with its conversation alone, bit for bit
 // and `import <logits.f32> <out.bin> [positions]` (rows of n_vocab floats, the last `positions` of them) to write the
@@ -171,7 +173,8 @@ int main(int argc, char** argv)
     if (argc >= 4 && std::string_view(argv[1]) == "import")
         return import_ref(argv[2], argv[3], 129280, argc > 4 ? uint32_t(std::stoul(argv[4])) : 0);
     if (argc < 4) {
-        std::println(stderr, "usage: ds41_ref_test <model-00001.gguf> <engram.gguf> short|long|penalty|q6k|dspark [dspark dir]");
+        std::println(stderr,
+                     "usage: ds41_ref_test <model-00001.gguf> <engram.gguf> short|long|penalty|q6k|dspark|lookup|pool [dspark dir]");
         return 2;
     }
     const std::string mode = argv[3];
@@ -310,6 +313,33 @@ int main(int argc, char** argv)
               std::format("greedy tokens with drafts equal those without ({} tokens)", plain.tokens.size()));
         check(drafted.drafts > 0 && drafted.accepted * 4 >= drafted.drafts,
               std::format("drafts kept: {} of {}", drafted.accepted, drafted.drafts));
+    } else if (mode == "lookup") {
+        // The prose's first 300 tokens, then its first 120 again: the model goes on repeating, and the lookup
+        // drafts the repeat from the context.
+        const auto ids = read_ids(kData / "ds41_short_ids.txt");
+        std::vector<int32_t> prompt(ids.begin(), ids.begin() + 300);
+        prompt.insert(prompt.end(), ids.begin() + 1, ids.begin() + 121);
+        mako::gen::GenerateParams gp;
+        gp.sampling.temperature = 0;
+        gp.max_tokens = 96;
+        auto run = [&](uint32_t match) {
+            engine.reset();
+            mako::gen::Session session(engine);
+            gp.lookup_match = match;
+            auto r = session.generate(prompt, gp);
+            std::println("  lookup_match {}: {} tokens in {:.0f} ms, {} drafts ({} from the context), {} kept ({} of the "
+                         "context's)",
+                         match, r.tokens.size(), r.decode_ms, r.drafts, r.lookup_drafts, r.accepted, r.lookup_accepted);
+            return r;
+        };
+        const auto plain = run(0), drafted = run(4);
+        check(drafted.tokens == plain.tokens,
+              std::format("greedy tokens with context drafts equal those without ({} tokens)", plain.tokens.size()));
+        check(drafted.lookup_drafts > 0 && drafted.lookup_accepted * 2 >= drafted.lookup_drafts,
+              std::format("context drafts kept: {} of {}", drafted.lookup_accepted, drafted.lookup_drafts));
+        // The repeat covers most of the reply: drafts from the context carry at least half of its tokens.
+        check(drafted.lookup_accepted * 2 >= drafted.tokens.size(),
+              std::format("{} of {} tokens came as context drafts", drafted.lookup_accepted, drafted.tokens.size()));
     } else if (mode == "pool") {
         const auto long_ids = read_ids(kData / "ds41_long_ids.txt"), short_ids = read_ids(kData / "ds41_short_ids.txt");
         const std::vector<int32_t> a(long_ids.begin(), long_ids.begin() + 3000), b(short_ids.begin(), short_ids.begin() + 600);

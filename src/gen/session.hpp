@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gen/lookup.hpp"
 #include "gen/model.hpp"
 #include "gen/sampler.hpp"
 
@@ -19,6 +20,9 @@ struct GenerateParams {
     uint32_t max_tokens = 256;
     std::vector<int32_t> stop_tokens; // generation ends after one of these (it is part of the output)
     bool speculative = true;          // draft with the next-token block, when the engine has it
+    // Drafts from repeats of the context (LookupDrafter) on engines that verify several tokens: the shortest match
+    // proposed from, in tokens (0: off). Needs `speculative`.
+    uint32_t lookup_match = 4;
     // Polled while the prompt is read (between groups of tokens): true stops (Finish::cancelled, no tokens), keeping
     // the part read so far in the context.
     std::function<bool()> cancelled;
@@ -56,6 +60,7 @@ struct GenerateResult {
     uint32_t prompt_tokens = 0, reused_tokens = 0; // reused: the prompt's leading tokens the context already held
     double prefill_ms = 0, decode_ms = 0;
     uint32_t drafts = 0, accepted = 0; // speculative verifications and drafts kept
+    uint32_t lookup_drafts = 0, lookup_accepted = 0; // of them, from repeats of the context
 };
 
 // A conversation's context on an engine. Each generate() gets the whole prompt (earlier turns included); the
@@ -126,6 +131,7 @@ private:
     std::vector<GenerateParams::PromptRows> keys_; // the input-row spans within ctx_ (their rows are not kept)
     std::vector<Saved> saved_;
     std::optional<Parked> parked_;
+    LookupDrafter lookup_;
     uint64_t clock_ = 0;
     int32_t mtp_next_ = -1; // the token the next-token block's cache assumes after ctx_.back(); -1: none
 };

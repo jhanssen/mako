@@ -111,6 +111,7 @@ public:
     // DSpark: three small blocks fed the trunk's streams entering its last layers, proposing the tokens after the
     // next one, each with a confidence.
     bool has_drafter() const override { return drafter_ != nullptr; }
+    bool can_verify() const override { return true; }
     std::vector<int32_t> draft(int32_t next) override;
     const std::vector<float>& verify(std::span<const int32_t> tokens) override;
     void keep(uint32_t n) override;

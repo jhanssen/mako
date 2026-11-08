@@ -77,6 +77,8 @@ public:
     // the next positions, returning their logits (a row each); keep(n) keeps the first n of them (n >= 1), undoing
     // the rest. Without a drafter has_drafter() is false and the rest is not called.
     virtual bool has_drafter() const { return false; }
+    // Whether verify() and keep() work without the engine's own drafter (drafts from the context, LookupDrafter).
+    virtual bool can_verify() const { return has_drafter(); }
     virtual std::vector<int32_t> draft(int32_t) { return {}; }
     virtual const std::vector<float>& verify(std::span<const int32_t>) { throw std::logic_error("no drafter"); }
     virtual void keep(uint32_t) { throw std::logic_error("no drafter"); }

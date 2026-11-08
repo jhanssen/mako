@@ -67,6 +67,12 @@ Measured in `performance.md`.
   sampling). The block's weights load and its experts take cache slots.
 - DeepSeek-V4.1 drafts with DSpark (`--dspark DIR`, `mako_serve` and `ds_run`): up to 4 drafts a step; its 8 GB come out
   of the expert cache, so it helps on code (+13%) more than on prose (-3%).
+- DeepSeek-V4.1 also drafts from the context itself (`--lookup-draft N`, default 4; 0: off), with or without DSpark:
+  when the reply repeats an earlier stretch of the conversation (a file written back with edits, quoted tool output),
+  the tokens that followed it are the drafts, 3 to 7 a step by the length of the match (at least N tokens). Each
+  match length stops offering while under 55% of its first drafts are kept (one probe in eight), so text that merely
+  shares a phrase with the context stops paying for rejected drafts after a few. No weights, no memory; the output is
+  the same as without (the engine verifies every draft). GLM-5.3 verifies one draft a step and does not use it.
 
 ## Ablation
 

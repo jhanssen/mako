@@ -25,6 +25,7 @@ struct ServerOptions {
     std::string model_id;        // reported by /v1/models and in responses
     gen::SamplingParams sampling; // defaults for fields a request leaves out
     bool speculative = true;
+    uint32_t lookup_match = 4; // gen::GenerateParams::lookup_match (0: off)
     uint32_t max_waiting = 4; // requests waiting behind the one generating; more get HTTP 503
     // Conversations kept besides the one generating (gen::SessionPool): a request continues the one that holds the
     // most of its prompt; the others are parked within park_bytes, the least recently used given up first.

@@ -73,6 +73,7 @@ int main(int argc, char** argv)
     std::string imatrix_out;
     uint64_t step_misses = 0;
     bool spec = true;
+    uint32_t lookup_match = 4;
     const auto args =
         mako::app::Cli("ds_run", "<model-00001.gguf> <engram.gguf>", 2, 2)
             .option("--ids", "I,J,...", "the prompt's token ids",
@@ -86,6 +87,8 @@ int main(int argc, char** argv)
             .flag("--spec", "speculative decoding in --gen (with --dspark; default on)", spec)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   opts.spin_wait)
+            .option("--lookup-draft", "N", "--gen: draft from repeats of the context matching N tokens or more (default 4; 0: off)",
+                    lookup_match)
             .option("--dspark", "DIR", "the drafter (dspark.json and dspark.bin)", opts.dspark)
             .option("--max-drafts", "N", "drafts a step at most", opts.max_drafts)
             .option("--draft-conf", "F", "the confidence a draft needs", opts.draft_conf)
@@ -457,13 +460,15 @@ int main(int argc, char** argv)
         gp.sampling.temperature = 0;
         gp.max_tokens = session_n;
         gp.speculative = spec;
+        gp.lookup_match = lookup_match;
         const auto r = session.generate(ids, gp);
         std::print("generated:");
         for (int32_t t : r.tokens)
             std::print(" {}", t);
-        std::println("\n{} tokens in {:.0f} ms ({:.2f} tok/s); prompt {:.0f} ms; drafts {} kept {} ({:.0f}%)", r.tokens.size(),
-                     r.decode_ms, r.tokens.size() / r.decode_ms * 1e3, r.prefill_ms, r.drafts, r.accepted,
-                     r.drafts ? 100.0 * r.accepted / r.drafts : 0.0);
+        std::println("\n{} tokens in {:.0f} ms ({:.2f} tok/s); prompt {:.0f} ms; drafts {} kept {} ({:.0f}%), of them {} "
+                     "from the context, {} kept",
+                     r.tokens.size(), r.decode_ms, r.tokens.size() / r.decode_ms * 1e3, r.prefill_ms, r.drafts, r.accepted,
+                     r.drafts ? 100.0 * r.accepted / r.drafts : 0.0, r.lookup_drafts, r.lookup_accepted);
         const auto& ss = engine.spec_stats();
         std::println("drafts {} ({:.1f} ms each), verifies {} of {:.1f} tokens ({:.1f} ms, {:.1f} misses, {:.1f} ms making "
                      "them resident each), steps {} ({:.1f} ms, {:.1f} misses, {:.1f} ms each)",

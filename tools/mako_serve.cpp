@@ -5,6 +5,7 @@
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
 //              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--no-spin-wait] [--no-keepalive]
+//              [--lookup-draft N]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -123,6 +124,8 @@ int main(int argc, char** argv)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   spin_wait)
             .flag("--keepalive", "while idle, a small GPU kernel a second keeps the weights mapped (default on)", keepalive)
+            .option("--lookup-draft", "N", "draft from repeats of the context matching N tokens or more (default 4; 0: off)",
+                    so.lookup_match)
             .option("--dspark", "DIR", "DeepSeek-V4.1's drafter (dspark.json and dspark.bin)", dspark)
             .option("--engram", "FILE", "DeepSeek-V4.1: the Engram tables of another GGUF (default: the model's own)",
                     engram)
