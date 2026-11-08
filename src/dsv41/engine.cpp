@@ -668,6 +668,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
                 enc->setBuffer(blk_ids, 0, 1);
                 enc->setBuffer(keep, uint64_t(g0 + t0) * blk_stride, 2);
                 enc->setBytes(&ta, sizeof(ta), 3);
+                check_fit(pso("ds_topk"), MTL::Size(1024, 1, 1), "ds_topk");
                 for (int r = repeats("ds_topk"); r > 0; --r)
                     enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
                 after(enc, "ds_topk");
@@ -685,6 +686,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             enc->setBuffer(sel, uint64_t(g0 + t0) * top * 4, 1);
             enc->setBuffer(keep, 0, 2);
             enc->setBytes(&ta, sizeof(ta), 3);
+            check_fit(pso("ds_topk"), MTL::Size(1024, 1, 1), "ds_topk");
             for (int r = repeats("ds_topk"); r > 0; --r)
                 enc->dispatchThreadgroups(MTL::Size(n, 1, 1), MTL::Size(1024, 1, 1));
             after(enc, "ds_topk");
@@ -1475,6 +1477,7 @@ std::vector<int32_t> Engine::draft(int32_t next)
         enc->setBuffer(drafter_->conf_w.buf, drafter_->conf_w.off, 5);
         enc->setBytes(&ma, sizeof(ma), 6);
         enc->setBytes(&dim, sizeof(dim), 7);
+        check_fit(pso("ds_draft_pick"), MTL::Size(1024, 1, 1), "ds_draft_pick");
         enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
         after(enc, "ds_draft_pick");
     }

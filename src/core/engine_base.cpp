@@ -538,6 +538,7 @@ void EngineBase::hc_step(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* post_x, 
     enc->setBuffer(pc, 0, 4);
     enc->setBuffer(x, 0, 5);
     enc->setBytes(&a, sizeof(a), 6);
+    check_fit(pso("hc_step_b"), MTL::Size(1024, 1, 1), "hc_step_b");
     for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(1024, 1, 1));
     after(enc, "hc_step_b");

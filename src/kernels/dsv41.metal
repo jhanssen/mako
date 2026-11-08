@@ -452,6 +452,7 @@ static uint fkey(float f)
 // For each token (one threadgroup of 1024 threads each; grid (tokens)): the k largest of its n values (n: its
 // visible rows / block, rounded up), their indices in increasing order into its row of ids (and a 1 per kept index
 // into flags). Values equal to the k-th largest are taken in index order. Nothing when n <= k (all are kept).
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void ds_topk(device const float* vall [[buffer(0)]], device int* idsall [[buffer(1)]],
                     device uchar* flagsall [[buffer(2)]], constant TopkArgs& a [[buffer(3)]],
                     uint tok [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
@@ -684,6 +685,7 @@ kernel void ds_markov(device const float* logits [[buffer(0)]], device const flo
 
 // drafts[step] = argmax of scores (lowest index on ties); conf[step] = sigmoid([x, embed[prev]] . w), x the block's
 // row `step` of dim floats. One threadgroup of 1024 threads.
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void ds_draft_pick(device const float* scores [[buffer(0)]], device int* drafts [[buffer(1)]],
                           device float* conf [[buffer(2)]], device const float* x [[buffer(3)]],
                           device const float* embed [[buffer(4)]], device const float* w [[buffer(5)]],

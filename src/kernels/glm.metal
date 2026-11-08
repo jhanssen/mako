@@ -222,6 +222,7 @@ kernel void hc_step_a(device const float* x [[buffer(0)]], device const float* R
 
 // B, one threadgroup per token: mixes = (sum of the partial dots) / rms(R_new), then hc_mix -> pc, then x = sum_h
 // pre[h] * R_new[h].
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void hc_step_b(device const float* part [[buffer(0)]], device const float* Rn [[buffer(1)]],
                       device const float* scale [[buffer(2)]], device const float* base [[buffer(3)]],
                       device float* pc [[buffer(4)]], device float* x [[buffer(5)]],
