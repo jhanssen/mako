@@ -118,22 +118,8 @@ void EngineBase::begin_staging(uint32_t tokens)
     stager_ = std::move(st);
 }
 
-void EngineBase::prefetch_tail()
-{
-    if (!tail_pending_)
-        return;
-    tail_pending_ = false;
-    for (uint32_t l = 0; l < tail_sel_.size(); ++l)
-        if (!tail_sel_[l].empty()) {
-            arena_->prefetch(l, tail_sel_[l]);
-            tail_sel_[l].clear();
-        }
-}
-
 void EngineBase::end_staging()
 {
-    if (stager_)
-        tail_pending_ = std::ranges::any_of(tail_sel_, [](const auto& v) { return !v.empty(); });
     if (stager_ && std::getenv("MAKO_STAGE_STATS"))
         log::info("staging: {:.1f} GB in {:.0f} ms ({:.1f} GB/s; readers busy {:.0f} ms)", stager_->read_bytes() / 1e9,
                   stager_->span_ms(), stager_->read_bytes() / 1e6 / std::max(1.0, stager_->span_ms()),
@@ -1004,15 +990,6 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
     for (uint32_t t = 0; t < G; ++t)
         for (uint32_t j = 0; j < k; ++j)
             users[selp[t * 16 + j]].push_back(t * 16 + j);
-    if (tail_sel_.size() <= il)
-        tail_sel_.resize(il + 1);
-    std::vector<int>& tail = tail_sel_[il];
-    tail.clear();
-    if (stager_)
-        for (uint32_t t = G; t-- > (G > kTailRows ? G - kTailRows : 0);)
-            for (uint32_t j = 0; j < k; ++j)
-                if (std::ranges::find(tail, selp[t * 16 + j]) == tail.end())
-                    tail.push_back(selp[t * 16 + j]);
     std::vector<int> order;
     for (int e = 0; e < int(dims_.n_expert); ++e)
         if (!users[e].empty() && table[e] >= 0)

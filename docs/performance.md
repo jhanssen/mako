@@ -202,6 +202,7 @@ the sections below take it to ~25 by default.
 | Per-row key descriptors with vector loads | no change for the output kernel (helped the score kernel slightly) |
 | More query tokens per attention dispatch (32 -> 256) | no change: occupancy was not the cost |
 | Decode attention GEMVs in multi-GEMV dispatches: q_a + kv (+ the compressor's kv and gate, + the indexer's weights) on the attention input, q_b (+ the indexer's query) on the normed q latent | tokens identical, no measurable gain: short prompt 42.2 vs 42.2 ms/step with `--telemetry layers` (six A/B pairs, 9.3 misses a step) and 41.3 vs 41.2 without (three pairs), 3000-token prompt 49.9 vs 50.1 (three pairs, 16.2 misses). Q8_0 GEMVs have ~2-3 us fixed a dispatch (IQ2_XXS ~9), so ~40 merged-away dispatches are worth ~0.1 ms (inferred, not measured). Reverted |
+| After a staged prefill, read ahead the experts its last 8 rows selected and the arena lacks when the first step starts (through `ExpertArena::prefetch`, a slot evicted per expert) | the 64 steps after a staged 2048-token tail on a 6144-token prompt: 62.6 / 62.9 -> 68.8 / 68.7 ms a step with 25.3 -> 25.1 misses a step (two A/B pairs, 74.5 GB arena, 45 s pause before each run): the reads ahead compete with the steps' own miss reads and the steps rarely want those experts. GLM-5.3 under `--simulate-ram 64` (8.4 GB arena, 7.3K-token prompt): misses identical (217.9 a token), 216 vs 216 ms. Reverted |
 
 ### Open
 
