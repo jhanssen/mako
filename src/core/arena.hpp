@@ -24,15 +24,16 @@ struct MemInfo {
     double phys = 0;          // RAM
     double working_set = 0;   // the Metal device's recommended working set
     double footprint = 0;     // what the process holds now (phys_footprint)
-    double filecache_min = 0; // the file cache macOS keeps before it compresses anonymous memory
+    double filecache_min = 0; // vm_page_filecache_min as the kernel's last pageout scan left it
+    double pageable = 0;      // active + inactive + free + speculative: what the kernel takes that floor as a share of
     double available = 0;     // free + purgeable + clean file cache
 };
 MemInfo query_memory(uint64_t working_set);
 
 // Bytes the expert arena may take: what is available now (less a reserve of 15% of RAM), within the GPU working set,
 // and the engine's whole anonymous footprint under RAM less a margin: a quarter of RAM from 96 GB up, 40% from 64 GB
-// (and at least the file-cache floor plus 12 GB). A large file write beside a bigger footprint once pushed the
-// engine into the compressor and froze the machine. Never less than 1 GB.
+// (and at least the file-cache floor the kernel will keep once the budget is wired, plus 12 GB). A large file write
+// beside a bigger footprint once pushed the engine into the compressor and froze the machine. Never less than 1 GB.
 double arena_budget(const MemInfo& m);
 
 // Anonymous memory locked for the object's lifetime (to make the machine look smaller than it is).

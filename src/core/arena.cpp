@@ -83,7 +83,9 @@ MemInfo query_memory(uint64_t working_set)
     count = HOST_VM_INFO64_COUNT;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs), &count) == KERN_SUCCESS) {
         const double clean = std::min<double>(double(vs.inactive_count) + vs.speculative_count, vs.external_page_count);
-        m.available = (double(vs.free_count) + vs.purgeable_count + clean) * double(page);
+        // free_count includes the speculative pages, which clean counts.
+        m.available = (double(vs.free_count) - vs.speculative_count + vs.purgeable_count + clean) * double(page);
+        m.pageable = (double(vs.active_count) + vs.inactive_count + vs.free_count) * double(page);
     }
     return m;
 }
@@ -116,17 +118,25 @@ double arena_budget(const MemInfo& m)
     constexpr double GB = 1e9;
     const double keep = std::max(7 * GB, 0.15 * m.phys);
     double leave = keep;
-    const double floor = m.filecache_min > 0 ? m.filecache_min + 12 * GB : 0.0;
     // 96 GB and up: a quarter of RAM (stress-tested on 128 GB: a 90 GB arena with 160 GB written beside it kept 22 GB
     // available, no swapping); smaller Macs keep the earlier 40% (untested lower).
     if (m.phys >= 96 * GB)
-        leave = std::max({leave, 0.25 * m.phys, floor});
+        leave = std::max(leave, 0.25 * m.phys);
     else if (m.phys >= 64 * GB)
-        leave = std::max({leave, 0.40 * m.phys, floor});
+        leave = std::max(leave, 0.40 * m.phys);
     const double cap = std::min(m.working_set, m.phys - leave);
     const double gpu = m.working_set - m.footprint - 1 * GB;
     const double ram = m.available - keep;
-    return std::max(1 * GB, std::min({gpu, ram, cap - m.footprint}));
+    double budget = std::min({gpu, ram, cap - m.footprint});
+    if (m.phys >= 64 * GB) {
+        // The kernel sets the file-cache floor to 10/27 of the pageable pages, but only while its pageout scan runs,
+        // so the sysctl holds whatever the last shortage left. Predict it for after the budget is wired instead:
+        // budget <= phys - footprint - 12 GB - (pageable - budget) * r. The pageable pages bound the sysctl, so a
+        // value above 10/27 of RAM means a smaller divisor.
+        const double r = std::max(10.0 / 27.0, m.filecache_min / m.phys);
+        budget = std::min(budget, (m.phys - m.footprint - 12 * GB - m.pageable * r) / (1 - r));
+    }
+    return std::max(1 * GB, budget);
 }
 
 ExpertArena::ExpertArena(MTL::Device* dev, uint64_t max_buffer, std::vector<LayerParts> layers, uint32_t n_expert,
