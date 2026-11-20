@@ -36,7 +36,7 @@ repo_glm=peasantsmith/GLM-5.3-Flash-Maya-GGUF@f16ee4ba50d8fd2bb726ea1862ca6ca14b
 repo_ds=peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF@d1fc01009f21e26157acb6858c315d0365483b72
 repo_unsloth=unsloth/GLM-5.3-Flash-GGUF@a38483c8cd5df544f53d70fb281afe97369d5ab6
 repo_ista=ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@a419d74cd28d5b9f8c5e2b9077d11a609c17bc32
-repo_abl=skafte/mako-ablations@b5a4188af1eb61375ebe2caf38f14d453052419d
+repo_abl=skafte/mako-ablations@b82d14ccd2c868ae93f37bd9ea6d3dc1886a4fe2
 repo_hy4f=peasantsmith/Hy4-Flash-Maya-GGUF@61b46da72d98a5227bfb5fd41505d4ca337af1d3
 
 # group repo path size sha256
@@ -56,6 +56,7 @@ dspark ds dspark/dspark.bin 7967616768 42df65159f980a9189d80597e42b30012c7b10e0d
 dspark ds dspark/dspark.json 96965 639c3144bca8cfe4db59057047dca40411f0cc732796e2a9321feb98fee2295f
 glm-abl abl glm-5.3-flash/refusal-3dir.abl 4423736 d75f26455b9dd26a99eb604ad21b233485da6f181ae922c47f417208bbde33c5
 ds-abl abl deepseek-v4.1-flash-1017/refusal.abl 3276856 b8c10979b684ea4c84c3146d69bef5313cd84a21e6391f2e1b97a9fabe094994
+hy4f-abl abl hy4-flash/refusal.abl 8257688 72cc9b29c9081fb230c173aac2cfef812f612d3d7839dafc4411efb27483a12f
 ds-vision ista mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf 972208096 0fdc4b7693f287e9665940cf42bd39c546ffe4f0def89c569d7d0e45d60d2df1
 ista-xs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf 5780704 0182a2a1f42d319a0dbc6e34aa82a063880c069fe3aafbbea86018f386e64e5f
 ista-xs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00006.gguf 39581533600 5c88039fa640460a9fc3465a6dfcd162a4083dd738d55e5b52e025be14555a08
@@ -99,9 +100,9 @@ ds) groups=ds vgroup=ds-vision agroup=ds-abl link= ;;
 ds-ista-xs) groups="ista-xs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS ;;
 ds-ista-xxs) groups="ista-xxs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS ;;
 hy4f)
-    groups=hy4f-m vgroup=hy4f-vision agroup= link=
-    if [ $ablate = 1 ] || [ $dspark = 1 ]; then
-        echo "--ablate and --dspark: mako runs neither for Hy4-flash yet" >&2
+    groups=hy4f-m vgroup=hy4f-vision agroup=hy4f-abl link=
+    if [ $dspark = 1 ]; then
+        echo "--dspark: DeepSeek-V4.1's drafter only" >&2
         exit 2
     fi ;;
 *) usage ;;

@@ -4,11 +4,14 @@
 #include "dsv41/engram.hpp"
 #include "gen/model.hpp"
 #include "hy4f/config.hpp"
+#include "mtl/ablation.hpp"
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace mako::hy4f {
@@ -74,6 +77,12 @@ public:
     // At most the chunk the engine was built with (which sized its sliding buffers and scratch). Results do not depend
     // on it.
     void set_prefill_chunk(uint32_t chunk);
+    // Ablation sites: stream0..3, each hyper-connection stream entering a layer (after its Engram, before the
+    // attention's mix), and head0..3, the streams before the output head (at the last layer's index). The four of
+    // a kind come in order in the file.
+    static constexpr std::array<std::string_view, 8> kAblationSites{"stream0", "stream1", "stream2", "stream3",
+                                                                    "head0",   "head1",   "head2",   "head3"};
+    void set_ablation(std::optional<mtl::Ablation> ablation);
     void set_miss_penalty(float penalty)
     {
         opts_.miss_penalty = penalty;
@@ -125,6 +134,10 @@ private:
     std::unique_ptr<gguf::ReadPool> engram_pool_;
     std::vector<int32_t> engram_history_;
     uint32_t n_top_ = 0; // pools a selecting token keeps (its own group comes on top)
+    std::optional<mtl::Ablation> ablation_;
+    int ablate_stream_ = -1, ablate_head_ = -1; // the first of the four sites' indices in ablation_
+    // The streams of `rows` tokens of R (from byte offset off) lose their directions at `site`'s four sites.
+    void ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* R, uint64_t off, uint32_t rows);
 
     gguf::ModelFiles::Ref token_embd_;
     DevTensor output_norm_, output_, head_fn_, head_base_, head_scale_;

@@ -35,9 +35,10 @@ public:
     float scale() const { return scale_; }
 
     // Encodes the projection of `rows` rows of n_embd floats at x + x_off with `pso` (the ablate_rows kernel);
-    // nothing when the layer's vectors at the site are all zero.
+    // nothing when the layer's vectors at the site are all zero. With cycle > 1, row r takes the directions of
+    // site + r % cycle (consecutive sites, e.g. one per interleaved stream).
     void apply(MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso, uint32_t layer, int site,
-               MTL::Buffer* x, uint64_t x_off, uint32_t rows) const;
+               MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cycle = 1) const;
 
 private:
     uint32_t n_embd_ = 0, n_layer_ = 0, k_ = 0;

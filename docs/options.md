@@ -85,12 +85,16 @@ x -= scale (x . v) v per direction, the vectors' norms carrying the strength, `-
 (`mako_serve` and `mako_run`).
 
 - Format (`MAKOABL1`, `src/mtl/ablation.hpp`): n_embd, n_layer, site names, then float32 vectors
-  [layer][site][k][n_embd]. `tools/make_ablation.py` builds one from raw [layer][k][n_embd] directions.
+  [layer][site][k][n_embd]. `tools/make_ablation.py` builds one from raw [layer][k][n_embd] directions,
+  `tools/hy4f_ablation.py` one for Hy4-flash from per-stream directions [layers + 1][4][k][n_embd].
 - Refusal directions: [skafte/mako-ablations](https://huggingface.co/skafte/mako-ablations) has one file per model
   (`mako-download.sh <model> --ablate`); the DeepSeek file serves both Maya-S and ISTA's builds.
 - GLM-5.3 sites: `ffn_out` (a layer's FFN output) and `stream` (the hyper-connection streams), both before the FFN
   output is mixed in; the next-token block is left alone.
 - DeepSeek-V4.1 sites: `attn_out` (a layer's attention output) and `shexp_out` (its shared expert's output).
+- Hy4-flash sites: `stream0` to `stream3`, each hyper-connection stream entering a layer (after its Engram, before
+  the attention's mix), and `head0` to `head3`, the streams before the output head (stored at the last layer). Each
+  stream has its own directions; the four of a kind come in order. `mako_serve` only.
 
 ## Other model files
 

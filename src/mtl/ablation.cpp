@@ -13,6 +13,7 @@ namespace {
 struct AblateArgs {
     uint32_t n_embd, k;
     float scale;
+    uint32_t cycle;
 };
 
 } // namespace
@@ -74,11 +75,16 @@ int Ablation::site(std::string_view name) const
 }
 
 void Ablation::apply(MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso, uint32_t layer, int site,
-                     MTL::Buffer* x, uint64_t x_off, uint32_t rows) const
+                     MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cycle) const
 {
-    if (!active(layer, site) || rows == 0)
+    if (rows == 0 || site < 0 || uint32_t(site) + cycle > names_.size())
         return;
-    const AblateArgs a{n_embd_, k_, scale_};
+    bool any = false;
+    for (uint32_t s = 0; s < cycle; ++s)
+        any = any || active(layer, site + int(s));
+    if (!any)
+        return;
+    const AblateArgs a{n_embd_, k_, scale_, cycle};
     enc->setComputePipelineState(pso);
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(buf_.get(), (uint64_t(layer) * names_.size() + uint64_t(site)) * k_ * n_embd_ * 4, 1);

@@ -36,6 +36,7 @@ set(MAKO_MODEL "$ENV{MAKO_MODEL}" CACHE FILEPATH "First GGUF shard for the tests
 set(MAKO_DS41_MODEL "$ENV{MAKO_DS41_MODEL}" CACHE FILEPATH "First DeepSeek-V4.1 GGUF shard for its tests")
 set(MAKO_DS41_ENGRAM "$ENV{MAKO_DS41_ENGRAM}" CACHE FILEPATH "A GGUF with other Engram tables for DeepSeek-V4.1's tests (default: the model's own)")
 set(MAKO_DS41_ABLATION "$ENV{MAKO_DS41_ABLATION}" CACHE FILEPATH "An ablation file for DeepSeek-V4.1 (optional test input)")
+set(MAKO_HY4F_ABLATION "$ENV{MAKO_HY4F_ABLATION}" CACHE FILEPATH "An ablation file for Hy4-flash (optional test input)")
 set(MAKO_HY4F_MODEL "$ENV{MAKO_HY4F_MODEL}" CACHE FILEPATH "First Hy4-flash GGUF shard for its tests")
 set(MAKO_HY4F_MMPROJ "$ENV{MAKO_HY4F_MMPROJ}" CACHE FILEPATH "Hy4-flash's vision projector for its tests (optional)")
 set(MAKO_DS41_DSPARK "$ENV{MAKO_DS41_DSPARK}" CACHE PATH "DeepSeek-V4.1's DSpark drafter directory (optional test input)")

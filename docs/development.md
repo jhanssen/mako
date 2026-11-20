@@ -12,7 +12,7 @@ one's options.
 - Inspection: `gguf_dump`, `tokenize`, `render_template`, `engram_rows`, `logit_compare`.
 - `ref_dump` and `ref_vision`: logits and image embeddings from the reference implementation, when CMake is given its
   checkout (`MAKO_REF_SRC`, `MAKO_REF_BUILD`; `ref_vision` needs its `mtmd` library built).
-- Python, in `tools/`: the generators of test data (`gen_*.py`; the unicode tables' in mako-common), `make_ablation.py`, `gguf_retag.py`, `self_check.py`.
+- Python, in `tools/`: the generators of test data (`gen_*.py`; the unicode tables' in mako-common), `make_ablation.py`, `hy4f_ablation.py`, `gguf_retag.py`, `self_check.py`.
 
 Programs generate through `gen::Session` (`src/gen/session.hpp`), for either model: it takes the whole prompt each
 time, keeps the longest prefix the engine already holds (continuing the current state, or restoring a checkpoint of
@@ -34,7 +34,7 @@ ctest has no effect. What each model variable enables:
 | (none) | `-L cpu` (no GPU either; what CI runs) and `-L kernels` (GPU kernels on random data) |
 | `MAKO_MODEL` (GLM-5.3) | `e2e_*`, the tokenizer, templates, GEMV/GEMM on real weights |
 | `MAKO_DS41_MODEL` (DeepSeek-V4.1) | `ds41_*`, `dsv41`, its tokenizer, template and Engram tests. Optional: `MAKO_DS41_ENGRAM` (other Engram tables), `MAKO_DS41_DSPARK` (the drafter), `MAKO_DS41_ABLATION` |
-| `MAKO_HY4F_MODEL` (Hy4-flash) | `hy4f_*` (its config, tokenizer and reference logits). Optional: `MAKO_HY4F_MMPROJ` (its vision projector: `vision_hy4f` and `hy4f_ref`'s image checks) |
+| `MAKO_HY4F_MODEL` (Hy4-flash) | `hy4f_*` (its config, tokenizer and reference logits). Optional: `MAKO_HY4F_MMPROJ` (its vision projector: `vision_hy4f` and `hy4f_ref`'s image checks), `MAKO_HY4F_ABLATION` (`hy4f_ablation`'s prefill and decode check with a real file) |
 
 mako-common (`external/mako-common`) has its own tests (`-L cpu`, `-L kernels`), built and run from its directory.
 `ctest -N -L <label>` lists a label's tests, `ctest

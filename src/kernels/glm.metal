@@ -1215,6 +1215,7 @@ struct AblateArgs {
     uint n_embd;
     uint k;      // directions, orthonormal
     float scale; // 1: the components are removed entirely
+    uint cycle;  // row r takes the (r % cycle)-th set of k directions
 };
 
 // Each row loses its components along k directions (x -= scale (x . v) v, one direction after another); one
@@ -1226,6 +1227,7 @@ kernel void ablate_rows(device float* x [[buffer(0)]], device const float* v [[b
 {
     threadgroup float part[8];
     x += uint64_t(row) * a.n_embd;
+    v += uint64_t(row % a.cycle) * a.k * a.n_embd;
     for (uint k = 0; k < a.k; ++k) {
         device const float* d = v + uint64_t(k) * a.n_embd;
         float acc = 0.0f;

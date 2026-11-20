@@ -951,6 +951,37 @@ const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const
     return logits_;
 }
 
+void Engine::set_ablation(std::optional<mtl::Ablation> ablation)
+{
+    ablate_stream_ = ablate_head_ = -1;
+    if (ablation) {
+        if (cfg_.hc != 4)
+            throw std::runtime_error(std::format("ablation: the sites are for 4 streams, the model has {}", cfg_.hc));
+        auto first = [&](size_t k) { // the index of kAblationSites[k]'s kind, -1 when the file has none of it
+            const int s0 = ablation->site(kAblationSites[k]);
+            for (size_t s = 0; s < 4; ++s) {
+                const int i = ablation->site(kAblationSites[k + s]);
+                if ((s0 < 0) != (i < 0) || (s0 >= 0 && i != s0 + int(s)))
+                    throw std::runtime_error(std::format("ablation: {}..{} must all be there, in order",
+                                                         kAblationSites[k], kAblationSites[k + 3]));
+            }
+            return s0;
+        };
+        ablate_stream_ = first(0);
+        ablate_head_ = first(4);
+    }
+    ablation_ = std::move(ablation);
+}
+
+void Engine::ablate(MTL::ComputeCommandEncoder*& enc, uint32_t il, int site, MTL::Buffer* R, uint64_t off,
+                    uint32_t rows)
+{
+    if (!ablation_ || site < 0)
+        return;
+    ablation_->apply(enc, pso("ablate_rows"), il, site, R, off, rows * cfg_.hc, cfg_.hc);
+    after(enc, "ablate_rows");
+}
+
 void Engine::run(std::span<const int32_t> tokens, bool all_logits)
 {
     const uint32_t G = uint32_t(tokens.size());
@@ -1070,6 +1101,9 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
             if (G == 1)
                 probe(enc, "engram_out", int(il), R, hd);
         }
+        ablate(enc, il, ablate_stream_, R, 0, G);
+        if (G == 1)
+            probe(enc, "stream_in", int(il), R, hd);
         for (uint32_t c0 = 0; c0 < G; c0 += chunk) {
             const uint32_t T = std::min(chunk, G - c0);
             const uint64_t r_off = uint64_t(c0) * hd * 4;
@@ -1133,7 +1167,11 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     MTL::Buffer* xl = scratch("hy_xl", uint64_t(nl) * E * 4);
     MTL::Buffer* xnl = scratch("hy_xnl", uint64_t(nl) * E * 4);
     MTL::Buffer* lg = scratch("hy_logits", uint64_t(nl) * cfg_.n_vocab * 4);
-    for (uint32_t l0 = all_logits ? 0 : G - 1; l0 < G; l0 += nl) {
+    const uint32_t first_logit = all_logits ? 0 : G - 1;
+    ablate(enc, cfg_.n_layer - 1, ablate_head_, R, uint64_t(first_logit) * hd * 4, G - first_logit);
+    if (G == 1)
+        probe(enc, "head_in", -1, R, hd);
+    for (uint32_t l0 = first_logit; l0 < G; l0 += nl) {
         const uint32_t n = std::min(nl, G - l0);
         norm(enc, R, nullptr, flat, n, hd, 0, cfg_.rms_eps, uint64_t(l0) * hd * 4);
         proj(enc, head_fn_, flat, 0, mixes, 0, n);

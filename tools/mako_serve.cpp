@@ -12,7 +12,7 @@
 // Sampling defaults come from the model's general.sampling.* metadata. SIGINT or SIGTERM stops it; with --learn the
 // session's routing counts are then added to the model's profile (which experts start resident). --ablate removes
 // per-layer directions (an ablation file, mtl::Ablation, with the model's sites: GLM-5.3 ffn_out and stream,
-// DeepSeek-V4.1 attn_out and shexp_out); --ablate-scale multiplies their strength. --engram: the GGUF with
+// DeepSeek-V4.1 attn_out and shexp_out, Hy4-flash stream0..3 and head0..3); --ablate-scale multiplies their strength. --engram: the GGUF with
 // DeepSeek-V4.1's Engram tables (default: the model's own shards). --stage-gb limits the ring that prompts'
 // missing experts are read ahead into (0: off; default: two layers' worth, at most 3 GB). --dspark:
 // DeepSeek-V4.1's drafter (dspark.json and dspark.bin) for speculative decoding; its 8 GB come out of the expert
@@ -279,8 +279,6 @@ int main(int argc, char** argv)
             auto cfg = mako::hy4f::Config::load(*model);
             if (!cfg)
                 throw std::runtime_error(cfg.error());
-            if (!ablate.empty())
-                throw std::runtime_error("ablation is not supported for Hy4-flash yet");
             mako::hy4f::Options opts;
             opts.max_ctx = max_ctx;
             opts.arena_gb = arena_gb;
@@ -297,6 +295,8 @@ int main(int argc, char** argv)
             so.prefill_piece = opts.prefill_group;
             so.speculative = false;
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
+            sites = mako::hy4f::Engine::kAblationSites;
+            set_ablation = [p = e.get()](mako::mtl::Ablation a) { p->set_ablation(std::move(a)); };
             l.base = e.get();
             l.model = std::move(e);
         } else if (deepseek) {
