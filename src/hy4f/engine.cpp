@@ -1,6 +1,7 @@
 #include "hy4f/engine.hpp"
 
 #include "gguf/read_pool.hpp"
+#include "safetensors/safetensors.hpp"
 #include "quant/dequant.hpp"
 
 #include <algorithm>
@@ -104,6 +105,25 @@ struct Engine::Layer {
     DevTensor ffn_gate, ffn_up, ffn_down;
     MoeWeights moe;
     ExpertArena::LayerParts experts{};
+};
+
+struct Engine::Drafter {
+    static constexpr uint32_t kSlots = 5, kRows = kSlots + 1, kLayers = 5, kHeads = 32;
+    static constexpr std::array<uint32_t, kLayers> kTarget{25, 29, 33, 37, 41}; // the layers whose KV each reads
+    static constexpr int32_t kMask = 120009;
+    struct Layer {
+        uint32_t target = 0;
+        DevTensor in_norm, q_a, q_a_norm, q_b, kv_lat, kv_pe, kv_norm, k_b, v_b, gate, wo, proj_norm, sinks;
+        DevTensor ffn_norm, ffn_gate, ffn_up, ffn_down;
+    };
+    std::array<Layer, kLayers> layers;
+    DevTensor enorm, hnorm, eh_proj, fusion_gate, final_norm;
+    DevTensor corr_hnorm, corr_enorm, corr_gate, corr_up, corr_down, conf_w;
+    float conf_bias = 0.0f;
+    DevTensor embd; // the target's token embeddings
+    // The taps of the last run's last tokens: each tapped layer's indexer lists and counts, the normed final hidden.
+    std::array<mtl::Ref<MTL::Buffer>, kLayers> tap_list, tap_count;
+    mtl::Ref<MTL::Buffer> tap_h;
 };
 
 Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx)
@@ -261,6 +281,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         engram_history_.assign(engram_->history(), -1);
     }
     logits_.resize(cfg_.n_vocab);
+    if (!opts_.dfly2.empty())
+        load_drafter(opts_.dfly2);
 
     load_.dense_ms = ms_since(t_load);
     set_staging_limit(opts_.stage_gb);
@@ -279,8 +301,6 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     init_runtime(std::move(init));
     set_keepalive(opts_.keepalive);
 }
-
-Engine::~Engine() = default;
 
 // Scratch bytes of a prefill: per group token (streams, FFN rows, Engram rows, routed outputs), per chunk token (the
 // attention's projections and outputs), the attention and indexer scores, the expert batch buffers.
@@ -302,6 +322,7 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
 
 void Engine::reset()
 {
+    tap_n_ = 0;
     pos_ = 0;
     rope_delta_ = 0;
     if (engram_)
@@ -383,6 +404,7 @@ std::vector<std::byte> Engine::save_positions(uint32_t pos) const
 
 void Engine::load_positions(uint32_t pos, std::span<const std::byte> data)
 {
+    tap_n_ = 0;
     const auto parts = positional(pos);
     uint64_t off = 0;
     for (const auto& [b, bytes] : parts) {
@@ -444,6 +466,7 @@ Engine::Checkpoint Engine::checkpoint()
 
 void Engine::restore(const Checkpoint& cp)
 {
+    tap_n_ = 0;
     if (cp.pos > opts_.max_ctx || cp.state.size() != checkpoint_bytes())
         throw std::runtime_error("checkpoint from another engine");
     const std::byte* p = cp.state.data();
@@ -729,8 +752,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     // Per-head matrices (k_b: nope -> R, v_b: R -> head_v): the batched GEMV for a few tokens, else a GEMM per head.
     auto per_head = [&](const DevTensor& w, MTL::Buffer* x, uint32_t xw, MTL::Buffer* y, uint32_t yw) {
         if (T < gemm_min_tokens_) {
-            for (uint32_t t = 0; t < T; ++t)
-                gemv(enc, w, x, uint64_t(t) * H * xw * 4, y, uint64_t(t) * H * yw * 4, H);
+            per_head_gemv(enc, w, x, xw, y, yw, H, T);
             return;
         }
         const uint32_t k = uint32_t(w.dims[0]), nr = uint32_t(w.dims[1]);
@@ -807,6 +829,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         const uint32_t Ls = list_stride(), rows = gt * H, splits = 8;
         part(enc, "attn indexer select");
         indexer_select(enc, il, t, pos0 + t, gt);
+        if (drafter_)
+            tap_lists(enc, il, pos0 + t, gt);
         part(enc, "attn sparse");
         MTL::Buffer* list = scratch("hy_idx_list", uint64_t(gt) * Ls * 4);
         MTL::Buffer* count = scratch("hy_idx_count", uint64_t(gt) * 4);
@@ -897,6 +921,24 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     proj(enc, L.wo, vout, 0, att, 0, T);
 }
 
+void Engine::per_head_gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint32_t xw,
+                           MTL::Buffer* y, uint32_t yw, uint32_t H, uint32_t T)
+{
+    mtl::Gemv::Args a;
+    a.type = w.type;
+    a.k = uint32_t(w.dims[0]);
+    a.n = uint32_t(w.dims[1]);
+    a.t = T;
+    a.batch = H;
+    const mtl::Gemv::ShortStrides s{mtl::Gemv::row_bytes(w.type, a.k) * a.n, H * xw, xw, H * yw, yw};
+    if (repeat_n_ == 1 && gemv_->encode_short_batch(enc, a, w.buf, w.off, x, 0, y, 0, s)) {
+        after(enc, std::format("gemv_short_batch {}x{}", a.k, a.n));
+        return;
+    }
+    for (uint32_t t = 0; t < T; ++t)
+        gemv(enc, w, x, uint64_t(t) * H * xw * 4, y, uint64_t(t) * H * yw * 4, H);
+}
+
 const std::vector<float>& Engine::step(int32_t token)
 {
     const int32_t t[1] = {token};
@@ -926,6 +968,10 @@ void Engine::keep(uint32_t n)
     const uint32_t T = uint32_t(verify_tokens_.size());
     if (n == 0 || n > T || pos_ != verify_pos0_ + T)
         throw std::runtime_error("keep: not after a verify of at least that many tokens");
+    if (draft_offered_) {
+        note_draft(float(n - 1));
+        draft_offered_ = false;
+    }
     if (n == T)
         return;
     pos_ = verify_pos0_ + n;
@@ -1025,6 +1071,11 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         throw std::runtime_error("context full");
     apply_pressure();
     const uint32_t E = cfg_.n_embd, hd = cfg_.hc * E, chunk = std::min(opts_.prefill_chunk, G);
+    // The drafter's taps: the run's last tap_n tokens.
+    const uint32_t tap_n = drafter_ ? std::min<uint32_t>(G, kMaxDecodeTokens) : 0;
+    tap_n_ = 0;
+    run_pos0_ = pos_;
+    run_G_ = G;
     const bool decode = G <= kMaxDecodeTokens;
     step_start_ = Clock::now();
     encoding_ = true;
@@ -1221,6 +1272,18 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         norm(enc, xl, &output_norm_, xnl, n, E, E, cfg_.rms_eps);
         if (G == 1)
             probe(enc, "result_norm", -1, xnl, E);
+        if (tap_n) {
+            const uint32_t a = std::max(l0, G - tap_n), b = l0 + n;
+            if (b > a) {
+                const uint32_t words = (b - a) * E;
+                enc->setComputePipelineState(pso("hy4_copy_words"));
+                enc->setBuffer(xnl, uint64_t(a - l0) * E * 4, 0);
+                enc->setBuffer(drafter_tap_h(), uint64_t(a - (G - tap_n)) * E * 4, 1);
+                enc->setBytes(&words, sizeof(words), 2);
+                enc->dispatchThreads(MTL::Size(words, 1, 1), MTL::Size(256, 1, 1));
+                after(enc, "hy4_copy_words");
+            }
+        }
         proj(enc, output_, xnl, 0, lg, 0, n);
         enc->endEncoding();
         finish(cb);
@@ -1239,6 +1302,11 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         cur_cb_ = cb;
         enc = encoder(cb, cur_layer_, -1);
     }
+    if (tap_n) {
+        tap_pos0_ = pos_ + G - tap_n;
+        tap_n_ = tap_n;
+        tap_h_from_ = all_logits ? 0 : tap_n - 1;
+    }
     pos_ += G;
     rope_delta_ = rope_delta;
     pool->release();
@@ -1255,6 +1323,450 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     last_step_.read_bytes = after_stats.read_bytes - before.read_bytes;
     if (timing())
         resolve_layer_times(cpu0, gpu0);
+}
+
+
+// DFly2.
+
+namespace {
+
+struct DraftPickArgs {
+    uint32_t n_vocab, width, slot;
+    float conf_bias;
+};
+
+// Rows of k floats (k a multiple of 32) as Q8_0 blocks, as ggml quantizes them: a float16 scale max|x| / 127, the
+// values rounded half away from zero; on all cores.
+void quantize_q8_0(const float* src, std::byte* dst, uint64_t k, uint64_t rows)
+{
+    const uint32_t threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::jthread> pool;
+    for (uint32_t w = 0; w < threads; ++w)
+        pool.emplace_back([=] {
+            for (uint64_t r = w; r < rows; r += threads)
+                for (uint64_t b = 0; b < k / 32; ++b) {
+                    const float* x = src + r * k + b * 32;
+                    float amax = 0.0f;
+                    for (int i = 0; i < 32; ++i)
+                        amax = std::max(amax, std::fabs(x[i]));
+                    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+                    std::byte* blk = dst + (r * (k / 32) + b) * 34;
+                    const _Float16 h = _Float16(d);
+                    std::memcpy(blk, &h, 2);
+                    for (int i = 0; i < 32; ++i) {
+                        const int8_t q = int8_t(std::round(x[i] * id));
+                        std::memcpy(blk + 2 + i, &q, 1);
+                    }
+                }
+        });
+}
+
+} // namespace
+
+
+Engine::~Engine() = default;
+
+MTL::Buffer* Engine::drafter_tap_h() const { return drafter_->tap_h.get(); }
+
+void Engine::load_drafter(const std::string& path)
+{
+    using D = Drafter;
+    const uint64_t E = cfg_.n_embd, H = D::kHeads, R = cfg_.kv_lora_rank, NR = cfg_.n_rot, HK = cfg_.head_k;
+    const uint64_t NOPE = HK - NR, HV = cfg_.head_v, QR = cfg_.q_lora_rank;
+    for (uint32_t il : D::kTarget)
+        if (il >= cfg_.n_layer || !layers_[il]->indexer || layers_[il]->swa || cfg_.n_head[il] != H)
+            throw std::runtime_error(
+                std::format("DFly2: target layer {} is not a {}-head sparse-attention layer", il, H));
+    if (token_embd_.tensor->type != gguf::Type::Q8_0 || E % 32 || uint32_t(D::kMask) >= cfg_.n_vocab)
+        throw std::runtime_error("DFly2: the token embeddings must be Q8_0 and hold the mask token");
+    auto file = safetensors::File::open(path);
+    if (!file)
+        throw std::runtime_error(file.error());
+    const std::string prefix = "model.dfly_layers.";
+    auto find = [&](const std::string& name, std::vector<uint64_t> dims) -> const gguf::Tensor& {
+        const gguf::Tensor* t = file->tensor(prefix + name);
+        if (!t)
+            throw std::runtime_error(std::format("{}: no {}{}", path, prefix, name));
+        if (t->type != gguf::Type::BF16 || t->dims != dims)
+            throw std::runtime_error(std::format("{}: {}{} is not BF16 of the expected shape", path, prefix, name));
+        return *t;
+    };
+    auto floats = [&](const gguf::Tensor& t) {
+        std::vector<uint16_t> raw(t.bytes / 2);
+        gguf::read_exact(file->fd(), raw.data(), t.bytes, t.offset);
+        std::vector<float> v(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) {
+            const uint32_t u = uint32_t(raw[i]) << 16;
+            std::memcpy(&v[i], &u, 4);
+        }
+        return v;
+    };
+    auto vec = [&](const std::string& name, std::vector<uint64_t> dims) {
+        const auto v = floats(find(name, dims));
+        DevTensor d = reserve(v.size() * 4, gguf::Type::F32, {v.size()});
+        std::memcpy(static_cast<char*>(d.buf->contents()) + d.off, v.data(), v.size() * 4);
+        return d;
+    };
+    auto q8 = [&](const float* src, std::vector<uint64_t> dims) {
+        uint64_t rows = 1;
+        for (size_t i = 1; i < dims.size(); ++i)
+            rows *= dims[i];
+        DevTensor d = reserve(rows * (dims[0] / 32) * 34, gguf::Type::Q8_0, dims);
+        quantize_q8_0(src, static_cast<std::byte*>(d.buf->contents()) + d.off, dims[0], rows);
+        return d;
+    };
+    auto mat = [&](const std::string& name, uint64_t k, uint64_t n) {
+        const auto v = floats(find(name, {k, n}));
+        return q8(v.data(), {k, n});
+    };
+    auto d = std::make_unique<Drafter>();
+    const uint64_t F = [&] {
+        const gguf::Tensor* t = file->tensor(prefix + "0.mlp.gate_proj.weight");
+        return t && t->dims.size() == 2 ? t->dims[1] : 0;
+    }();
+    for (uint32_t i = 0; i < D::kLayers; ++i) {
+        D::Layer& L = d->layers[i];
+        const std::string p = std::format("{}.", i), a = p + "self_attn.";
+        L.target = D::kTarget[i];
+        L.in_norm = vec(p + "input_layernorm.weight", {E});
+        L.q_a = mat(a + "q_a_proj.weight", E, QR);
+        L.q_a_norm = vec(a + "q_a_layernorm.weight", {QR});
+        L.q_b = mat(a + "q_b_proj.weight", QR, H * HK);
+        const DevTensor kv = mat(a + "kv_a_proj_with_mqa.weight", E, R + NR);
+        const uint64_t kv_row = mtl::Gemv::row_bytes(kv.type, uint32_t(E));
+        L.kv_lat = {kv.buf, kv.off, kv.type, {E, R}};
+        L.kv_pe = {kv.buf, kv.off + R * kv_row, kv.type, {E, NR}};
+        L.kv_norm = vec(a + "kv_a_layernorm.weight", {R});
+        {
+            // kv_b's rows per head: the key's nope part (absorbed into the query: its transpose, latent x nope),
+            // then the value's (head_v x latent).
+            const auto kvb = floats(find(a + "kv_b_proj.weight", {R, H * (NOPE + HV)}));
+            std::vector<float> kb(H * R * NOPE), vb(H * HV * R);
+            for (uint64_t h = 0; h < H; ++h) {
+                const float* w = kvb.data() + h * (NOPE + HV) * R;
+                for (uint64_t j = 0; j < NOPE; ++j)
+                    for (uint64_t c = 0; c < R; ++c)
+                        kb[(h * R + c) * NOPE + j] = w[j * R + c];
+                std::memcpy(vb.data() + h * HV * R, w + NOPE * R, HV * R * 4);
+            }
+            L.k_b = q8(kb.data(), {NOPE, R, H});
+            L.v_b = q8(vb.data(), {R, HV, H});
+        }
+        L.gate = mat(a + "linear_gate.weight", E, H * HV);
+        L.wo = mat(a + "o_proj.weight", H * HV, E);
+        L.proj_norm = vec(a + "post_proj_norm.weight", {E});
+        L.sinks = vec(a + "learnable_sink_param", {H});
+        L.ffn_norm = vec(p + "post_attention_layernorm.weight", {E});
+        L.ffn_gate = mat(p + "mlp.gate_proj.weight", E, F);
+        L.ffn_up = mat(p + "mlp.up_proj.weight", E, F);
+        L.ffn_down = mat(p + "mlp.down_proj.weight", F, E);
+    }
+    d->enorm = vec("mtp_fusion.enorm.weight", {E});
+    d->hnorm = vec("mtp_fusion.hnorm.weight", {E});
+    d->eh_proj = mat("mtp_fusion.eh_proj.weight", 2 * E, E);
+    d->fusion_gate = vec("mtp_fusion.gate", {E});
+    d->final_norm = vec("final_norm.weight", {E});
+    d->corr_hnorm = vec("hidden_correction.hidden_norm.weight", {E});
+    d->corr_enorm = vec("hidden_correction.embed_norm.weight", {E});
+    const uint64_t CF = [&] {
+        const gguf::Tensor* t = file->tensor(prefix + "hidden_correction.gate_proj.weight");
+        return t && t->dims.size() == 2 ? t->dims[1] : 0;
+    }();
+    d->corr_gate = mat("hidden_correction.gate_proj.weight", 2 * E, CF);
+    d->corr_up = mat("hidden_correction.up_proj.weight", 2 * E, CF);
+    d->corr_down = mat("hidden_correction.down_proj.weight", CF, E);
+    d->conf_w = vec("confidence_head.proj.weight", {E, 1});
+    d->conf_bias = floats(find("confidence_head.proj.bias", {1}))[0];
+    d->embd = upload("token_embd.weight");
+    auto buffer = [&](uint64_t bytes) {
+        mtl::Ref<MTL::Buffer> b(
+            ctx_.device()->newBuffer(std::max<uint64_t>(bytes, 16), MTL::ResourceStorageModeShared));
+        std::memset(b->contents(), 0, b->length());
+        return b;
+    };
+    for (uint32_t i = 0; i < D::kLayers; ++i) {
+        d->tap_list[i] = buffer(uint64_t(kMaxDecodeTokens) * list_stride() * 4);
+        d->tap_count[i] = buffer(uint64_t(kMaxDecodeTokens) * 4);
+    }
+    d->tap_h = buffer(uint64_t(kMaxDecodeTokens) * E * 4);
+    drafter_ = std::move(d);
+}
+
+void Engine::tap_lists(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t pos, uint32_t count)
+{
+    const auto it = std::ranges::find(Drafter::kTarget, il);
+    if (it == Drafter::kTarget.end())
+        return;
+    const uint32_t i = uint32_t(it - Drafter::kTarget.begin());
+    const uint32_t end = run_pos0_ + run_G_, first = end - std::min<uint32_t>(run_G_, kMaxDecodeTokens);
+    const uint32_t a = std::max(pos, first), b = std::min(pos + count, end);
+    if (b <= a)
+        return;
+    const uint32_t Ls = list_stride();
+    auto copy = [&](MTL::Buffer* src, uint64_t src_off, MTL::Buffer* dst, uint64_t dst_off, uint32_t words) {
+        enc->setComputePipelineState(pso("hy4_copy_words"));
+        enc->setBuffer(src, src_off, 0);
+        enc->setBuffer(dst, dst_off, 1);
+        enc->setBytes(&words, sizeof(words), 2);
+        enc->dispatchThreads(MTL::Size(words, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "hy4_copy_words");
+    };
+    copy(scratch("hy_idx_list", 0), uint64_t(a - pos) * Ls * 4, drafter_->tap_list[i].get(),
+         uint64_t(a - first) * Ls * 4, (b - a) * Ls);
+    copy(scratch("hy_idx_count", 0), uint64_t(a - pos) * 4, drafter_->tap_count[i].get(), uint64_t(a - first) * 4,
+         b - a);
+}
+
+std::vector<int32_t> Engine::draft(int32_t next)
+{
+    using D = Drafter;
+    draft_conf_.clear();
+    if (!drafter_ || next < 0 || uint32_t(next) >= cfg_.n_vocab || pos_ == 0 || pos_ + D::kRows > opts_.max_ctx)
+        return {};
+    // The taps of the last accepted position, pos_ - 1, from the last run (or the verify keep() cut short).
+    const uint32_t last = pos_ - 1;
+    if (tap_n_ == 0 || last < tap_pos0_ + tap_h_from_ || last >= tap_pos0_ + tap_n_)
+        return {};
+    const uint32_t row = last - tap_pos0_;
+    if (draft_gain_ < opts_.draft_min_gain && ++draft_skipped_ % std::max(1u, opts_.draft_probe) != 0)
+        return {};
+    const uint32_t E = cfg_.n_embd, H = D::kHeads, R = cfg_.kv_lora_rank, NR = cfg_.n_rot, HK = cfg_.head_k;
+    const uint32_t NOPE = HK - NR, HV = cfg_.head_v, QR = cfg_.q_lora_rank, V = cfg_.n_vocab, T = D::kRows;
+    const uint32_t Ls = list_stride(), Ld = Ls + 32, splits = 8;
+    const uint32_t select_from = (n_top_ + 1) * cfg_.indexer_kpool;
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    // Each layer's key lists: the target layer's for `last` (every earlier position while it attends densely), then
+    // the block's rows up to each row's own.
+    MTL::Buffer* lists = scratch("dr_lists", uint64_t(D::kLayers) * T * Ld * 4);
+    MTL::Buffer* counts = scratch("dr_counts", uint64_t(D::kLayers) * T * 4);
+    for (uint32_t i = 0; i < D::kLayers; ++i) {
+        auto* L = static_cast<uint32_t*>(lists->contents()) + uint64_t(i) * T * Ld;
+        auto* C = static_cast<uint32_t*>(counts->contents()) + uint64_t(i) * T;
+        uint32_t n = 0;
+        if (last < select_from) {
+            for (; n < pos_; ++n)
+                L[n] = n;
+        } else {
+            n = static_cast<const uint32_t*>(drafter_->tap_count[i]->contents())[row];
+            std::memcpy(L, static_cast<const uint32_t*>(drafter_->tap_list[i]->contents()) + uint64_t(row) * Ls,
+                        uint64_t(n) * 4);
+        }
+        for (uint32_t r = 0; r < T; ++r) {
+            uint32_t* Lr = L + uint64_t(r) * Ld;
+            if (r)
+                std::memcpy(Lr, L, uint64_t(n) * 4);
+            for (uint32_t j = 0; j <= r; ++j)
+                Lr[n + j] = pos_ + j;
+            C[r] = n + r + 1;
+        }
+    }
+    rope_positions(pos_, pos_ + T);
+
+    MTL::Buffer* ids = scratch("dr_ids", 64);
+    MTL::Buffer* prev = scratch("dr_prev", 64);
+    MTL::Buffer* drafts = scratch("dr_drafts", 64);
+    MTL::Buffer* conf = scratch("dr_conf", 64);
+    {
+        auto* id = static_cast<int32_t*>(ids->contents());
+        id[0] = next;
+        for (uint32_t r = 1; r < T; ++r)
+            id[r] = D::kMask;
+        static_cast<int32_t*>(prev->contents())[0] = next;
+    }
+    MTL::Buffer* emb = scratch("dr_emb", uint64_t(T) * E * 4);
+    MTL::Buffer* x = scratch("dr_x", uint64_t(T) * E * 4);
+    MTL::Buffer* xa = scratch("dr_xa", uint64_t(T) * E * 4);
+    MTL::Buffer* cat = scratch("dr_cat", uint64_t(2) * E * 4);
+    MTL::Buffer* f = scratch("dr_f", uint64_t(T) * E * 4);
+    MTL::Buffer* qr = scratch("dr_qr", uint64_t(T) * QR * 4);
+    MTL::Buffer* qrn = scratch("dr_qrn", uint64_t(T) * QR * 4);
+    MTL::Buffer* q = scratch("dr_q", uint64_t(T) * H * HK * 4);
+    MTL::Buffer* qn = scratch("dr_qn", uint64_t(T) * H * NOPE * 4);
+    MTL::Buffer* qp = scratch("dr_qp", uint64_t(T) * H * NR * 4);
+    MTL::Buffer* kvl = scratch("dr_kvl", uint64_t(T) * R * 4);
+    MTL::Buffer* kvn = scratch("dr_kvn", uint64_t(T) * R * 4);
+    MTL::Buffer* kpe = scratch("dr_kpe", uint64_t(T) * NR * 4);
+    MTL::Buffer* qabs = scratch("dr_qabs", uint64_t(T) * H * R * 4);
+    MTL::Buffer* qlh = scratch("dr_qlh", uint64_t(T) * H * R * 2);
+    MTL::Buffer* g = scratch("dr_g", uint64_t(T) * H * HV * 4);
+    MTL::Buffer* lat = scratch("dr_lat", uint64_t(T) * H * R * 4);
+    MTL::Buffer* vout = scratch("dr_vout", uint64_t(T) * H * HV * 4);
+    MTL::Buffer* att = scratch("dr_att", uint64_t(T) * E * 4);
+    MTL::Buffer* sl = scratch("dr_sl", uint64_t(T) * H * Ld * 4);
+    MTL::Buffer* sp = scratch("dr_sp", uint64_t(T) * H * Ld * 4);
+    MTL::Buffer* partial = scratch("dr_part", uint64_t(splits) * T * H * R * 4);
+    MTL::Buffer* h = scratch("dr_h", uint64_t(T) * E * 4);
+    MTL::Buffer* pe = scratch("dr_pe", uint64_t(E) * 4);
+    MTL::Buffer* hc = scratch("dr_hc", uint64_t(E) * 4);
+    MTL::Buffer* lg = scratch("dr_logits", uint64_t(V) * 4);
+    const float eps = cfg_.rms_eps, scale = 1.0f / std::sqrt(float(HK));
+
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    cur_layer_ = cfg_.n_layer;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, cur_layer_, -1);
+    auto embed = [&](MTL::Buffer* id, uint64_t id_off, MTL::Buffer* out, uint32_t rows) {
+        enc->setComputePipelineState(pso("hy4_embed_q8"));
+        enc->setBuffer(drafter_->embd.buf, drafter_->embd.off, 0);
+        enc->setBuffer(id, id_off, 1);
+        enc->setBuffer(out, 0, 2);
+        enc->setBytes(&E, sizeof(E), 3);
+        enc->dispatchThreads(MTL::Size(E, rows, 1), MTL::Size(256, 1, 1));
+        after(enc, "hy4_embed_q8");
+    };
+    auto add = [&](MTL::Buffer* a, uint64_t a_off, MTL::Buffer* b, MTL::Buffer* y, uint32_t n) {
+        enc->setComputePipelineState(pso("add"));
+        enc->setBuffer(a, a_off, 0);
+        enc->setBuffer(b, 0, 1);
+        enc->setBuffer(y, 0, 2);
+        enc->setBytes(&n, sizeof(n), 3);
+        enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "add");
+    };
+    embed(ids, 0, emb, T);
+    {
+        const uint32_t n = T * E;
+        dispatch(enc, "hy4_copy_words", {emb, x}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+    }
+    // The fusion on the anchor's row: x[0] += gate * eh_proj(enorm(E(next)) :: hnorm(h(last))).
+    norm(enc, emb, &drafter_->enorm, cat, 1, E, E, eps);
+    norm(enc, drafter_->tap_h.get(), &drafter_->hnorm, cat, 1, E, E, eps, uint64_t(row) * E * 4, uint64_t(E) * 4);
+    proj(enc, drafter_->eh_proj, cat, 0, f, 0, 1);
+    enc->setComputePipelineState(pso("hy4_gate_add"));
+    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(drafter_->fusion_gate.buf, drafter_->fusion_gate.off, 1);
+    enc->setBuffer(f, 0, 2);
+    enc->setBytes(&E, sizeof(E), 3);
+    enc->dispatchThreads(MTL::Size(E, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "hy4_gate_add");
+    for (uint32_t i = 0; i < D::kLayers; ++i) {
+        const D::Layer& L = drafter_->layers[i];
+        const uint32_t il = L.target;
+        MTL::Buffer* list = lists;
+        const uint64_t list_off = uint64_t(i) * T * Ld * 4, count_off = uint64_t(i) * T * 4;
+        norm(enc, x, &L.in_norm, xa, T, E, E, eps);
+        proj(enc, L.q_a, xa, 0, qr, 0, T);
+        proj(enc, L.kv_lat, xa, 0, kvl, 0, T);
+        proj(enc, L.kv_pe, xa, 0, kpe, 0, T);
+        proj(enc, L.gate, xa, 0, g, 0, T);
+        norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, eps);
+        proj(enc, L.q_b, qrn, 0, q, 0, T);
+        norm(enc, kvl, &L.kv_norm, kvn, T, R, R, eps);
+        const SplitArgs spa{H, NOPE, NR};
+        dispatch(enc, "hy4_split_q", {q, qn, qp}, &spa, sizeof(spa), MTL::Size(HK, H, T), MTL::Size(256, 1, 1));
+        rope(enc, qp, 0, freq_full_.get(), NR, H, pos_, T);
+        rope(enc, kpe, 0, freq_full_.get(), NR, 1, pos_, T);
+        // The block's rows go where the target writes its own when it runs these positions.
+        for (auto [src, dst, w] : {std::tuple{kvn, lat_[il].get(), R}, std::tuple{kpe, pe_[il].get(), NR}}) {
+            const uint32_t n = T * w;
+            enc->setComputePipelineState(pso("store_half"));
+            enc->setBuffer(src, 0, 0);
+            enc->setBuffer(dst, uint64_t(pos_ - row_base_[il]) * w * 2, 1);
+            enc->setBytes(&n, sizeof(n), 2);
+            enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+            after(enc, "store_half");
+        }
+        per_head_gemv(enc, L.k_b, qn, NOPE, qabs, R, H, T);
+        gemm_->to_half(enc, qabs, 0, T * H, R, 0, qlh, 0);
+        after(enc, "to_half");
+        const GatherArgs ga{H, R, Ld, splits, T};
+        enc->setComputePipelineState(pso("attn_gather_scores"));
+        enc->setBuffer(qlh, 0, 0);
+        enc->setBuffer(lat_[il].get(), 0, 1);
+        enc->setBuffer(list, list_off, 2);
+        enc->setBuffer(counts, count_off, 3);
+        enc->setBuffer(sl, 0, 4);
+        enc->setBytes(&ga, sizeof(ga), 5);
+        enc->dispatchThreadgroups(MTL::Size((Ld + 31) / 32, 1, T), MTL::Size(128, 1, 1));
+        after(enc, "attn_gather_scores");
+        const GatherRopeArgs gr{H, NR, Ld};
+        enc->setComputePipelineState(pso("hy4_gather_rope"));
+        enc->setBuffer(qp, 0, 0);
+        enc->setBuffer(pe_[il].get(), 0, 1);
+        enc->setBuffer(list, list_off, 2);
+        enc->setBuffer(counts, count_off, 3);
+        enc->setBuffer(sp, 0, 4);
+        enc->setBytes(&gr, sizeof(gr), 5);
+        enc->dispatchThreadgroups(MTL::Size((Ld + 63) / 64, H, T), MTL::Size(64, 1, 1));
+        after(enc, "hy4_gather_rope");
+        const ListSoftmaxArgs la{Ld, scale, H};
+        enc->setComputePipelineState(pso("hy4_softmax_list"));
+        enc->setBuffer(sl, 0, 0);
+        enc->setBuffer(sp, 0, 1);
+        enc->setBuffer(counts, count_off, 2);
+        enc->setBuffer(L.sinks.buf, L.sinks.off, 3);
+        enc->setBytes(&la, sizeof(la), 4);
+        enc->dispatchThreadgroups(MTL::Size(T * H, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "hy4_softmax_list");
+        enc->setComputePipelineState(pso("attn_gather_pv"));
+        enc->setBuffer(sl, 0, 0);
+        enc->setBuffer(lat_[il].get(), 0, 1);
+        enc->setBuffer(list, list_off, 2);
+        enc->setBuffer(counts, count_off, 3);
+        enc->setBuffer(partial, 0, 4);
+        enc->setBytes(&ga, sizeof(ga), 5);
+        enc->dispatchThreadgroups(MTL::Size(R / 128, 1, T * splits), MTL::Size(256, 1, 1));
+        after(enc, "attn_gather_pv");
+        const uint32_t sum[2] = {T * H * R, splits};
+        dispatch(enc, "sum_splits", {partial, lat}, sum, sizeof(sum), MTL::Size(T * H * R, 1, 1),
+                 MTL::Size(256, 1, 1));
+        per_head_gemv(enc, L.v_b, lat, R, vout, HV, H, T);
+        const uint32_t n = T * H * HV;
+        dispatch(enc, "hy4_gate_mul", {vout, g}, &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+        proj(enc, L.wo, vout, 0, att, 0, T);
+        norm(enc, att, &L.proj_norm, f, T, E, E, eps);
+        add(x, 0, f, x, T * E);
+        norm(enc, x, &L.ffn_norm, xa, T, E, E, eps);
+        ffn_dense(enc, L.ffn_gate, L.ffn_up, L.ffn_down, xa, f, 0.0f, T);
+        add(x, 0, f, x, T * E);
+        probe(enc, "dr_x", int(i), x, uint64_t(T) * E);
+    }
+    norm(enc, x, &drafter_->final_norm, h, T, E, E, eps);
+    // Draft s from row s + 1, corrected by the embedding of the token before it (next, then draft s - 1). Each slot
+    // is waited for: one whose draft would not be offered ends the drafting there.
+    const auto* dp = static_cast<const int32_t*>(drafts->contents());
+    const auto* cp = static_cast<const float*>(conf->contents());
+    std::vector<int32_t> out;
+    float cum = 1.0f;
+    const uint32_t slots = std::min(D::kSlots, opts_.max_drafts);
+    for (uint32_t s = 0; s < slots; ++s) {
+        if (s) {
+            cb = ctx_.queue()->commandBuffer();
+            cur_cb_ = cb;
+            enc = encoder(cb, cur_layer_, -1);
+        }
+        embed(prev, uint64_t(s) * 4, pe, 1);
+        norm(enc, h, &drafter_->corr_hnorm, cat, 1, E, E, eps, uint64_t(s + 1) * E * 4, 0);
+        norm(enc, pe, &drafter_->corr_enorm, cat, 1, E, E, eps, 0, uint64_t(E) * 4);
+        ffn_dense(enc, drafter_->corr_gate, drafter_->corr_up, drafter_->corr_down, cat, f, 0.0f, 1);
+        add(h, uint64_t(s + 1) * E * 4, f, hc, E);
+        proj(enc, output_, hc, 0, lg, 0, 1);
+        probe(enc, "dr_hc", int(s), hc, E);
+        const DraftPickArgs pa{V, E, s, drafter_->conf_bias};
+        enc->setComputePipelineState(pso("hy4_draft_pick"));
+        enc->setBuffer(lg, 0, 0);
+        enc->setBuffer(hc, 0, 1);
+        enc->setBuffer(drafter_->conf_w.buf, drafter_->conf_w.off, 2);
+        enc->setBuffer(drafts, 0, 3);
+        enc->setBuffer(conf, 0, 4);
+        enc->setBuffer(prev, 0, 5);
+        enc->setBytes(&pa, sizeof(pa), 6);
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+        after(enc, "hy4_draft_pick");
+        enc->endEncoding();
+        finish(cb);
+        draft_conf_.push_back(cp[s]);
+        cum *= cp[s];
+        if (cp[s] < opts_.draft_conf || cum < opts_.draft_cum)
+            break;
+        out.push_back(dp[s]);
+    }
+    pool->release();
+    draft_offered_ = !out.empty();
+    if (out.empty())
+        note_draft(0.0f);
+    return out;
 }
 
 } // namespace mako::hy4f

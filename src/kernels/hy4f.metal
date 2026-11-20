@@ -318,3 +318,80 @@ kernel void hy4_rope3(device float* x [[buffer(0)]], device const float* freq [[
     p[0] = x0 * c - x1 * s;
     p[1] = x0 * s + x1 * c;
 }
+
+// DFly2 drafter.
+
+// Rows of a Q8_0 table (blocks of a float16 scale and 32 int8 values) as floats: out[r] = table[ids[r]]. Grid
+// (width, rows).
+kernel void hy4_embed_q8(device const uchar* table [[buffer(0)]], device const int* ids [[buffer(1)]],
+                         device float* out [[buffer(2)]], constant uint& width [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x, r = gid.y;
+    if (i >= width)
+        return;
+    device const uchar* blk = table + (uint64_t(ids[r]) * (width / 32) + i / 32) * 34;
+    const float d = float(*reinterpret_cast<device const half*>(blk));
+    out[uint64_t(r) * width + i] = d * float(reinterpret_cast<device const char*>(blk + 2)[i % 32]);
+}
+
+// y[i] += g[i] * f[i].
+kernel void hy4_gate_add(device float* y [[buffer(0)]], device const float* g [[buffer(1)]],
+                         device const float* f [[buffer(2)]], constant uint& n [[buffer(3)]],
+                         uint i [[thread_position_in_grid]])
+{
+    if (i < n)
+        y[i] += g[i] * f[i];
+}
+
+struct DraftPickArgs {
+    uint n_vocab, width, slot;
+    float conf_bias;
+};
+
+// One threadgroup of 1024: draft `slot` is the largest logit (the lowest index on ties), also written to
+// prev[slot + 1] for the next step's embedding; its confidence sigmoid(conf_w . h + bias).
+kernel void hy4_draft_pick(device const float* logits [[buffer(0)]], device const float* h [[buffer(1)]],
+                           device const float* conf_w [[buffer(2)]], device int* drafts [[buffer(3)]],
+                           device float* conf [[buffer(4)]], device int* prev [[buffer(5)]],
+                           constant DraftPickArgs& a [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]])
+{
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
+    threadgroup float best_v[32];
+    threadgroup uint best_i[32];
+    threadgroup float dots[32];
+    float bv = -INFINITY;
+    uint bi = 0xffffffffu;
+    for (uint i = tid; i < a.n_vocab; i += 1024) {
+        const float v = logits[i];
+        if (v > bv) { // ascending i within the thread: strict > keeps the lowest index
+            bv = v;
+            bi = i;
+        }
+    }
+    float d = 0.0f;
+    for (uint i = tid; i < a.width; i += 1024)
+        d += conf_w[i] * h[i];
+    const float m = simd_max(bv);
+    const uint mi = simd_min(bv == m ? bi : 0xffffffffu);
+    d = simd_sum(d);
+    if (lane == 0) {
+        best_v[sg] = m;
+        best_i[sg] = mi;
+        dots[sg] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const float v = best_v[lane];
+        const float mm = simd_max(v);
+        const uint ii = simd_min(v == mm ? best_i[lane] : 0xffffffffu);
+        const float dd = simd_sum(dots[lane]);
+        if (lane == 0) {
+            const int id = ii < a.n_vocab ? int(ii) : 0;
+            drafts[a.slot] = id;
+            prev[a.slot + 1] = id;
+            conf[a.slot] = 1.0f / (1.0f + precise::exp(-(dd + a.conf_bias)));
+        }
+    }
+}

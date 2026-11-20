@@ -80,6 +80,14 @@ Measured in `performance.md`.
 - Hy4-flash drafts from the context the same way (on with `--spec`, the default): a reply repeating a 4.6 KB file from
   its prompt 25.4 -> 14.8 ms/token (94% of drafts kept), a story unchanged. A verify's rows and the steps after its
   rejected tokens are undone are bit-identical to decoding the same tokens one at a time.
+- Hy4-flash drafts with Tencent's DFly2 (`--dfly2 FILE`, `mako_serve` and `hy4f_run`; `mako-download.sh hy4f --dfly2`
+  fetches the file, `model-00148-of-00148.safetensors` of tencent/Hy4-flash, 1.7 GB, held as 0.9 GB of Q8_0 plus the
+  token embeddings on the GPU): 5 layers reading the KV and indexer choices of target layers 25-41, up to 5 drafts a
+  step while each one's confidence is at least 0.5 and their product at least 0.5. Drafting pauses while under 0.4
+  drafts a call are kept (one step in 8 tries again). Measured (M5 Max, Maya-M, 500 tokens): through the server code
+  39.5 -> 50.8 tok/s, a story about even (39.6 -> 39.2-40.5 sampled); `hy4f_run --spec` code 40.8 -> 56.8 (77% of
+  drafts kept, 3.6 tokens a round), prose about even. Greedy output is the same as without. A verify of n tokens costs
+  ~24 / 30 / 38 / 48 / 58 / 75 ms for n = 1-6 (each token's 16 experts read on their own), a draft round ~7-8 ms.
 
 ## Ablation
 

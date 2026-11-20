@@ -29,7 +29,7 @@ target_link_libraries(mako_dsv41 PUBLIC mako_core mako_mtl mako_gguf PRIVATE gla
 
 add_library(mako_hy4f STATIC hy4f/config.cpp hy4f/engine.cpp)
 target_include_directories(mako_hy4f PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mako_hy4f PUBLIC mako_dsv41 mako_core mako_mtl mako_gguf)
+target_link_libraries(mako_hy4f PUBLIC mako_dsv41 mako_core mako_mtl mako_gguf mako_safetensors)
 
 add_library(mako_gen STATIC gen/lookup.cpp gen/loop_guard.cpp gen/pool.cpp gen/sampler.cpp gen/session.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -8,7 +8,7 @@
 | `ds` | DeepSeek-V4.1-Flash-1017, Maya-S IQ2_XXS with its Engram tables | 339 GB | ~25 tokens/s decode (~19 at 16-32K tokens of context), ~500-800 tokens/s prefill |
 | `ds-ista-xs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XS | 266 GB | ~34 tokens/s decode with `--miss-penalty 0.1`, the same perplexity as Maya-S on our prose and code texts |
 | `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS | 249 GB | ~33 tokens/s decode without the penalty (IQ2_XS: ~31), perplexity 3-5% higher than Maya-S; with the penalty unmeasured |
-| `hy4f` | Hy4-flash, Maya-M IQ3_XXS with its n-gram table | 132 GB (the 63 GB table is read from the SSD a row at a time) | ~41 tokens/s decode at short context, every expert resident; ~650 tokens/s prefill (2210 tokens); images with `--vision`; drafts from the context, no drafter yet |
+| `hy4f` | Hy4-flash, Maya-M IQ3_XXS with its n-gram table | 132 GB (the 63 GB table is read from the SSD a row at a time) | ~41 tokens/s decode at short context, every expert resident; ~650 tokens/s prefill (2210 tokens); images with `--vision`; DFly2 drafting with `--dfly2` (code ~1.3-1.4x, prose about even) |
 
 Measurements and how they were taken: [performance.md](performance.md). The fastest setup measured:
 
@@ -21,7 +21,7 @@ Measurements and how they were taken: [performance.md](performance.md). The fast
 ## Download
 
 ```sh
-tools/mako-download.sh glm|ds|ds-ista-xs|ds-ista-xxs|hy4f [--vision] [--dspark] [--ablate] [--dir DIR] [--dry-run]
+tools/mako-download.sh glm|ds|ds-ista-xs|ds-ista-xxs|hy4f [--vision] [--dspark] [--dfly2] [--ablate] [--dir DIR] [--dry-run]
 ```
 
 `bin/mako-download` in the release archive. It downloads at the repository revisions mako was tested with, using the
@@ -31,6 +31,7 @@ says otherwise; `--dry-run` lists them and the space needed.
 
 - `--vision`: the vision projector (1.0-1.2 GB; `mako_serve --mmproj FILE`, [vision.md](vision.md))
 - `--dspark`: DeepSeek's drafter for speculative decoding (8 GB; `mako_serve --dspark DIR`)
+- `--dfly2`: Hy4-flash's drafter, Tencent's DFly2 (1.7 GB; `mako_serve --dfly2 FILE`)
 - `--ablate`: refusal ablation directions ([options.md](options.md#ablation))
 
 ## Download by hand

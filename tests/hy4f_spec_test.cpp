@@ -2,7 +2,9 @@
 // after keep() as if the rejected tokens had never run, at a position inside the dense window and among the indexer's
 // selecting positions with rejected tokens completing a pool group; then verifies of 2-8 keeping 1-8 one after another
 // across the window layers' buffer moves (their 1600 rows fill at 1600 positions).
-//   hy4f_spec_test <model-00001.gguf>
+// With the DFly2 drafter (second argument): greedy decoding drafting and verifying gives the tokens decoding one
+// step at a time does, and on a code prompt it keeps most of its drafts.
+//   hy4f_spec_test <model-00001.gguf> [dfly2.safetensors]
 #include "hy4f/config.hpp"
 #include "hy4f/engine.hpp"
 
@@ -51,7 +53,7 @@ double kl(const float* p_logits, const float* q_logits, size_t n)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::println(stderr, "usage: hy4f_spec_test <model-00001.gguf>");
+        std::println(stderr, "usage: hy4f_spec_test <model-00001.gguf> [dfly2.safetensors]");
         return 2;
     }
     if (!std::filesystem::exists(argv[1])) {
@@ -80,6 +82,9 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     mako::hy4f::Options opts;
     opts.max_ctx = 4096;
+    const bool with_drafter = argc > 2 && std::string_view(argv[2]).size() && std::filesystem::exists(argv[2]);
+    if (with_drafter)
+        opts.dfly2 = argv[2];
     mako::hy4f::Engine engine(*m, *cfg, opts, ctx);
     const size_t V = cfg->n_vocab;
 
@@ -148,8 +153,55 @@ int main(int argc, char** argv)
             ++rounds;
         }
         check(same && engine.position() == from + n,
-              std::format("positions {}-{} in {} verifies of 2-8 keeping 1-8: every kept row as the steps' (bit for bit)",
+              std::format("positions {}-{} in {} verifies of 2-8 keeping 1-8: every kept row as the steps' "
+                          "(bit for bit)",
                           from, from + n - 1, rounds));
+    }
+    if (with_drafter) {
+        // "Write a Python implementation of a red-black tree with insert, delete and search, with comments." through
+        // the chat template, thinking off.
+        const std::vector<int32_t> prompt = {120000, 13251, 120001, 120039, 59785, 287, 62, 4138, 506, 25, 3202, 32980,
+                                             1121, 120025, 120000, 3717, 120001, 15434, 259, 8010, 8143, 299, 259, 4180,
+                                             68321, 7338, 430, 7231, 11, 10691, 303, 4997, 11, 430, 10977, 13, 120025,
+                                             120000, 611, 10372, 120001, 120029, 120030};
+        const auto argmax = [&](const float* l) { return int32_t(std::max_element(l, l + V) - l); };
+        constexpr uint32_t n = 160;
+        engine.reset();
+        engine.prefill(std::span(prompt).first(prompt.size() - 1));
+        std::vector<int32_t> plain;
+        int32_t next = argmax(engine.step(prompt.back()).data());
+        for (uint32_t i = 0; i < n; ++i) {
+            plain.push_back(next);
+            next = argmax(engine.step(next).data());
+        }
+        engine.reset();
+        engine.prefill(std::span(prompt).first(prompt.size() - 1));
+        std::vector<int32_t> spec;
+        next = argmax(engine.step(prompt.back()).data());
+        uint64_t offered = 0, kept = 0;
+        while (spec.size() < n) {
+            const std::vector<int32_t> drafts = engine.draft(next);
+            std::vector<int32_t> run{next};
+            run.insert(run.end(), drafts.begin(), drafts.end());
+            const std::vector<float> rows = drafts.empty() ? engine.step(next) : engine.verify(run);
+            uint32_t k = 1;
+            int32_t t = argmax(rows.data());
+            while (k < run.size() && t == run[k])
+                t = argmax(rows.data() + uint64_t(k++) * V);
+            if (!drafts.empty())
+                engine.keep(k);
+            spec.insert(spec.end(), run.begin(), run.begin() + k);
+            offered += drafts.size();
+            kept += k - 1;
+            next = t;
+        }
+        spec.resize(n);
+        check(spec == plain,
+              std::format("DFly2: {} greedy tokens drafting and verifying, the same as step by step", n));
+        check(offered > 0 && kept >= offered / 2,
+              std::format("DFly2 on code: {} of {} drafts kept", kept, offered));
+    } else {
+        std::println("  (no DFly2 drafter given: its checks skipped)");
     }
     std::println("{} failures", failures);
     return failures ? 1 : 0;

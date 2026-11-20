@@ -3,10 +3,16 @@
 //
 //   hy4f_run <model-00001.gguf> (--ids I,J,... | --text T | --text-file F) [--ref DIR] [--prefill 0|1] [-n N] [--max-ctx N]
 //            [--arena-gb N] [--chunk N] [--group N] [--probe-out DIR] [--telemetry summary|layers|kernels]
-//            [--indexer-top-k N]
+//            [--indexer-top-k N] [--dfly2 FILE [--spec] [--draft-conf C] [--draft-cum C] [--draft-log FILE]]
+//            [--verify-cost]
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // --probe-out DIR: one step at a time, each probe the engine reports written as DIR/<name>-<layer>.<pos>.f32.
 // --indexer-top-k N: the tokens the indexer layers keep in place of the model's (the context length or more: all).
+// --dfly2 FILE: the DFly2 drafter (Tencent's safetensors file); with --spec, -n generates greedily drafting and
+// verifying (the same tokens as without), and reports the drafts kept and the tokens a round.
+// --draft-conf / --draft-cum: the drafter's offering thresholds; --draft-log FILE: a line a round, each computed slot's
+// confidence and whether its draft matched the target's choice (1), did not (0) or followed one that did not (-).
+// --verify-cost: after the prompt, the time of a verify of 1 to 8 tokens (each kept to its first, 20 times).
 #include "app/cli.hpp"
 #include "hy4f/config.hpp"
 #include "hy4f/engine.hpp"
@@ -50,6 +56,8 @@ int main(int argc, char** argv)
     bool use_prefill = false, part_timing = false;
     size_t steps_from = 0, out_from = 0, out_to = SIZE_MAX;
     uint32_t indexer_top_k = 0;
+    bool spec = false, verify_cost = false;
+    std::string draft_log;
     std::string logits_out, compare;
     const auto args =
         mako::app::Cli("hy4f_run", "<model-00001.gguf>", 1, 1)
@@ -81,6 +89,12 @@ int main(int argc, char** argv)
             .option("--group", "N", "prompt rows that read the missing experts once", opts.prefill_group)
             .option("--probe-out", "DIR", "write the engine's probes", probe_out)
             .option("--indexer-top-k", "N", "the tokens the indexer layers keep (0: the model's)", indexer_top_k)
+            .option("--dfly2", "FILE", "the DFly2 drafter", opts.dfly2)
+            .flag("--spec", "with -n: draft and verify", spec)
+            .flag("--verify-cost", "time verifies of 1 to 8 tokens", verify_cost)
+            .option("--draft-conf", "C", "offer a draft while its confidence is at least C", opts.draft_conf)
+            .option("--draft-cum", "C", "and while the product of the confidences is at least C", opts.draft_cum)
+            .option("--draft-log", "FILE", "each round's confidences and outcomes", draft_log)
             .option("--telemetry", "summary|layers|parts|kernels", "telemetry (with -n: GPU time per part or kernel)",
                     [&](const std::string& v) {
                         opts.telemetry = v == "summary"   ? mako::core::Telemetry::summary
@@ -216,7 +230,68 @@ int main(int argc, char** argv)
         std::println("against the reference: {} positions, top-1 agreement {:.1f}%, mean KL {:.5f}", compared,
                      100.0 * agree / compared, kl_sum / compared);
 
-    if (gen > 0) {
+    if (verify_cost) {
+        const int32_t t0 = int32_t(std::max_element(logits.back().begin(), logits.back().end()) - logits.back().begin());
+        for (uint32_t w = 1; w <= 8; ++w) {
+            std::vector<int32_t> run(w, t0);
+            engine.verify(run); // first-use costs
+            engine.keep(1);
+            const auto tv = std::chrono::steady_clock::now();
+            for (int i = 0; i < 20; ++i) {
+                engine.verify(run);
+                engine.keep(1);
+            }
+            std::println("verify of {}: {:.2f} ms", w,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count() / 20);
+        }
+    }
+    if (gen > 0 && spec && engine.has_drafter()) {
+        // Greedy: the drafts kept up to the first that differs from the target's choice, then its own token.
+        std::vector<int32_t> out;
+        int32_t next = int32_t(std::max_element(logits.back().begin(), logits.back().end()) - logits.back().begin());
+        const auto tg = std::chrono::steady_clock::now();
+        uint64_t rounds = 0, offered = 0, kept = 0;
+        double draft_ms = 0, verify_ms = 0;
+        std::ofstream dlog;
+        if (!draft_log.empty())
+            dlog.open(draft_log);
+        while (int(out.size()) < gen) {
+            const auto td = std::chrono::steady_clock::now();
+            const std::vector<int32_t> drafts = engine.draft(next);
+            draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count();
+            std::vector<int32_t> run{next};
+            run.insert(run.end(), drafts.begin(), drafts.end());
+            const auto tv = std::chrono::steady_clock::now();
+            const std::vector<float> rows = drafts.empty() ? engine.step(next) : engine.verify(run);
+            verify_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count();
+            uint32_t n = 1;
+            int32_t t = int32_t(std::max_element(rows.begin(), rows.begin() + V) - rows.begin());
+            while (n < run.size() && t == run[n]) {
+                t = int32_t(std::max_element(rows.begin() + uint64_t(n) * V, rows.begin() + uint64_t(n + 1) * V) -
+                            (rows.begin() + uint64_t(n) * V));
+                ++n;
+            }
+            if (!drafts.empty())
+                engine.keep(n);
+            if (dlog.is_open()) {
+                const auto& c = engine.draft_confidences();
+                for (size_t i = 0; i < c.size(); ++i)
+                    dlog << std::format("{:.3f}:{} ", c[i], i < drafts.size() ? (i + 1 < n ? "1" : i + 1 == n ? "0" : "-") : "x");
+                dlog << "\n";
+            }
+            out.insert(out.end(), run.begin(), run.begin() + n);
+            offered += drafts.size();
+            kept += n - 1;
+            ++rounds;
+            next = t;
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
+        std::println("generated: {}", tok->decode(out));
+        std::println("{} tokens in {:.2f} s: {:.1f} tokens/s; {} rounds, {:.2f} tokens a round, {} of {} drafts kept "
+                     "({:.0f}%), drafting {:.1f} ms and verifying {:.1f} ms a round",
+                     out.size(), s, out.size() / s, rounds, double(out.size()) / rounds, kept, offered,
+                     offered ? 100.0 * kept / offered : 0.0, draft_ms / rounds, verify_ms / rounds);
+    } else if (gen > 0) {
         std::vector<int32_t> out;
         int32_t next = int32_t(std::max_element(logits.back().begin(), logits.back().end()) - logits.back().begin());
         const auto tg = std::chrono::steady_clock::now();

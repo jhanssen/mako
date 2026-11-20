@@ -39,6 +39,7 @@ set(MAKO_DS41_ABLATION "$ENV{MAKO_DS41_ABLATION}" CACHE FILEPATH "An ablation fi
 set(MAKO_HY4F_ABLATION "$ENV{MAKO_HY4F_ABLATION}" CACHE FILEPATH "An ablation file for Hy4-flash (optional test input)")
 set(MAKO_HY4F_MODEL "$ENV{MAKO_HY4F_MODEL}" CACHE FILEPATH "First Hy4-flash GGUF shard for its tests")
 set(MAKO_HY4F_MMPROJ "$ENV{MAKO_HY4F_MMPROJ}" CACHE FILEPATH "Hy4-flash's vision projector for its tests (optional)")
+set(MAKO_HY4F_DFLY2 "$ENV{MAKO_HY4F_DFLY2}" CACHE FILEPATH "Hy4-flash's DFly2 drafter (Tencent's last safetensors shard) for its tests (optional)")
 set(MAKO_DS41_DSPARK "$ENV{MAKO_DS41_DSPARK}" CACHE PATH "DeepSeek-V4.1's DSpark drafter directory (optional test input)")
 enable_testing()
 add_subdirectory(tests)

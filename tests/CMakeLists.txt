@@ -173,7 +173,7 @@ set_tests_properties(hy4f_ablation PROPERTIES LABELS hy4f RESOURCE_LOCK gpu_mode
 add_executable(hy4f_spec_test hy4f_spec_test.cpp)
 target_link_libraries(hy4f_spec_test PRIVATE mako_hy4f)
 target_compile_definitions(hy4f_spec_test PRIVATE MAKO_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
-add_test(NAME hy4f_spec COMMAND hy4f_spec_test "${MAKO_HY4F_MODEL}")
+add_test(NAME hy4f_spec COMMAND hy4f_spec_test "${MAKO_HY4F_MODEL}" "${MAKO_HY4F_DFLY2}")
 set_tests_properties(hy4f_spec PROPERTIES LABELS hy4f RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
 add_executable(hy4f_ref_test hy4f_ref_test.cpp)
 target_link_libraries(hy4f_ref_test PRIVATE mako_hy4f mako_vision mako_text mako_chat)

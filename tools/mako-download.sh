@@ -1,7 +1,7 @@
 #!/bin/sh
 # Downloads a model mako runs from Hugging Face, at the repository revisions this version of mako was tested with,
 # and checks each file's size and SHA-256. Interrupted downloads resume; files already complete are kept.
-#   tools/mako-download.sh <model> [--vision] [--dspark] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
+#   tools/mako-download.sh <model> [--vision] [--dspark] [--dfly2] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
 #                          [--curl]
 # With the hf CLI when it is installed (Xet storage, its saved login), else with curl. HF_TOKEN, when set, is sent with
 # each request.
@@ -9,8 +9,8 @@ set -eu
 
 usage() {
     cat >&2 <<'EOF'
-usage: mako-download.sh <model> [--vision] [--dspark] [--ablate] [--dir DIR] [--no-verify] [--recheck] [--dry-run]
-                        [--curl]
+usage: mako-download.sh <model> [--vision] [--dspark] [--dfly2] [--ablate] [--dir DIR] [--no-verify] [--recheck]
+                        [--dry-run] [--curl]
 
 models:
   glm           GLM-5.3-Flash, Maya-S-v2 IQ2_XXS (96.5 GB)
@@ -21,6 +21,7 @@ models:
 
   --vision      the vision projector (0.8-1.2 GB; mako_serve --mmproj)
   --dspark      DeepSeek's DSpark drafter (8 GB, in DIR/dspark; mako_serve --dspark)
+  --dfly2       Hy4-flash's DFly2 drafter (1.7 GB, Tencent's last shard; mako_serve --dfly2)
   --ablate      the model's refusal ablation file (3-4 MB; mako_serve --ablate)
   --dir DIR     where to put the files (default ~/models/<model>)
   --no-verify   skip the SHA-256 check (sizes are still checked)
@@ -38,6 +39,7 @@ repo_unsloth=unsloth/GLM-5.3-Flash-GGUF@a38483c8cd5df544f53d70fb281afe97369d5ab6
 repo_ista=ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@a419d74cd28d5b9f8c5e2b9077d11a609c17bc32
 repo_abl=skafte/mako-ablations@b82d14ccd2c868ae93f37bd9ea6d3dc1886a4fe2
 repo_hy4f=peasantsmith/Hy4-Flash-Maya-GGUF@61b46da72d98a5227bfb5fd41505d4ca337af1d3
+repo_tencent=tencent/Hy4-flash@b2498eba6a1a3f9bbcab4190bc1313a3c7010c2f
 
 # group repo path size sha256
 manifest() {
@@ -72,18 +74,20 @@ ista-engram ista DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf 110595290816 3dac4c54893
 hy4f-m hy4f Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf 68391812128 9ef12ab340a06b631069f99b9faccc9e99b686cf9d98b74bb872c4923e4732af
 hy4f-m hy4f Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00002-of-00002.gguf 63360616160 5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244
 hy4f-vision hy4f Maya-M/mmproj-Hy4-Flash-Maya-M.gguf 784524096 09fdf3964ecb185340fa2d4426f1fcc51e3286d687d468d4b4d5988ab358769f
+hy4f-dfly2 tencent model-00148-of-00148.safetensors 1691383434 9e65e4e71345913784004a081ea3831b34d666e46bb6ba36dc3c6d3798b76ac3
 EOF
 }
 
 [ $# -ge 1 ] || usage
 model=$1
 shift
-vision=0 dspark=0 ablate=0 verify=1 recheck=0 dry=0 dir= curl=0
+vision=0 dspark=0 dfly2=0 ablate=0 verify=1 recheck=0 dry=0 dir= curl=0
 while [ $# -gt 0 ]; do
     case $1 in
     --curl) curl=1 ;;
     --vision) vision=1 ;;
     --dspark) dspark=1 ;;
+    --dfly2) dfly2=1 ;;
     --ablate) ablate=1 ;;
     --no-verify) verify=0 ;;
     --recheck) recheck=1 ;;
@@ -102,11 +106,16 @@ ds-ista-xxs) groups="ista-xxs ista-engram" vgroup=ds-vision agroup=ds-abl link=D
 hy4f)
     groups=hy4f-m vgroup=hy4f-vision agroup=hy4f-abl link=
     if [ $dspark = 1 ]; then
-        echo "--dspark: DeepSeek-V4.1's drafter only" >&2
+        echo "--dspark: DeepSeek-V4.1's drafter only (Hy4-flash's: --dfly2)" >&2
         exit 2
-    fi ;;
+    fi
+    [ $dfly2 = 1 ] && groups="$groups hy4f-dfly2" ;;
 *) usage ;;
 esac
+if [ $dfly2 = 1 ] && [ $model != hy4f ]; then
+    echo "--dfly2: Hy4-flash's drafter only" >&2
+    exit 2
+fi
 [ $vision = 1 ] && groups="$groups $vgroup"
 [ $ablate = 1 ] && groups="$groups $agroup"
 if [ $dspark = 1 ]; then
@@ -255,6 +264,7 @@ opt() { # name value
 }
 [ $vision = 1 ] && opt --mmproj "$(dest_of "$(echo "$files" | awk '/mmproj/ { print $2 }')")"
 [ $dspark = 1 ] && opt --dspark "$dir/dspark"
+[ $dfly2 = 1 ] && opt --dfly2 "$(dest_of model-00148-of-00148.safetensors)"
 [ $ablate = 1 ] && opt --ablate "$(dest_of "$(echo "$files" | awk '/\.abl / { print $2 }')")"
 case $model in ds-ista-*) opt --miss-penalty 0.1 ;; esac
 

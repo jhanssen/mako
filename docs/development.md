@@ -34,7 +34,7 @@ ctest has no effect. What each model variable enables:
 | (none) | `-L cpu` (no GPU either; what CI runs) and `-L kernels` (GPU kernels on random data) |
 | `MAKO_MODEL` (GLM-5.3) | `e2e_*`, the tokenizer, templates, GEMV/GEMM on real weights |
 | `MAKO_DS41_MODEL` (DeepSeek-V4.1) | `ds41_*`, `dsv41`, its tokenizer, template and Engram tests. Optional: `MAKO_DS41_ENGRAM` (other Engram tables), `MAKO_DS41_DSPARK` (the drafter), `MAKO_DS41_ABLATION` |
-| `MAKO_HY4F_MODEL` (Hy4-flash) | `hy4f_*` (its config, tokenizer and reference logits). Optional: `MAKO_HY4F_MMPROJ` (its vision projector: `vision_hy4f` and `hy4f_ref`'s image checks), `MAKO_HY4F_ABLATION` (`hy4f_ablation`'s prefill and decode check with a real file) |
+| `MAKO_HY4F_MODEL` (Hy4-flash) | `hy4f_*` (its config, tokenizer and reference logits). Optional: `MAKO_HY4F_MMPROJ` (its vision projector: `vision_hy4f` and `hy4f_ref`'s image checks), `MAKO_HY4F_ABLATION` (`hy4f_ablation`'s prefill and decode check with a real file), `MAKO_HY4F_DFLY2` (the DFly2 drafter: `hy4f_spec`'s drafting checks) |
 
 mako-common (`external/mako-common`) has its own tests (`-L cpu`, `-L kernels`), built and run from its directory.
 `ctest -N -L <label>` lists a label's tests, `ctest

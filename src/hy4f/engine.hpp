@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -34,6 +35,16 @@ struct Options {
     float miss_penalty = 0.0f; // core::Routing::miss_penalty
     uint32_t prefetch_k = 4;   // decode: experts of the layer prefetch_ahead later predicted and read ahead (0: off)
     uint32_t prefetch_ahead = 2;
+    // The DFly2 drafter: Tencent's safetensors file holding model.dfly_layers.* (empty: none). Drafts are offered
+    // while each one's confidence is at least draft_conf and the product of theirs at least draft_cum, at most
+    // max_drafts.
+    std::string dfly2;
+    float draft_conf = 0.5f, draft_cum = 0.5f;
+    uint32_t max_drafts = 5;
+    // Drafting pauses while the drafts kept per draft() call (a running mean) are under this, trying one step in
+    // draft_probe: a call costs about a quarter of a step and a kept draft saves about two thirds of one.
+    float draft_min_gain = 0.4f;
+    uint32_t draft_probe = 8;
 };
 
 // Hy4-flash: dense weights resident, routed experts (at the latent width) in the shared expert arena, Engram rows
@@ -59,6 +70,13 @@ public:
     bool can_verify() const override { return true; }
     const std::vector<float>& verify(std::span<const int32_t> tokens) override;
     void keep(uint32_t n) override;
+    // DFly2 (Options::dfly2): the block [next, mask x 5] at positions position() .. +5 through its 5 layers, each
+    // attending to a target layer's cached rows at the positions that layer's indexer chose for position() - 1
+    // and to the block's own rows; a draft a slot, each corrected by the one before it.
+    bool has_drafter() const override { return drafter_ != nullptr; }
+    std::vector<int32_t> draft(int32_t next) override;
+    // The last draft()'s confidences (as many as it computed).
+    const std::vector<float>& draft_confidences() const { return draft_conf_; }
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
     using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
@@ -164,6 +182,24 @@ private:
     int32_t verify_delta_ = 0;
     std::vector<int32_t> verify_tokens_, verify_history_;
     bool verifying_ = false;
+    struct Drafter;
+    std::unique_ptr<Drafter> drafter_;
+    std::vector<float> draft_conf_;
+    float draft_gain_ = 1.0f; // running mean of the drafts kept per draft() call
+    bool draft_offered_ = false;
+    uint32_t draft_skipped_ = 0;
+    void note_draft(float kept) { draft_gain_ = 0.9f * draft_gain_ + 0.1f * kept; }
+    // The last run's tokens (positions run_pos0_ ..), for the drafter's taps: the last tap_n_ of them keep their
+    // normed final hidden (from row tap_h_from_ on) and, in the tapped layers, their indexer lists.
+    uint32_t run_pos0_ = 0, run_G_ = 0, tap_pos0_ = 0, tap_n_ = 0, tap_h_from_ = 0;
+    void load_drafter(const std::string& path);
+    // H per-head matrices (w's third dimension) over T tokens: x rows of H * xw floats, y rows of H * yw.
+    void per_head_gemv(MTL::ComputeCommandEncoder*& enc, const DevTensor& w, MTL::Buffer* x, uint32_t xw,
+                       MTL::Buffer* y, uint32_t yw, uint32_t H, uint32_t T);
+    MTL::Buffer* drafter_tap_h() const;
+    // Copies the indexer lists of tapped layer il's tokens at positions pos .. pos + count - 1 (rows 0.. of the list
+    // scratch) out, those among the run's tap rows.
+    void tap_lists(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t pos, uint32_t count);
     LogitsSink logits_sink_;
     std::function<void(uint32_t)> layer_done_;
     core::StepStats last_prefill_;

@@ -1,7 +1,7 @@
 // OpenAI- and Anthropic-compatible HTTP server for a model (GLM-5.3 or DeepSeek-V4.1).
 //   mako_serve <model.gguf> [--host H] [--port N] [--ctx N] [--model-id NAME] [--arena-gb N] [--stage-gb N] [--no-spec]
 //              [--ablate FILE] [--ablate-scale S] [--max-waiting N] [--learn] [--dump-requests DIR] [--engram FILE]
-//              [--dspark DIR] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
+//              [--dspark DIR] [--dfly2 FILE] [--miss-penalty F] [--dense-quant q4_k|q5_k|q6_k] [--prefetch K]
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
 //              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--no-spin-wait] [--no-keepalive] [--no-page-cache]
@@ -16,7 +16,8 @@
 // DeepSeek-V4.1's Engram tables (default: the model's own shards). --stage-gb limits the ring that prompts'
 // missing experts are read ahead into (0: off; default: two layers' worth, at most 3 GB). --dspark:
 // DeepSeek-V4.1's drafter (dspark.json and dspark.bin) for speculative decoding; its 8 GB come out of the expert
-// cache (measured: +13% on code, -3% on prose). DeepSeek-V4.1 trade-offs (accuracy for speed, docs/performance.md):
+// cache (measured: +13% on code, -3% on prose). --dfly2: Hy4-flash's DFly2 drafter (Tencent's last safetensors
+// shard, 1.7 GB, held as 0.9 GB of Q8_0). DeepSeek-V4.1 trade-offs (accuracy for speed, docs/performance.md):
 // --miss-penalty lowers the routing score of experts not in memory (fewer SSD reads; output then depends on what is
 // cached); --dense-quant re-quantizes the dense Q8_0 weights at load (--imatrix: activation statistics from
 // ds_run --imatrix-out weighting its rounding). --prefetch K (default 4; 0: off) reads the top K experts that layer
@@ -88,7 +89,7 @@ int main(int argc, char** argv)
     };
     uint32_t max_ctx = 131072;
     double arena_gb = -1, stage_gb = -1, park_gb = -1;
-    std::string ablate, engram, dspark, imatrix, mmproj_path;
+    std::string ablate, engram, dspark, dfly2, imatrix, mmproj_path;
     uint32_t image_max_tokens = 0;
     float ablate_scale = 1.0f, miss_penalty = 0.0f;
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
@@ -121,7 +122,7 @@ int main(int argc, char** argv)
             .option("--slice-ms", "N", "how long a request generates before waiting ones get a turn (default 1000)",
                     so.slice_ms)
             .option("--max-waiting", "N", "requests that may wait before new ones are refused", so.max_waiting)
-            .flag("--spec", "speculative decoding (GLM-5.3's MTP block, DeepSeek-V4.1 with --dspark, Hy4-flash from the context; default on)",
+            .flag("--spec", "speculative decoding (GLM-5.3's MTP block, DeepSeek-V4.1 with --dspark, Hy4-flash with --dfly2 and from the context; default on)",
                   so.speculative)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   spin_wait)
@@ -131,6 +132,7 @@ int main(int argc, char** argv)
             .option("--lookup-draft", "N", "draft from repeats of the context matching N tokens or more (default 4; 0: off)",
                     so.lookup_match)
             .option("--dspark", "DIR", "DeepSeek-V4.1's drafter (dspark.json and dspark.bin)", dspark)
+            .option("--dfly2", "FILE", "Hy4-flash's drafter (Tencent's model-00148-of-00148.safetensors)", dfly2)
             .option("--engram", "FILE", "DeepSeek-V4.1: the Engram tables of another GGUF (default: the model's own)",
                     engram)
             .option("--miss-penalty", "F", "DeepSeek-V4.1: lower routing scores of experts not in memory (0.05-0.2)",
@@ -291,6 +293,8 @@ int main(int argc, char** argv)
             opts.page_cache = page_cache;
             opts.keepalive = keepalive;
             opts.dense_quant = dense_quant;
+            if (so.speculative)
+                opts.dfly2 = dfly2;
             auto e = std::make_unique<mako::hy4f::Engine>(*model, *cfg, opts, ctx);
             so.prefill_piece = opts.prefill_group;
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
