@@ -51,7 +51,9 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
 
 - Prompts: `hy4f_short_ids.txt` ("The quick brown fox jumps over the lazy dog. The capital of France is", 15 tokens,
   no BOS) and `hy4f_long_ids.txt` (`docs/architecture.md` at the time, 2210 tokens: past the 512-token window and,
-  from position 2048, the indexer's selection), both tokenized as text with control tokens parsed.
+  from position 2048, the indexer's selection), both tokenized as text with control tokens parsed;
+  `hy4f_long16_ids.txt`: the first 16384 tokens of `docs/performance.md`, `src/gen/session.cpp` and
+  `src/hy4f/engine.cpp` at the time, concatenated (mako's tokenizer); its reference file holds positions 15360 on.
 - Model: the Maya-M GGUF (`Maya-M/` of
   [peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF) at
   `61b46da72d98a5227bfb5fd41505d4ca337af1d3`).
@@ -62,6 +64,9 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
   build/tools/ref_dump/ref_dump <Maya-M shard 1> "@$(cat <text file>)" /tmp/ref_long
   build/tests/hy4f_ref_test - --import-ref /tmp/ref_long long
   ```
+
+  For `long16`: `REF_BATCH=256 REF_FROM=15360 build/tools/ref_dump/ref_dump <Maya-M shard 1> $(cat
+  tests/data/hy4f_long16_ids.txt) /tmp/ref_long16`, then `--import-ref /tmp/ref_long16 long16 15360`.
 
 ## Recorded outputs
 

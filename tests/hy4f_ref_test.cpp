@@ -2,6 +2,8 @@
 //   short: 15 prompt tokens one decode step each;
 //   long:  2210 tokens of prose through prefill (past the 512-token window and, from 2048, the indexer's selection),
 //          then its last 30 as decode steps after a prefill of the rest, against both the reference and the prefill;
+//   long16: 16384 tokens of mako's docs and sources through prefill, its last 1024 positions (the reference file holds
+//          only those);
 //   a checkpoint taken after the short prompt and restored gives the same greedy continuation, and the long prompt's
 //   context saved (checkpoint and positions), reset and loaded again does too; a prefill in other chunks gives the same
 //   logits.
@@ -9,9 +11,10 @@
 // images): prefilled in chunks of 100 it gives the same logits as in chunks of 512, its last tokens as decode steps
 // stay close to the prefill, a checkpoint after it repeats the greedy answer, and the answer names the colour asked.
 //   hy4f_ref_test <model-00001.gguf> [mmproj.gguf]     (HY4F_IMAGE_ONLY=1: the image checks alone)
-//   hy4f_ref_test - --import-ref <logits dir> short|long
+//   hy4f_ref_test - --import-ref <logits dir> short|long|long16 [from]
 // --import-ref turns a reference run's logits (logits.<pos>.f32) for a case's prompt (data/hy4f_<case>_ids.txt) into
-// its stored top-k (data/hy4f_<case>_ref.bin). Exit 77: the model is missing (skipped).
+// its stored top-k (data/hy4f_<case>_ref.bin), of positions `from` on (the file's first position follows from the
+// prompt's length). Exit 77: the model is missing (skipped).
 #include "chat/template.hpp"
 #include "hy4f/config.hpp"
 #include "hy4f/engine.hpp"
@@ -78,7 +81,7 @@ std::vector<double> log_softmax(const float* x, size_t n)
 }
 
 struct RefTopK {
-    uint32_t positions = 0, k = 0;
+    uint32_t positions = 0, k = 0, first = 0; // first: the prompt position of the file's first
     std::vector<float> lse;
     std::vector<std::vector<std::pair<int32_t, float>>> top;
 };
@@ -107,16 +110,23 @@ RefTopK read_ref(const std::string& name)
             row.emplace_back(id, v);
         }
     }
+    const size_t n_ids = read_ids(name).size();
+    r.first = n_ids >= r.positions ? uint32_t(n_ids - r.positions) : 0;
     return r;
 }
 
-int import_ref(const std::filesystem::path& dir, const std::string& name)
+int import_ref(const std::filesystem::path& dir, const std::string& name, uint32_t from)
 {
-    const uint32_t n = uint32_t(read_ids(name).size()), k = 64;
+    const uint32_t total = uint32_t(read_ids(name).size()), k = 64;
+    if (from >= total) {
+        std::println(stderr, "position {} is past the prompt's {} tokens", from, total);
+        return 1;
+    }
+    const uint32_t n = total - from;
     std::ofstream out(kData / std::format("hy4f_{}_ref.bin", name), std::ios::binary);
     out.write(reinterpret_cast<const char*>(&n), 4);
     out.write(reinterpret_cast<const char*>(&k), 4);
-    for (uint32_t pos = 0; pos < n; ++pos) {
+    for (uint32_t pos = from; pos < total; ++pos) {
         const std::string raw = read_file(dir / std::format("logits.{}.f32", pos));
         if (raw.empty()) {
             std::println(stderr, "missing reference logits at position {}", pos);
@@ -147,17 +157,18 @@ struct Parity {
 
     void add(uint32_t pos, const float* logits, size_t n_vocab)
     {
-        if (pos < from || pos >= to || pos >= ref.positions)
+        if (pos < from || pos >= to || pos < ref.first || pos - ref.first >= ref.positions)
             return;
+        const uint32_t at = pos - ref.first;
         const auto ours = log_softmax(logits, n_vocab);
         double kl = 0;
-        for (const auto& [id, v] : ref.top[pos]) {
-            const double lp = v - ref.lse[pos];
+        for (const auto& [id, v] : ref.top[at]) {
+            const double lp = v - ref.lse[at];
             kl += std::exp(lp) * (lp - ours[id]);
         }
         kl_sum += kl;
         kl_max = std::max(kl_max, kl);
-        agree += int(std::max_element(logits, logits + n_vocab) - logits) == ref.top[pos][0].first;
+        agree += int(std::max_element(logits, logits + n_vocab) - logits) == ref.top[at][0].first;
         ++n;
     }
     void check_limits(const std::string& what, double kl_limit, double top1_limit) const
@@ -279,11 +290,11 @@ void image_checks(const mako::gguf::ModelFiles& model, mako::hy4f::Engine& engin
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::println(stderr, "usage: hy4f_ref_test <model-00001.gguf> | - --import-ref <dir> short|long");
+        std::println(stderr, "usage: hy4f_ref_test <model-00001.gguf> | - --import-ref <dir> short|long|long16 [from]");
         return 2;
     }
-    if (argc == 5 && std::string_view(argv[2]) == "--import-ref")
-        return import_ref(argv[3], argv[4]);
+    if ((argc == 5 || argc == 6) && std::string_view(argv[2]) == "--import-ref")
+        return import_ref(argv[3], argv[4], argc == 6 ? uint32_t(std::stoul(argv[5])) : 0);
     if (!std::filesystem::exists(argv[1])) {
         std::println("model {} not found: skipped", argv[1]);
         return 77;
@@ -300,7 +311,7 @@ int main(int argc, char** argv)
     }
     mako::mtl::Context ctx;
     mako::hy4f::Options opts;
-    opts.max_ctx = 4096;
+    opts.max_ctx = 16640;
     mako::hy4f::Engine engine(*m, *cfg, opts, ctx);
     const size_t V = cfg->n_vocab;
 
@@ -399,6 +410,17 @@ int main(int argc, char** argv)
         steps.check_limits("long: the tail's decode steps vs reference", 0.0112, 0.93);
         check(kl / kTail < 1.95e-3, std::format("long: the tail's decode steps vs its prefill: KL mean {:.2e} (limit 1.95e-3), max {:.2e}",
                                            kl / kTail, kl_max));
+    }
+    // 16384 tokens: the indexers choose 31 of up to 255 pools; the window layers' buffers have slid ~30 times.
+    if (std::filesystem::exists(kData / "hy4f_long16_ref.bin")) {
+        engine.reset();
+        const auto ids = read_ids("long16");
+        const RefTopK ref = read_ref("long16");
+        Parity tail{ref};
+        engine.set_logits_sink([&](uint32_t pos, const float* l) { tail.add(pos, l, V); });
+        engine.prefill(ids);
+        engine.set_logits_sink({});
+        tail.check_limits(std::format("long16: prefill vs reference, positions {} on", ref.first), 1, 0);
     }
     }
     if (argc >= 3 && std::string_view(argv[2]).size() && std::filesystem::exists(argv[2]))

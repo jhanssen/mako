@@ -4,6 +4,7 @@
 // An id list starting with '@' is text to tokenize instead; the ids are printed.
 // REF_INDEXER_TOP_K=N in the environment overrides the model's sparse-attention selection width.
 // REF_BATCH=N: logits only (no intermediate tensors), the ids fed N at a time: much faster for long prompts.
+// REF_FROM=P (with REF_BATCH): logits only of positions P on.
 // REF_TOKENIZE=<file>: load only the vocabulary, tokenize each 0x1E-separated case of <file> (special tokens
 // parsed) and print one line of ids per case; the other arguments are ignored.
 #include "ggml-backend.h"
@@ -148,6 +149,7 @@ int main(int argc, char** argv)
         std::println("ids {}", list);
     }
     if (batch) {
+        const size_t from = std::getenv("REF_FROM") ? size_t(std::atoll(std::getenv("REF_FROM"))) : 0;
         llama_batch b = llama_batch_init(batch, 0, 1);
         for (size_t i0 = 0; i0 < ids.size(); i0 += size_t(batch)) {
             const int n = int(std::min<size_t>(size_t(batch), ids.size() - i0));
@@ -157,13 +159,15 @@ int main(int argc, char** argv)
                 b.pos[j] = llama_pos(i0 + j);
                 b.n_seq_id[j] = 1;
                 b.seq_id[j][0] = 0;
-                b.logits[j] = 1;
+                b.logits[j] = i0 + j >= from;
             }
             if (llama_decode(ctx, b) != 0) {
                 std::println(stderr, "decode failed at {}", i0);
                 return 1;
             }
             for (int j = 0; j < n; ++j) {
+                if (i0 + j < from)
+                    continue;
                 const float* logits = llama_get_logits_ith(ctx, j);
                 std::ofstream out(d.dir / ("logits." + std::to_string(i0 + j) + ".f32"), std::ios::binary);
                 out.write(reinterpret_cast<const char*>(logits), std::streamsize(n_vocab) * 4);
