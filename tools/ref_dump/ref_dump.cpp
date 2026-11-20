@@ -2,7 +2,8 @@
 // intermediate tensors of every step as raw fp32 or int32: <out>/<name>.<pos>.f32|.i32 (name as "<tensor>-<layer>").
 //   ref_dump <model.gguf> <id,id,...> <out_dir> [name-substring ...]
 // An id list starting with '@' is text to tokenize instead; the ids are printed.
-// REF_INDEXER_TOP_K=N in the environment overrides the model's sparse-attention selection width.
+// REF_INDEXER_TOP_K=N in the environment overrides the model's sparse-attention selection width (REF_ARCH: the
+// architecture whose key it sets, default glm5-next).
 // REF_BATCH=N: logits only (no intermediate tensors), the ids fed N at a time: much faster for long prompts.
 // REF_FROM=P (with REF_BATCH): logits only of positions P on.
 // REF_TOKENIZE=<file>: load only the vocabulary, tokenize each 0x1E-separated case of <file> (special tokens
@@ -108,7 +109,8 @@ int main(int argc, char** argv)
     if (const char* k = std::getenv("REF_INDEXER_TOP_K")) {
         llama_model_kv_override o{};
         o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
-        std::strncpy(o.key, "glm5-next.attention.indexer.top_k", sizeof(o.key) - 1);
+        const char* arch = std::getenv("REF_ARCH") ? std::getenv("REF_ARCH") : "glm5-next";
+        std::snprintf(o.key, sizeof(o.key), "%s.attention.indexer.top_k", arch);
         o.val_i64 = std::atoll(k);
         overrides.push_back(o);
         overrides.push_back(llama_model_kv_override{});

@@ -3,7 +3,7 @@
 //   long:  2210 tokens of prose through prefill (past the 512-token window and, from 2048, the indexer's selection),
 //          then its last 30 as decode steps after a prefill of the rest, against both the reference and the prefill;
 //   long16: 16384 tokens of mako's docs and sources through prefill, its last 1024 positions (the reference file holds
-//          only those);
+//          only those; far looser limits, see there);
 //   a checkpoint taken after the short prompt and restored gives the same greedy continuation, and the long prompt's
 //   context saved (checkpoint and positions), reset and loaded again does too; a prefill in other chunks gives the same
 //   logits.
@@ -411,7 +411,9 @@ int main(int argc, char** argv)
         check(kl / kTail < 1.95e-3, std::format("long: the tail's decode steps vs its prefill: KL mean {:.2e} (limit 1.95e-3), max {:.2e}",
                                            kl / kTail, kl_max));
     }
-    // 16384 tokens: the indexers choose 31 of up to 255 pools; the window layers' buffers have slid ~30 times.
+    // 16384 tokens: the indexers keep 511 of up to 4095 groups; the window layers' buffers have slid ~30 times.
+    // Measured KL 0.328, top-1 84.2%. Not closer at this length: mako's own decode steps over the whole prompt differ
+    // from its prefill by KL 0.19 (top-1 88%), the routing's near-ties compounding; a limit for regressions only.
     if (std::filesystem::exists(kData / "hy4f_long16_ref.bin")) {
         engine.reset();
         const auto ids = read_ids("long16");
@@ -420,7 +422,7 @@ int main(int argc, char** argv)
         engine.set_logits_sink([&](uint32_t pos, const float* l) { tail.add(pos, l, V); });
         engine.prefill(ids);
         engine.set_logits_sink({});
-        tail.check_limits(std::format("long16: prefill vs reference, positions {} on", ref.first), 1, 0);
+        tail.check_limits(std::format("long16: prefill vs reference, positions {} on", ref.first), 0.36, 0.83);
     }
     }
     if (argc >= 3 && std::string_view(argv[2]).size() && std::filesystem::exists(argv[2]))

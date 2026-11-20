@@ -3,8 +3,10 @@
 //
 //   hy4f_run <model-00001.gguf> (--ids I,J,... | --text T | --text-file F) [--ref DIR] [--prefill 0|1] [-n N] [--max-ctx N]
 //            [--arena-gb N] [--chunk N] [--group N] [--probe-out DIR] [--telemetry summary|layers|kernels]
+//            [--indexer-top-k N]
 // --prefill 1: the ids through prefill() (every position's logits from its sink) instead of one step each.
 // --probe-out DIR: one step at a time, each probe the engine reports written as DIR/<name>-<layer>.<pos>.f32.
+// --indexer-top-k N: the tokens the indexer layers keep in place of the model's (the context length or more: all).
 #include "app/cli.hpp"
 #include "hy4f/config.hpp"
 #include "hy4f/engine.hpp"
@@ -47,6 +49,7 @@ int main(int argc, char** argv)
     int gen = 0;
     bool use_prefill = false, part_timing = false;
     size_t steps_from = 0, out_from = 0, out_to = SIZE_MAX;
+    uint32_t indexer_top_k = 0;
     std::string logits_out, compare;
     const auto args =
         mako::app::Cli("hy4f_run", "<model-00001.gguf>", 1, 1)
@@ -77,6 +80,7 @@ int main(int argc, char** argv)
             .option("--chunk", "N", "prompt rows a prefill step", opts.prefill_chunk)
             .option("--group", "N", "prompt rows that read the missing experts once", opts.prefill_group)
             .option("--probe-out", "DIR", "write the engine's probes", probe_out)
+            .option("--indexer-top-k", "N", "the tokens the indexer layers keep (0: the model's)", indexer_top_k)
             .option("--telemetry", "summary|layers|parts|kernels", "telemetry (with -n: GPU time per part or kernel)",
                     [&](const std::string& v) {
                         opts.telemetry = v == "summary"   ? mako::core::Telemetry::summary
@@ -95,6 +99,8 @@ int main(int argc, char** argv)
         std::println(stderr, "{}", cfg.error());
         return 1;
     }
+    if (indexer_top_k)
+        cfg->indexer_top_k = indexer_top_k;
     auto tok = mako::text::Tokenizer::load(m->meta());
     if (!tok) {
         std::println(stderr, "{}", tok.error());
