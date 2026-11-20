@@ -39,6 +39,8 @@
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
 #include "dsv41/engine.hpp"
+#include "hy4f/config.hpp"
+#include "hy4f/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
 #include "gguf/model_files.hpp"
@@ -182,7 +184,8 @@ int main(int argc, char** argv)
         mako::log::error("{}", model.error());
         return 1;
     }
-    const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
+    const std::string arch(model->meta().get_string("general.architecture").value_or(""));
+    const bool deepseek = arch == "deepseek41", hy4f = arch == "hy_v4_flash";
     if (deepseek) {
         if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, model_path)
                                     : mako::dsv41::Engram::add_files(*model, engram);
@@ -208,7 +211,7 @@ int main(int argc, char** argv)
     {
         auto t = mako::server::thinking_support(*tmpl);
         mako::log::info("chat template: reasoning {}; reasoning_effort by name{}{}",
-                        t.can_disable ? "can be skipped" : "always on", t.medium ? " (medium included)" : "",
+                        t.can_disable || t.no_think ? "can be skipped" : "always on", t.medium ? " (medium included)" : "",
                         t.numeric ? " or 1..100" : "");
         t.default_effort = so.reasoning_effort;
         try {
@@ -245,6 +248,10 @@ int main(int argc, char** argv)
             mako::log::error("{}", m.error());
             return 1;
         }
+        if (hy4f) {
+            mako::log::error("images are not supported for Hy4-flash yet");
+            return 1;
+        }
         if ((m->prep.kind == mako::vision::Projector::deepseek41v) != deepseek) {
             mako::log::error("{} is a projector for the other model", mmproj_path);
             return 1;
@@ -269,7 +276,31 @@ int main(int argc, char** argv)
         uint32_t n_embd = 0, n_layer = 0;
         std::span<const std::string_view> sites;
         std::function<void(mako::mtl::Ablation)> set_ablation;
-        if (deepseek) {
+        if (hy4f) {
+            auto cfg = mako::hy4f::Config::load(*model);
+            if (!cfg)
+                throw std::runtime_error(cfg.error());
+            if (!ablate.empty())
+                throw std::runtime_error("ablation is not supported for Hy4-flash yet");
+            mako::hy4f::Options opts;
+            opts.max_ctx = max_ctx;
+            opts.arena_gb = arena_gb;
+            opts.park_gb = park_gb;
+            opts.stage_gb = stage_gb;
+            opts.miss_penalty = miss_penalty;
+            opts.prefetch_k = prefetch_k;
+            opts.prefetch_ahead = prefetch_ahead;
+            opts.spin_wait = spin_wait;
+            opts.page_cache = page_cache;
+            opts.keepalive = keepalive;
+            opts.dense_quant = dense_quant;
+            auto e = std::make_unique<mako::hy4f::Engine>(*model, *cfg, opts, ctx);
+            so.prefill_piece = opts.prefill_group;
+            so.speculative = false;
+            n_embd = cfg->n_embd, n_layer = cfg->n_layer;
+            l.base = e.get();
+            l.model = std::move(e);
+        } else if (deepseek) {
             auto cfg = mako::dsv41::Config::load(*model);
             if (!cfg)
                 throw std::runtime_error(cfg.error());

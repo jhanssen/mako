@@ -58,13 +58,16 @@ struct ThinkingOptions {
     bool can_disable = false; // enable_thinking: false renders a prompt that skips the reasoning
     bool numeric = false;     // reasoning_effort takes a number
     bool medium = false;      // reasoning_effort "medium" is a level of its own
+    bool low = true;          // the template takes "low" (else it means "high")
+    bool no_think = false;    // reasoning_effort "no_think" ends the reasoning before it starts (Hy4's)
     std::optional<Effort> default_effort;
 };
 ThinkingOptions thinking_support(const chat::Template& tmpl);
 
 // The template variables for an effort (unset: the default's): "none" (or "minimal", 0) ends the reasoning before it
-// starts where the template can, else asks for "low"; "medium" becomes "high" where the template has no medium; a
-// number needs a template that takes one. Throws BadRequest.
+// starts where the template can (enable_thinking: false, or reasoning_effort "no_think"), else asks for "low";
+// "medium" and "low" become "high" where the template has no such level; a number needs a template that takes one.
+// Throws BadRequest.
 struct ThinkingChoice {
     std::optional<Effort> reasoning_effort;
     std::optional<bool> enable_thinking;
@@ -95,10 +98,15 @@ struct Delta {
     bool empty() const { return reasoning.empty() && content.empty() && calls.empty(); }
 };
 
+// A control token by its plain name ("<think>", "</tool_call>"), or its ":opensource" form ("<think:opensource>") when
+// the vocabulary has only that (Hy4's); -1 when it has neither.
+int32_t control_token(const text::Tokenizer& tok, std::string_view name);
+
 // Splits generated tokens into reasoning, answer and tool calls, following the template's markup: when the prompt
 // ends in <think>, reasoning runs to </think>; then the answer with tool calls, in one of two forms (by the
 // vocabulary): <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call> blocks (special tokens;
-// values are JSON unless the tool's schema types them as strings), or DSML text blocks, <｜DSML｜ calls> of
+// values are JSON unless the tool's schema types them as strings; Hy4's ":opensource" forms of them, inside
+// <tool_calls>...</tool_calls>), or DSML text blocks, <｜DSML｜ calls> of
 // <｜DSML｜ invoke name="..."> with <｜DSML｜ parameter name="k" string="true|false">v</｜DSML｜ parameter> each
 // (string="true": v is text, else JSON).
 class OutputParser {
@@ -154,6 +162,8 @@ private:
     std::vector<int32_t> name_tokens_; // a required call's name
     size_t name_seen_ = 0;             // tokens of the first call's name so far
     int32_t think_end_, call_begin_, call_end_, key_begin_, key_end_, value_begin_, value_end_;
+    int32_t calls_begin_, calls_end_; // the calls' wrapper (Hy4's), else -1
+    bool calls_opened_ = false;
     bool dsml_form_ = false;       // tool calls as DSML text
     std::string dsml_;             // DSML text not yet parsed
     std::vector<int32_t> forced_;  // DSML: a required call's opening tokens

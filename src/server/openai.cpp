@@ -279,6 +279,8 @@ ThinkingOptions thinking_support(const chat::Template& tmpl)
     t.can_disable = plain && off && *plain != *off;
     t.numeric = honours(R"(,"reasoning_effort":25)");
     t.medium = honours(R"(,"reasoning_effort":"medium")");
+    t.low = render(R"(,"reasoning_effort":"low")").has_value();
+    t.no_think = honours(R"(,"reasoning_effort":"no_think")");
     return t;
 }
 
@@ -290,7 +292,9 @@ ThinkingChoice choose_thinking(const std::optional<Effort>& effort, const Thinki
     const auto none = [&]() -> ThinkingChoice {
         if (t.can_disable)
             return {.enable_thinking = false};
-        return {.reasoning_effort = Effort("low")};
+        if (t.no_think)
+            return {.reasoning_effort = Effort("no_think")};
+        return {.reasoning_effort = Effort(t.low ? "low" : "high")};
     };
     if (const auto* n = std::get_if<int64_t>(&*e)) {
         if (*n == 0)
@@ -304,7 +308,7 @@ ThinkingChoice choose_thinking(const std::optional<Effort>& effort, const Thinki
     const auto& name = std::get<std::string>(*e);
     if (name == "none" || name == "minimal")
         return none();
-    if (name == "medium" && !t.medium)
+    if ((name == "medium" && !t.medium) || (name == "low" && !t.low))
         return {.reasoning_effort = Effort("high")};
     return {.reasoning_effort = *e};
 }
@@ -494,6 +498,15 @@ constexpr std::string_view kDsmlCalls = "<｜DSML｜ calls>", kDsmlCallsEnd = "<
 
 } // namespace
 
+int32_t control_token(const text::Tokenizer& tok, std::string_view name)
+{
+    if (const int32_t id = tok.find(name); id >= 0)
+        return id;
+    if (name.size() < 2 || name.back() != '>')
+        return -1;
+    return tok.find(std::string(name.substr(0, name.size() - 1)) + ":opensource>");
+}
+
 OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, std::vector<std::string> stop,
                            bool reasoning_first)
     : tools_(std::make_unique<Tools>()), stop_(std::move(stop)), stream_(tok, false),
@@ -501,13 +514,16 @@ OutputParser::OutputParser(const text::Tokenizer& tok, std::string_view tools, s
 {
     if (glz::read_json(tools_->defs, tools) || !tools_->defs.is_array())
         tools_->defs = glz::generic::array_t{};
-    think_end_ = tok.find("</think>");
-    call_begin_ = tok.find("<tool_call>");
-    call_end_ = tok.find("</tool_call>");
-    key_begin_ = tok.find("<arg_key>");
-    key_end_ = tok.find("</arg_key>");
-    value_begin_ = tok.find("<arg_value>");
-    value_end_ = tok.find("</arg_value>");
+    think_end_ = control_token(tok, "</think>");
+    call_begin_ = control_token(tok, "<tool_call>");
+    call_end_ = control_token(tok, "</tool_call>");
+    key_begin_ = control_token(tok, "<arg_key>");
+    key_end_ = control_token(tok, "</arg_key>");
+    value_begin_ = control_token(tok, "<arg_value>");
+    value_end_ = control_token(tok, "</arg_value>");
+    // Only the ":opensource" vocabulary wraps its calls (GLM's has no <tool_calls>).
+    calls_begin_ = tok.find("<tool_calls:opensource>");
+    calls_end_ = tok.find("</tool_calls:opensource>");
     dsml_form_ = tok.find("｜DSML｜") >= 0 && call_begin_ < 0;
 }
 
@@ -542,7 +558,7 @@ int32_t OutputParser::forced() const
                    ? forced_[forced_seen_]
                    : -1;
     if (mode_ == Mode::content && calls_.empty() && !content_started_ && pending_.empty())
-        return call_begin_;
+        return calls_begin_ >= 0 && !calls_opened_ ? calls_begin_ : call_begin_;
     if (mode_ == Mode::name && calls_.size() == 1 && !name_tokens_.empty()) {
         if (name_seen_ < name_tokens_.size())
             return name_tokens_[name_seen_];
@@ -554,7 +570,7 @@ int32_t OutputParser::forced() const
 
 ReasoningBudget::ReasoningBudget(const text::Tokenizer& tok, uint32_t budget)
     : wrap_(tok.encode("\n\nI have to stop thinking here and give my answer.\n", false)),
-      think_end_(tok.find("</think>")), budget_(budget), soft_from_(budget - std::min(1024u, budget / 4))
+      think_end_(control_token(tok, "</think>")), budget_(budget), soft_from_(budget - std::min(1024u, budget / 4))
 {
     wrap_.push_back(think_end_);
 }
@@ -599,6 +615,9 @@ bool OutputParser::push(int32_t token, Delta& out)
     if (marker(think_end_, {Mode::reasoning})) {
         flush_text(out);
         mode_ = Mode::content;
+    } else if (marker(calls_begin_, {Mode::content}) || marker(calls_end_, {Mode::content})) {
+        flush_text(out);
+        calls_opened_ = calls_opened_ || token == calls_begin_;
     } else if (dsml_form_) {
         text(stream_.push(token), out);
     } else if (marker(call_begin_, {Mode::content})) {

@@ -230,7 +230,7 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
     std::optional<gen::LoopGuard> guard;
     if (opts.loop_guard)
         guard.emplace(opts.loop_guard);
-    const int32_t think_end = tok.find("</think>");
+    const int32_t think_end = control_token(tok, "</think>");
     size_t generated = 0, base = 0;
     bool close_reasoning = false, in_code = false;
     std::string fence_tail; // the answer's last two characters, for a ``` split across deltas
@@ -380,7 +380,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
         cr = parse();
         const auto rendered = tmpl.render(cr.context);
         prompt = expand(cr, tok.encode(rendered.text, rendered.input), *images);
-        cr.reasoning_first = !prompt.empty() && prompt.back() == tok.find("<think>");
+        cr.reasoning_first = !prompt.empty() && prompt.back() == control_token(tok, "<think>");
     } catch (const std::exception& e) {
         return fail(400, e.what());
     }

@@ -20,7 +20,7 @@ if(MAKO_REF_SRC AND MAKO_REF_BUILD)
 endif()
 
 add_executable(mako_serve mako_serve.cpp)
-target_link_libraries(mako_serve PRIVATE mako_server mako_dsv41 mako_app)
+target_link_libraries(mako_serve PRIVATE mako_server mako_dsv41 mako_hy4f mako_app)
 
 add_executable(prefill_sweep prefill_sweep.cpp)
 target_link_libraries(prefill_sweep PRIVATE mako_glm mako_text mako_app)
