@@ -27,8 +27,8 @@ struct IhcArgs {
     float eps, magnitude;
     uint32_t tokens;
 };
-struct RopeArgs {
-    uint32_t head_dim, heads, n_rot, stride, pos0, pos_step, inverse;
+struct Rope3Args {
+    uint32_t head_dim, heads, n_rot, stride, pos_step, sec_h, sec_w;
 };
 struct EngramRowsArgs {
     uint32_t dim, cols, token_stride;
@@ -303,6 +303,7 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
 void Engine::reset()
 {
     pos_ = 0;
+    rope_delta_ = 0;
     if (engram_)
         engram_history_.assign(engram_->history(), -1);
     row_base_.assign(cfg_.n_layer, 0);
@@ -394,12 +395,12 @@ void Engine::load_positions(uint32_t pos, std::span<const std::byte> data)
         throw std::runtime_error("positions from another engine");
 }
 
-// The state's layout: the Engram history; per window layer sliding_window + kKeyAlign latent then rope rows (the
+// The state's layout: the Engram history, rope_delta_; per window layer sliding_window + kKeyAlign latent then rope rows (the
 // positions from the next token's first key to pos, from the start); per indexer layer kpool value | gate rows (the
 // positions of pos's group before it, from the start).
 uint64_t Engine::checkpoint_bytes() const
 {
-    uint64_t n = engram_history_.size() * 4;
+    uint64_t n = engram_history_.size() * 4 + 4; // and rope_delta_
     for (const auto& L : layers_) {
         if (L->swa)
             n += uint64_t(cfg_.sliding_window + kKeyAlign) * (cfg_.kv_lora_rank + cfg_.n_rot) * 2;
@@ -417,6 +418,8 @@ Engine::Checkpoint Engine::checkpoint()
     std::byte* p = cp.state.data();
     std::memcpy(p, engram_history_.data(), engram_history_.size() * 4);
     p += engram_history_.size() * 4;
+    std::memcpy(p, &rope_delta_, 4);
+    p += 4;
     const uint32_t W = cfg_.sliding_window, kp = cfg_.indexer_kpool;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const Layer& L = *layers_[il];
@@ -446,6 +449,8 @@ void Engine::restore(const Checkpoint& cp)
     const std::byte* p = cp.state.data();
     std::memcpy(engram_history_.data(), p, engram_history_.size() * 4);
     p += engram_history_.size() * 4;
+    std::memcpy(&rope_delta_, p, 4);
+    p += 4;
     const uint32_t W = cfg_.sliding_window, kp = cfg_.indexer_kpool;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
         const Layer& L = *layers_[il];
@@ -472,14 +477,61 @@ void Engine::restore(const Checkpoint& cp)
 void Engine::rope(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* freqs,
                   uint32_t head_dim, uint32_t heads, uint32_t pos0, uint32_t T, uint32_t step)
 {
-    const RopeArgs a{head_dim, heads, cfg_.n_rot, heads * head_dim, pos0, step, 0};
-    enc->setComputePipelineState(pso("ds_rope"));
+    const Rope3Args a{head_dim, heads, cfg_.n_rot, heads * head_dim, step, cfg_.mrope_h, cfg_.mrope_w};
+    enc->setComputePipelineState(pso("hy4_rope3"));
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(freqs, 0, 1);
-    enc->setBytes(&a, sizeof(a), 2);
-    for (int r = repeats("ds_rope"); r > 0; --r)
+    enc->setBuffer(scratch("hy_pos3", 0), uint64_t(pos0 - pos3_lo_) * 16, 2);
+    enc->setBytes(&a, sizeof(a), 3);
+    for (int r = repeats("hy4_rope3"); r > 0; --r)
         enc->dispatchThreads(MTL::Size(cfg_.n_rot / 2, heads, T), MTL::Size(32, 1, 1));
-    after(enc, "ds_rope");
+    after(enc, "hy4_rope3");
+}
+
+void Engine::set_input_rows(std::span<const gen::InputRows> rows)
+{
+    for (const auto& r : rows)
+        if (r.cols && (r.count == 0 || r.count % r.cols))
+            throw std::runtime_error("image rows that are not whole rows of their columns");
+    input_rows_.assign(rows.begin(), rows.end());
+}
+
+int32_t Engine::rope_positions(std::span<const gen::InputRows> rows, int32_t delta, uint32_t pos, uint32_t lo,
+                               uint32_t end, int32_t* out)
+{
+    // An image's positions short of its tokens: max(rows, cols) for rows * cols tokens.
+    const auto adjust = [](const gen::InputRows& r) {
+        return int64_t(std::max(r.count / r.cols, r.cols)) - int64_t(r.count);
+    };
+    int64_t d = delta;
+    for (const auto& r : rows)
+        if (r.cols && r.pos + r.count > lo && r.pos + r.count <= pos)
+            d -= adjust(r);
+    for (uint32_t p = lo; p < end; ++p, out += 4) {
+        const auto r = std::ranges::find_if(rows, [&](const gen::InputRows& r) {
+            return r.cols && p >= r.pos && p - r.pos < r.count;
+        });
+        out[3] = 0;
+        if (r == rows.end()) {
+            out[0] = out[1] = out[2] = int32_t(p + d);
+            continue;
+        }
+        const uint32_t off = p - r->pos;
+        const int32_t base = int32_t(r->pos + d);
+        out[0] = base;
+        out[1] = base + int32_t(off / r->cols);
+        out[2] = base + int32_t(off % r->cols);
+        if (off + 1 == r->count)
+            d += adjust(*r);
+    }
+    return int32_t(d);
+}
+
+int32_t Engine::rope_positions(uint32_t lo, uint32_t end)
+{
+    MTL::Buffer* b = scratch("hy_pos3", std::max<uint64_t>(uint64_t(end - lo) * 16, 16));
+    pos3_lo_ = lo;
+    return rope_positions(input_rows_, rope_delta_, pos_, lo, end, static_cast<int32_t*>(b->contents()));
 }
 
 void Engine::hc_pre(MTL::ComputeCommandEncoder*& enc, const DevTensor& fn, const DevTensor& scale,
@@ -935,8 +987,9 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         engram_->read(rows, static_cast<float*>(eg->contents()), *engram_pool_);
         engram_history_ = engram_->advance(engram_history_, tokens);
         auto* v = static_cast<uint32_t*>(eg_valid->contents());
+        // Image positions have no n-gram of their own.
         for (uint32_t t = 0; t < G; ++t)
-            v[t] = rows[uint64_t(t) * eg_layers * eg_cols] >= 0 ? 1u : 0u;
+            v[t] = rows[uint64_t(t) * eg_layers * eg_cols] >= 0 && !input_at(pos_ + t) ? 1u : 0u;
         last_step_.engram_ms = ms_since(t_eg);
         last_step_.engram_rows = eg_rows;
     }
@@ -952,6 +1005,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     MTL::Buffer* er = scratch("hy_er", std::max<uint64_t>(uint64_t(G) * eg_cols * eg_dim * 4, 16));
     MTL::Buffer* ekv = scratch("hy_ekv", uint64_t(G) * 5 * E * 4);
     embed(token_embd_, tokens.first(G), pos_, static_cast<float*>(xg->contents()));
+    // From the first position of pos_'s pool group: the new pools are roped at their first position.
+    const int32_t rope_delta = rope_positions(pos_ / cfg_.indexer_kpool * cfg_.indexer_kpool, pos_ + G);
 
     const double prep_ms = ms_since(step_start_);
     if (!decode)
@@ -1112,6 +1167,7 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         enc = encoder(cb, cur_layer_, -1);
     }
     pos_ += G;
+    rope_delta_ = rope_delta;
     pool->release();
 
     stats_.step_ms += ms_since(step_start_);

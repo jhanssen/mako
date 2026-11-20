@@ -5,16 +5,26 @@
 //   a checkpoint taken after the short prompt and restored gives the same greedy continuation, and the long prompt's
 //   context saved (checkpoint and positions), reset and loaded again does too; a prefill in other chunks gives the same
 //   logits.
-//   hy4f_ref_test <model-00001.gguf>
+// With the vision projector, an image prompt (data/vision/shapes.png and a question about it; no reference logits for
+// images): prefilled in chunks of 100 it gives the same logits as in chunks of 512, its last tokens as decode steps
+// stay close to the prefill, a checkpoint after it repeats the greedy answer, and the answer names the colour asked.
+//   hy4f_ref_test <model-00001.gguf> [mmproj.gguf]     (HY4F_IMAGE_ONLY=1: the image checks alone)
 //   hy4f_ref_test - --import-ref <logits dir> short|long
 // --import-ref turns a reference run's logits (logits.<pos>.f32) for a case's prompt (data/hy4f_<case>_ids.txt) into
 // its stored top-k (data/hy4f_<case>_ref.bin). Exit 77: the model is missing (skipped).
+#include "chat/template.hpp"
 #include "hy4f/config.hpp"
 #include "hy4f/engine.hpp"
 #include "mtl/context.hpp"
+#include "text/tokenizer.hpp"
+#include "vision/encoder.hpp"
+#include "vision/image.hpp"
+#include "vision/mmproj.hpp"
+#include "vision/prompt.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <cstring>
 #include <format>
@@ -170,6 +180,100 @@ double kl_full(const std::vector<float>& a, const std::vector<float>& b)
 
 int32_t argmax(const std::vector<float>& l) { return int32_t(std::max_element(l.begin(), l.end()) - l.begin()); }
 
+void image_checks(const mako::gguf::ModelFiles& model, mako::hy4f::Engine& engine, const char* mmproj_path,
+                  const mako::mtl::Context& ctx)
+{
+    namespace vision = mako::vision;
+    auto mm = vision::open_mmproj(mmproj_path);
+    auto tok = mako::text::Tokenizer::load(model.meta());
+    if (!mm || !tok) {
+        check(false, std::format("image: {}", !mm ? mm.error() : tok.error()));
+        return;
+    }
+    const std::string png = read_file(kData / "vision" / "shapes.png");
+    const auto prep = vision::prepare(mm->prep, vision::decode_image(std::as_bytes(std::span(png.data(), png.size()))));
+    vision::Encoder enc(ctx, *mm);
+    const auto img = enc.encode(prep);
+    const mako::chat::Template tmpl{std::string(model.meta().get_string("tokenizer.chat_template").value_or(""))};
+    const auto rendered = tmpl.render(
+        R"({"messages":[{"role":"user","content":[{"type":"image"},{"type":"text","text":"What colour is the circle? Answer in one word."}]}],"add_generation_prompt":true,"reasoning_effort":"no_think"})");
+    const auto ids = tok->encode(rendered.text, rendered.input);
+    const uint64_t key = 1;
+    const uint32_t cols = vision::Encoder::cols_for(*mm, prep);
+    auto prompt = vision::expand_images(ids, tok->find(vision::placeholder(mm->prep.kind)), std::span(&img.rows, 1),
+                                        std::span(&key, 1), std::span(&cols, 1));
+    std::vector<mako::gen::InputRows> rows{prompt.rows[0].rows};
+    rows[0].rows = img.embd.data();
+    const auto& toks = prompt.tokens;
+    const uint32_t n = uint32_t(toks.size()), V = engine.n_vocab(), image_end = rows[0].pos + rows[0].count;
+    std::println("  image: {} x {} cells, prompt {} tokens (rows {}..{})", img.cells_x, img.cells_y, n, rows[0].pos,
+                 image_end - 1);
+
+    // The image's last rows and the text after it.
+    const uint32_t from = image_end - 16;
+    std::vector<std::vector<float>> l512(n - from);
+    engine.reset();
+    engine.set_input_rows(rows);
+    engine.set_logits_sink([&](uint32_t pos, const float* l) {
+        if (pos >= from)
+            l512[pos - from].assign(l, l + V);
+    });
+    engine.prefill(toks);
+    engine.set_logits_sink({});
+    const auto cp = engine.checkpoint();
+    const auto saved = engine.save_positions(cp.pos);
+    const std::vector<float> first = engine.logits();
+    // Up to the end of the answer.
+    auto greedy = [&](int count) {
+        std::vector<int32_t> out{argmax(first)};
+        for (int i = 1; i < count && out.back() != tok->eos(); ++i)
+            out.push_back(argmax(engine.step(out.back())));
+        return out;
+    };
+    const auto a = greedy(16);
+    const std::string answer = tok->decode(a, false);
+    std::string lower;
+    for (char c : answer)
+        lower += char(std::tolower(static_cast<unsigned char>(c)));
+    check(lower.find("red") != std::string::npos && a.back() == tok->eos(),
+          std::format("image: the answer names the circle's colour: {:?} ({} tokens to the end)", answer, a.size()));
+    engine.reset();
+    engine.load_positions(cp.pos, saved);
+    engine.restore(cp);
+    check(greedy(16) == a, "image: the greedy answer is the same after the context is saved, reset and loaded");
+
+    engine.reset();
+    engine.set_prefill_chunk(100);
+    bool same = true;
+    engine.set_logits_sink([&](uint32_t pos, const float* l) {
+        if (pos >= from)
+            same = same && std::equal(l, l + V, l512[pos - from].begin());
+    });
+    engine.prefill(toks);
+    engine.set_logits_sink({});
+    engine.set_prefill_chunk(512);
+    check(same, "image: a prefill in chunks of 100 gives the same logits as in chunks of 512 (the image's last rows on)");
+
+    // The last 4 image rows and the text after as decode steps, compared where the logits are used: from the image's
+    // end token on (an image row's next-token logits are diffuse: up to KL 0.5 between the two paths).
+    const uint32_t steps_from = image_end - 4;
+    engine.reset();
+    engine.prefill(std::span(toks).first(steps_from));
+    double kl = 0, kl_max = 0;
+    for (uint32_t p = steps_from; p < n; ++p) {
+        const auto& l = engine.step(toks[p]);
+        const double k = kl_full(l512[p - from], std::vector<float>(l.begin(), l.end()));
+        if (p < image_end)
+            continue;
+        kl += k;
+        kl_max = std::max(kl_max, k);
+    }
+    kl /= n - image_end;
+    // Measured: 2.7e-3 (text alone, the long prompt's tail: 1.8e-3).
+    check(kl < 4e-3, std::format("image: decode steps from the image's last rows vs the prefill, from its end on: KL mean {:.2e} (limit 4e-3), max {:.2e}", kl, kl_max));
+    engine.set_input_rows({});
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -203,6 +307,7 @@ int main(int argc, char** argv)
     // Limits: ~1.1x the KL measured when set, top-1 about a point below. Measured: short decode KL 0.0155, top-1
     // 93.3% (14 of 15); long prefill 0.0195, 92.9%, of it 512-2047 0.0194, 92.8%, 2048 on 0.0131, 93.8%; the tail's
     // steps 0.0102, 96.7%, against its prefill KL 1.77e-3.
+    if (!std::getenv("HY4F_IMAGE_ONLY")) {
     {
         const auto ids = read_ids("short");
         const RefTopK ref = read_ref("short");
@@ -295,6 +400,11 @@ int main(int argc, char** argv)
         check(kl / kTail < 1.95e-3, std::format("long: the tail's decode steps vs its prefill: KL mean {:.2e} (limit 1.95e-3), max {:.2e}",
                                            kl / kTail, kl_max));
     }
+    }
+    if (argc >= 3 && std::string_view(argv[2]).size() && std::filesystem::exists(argv[2]))
+        image_checks(*m, engine, argv[2], ctx);
+    else
+        std::println("  (no vision projector: the image checks skipped)");
     std::println("{}", failures ? std::format("{} failures", failures) : std::string("all passed"));
     return failures ? 1 : 0;
 }

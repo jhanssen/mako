@@ -144,7 +144,7 @@ std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> 
         return prompt;
     if (!opts.vision || !opts.mmproj)
         throw BadRequest("this server takes no images (start it with --mmproj)");
-    std::vector<uint32_t> counts;
+    std::vector<uint32_t> counts, cols;
     for (const std::string& bytes : cr.images) {
         vision::Prepared p;
         try {
@@ -157,6 +157,7 @@ std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> 
         uint64_t key = 0;
         std::memcpy(&key, d, sizeof(key));
         counts.push_back(vision::Encoder::rows_for(*opts.mmproj, p));
+        cols.push_back(vision::Encoder::cols_for(*opts.mmproj, p));
         images.keys.push_back(key);
         images.prepared.push_back(std::move(p));
     }
@@ -164,7 +165,7 @@ std::vector<int32_t> Server::Impl::expand(ChatRequest& cr, std::vector<int32_t> 
     const int32_t ph = tok.find(vision::placeholder(opts.mmproj->prep.kind));
     if (ph < 0)
         throw BadRequest("the model's vocabulary has no image placeholder");
-    auto out = vision::expand_images(prompt, ph, counts, images.keys);
+    auto out = vision::expand_images(prompt, ph, counts, images.keys, cols);
     images.rows = std::move(out.rows);
     return std::move(out.tokens);
 }

@@ -292,3 +292,29 @@ kernel void hy4_copy_words(device const uint* x [[buffer(0)]], device uint* y [[
     if (i < n)
         y[i] = x[i];
 }
+
+struct Rope3Args {
+    uint head_dim, heads, n_rot, stride;
+    uint pos_step; // row t's position at pos[t * pos_step]
+    uint sec_h, sec_w;
+};
+
+// Rotates the last n_rot dims of each head of each row, pairs (2i, 2i + 1), by pos_a * freq[i]: a the row (pos.y)
+// for i % 3 == 1 below 3 * sec_h, the column (pos.z) for i % 3 == 2 below 3 * sec_w, else the sequence position
+// (pos.x). Grid (n_rot / 2, heads, rows).
+kernel void hy4_rope3(device float* x [[buffer(0)]], device const float* freq [[buffer(1)]],
+                      device const int4* pos [[buffer(2)]], constant Rope3Args& a [[buffer(3)]],
+                      uint3 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x, h = gid.y, t = gid.z;
+    if (i >= a.n_rot / 2 || h >= a.heads)
+        return;
+    device float* p = x + uint64_t(t) * a.stride + uint64_t(h) * a.head_dim + (a.head_dim - a.n_rot) + 2 * i;
+    const int4 ps = pos[t * a.pos_step];
+    const int at = i % 3 == 1 && i < 3 * a.sec_h ? ps.y : i % 3 == 2 && i < 3 * a.sec_w ? ps.z : ps.x;
+    const float ang = float(at) * freq[i];
+    const float c = precise::cos(ang), s = precise::sin(ang);
+    const float x0 = p[0], x1 = p[1];
+    p[0] = x0 * c - x1 * s;
+    p[1] = x0 * s + x1 * c;
+}

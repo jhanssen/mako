@@ -102,6 +102,15 @@ comparison.
 
 `tools/gen_vision_fixtures.py tests/data/vision` writes the images: smooth ramps with a periodic checker, in the common
 PNG colour types and bit depths (`gray8`, `graya8`, `pal8`, `rgb16`, `rgba8`) and RGB at sizes that take each of the
-preprocessing's sizing paths. `expected.txt` holds, per projector type (`glm5v`, `deepseek41v`) and image, the size
-the reference prepares it to and the SHA-256 of its prepared input (fp32 planar, `ref_vision`'s `inp_raw`);
-`vision_prep` checks mako's preprocessing gives the same bytes.
+preprocessing's sizing paths. `expected.txt` holds, per projector type (`glm5v`, `deepseek41v`, `hy4f`) and image, the
+size the reference prepares it to and the SHA-256 of its prepared input (fp32 planar, `ref_vision`'s `inp_raw`);
+`vision_prep` checks mako's preprocessing gives the same bytes. For `hy4f` the reference read the Maya-M projector
+(`mmproj-Hy4-Flash-Maya-M.gguf` at `61b46da72d98a5227bfb5fd41505d4ca337af1d3`) retagged `hy_v4_vl`
+(`tools/gguf_retag.py`), with llama.cpp pull request #32517 at `b7c3f5da30fe1c44f7d015dc051ef0f373c708ec`.
+
+- `hy4f_rgb_200x150_rows.f16`: Hy4-flash's encoder rows for `rgb_200x150.png` (35 x 3072, fp16), from that reference
+  with the projector's tensors dequantised to F32 (gguf-py's `dequantize`, written back as an F32 GGUF), so that the
+  reference's CPU backend does not round its activations to 8 bits: `ref_vision - <F32 mmproj> rgb_200x150.png out`.
+  `vision_hy4f` compares against it.
+- `shapes.png` (800x600: a red circle top left, a green triangle top right, a blue square bottom right, "MAKO 2026" in
+  the middle; `tools/gen_shapes_image.py`, Pillow): the image `hy4f_ref` asks about.

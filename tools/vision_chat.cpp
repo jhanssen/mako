@@ -8,6 +8,8 @@
 #include "gen/session.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "hy4f/config.hpp"
+#include "hy4f/engine.hpp"
 #include "mtl/context.hpp"
 #include "text/tokenizer.hpp"
 #include "vision/encoder.hpp"
@@ -76,7 +78,8 @@ int main(int argc, char** argv)
         auto model = mako::gguf::ModelFiles::open(argv[1]);
         if (!model)
             throw std::runtime_error(model.error());
-        const bool deepseek = model->meta().get_string("general.architecture").value_or("") == "deepseek41";
+        const std::string arch(model->meta().get_string("general.architecture").value_or(""));
+        const bool deepseek = arch == "deepseek41", hy4f = arch == "hy_v4_flash";
         if (deepseek)
             if (auto r = mako::dsv41::Engram::add_named(*model, argv[1]); !r)
                 throw std::runtime_error(r.error());
@@ -97,8 +100,17 @@ int main(int argc, char** argv)
         mako::mtl::Context ctx;
         std::unique_ptr<mako::glm::Engine> glm;
         std::unique_ptr<mako::dsv41::Engine> ds;
+        std::unique_ptr<mako::hy4f::Engine> hy;
         mako::gen::Model* engine = nullptr;
-        if (deepseek) {
+        if (hy4f) {
+            auto cfg = mako::hy4f::Config::load(*model);
+            if (!cfg)
+                throw std::runtime_error(cfg.error());
+            mako::hy4f::Options opts;
+            opts.max_ctx = max_ctx;
+            hy = std::make_unique<mako::hy4f::Engine>(*model, *cfg, opts, ctx);
+            engine = hy.get();
+        } else if (deepseek) {
             auto cfg = mako::dsv41::Config::load(*model);
             if (!cfg)
                 throw std::runtime_error(cfg.error());
@@ -125,14 +137,16 @@ int main(int argc, char** argv)
 
         std::string context = std::format(
             R"({{"messages":[{{"role":"user","content":[{{"type":"image"}},{{"type":"text","text":{}}}]}}],"add_generation_prompt":true{}}})",
-            json_string(argv[4]), no_think ? R"(,"enable_thinking":false)" : "");
+            json_string(argv[4]),
+            !no_think ? "" : hy4f ? R"(,"reasoning_effort":"no_think")" : R"(,"enable_thinking":false)");
         const auto rendered = tmpl.render(context);
         const auto ids = tok->encode(rendered.text, rendered.input);
         const int32_t ph = tok->find(mako::vision::placeholder(mm->prep.kind));
         if (ph < 0)
             throw std::runtime_error("the model's vocabulary has no image placeholder token");
         const uint64_t key = std::hash<std::string_view>{}(std::string_view(bytes.data(), bytes.size()));
-        auto prompt = mako::vision::expand_images(ids, ph, std::span(&rows.rows, 1), std::span(&key, 1));
+        const uint32_t cols = mako::vision::Encoder::cols_for(*mm, prep);
+        auto prompt = mako::vision::expand_images(ids, ph, std::span(&rows.rows, 1), std::span(&key, 1), std::span(&cols, 1));
         prompt.rows[0].rows.rows = rows.embd.data();
         std::println("prompt: {} tokens ({} of them image rows)", prompt.tokens.size(), rows.rows);
 

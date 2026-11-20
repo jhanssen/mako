@@ -10,10 +10,12 @@
 namespace mako::gen {
 
 // Rows that stand in for tokens' embeddings (an image's encoder output): sequence position pos + i takes
-// rows[i * width, (i + 1) * width), width the model's embedding width.
+// rows[i * width, (i + 1) * width), width the model's embedding width. cols: the span is an image of rows of cols
+// tokens, for engines that give its tokens 2D positions (0: none).
 struct InputRows {
     uint32_t pos = 0, count = 0;
     const float* rows = nullptr;
+    uint32_t cols = 0;
 };
 
 // What a Session needs of an engine: tokens in, logits out, and the state to keep or go back to.

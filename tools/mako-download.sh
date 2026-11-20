@@ -19,7 +19,7 @@ models:
   ds-ista-xxs   DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS and the IQ4_NL Engram file (249 GB)
   hy4f          Hy4-flash, Maya-M IQ3_XXS with its n-gram table (132 GB)
 
-  --vision      the vision projector (1.0-1.2 GB; mako_serve --mmproj)
+  --vision      the vision projector (0.8-1.2 GB; mako_serve --mmproj)
   --dspark      DeepSeek's DSpark drafter (8 GB, in DIR/dspark; mako_serve --dspark)
   --ablate      the model's refusal ablation file (3-4 MB; mako_serve --ablate)
   --dir DIR     where to put the files (default ~/models/<model>)
@@ -70,6 +70,7 @@ ista-xxs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00005-of-00006.gguf 19923
 ista-engram ista DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf 110595290816 3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3
 hy4f-m hy4f Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf 68391812128 9ef12ab340a06b631069f99b9faccc9e99b686cf9d98b74bb872c4923e4732af
 hy4f-m hy4f Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00002-of-00002.gguf 63360616160 5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244
+hy4f-vision hy4f Maya-M/mmproj-Hy4-Flash-Maya-M.gguf 784524096 09fdf3964ecb185340fa2d4426f1fcc51e3286d687d468d4b4d5988ab358769f
 EOF
 }
 
@@ -98,9 +99,9 @@ ds) groups=ds vgroup=ds-vision agroup=ds-abl link= ;;
 ds-ista-xs) groups="ista-xs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS ;;
 ds-ista-xxs) groups="ista-xxs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS ;;
 hy4f)
-    groups=hy4f-m vgroup= agroup= link=
-    if [ $vision = 1 ] || [ $ablate = 1 ] || [ $dspark = 1 ]; then
-        echo "--vision, --ablate and --dspark: mako runs none of them for Hy4-flash yet" >&2
+    groups=hy4f-m vgroup=hy4f-vision agroup= link=
+    if [ $ablate = 1 ] || [ $dspark = 1 ]; then
+        echo "--ablate and --dspark: mako runs neither for Hy4-flash yet" >&2
         exit 2
     fi ;;
 *) usage ;;

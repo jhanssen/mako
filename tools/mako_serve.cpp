@@ -248,12 +248,11 @@ int main(int argc, char** argv)
             mako::log::error("{}", m.error());
             return 1;
         }
-        if (hy4f) {
-            mako::log::error("images are not supported for Hy4-flash yet");
-            return 1;
-        }
-        if ((m->prep.kind == mako::vision::Projector::deepseek41v) != deepseek) {
-            mako::log::error("{} is a projector for the other model", mmproj_path);
+        const auto kind = deepseek ? mako::vision::Projector::deepseek41v
+                          : hy4f   ? mako::vision::Projector::hy4f
+                                   : mako::vision::Projector::glm5v;
+        if (m->prep.kind != kind) {
+            mako::log::error("{} is a projector for another model", mmproj_path);
             return 1;
         }
         mmproj.emplace(std::move(*m));

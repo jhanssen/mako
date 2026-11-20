@@ -1,15 +1,16 @@
 # Vision
 
-Images as prompt input for both models, from a projector file (an "mmproj" GGUF) next to the text model:
+Images as prompt input for all three models, from a projector file (an "mmproj" GGUF) next to the text model:
 
 | Model | mmproj | Projector type |
 | --- | --- | --- |
 | DeepSeek-V4.1-Flash-1017 | `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` (972 MB) from `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` | `deepseek41v`; the published file says `deepseek4v` (mako takes it as V4.1 without V4's padding vector; the reference needs `tools/gguf_retag.py <in> <out> clip.projector_type deepseek41v`) |
 | GLM-5.3-Flash | `mmproj-BF16.gguf` (1.16 GB) from `unsloth/GLM-5.3-Flash-GGUF` | `glm5v` |
+| Hy4-flash | `Maya-M/mmproj-Hy4-Flash-Maya-M.gguf` (785 MB, Q8_0 / F16 / F32) from `peasantsmith/Hy4-Flash-Maya-GGUF` | `hy_v4_flash` (the reference names this tower `hy_v4_vl`: `tools/gguf_retag.py <in> <out> clip.projector_type hy_v4_vl`) |
 
 The reference is the llama.cpp checkout `ref_vision` links (`tools/ref_dump`), on its CPU backend.
 
-## What the two pipelines do
+## What the GLM and DeepSeek pipelines do
 
 Both: decoded RGB image -> size plan and resize/pad -> normalise -> 14x14 patch embedding -> a ViT (1024 wide, 16
 heads of 64, RMSNorm, fused QKV with bias, 2D RoPE, full bidirectional attention, SwiGLU) -> post-norm -> merge
@@ -31,6 +32,31 @@ and k+32 rotate together, by the patch's row times `10000^(-k/16)` for k < 16 an
 
 A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM 1036x1036, 74x74 patches, 37x37 =
 1369 rows.
+
+## Hy4-flash
+
+Decoded RGB image -> sides rounded to the nearest multiples of 32 (halves to even), aspect kept, scaled into
+[4096, 4194304] pixels -> bicubic (a = -0.5) with int16 weights (as torchvision rounds them) -> (x/255 - 0.5)/0.5 -> 16x16
+patch embedding + bias, plus the learned 128x128 position grid resampled bilinearly to the patch grid (scale
+`(n + 0.1) / 128`) -> 27 SigLIP-style blocks (1152 wide, 16 heads of 72, LayerNorm with bias, separate biased q / k /
+v and output, no RoPE, MLP 4304 with exact GELU, eps 1e-5) -> RMSNorm -> 2x2 convolution (stride 2, 4608) + bias, exact
+GELU, 1x1 convolution to 3072 + bias -> a learned newline row after each row of cells. An image of h x w cells is h *
+(w + 1) rows between `<｜hy_image▁start:opensource｜>` and `<｜hy_image▁end:opensource｜>` (the template writes one
+`<｜hy_image▁pad:opensource｜>` between them; the server expands it to the rows).
+
+The text model gives image rows 2D positions (interleaved multi-axis RoPE, sections 12 / 10 / 10 of the 32 rope
+frequencies): an image starting at sequence position s takes (s, s + row, s + col) for its row and column (the newline
+is column w), and the text after it continues at s + max(h, w + 1). Frequencies i % 3 == 1 below 30 rotate by the row,
+i % 3 == 2 below 30 by the column, the rest by the sequence position; text has the three equal, which is plain RoPE.
+Window and indexer groups follow token slots, not positions; a pool is roped at its first token's position. Engram
+gives image positions nothing; n-grams of later tokens hash the image's pad ids like any token. This follows the
+model's published modelling code (transformers pull request 50903); the reference's Hy4-flash text model runs every
+token at its slot position, and its image path refuses a text model without rope sections (by its code; not run).
+
+In mako the ViT runs on the patches in 2x2 block order (as GLM's), so a block's four rows are the 2x2 convolution's
+input row; the heads are zero-padded to 80 for the attention kernel (`vit_flash_attn80`), the output projection's
+inputs to match, and the MLP to 4320 (the GEMM steps 32 columns). `gen::InputRows::cols` gives an image span's row width;
+the engine keeps the offset between slot and sequence position in its checkpoints.
 
 ## In mako
 
@@ -72,6 +98,15 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
   same rows in the reference's CPU-vs-GPU comparison as in mako's (layer 23: 4.34 vs 4.37 on row 1934). No
   automated encoder test yet (the reference rows are large); `vision_run --probe` and `ref_vision` with
   `REF_VISION_DUMP` compare stage by stage.
+- Hy4-flash encoder: against the reference with the projector's weights dequantised to F32 (the Q8_0 file makes the
+  reference round its activations to 8 bits, 1.3-1.6% off its own F32 run): per-row cosine >= 0.99998, relative RMS
+  error 0.8e-3 (517x333) and 1.2e-3 (1024x768); `vision_hy4f` checks a small image's rows. Preprocessing bit-exact
+  (`vision_prep`).
+- Hy4-flash text with images: no reference logits (see above). `hy4f_ref` (with `MAKO_HY4F_MMPROJ`) checks an image
+  prompt in chunks of 100 against 512 (bit-identical), decode steps across the image's end against the prefill (KL
+  2.7e-3), a saved, reset and loaded context repeating the answer, and the answer (the shapes image: the circle is
+  red); `hy4f_positions` checks the positions against the modelling code's rule for chunked runs. Through the server
+  the shapes image's colours, places and text come out right, and a second question reuses the image.
 - Text: answers about a known image (the Sonoma wallpaper) are right for both models, through `vision_chat` and the
   server (colours, no text in it, the shapes). Not done yet: GLM logits after an image prompt against the reference
   (which can run GLM on the CPU).
@@ -94,3 +129,5 @@ A 1024x1024 image: DeepSeek 1036x1036, 74x74 patches, 25x25 cells, 652 rows; GLM
    `vision::expand_images`, `tools/vision_chat`.
 4. Server API. Done: `--mmproj`, OpenAI `image_url` (data: URLs) and Anthropic `image` blocks (user messages and
    tool results), the last 8 encoded images cached (docs/server.md).
+5. Hy4-flash: its tower and 2D positions. Done (above). Encode on an M5 Max: 512x320 ~21 ms, 1024x768 ~150 ms,
+   800x608 ~100-450 ms (the first image of a process is the slower).

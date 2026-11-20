@@ -41,6 +41,13 @@ public:
     Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& opts, mtl::Context& ctx);
     ~Engine();
 
+    // Image spans with cols set take 2D positions (their rows and columns); an image of r rows of c tokens advances
+    // the sequence position by max(r, c).
+    void set_input_rows(std::span<const gen::InputRows> rows) override;
+    // The RoPE positions (sequence, row, column, 0) of positions lo..end-1 into out, given the images among `rows`
+    // and `delta` (the sequence position of pos minus pos) at a position pos >= lo; returns the delta at end.
+    static int32_t rope_positions(std::span<const gen::InputRows> rows, int32_t delta, uint32_t pos, uint32_t lo,
+                                  uint32_t end, int32_t* out);
     const std::vector<float>& step(int32_t token) override;
     const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {},
                                       const std::function<void(size_t)>& progress = {}) override;
@@ -97,9 +104,12 @@ private:
     // `probe`: the normed output's probe name (one token).
     void hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* out, const DevTensor& post_norm, MTL::Buffer* R,
                  uint64_t r_off, MTL::Buffer* pc, uint32_t T, const char* probe_name = nullptr, int layer = 0);
-    // T rows (stride heads * head_dim) roped on their last n_rot values at positions pos0, pos0 + step, ...
+    // T rows (stride heads * head_dim) roped on their last n_rot values, at the RoPE positions of positions pos0,
+    // pos0 + step, ... (from pos3_lo_ on, set by run()).
     void rope(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* freqs, uint32_t head_dim,
               uint32_t heads, uint32_t pos0, uint32_t T, uint32_t step = 1);
+    // The RoPE positions of positions lo..end-1 into the scratch "hy_pos3"; returns rope_delta_ at end.
+    int32_t rope_positions(uint32_t lo, uint32_t end);
     uint64_t prefill_scratch(uint32_t chunk, uint32_t group) const;
     // Before layer il's rows of T tokens at pos0 go into its sliding buffers (a window layer's latent and rope rows,
     // an indexer's value | gate rows): when they would not fit, the rows still needed move to the front.
@@ -126,6 +136,9 @@ private:
     std::vector<uint32_t> row_base_, idx_base_;
     uint32_t swa_cap_ = 0, idx_cap_ = 0, built_chunk_ = 0;
     uint32_t pos_ = 0;
+    // The sequence position of pos_ minus pos_ (images take fewer positions than tokens); in the checkpoints.
+    int32_t rope_delta_ = 0;
+    uint32_t pos3_lo_ = 0;
     std::vector<float> logits_;
     LogitsSink logits_sink_;
     std::function<void(uint32_t)> layer_done_;

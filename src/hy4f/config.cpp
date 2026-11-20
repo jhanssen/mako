@@ -33,6 +33,15 @@ std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
     c.rope_base_swa = k.f32("rope.freq_base_swa");
     if (c.n_rot == 0 || c.n_rot >= c.head_k)
         k.missing += std::format(" rope.dimension_count({} for a {}-wide head)", c.n_rot, c.head_k);
+    if (k.has("rope.dimension_sections")) {
+        const auto s = k.ints("rope.dimension_sections");
+        if (s.size() < 3 || s[0] + s[1] + s[2] != int64_t(c.n_rot / 2))
+            k.missing += " rope.dimension_sections(t, h, w summing to n_rot / 2)";
+        else {
+            c.mrope_h = uint32_t(s[1]);
+            c.mrope_w = uint32_t(s[2]);
+        }
+    }
     // The sliding-window layers must not declare another latent geometry.
     const std::pair<const char*, uint32_t> swa_dims[] = {{"attention.key_length_mla_swa", c.head_k},
                                                           {"attention.value_length_mla_swa", c.head_v}};

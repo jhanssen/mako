@@ -8,7 +8,7 @@
 | `ds` | DeepSeek-V4.1-Flash-1017, Maya-S IQ2_XXS with its Engram tables | 339 GB | ~25 tokens/s decode (~19 at 16-32K tokens of context), ~500-800 tokens/s prefill |
 | `ds-ista-xs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XS | 266 GB | ~34 tokens/s decode with `--miss-penalty 0.1`, the same perplexity as Maya-S on our prose and code texts |
 | `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS | 249 GB | ~33 tokens/s decode without the penalty (IQ2_XS: ~31), perplexity 3-5% higher than Maya-S; with the penalty unmeasured |
-| `hy4f` | Hy4-flash, Maya-M IQ3_XXS with its n-gram table | 132 GB (the 63 GB table is read from the SSD a row at a time) | ~41 tokens/s decode at short context, every expert resident; ~650 tokens/s prefill (2210 tokens); text only so far (no images, drafter or ablation) |
+| `hy4f` | Hy4-flash, Maya-M IQ3_XXS with its n-gram table | 132 GB (the 63 GB table is read from the SSD a row at a time) | ~41 tokens/s decode at short context, every expert resident; ~650 tokens/s prefill (2210 tokens); images with `--vision`; no drafter or ablation yet |
 
 Measurements and how they were taken: [performance.md](performance.md). The fastest setup measured:
 
@@ -50,7 +50,8 @@ says otherwise; `--dry-run` lists them and the space needed.
   [peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF). The other Maya sizes
   carry the same tensors and should load; only Maya-M has been run. Maya-L's experts (IQ4_XS, 81.8 GB) need about 89 GB
   of memory to stay resident with the dense weights.
-- **Vision projectors**: GLM-5.3's `mmproj-BF16.gguf` from
+- **Vision projectors**: Hy4-flash's `Maya-M/mmproj-Hy4-Flash-Maya-M.gguf` from the same repository (the other sizes'
+  files are the same size; only Maya-M's has been run); GLM-5.3's `mmproj-BF16.gguf` from
   [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF); DeepSeek-V4.1's
   `mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf` from
   [ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)

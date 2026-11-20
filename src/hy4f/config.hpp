@@ -26,6 +26,10 @@ struct Config {
     uint32_t head_v = 0;
     uint32_t n_rot = 0;
     float rope_base = 0.0f, rope_base_swa = 0.0f;
+    // Image positions (interleaved multi-axis RoPE): of the n_rot / 2 frequencies, i % 3 == 1 below 3 * mrope_h
+    // rotate by the row, i % 3 == 2 below 3 * mrope_w by the column, the rest by the sequence position. The published
+    // config's sections are (12, 10, 10); files without rope.dimension_sections take those.
+    uint32_t mrope_h = 10, mrope_w = 10;
 
     uint32_t sliding_window = 0;
     std::vector<bool> is_swa;      // per layer
