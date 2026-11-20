@@ -18,35 +18,6 @@ static float tg_max(float v, threadgroup float* scratch, uint tid)
     return m;
 }
 
-// y = (x - mean) / sqrt(var + eps) * w + b, one threadgroup per row.
-struct LayerNormArgs {
-    uint n;
-    float eps;
-    uint ystride; // y row stride in elements
-};
-
-kernel void layer_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
-                       device const float* b [[buffer(2)]], device float* y [[buffer(3)]],
-                       constant LayerNormArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
-                       uint tid [[thread_position_in_threadgroup]])
-{
-    threadgroup float scratch[TG / 32];
-    device const float* xr = x + uint64_t(row) * a.n;
-    device float* yr = y + uint64_t(row) * a.ystride;
-    float s = 0.0f;
-    for (uint i = tid; i < a.n; i += TG)
-        s += xr[i];
-    const float mean = tg_sum(s, scratch, tid) / float(a.n);
-    float v = 0.0f;
-    for (uint i = tid; i < a.n; i += TG) {
-        const float d = xr[i] - mean;
-        v += d * d;
-    }
-    const float inv = rsqrt(tg_sum(v, scratch, tid) / float(a.n) + a.eps);
-    for (uint i = tid; i < a.n; i += TG)
-        yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
-}
-
 struct HcArgs {
     uint n_embd;
     uint iters;
