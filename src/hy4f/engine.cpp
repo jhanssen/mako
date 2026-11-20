@@ -904,6 +904,37 @@ const std::vector<float>& Engine::step(int32_t token)
     return logits_;
 }
 
+const std::vector<float>& Engine::verify(std::span<const int32_t> tokens)
+{
+    if (tokens.empty() || tokens.size() > kMaxDecodeTokens)
+        throw std::runtime_error(std::format("verify: 1 to {} tokens", kMaxDecodeTokens));
+    verify_pos0_ = pos_;
+    verify_delta_ = rope_delta_;
+    verify_tokens_.assign(tokens.begin(), tokens.end());
+    verify_history_ = engram_history_;
+    verifying_ = true;
+    struct Reset {
+        bool& v;
+        ~Reset() { v = false; }
+    } reset{verifying_};
+    run(tokens, true);
+    return logits_all_;
+}
+
+void Engine::keep(uint32_t n)
+{
+    const uint32_t T = uint32_t(verify_tokens_.size());
+    if (n == 0 || n > T || pos_ != verify_pos0_ + T)
+        throw std::runtime_error("keep: not after a verify of at least that many tokens");
+    if (n == T)
+        return;
+    pos_ = verify_pos0_ + n;
+    rope_delta_ = verify_delta_; // a decode step's tokens are text
+    if (engram_)
+        engram_history_ = engram_->advance(verify_history_, std::span<const int32_t>(verify_tokens_).first(n));
+    verify_tokens_.resize(n);
+}
+
 const std::vector<float>& Engine::prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled,
                                           const std::function<void(size_t)>& progress)
 {
@@ -1168,6 +1199,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
     MTL::Buffer* xnl = scratch("hy_xnl", uint64_t(nl) * E * 4);
     MTL::Buffer* lg = scratch("hy_logits", uint64_t(nl) * cfg_.n_vocab * 4);
     const uint32_t first_logit = all_logits ? 0 : G - 1;
+    if (all_logits && verifying_)
+        logits_all_.resize(uint64_t(G) * cfg_.n_vocab);
     ablate(enc, cfg_.n_layer - 1, ablate_head_, R, uint64_t(first_logit) * hd * 4, G - first_logit);
     if (G == 1)
         probe(enc, "head_in", -1, R, hd);
@@ -1193,6 +1226,8 @@ void Engine::run(std::span<const int32_t> tokens, bool all_logits)
         finish(cb);
         drain();
         const auto* lgp = static_cast<const float*>(lg->contents());
+        if (all_logits && verifying_)
+            std::memcpy(logits_all_.data() + uint64_t(l0) * cfg_.n_vocab, lgp, uint64_t(n) * cfg_.n_vocab * 4);
         if (all_logits && logits_sink_)
             for (uint32_t i = 0; i < n; ++i)
                 logits_sink_(pos_ + l0 + i, lgp + uint64_t(i) * cfg_.n_vocab);

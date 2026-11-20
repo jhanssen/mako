@@ -54,6 +54,11 @@ public:
     const std::vector<float>& step(int32_t token) override;
     const std::vector<float>& prefill(std::span<const int32_t> tokens, const std::function<bool()>& cancelled = {},
                                       const std::function<void(size_t)>& progress = {}) override;
+    // Up to kMaxDecodeTokens tokens in one decode step (their logits a row each), then keep(n) rewinds to the first n
+    // (the window and indexer rows past them are overwritten when those positions run again).
+    bool can_verify() const override { return true; }
+    const std::vector<float>& verify(std::span<const int32_t> tokens) override;
+    void keep(uint32_t n) override;
     // When set, prefill() computes the logits of every position and passes each here (for evaluations).
     using LogitsSink = std::function<void(uint32_t pos, const float* logits)>;
     void set_logits_sink(LogitsSink sink) { logits_sink_ = std::move(sink); }
@@ -153,6 +158,12 @@ private:
     int32_t rope_delta_ = 0;
     uint32_t pos3_lo_ = 0;
     std::vector<float> logits_;
+    std::vector<float> logits_all_; // verify(): a row per token
+    // The last verify(): its first position, rope delta, tokens and the Engram history before it.
+    uint32_t verify_pos0_ = 0;
+    int32_t verify_delta_ = 0;
+    std::vector<int32_t> verify_tokens_, verify_history_;
+    bool verifying_ = false;
     LogitsSink logits_sink_;
     std::function<void(uint32_t)> layer_done_;
     core::StepStats last_prefill_;

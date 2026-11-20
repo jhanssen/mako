@@ -121,7 +121,7 @@ int main(int argc, char** argv)
             .option("--slice-ms", "N", "how long a request generates before waiting ones get a turn (default 1000)",
                     so.slice_ms)
             .option("--max-waiting", "N", "requests that may wait before new ones are refused", so.max_waiting)
-            .flag("--spec", "speculative decoding (GLM-5.3's MTP block, DeepSeek-V4.1 with --dspark; default on)",
+            .flag("--spec", "speculative decoding (GLM-5.3's MTP block, DeepSeek-V4.1 with --dspark, Hy4-flash from the context; default on)",
                   so.speculative)
             .flag("--spin-wait", "wait for each step's GPU work spinning on a core, not blocking (default on)",
                   spin_wait)
@@ -293,7 +293,6 @@ int main(int argc, char** argv)
             opts.dense_quant = dense_quant;
             auto e = std::make_unique<mako::hy4f::Engine>(*model, *cfg, opts, ctx);
             so.prefill_piece = opts.prefill_group;
-            so.speculative = false;
             n_embd = cfg->n_embd, n_layer = cfg->n_layer;
             sites = mako::hy4f::Engine::kAblationSites;
             set_ablation = [p = e.get()](mako::mtl::Ablation a) { p->set_ablation(std::move(a)); };

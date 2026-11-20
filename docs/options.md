@@ -77,6 +77,9 @@ Measured in `performance.md`.
   match length stops offering while under 55% of its first drafts are kept (one probe in eight), so text that merely
   shares a phrase with the context stops paying for rejected drafts after a few. No weights, no memory; the output is
   the same as without (the engine verifies every draft). GLM-5.3 verifies one draft a step and does not use it.
+- Hy4-flash drafts from the context the same way (on with `--spec`, the default): a reply repeating a 4.6 KB file from
+  its prompt 25.4 -> 14.8 ms/token (94% of drafts kept), a story unchanged. A verify's rows and the steps after its
+  rejected tokens are undone are bit-identical to decoding the same tokens one at a time.
 
 ## Ablation
 

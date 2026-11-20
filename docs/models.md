@@ -8,7 +8,7 @@
 | `ds` | DeepSeek-V4.1-Flash-1017, Maya-S IQ2_XXS with its Engram tables | 339 GB | ~25 tokens/s decode (~19 at 16-32K tokens of context), ~500-800 tokens/s prefill |
 | `ds-ista-xs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XS | 266 GB | ~34 tokens/s decode with `--miss-penalty 0.1`, the same perplexity as Maya-S on our prose and code texts |
 | `ds-ista-xxs` | DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS | 249 GB | ~33 tokens/s decode without the penalty (IQ2_XS: ~31), perplexity 3-5% higher than Maya-S; with the penalty unmeasured |
-| `hy4f` | Hy4-flash, Maya-M IQ3_XXS with its n-gram table | 132 GB (the 63 GB table is read from the SSD a row at a time) | ~41 tokens/s decode at short context, every expert resident; ~650 tokens/s prefill (2210 tokens); images with `--vision`; no drafter yet |
+| `hy4f` | Hy4-flash, Maya-M IQ3_XXS with its n-gram table | 132 GB (the 63 GB table is read from the SSD a row at a time) | ~41 tokens/s decode at short context, every expert resident; ~650 tokens/s prefill (2210 tokens); images with `--vision`; drafts from the context, no drafter yet |
 
 Measurements and how they were taken: [performance.md](performance.md). The fastest setup measured:
 
