@@ -28,7 +28,7 @@ int main(int argc, char** argv)
         return 1;
     }
     auto cfg = mako::dsv41::Config::load(*m);
-    auto e = cfg ? mako::dsv41::Engram::open(*cfg, *m) : std::unexpected(cfg.error());
+    auto e = cfg ? mako::dsv41::Engram::open(cfg->engram, *m) : std::unexpected(cfg.error());
     if (!e) {
         std::println(stderr, "{}", e.error());
         return 1;

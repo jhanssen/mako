@@ -144,3 +144,13 @@ foreach(m prefill short long long_noskip penalty q6k dspark lookup pool)
 endforeach()
 set_tests_properties(ds41_prefill PROPERTIES LABELS "e2e;quick")
 set_tests_properties(ds41_long_noskip PROPERTIES LABELS slow)
+
+add_executable(hy4f_config_test hy4f_config_test.cpp)
+target_link_libraries(hy4f_config_test PRIVATE mako_hy4f)
+add_test(NAME hy4f_config COMMAND hy4f_config_test "${MAKO_HY4F_MODEL}")
+set_tests_properties(hy4f_config PROPERTIES LABELS hy4f SKIP_RETURN_CODE 77)
+add_test(NAME tokenizer_hy4f COMMAND tokenizer_test "${MAKO_HY4F_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_tokenizer_cases.bin
+         ${CMAKE_CURRENT_SOURCE_DIR}/data/hy4f_tokenizer_expected.txt)
+add_test(NAME tokenizer_hy4f_special COMMAND tokenizer_test "${MAKO_HY4F_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/hy4f_tokenizer_cases.bin
+         ${CMAKE_CURRENT_SOURCE_DIR}/data/hy4f_special_expected.txt)
+set_tests_properties(tokenizer_hy4f tokenizer_hy4f_special PROPERTIES LABELS "tokenizer;hy4f" SKIP_RETURN_CODE 77)

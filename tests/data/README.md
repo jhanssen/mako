@@ -60,6 +60,12 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
   per case: `REF_TOKENIZE=tests/data/glm_tokenizer_cases.bin build/tools/ref_dump/ref_dump <model> 0 /tmp >
   expected.txt`. For DeepSeek, whose architecture that llama.cpp does not load, `tools/vocab_only_gguf.py` first
   writes a GGUF carrying only the model's `tokenizer.ggml.*` keys (architecture "llama", dummy geometry).
+- `hy4f_tokenizer_expected.txt`: Hy4-flash's ids for the same cases, from the Maya-M GGUF (`Maya-M/` of
+  [peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF) at
+  `61b46da72d98a5227bfb5fd41505d4ca337af1d3`) through llama.cpp pull request #32517 at
+  `b7c3f5da30fe1c44f7d015dc051ef0f373c708ec` (CPU build), loaded directly.
+- `hy4f_tokenizer_cases.bin` (13 cases, written by hand: Hy4's chat, reasoning, tool and image control tokens in and
+  around text) and `hy4f_special_expected.txt`, its ids from the same reference.
 
 ## Chat templates
 

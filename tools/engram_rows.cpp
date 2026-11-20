@@ -33,7 +33,7 @@ int main(int argc, char** argv)
         std::println(stderr, "{}", cfg.error());
         return 1;
     }
-    auto e = mako::dsv41::Engram::open(*cfg, *m);
+    auto e = mako::dsv41::Engram::open(cfg->engram, *m);
     if (!e) {
         std::println(stderr, "{}", e.error());
         return 1;

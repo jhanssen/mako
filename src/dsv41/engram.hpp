@@ -23,7 +23,7 @@ public:
     // Adds the GGUFs of a comma-separated list (tables may be split over several files).
     static std::expected<void, std::string> add_files(gguf::ModelFiles& m, const std::string& list);
     // Finds the tables in `m` (one tensor holding every layer's table in turn, or one per layer).
-    static std::expected<Engram, std::string> open(const Config& cfg, const gguf::ModelFiles& m);
+    static std::expected<Engram, std::string> open(const EngramConfig& c, const gguf::ModelFiles& m);
 
     uint32_t layers() const { return uint32_t(tables_.size()); }
     uint32_t columns() const { return cols_; }

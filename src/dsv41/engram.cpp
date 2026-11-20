@@ -63,9 +63,8 @@ std::expected<void, std::string> Engram::add_files(gguf::ModelFiles& m, const st
     return {};
 }
 
-std::expected<Engram, std::string> Engram::open(const Config& cfg, const gguf::ModelFiles& m)
+std::expected<Engram, std::string> Engram::open(const EngramConfig& c, const gguf::ModelFiles& m)
 {
-    const auto& c = cfg.engram;
     Engram e;
     e.ngram_ = c.max_ngram;
     e.cols_ = c.columns();

@@ -270,7 +270,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         layer_mla_.push_back(1);
     }
 
-    auto eg = Engram::open(cfg_, model_);
+    auto eg = Engram::open(cfg_.engram, model_);
     if (!eg)
         throw std::runtime_error(eg.error());
     engram_.emplace(std::move(*eg));

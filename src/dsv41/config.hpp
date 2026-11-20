@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gguf/keys.hpp"
 #include "gguf/model_files.hpp"
 
 #include <cstdint>
@@ -8,6 +9,21 @@
 #include <vector>
 
 namespace mako::dsv41 {
+
+// Engram: hashed n-gram tables read per token.
+struct EngramConfig {
+    std::vector<int32_t> layers;
+    std::vector<int64_t> num_embeddings; // rows per layer's table
+    uint32_t max_ngram = 0, heads = 0, head_dim = 0;
+    int32_t pad_token = 0;
+    std::vector<int32_t> token_map;    // vocabulary -> compressed id
+    std::vector<int64_t> multipliers;  // per layer, max_ngram
+    std::vector<int64_t> primes, offsets; // per layer, (max_ngram - 1) * heads columns
+    uint32_t columns() const { return (max_ngram - 1) * heads; }
+
+    // From <arch>.ple.* / <arch>.engram.* keys (or integer tensors); problems are noted in k.missing.
+    static EngramConfig load(gguf::Keys& k, const gguf::ModelFiles& m);
+};
 
 // DeepSeek-V4.1's geometry from a GGUF's deepseek41.* metadata.
 struct Config {
@@ -46,17 +62,7 @@ struct Config {
     uint32_t hc = 0, hc_sinkhorn_iters = 0;
     float hc_eps = 0.0f;
 
-    // Engram: hashed n-gram tables read per token.
-    struct Engram {
-        std::vector<int32_t> layers;
-        std::vector<int64_t> num_embeddings; // rows per layer's table
-        uint32_t max_ngram = 0, heads = 0, head_dim = 0;
-        int32_t pad_token = 0;
-        std::vector<int32_t> token_map;    // vocabulary -> compressed id
-        std::vector<int64_t> multipliers;  // per layer, max_ngram
-        std::vector<int64_t> primes, offsets; // per layer, (max_ngram - 1) * heads columns
-        uint32_t columns() const { return (max_ngram - 1) * heads; }
-    } engram;
+    EngramConfig engram;
 
     static std::expected<Config, std::string> load(const gguf::ModelFiles& m);
 };

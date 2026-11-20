@@ -26,6 +26,10 @@ add_library(mako_dsv41 STATIC dsv41/config.cpp dsv41/engine.cpp dsv41/engram.cpp
 target_include_directories(mako_dsv41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_dsv41 PUBLIC mako_core mako_mtl mako_gguf PRIVATE glaze_headers)
 
+add_library(mako_hy4f STATIC hy4f/config.cpp)
+target_include_directories(mako_hy4f PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mako_hy4f PUBLIC mako_dsv41 mako_core mako_mtl mako_gguf)
+
 add_library(mako_gen STATIC gen/lookup.cpp gen/loop_guard.cpp gen/pool.cpp gen/sampler.cpp gen/session.cpp)
 target_include_directories(mako_gen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_gen PUBLIC mako_log)

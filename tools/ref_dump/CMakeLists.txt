@@ -5,6 +5,8 @@ target_include_directories(ref_dump PRIVATE ${MAKO_REF_SRC}/include ${MAKO_REF_S
 target_link_directories(ref_dump PRIVATE ${MAKO_REF_BUILD}/bin)
 target_link_libraries(ref_dump PRIVATE llama ggml ggml-base)
 set_target_properties(ref_dump PROPERTIES BUILD_RPATH ${MAKO_REF_BUILD}/bin)
+# Newer reference trees deprecate the batch API ref_dump uses; it still works there.
+target_compile_options(ref_dump PRIVATE -Wno-deprecated-declarations)
 
 # Image embeddings through the reference's multimodal library.
 add_executable(ref_vision ref_vision.cpp)
