@@ -221,7 +221,7 @@ int main(int argc, char** argv)
         int32_t next = int32_t(std::max_element(logits.back().begin(), logits.back().end()) - logits.back().begin());
         const auto tg = std::chrono::steady_clock::now();
         std::vector<mako::core::KernelTime> parts;
-        double gpu_ms = 0, wall_ms = 0;
+        double gpu_ms = 0, wall_ms = 0, engram_ms = 0;
         for (int i = 0; i < gen; ++i) {
             out.push_back(next);
             const auto& l = engine.step(next);
@@ -231,6 +231,7 @@ int main(int argc, char** argv)
             const auto& st = engine.last_step();
             gpu_ms += st.gpu_ms;
             wall_ms += st.wall_ms;
+            engram_ms += st.engram_ms;
             for (const auto* list : {&st.parts, &st.kernels})
                 for (const auto& k : *list) {
                     auto it = std::ranges::find(parts, k.kernel, &mako::core::KernelTime::kernel);
@@ -248,8 +249,10 @@ int main(int argc, char** argv)
         }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
         std::println("generated: {}", tok->decode(out));
-        std::println("{} tokens in {:.2f} s: {:.1f} tokens/s, last step {:.1f} ms ({} misses)", gen, s, gen / s,
-                     engine.last_step().wall_ms, engine.last_step().misses);
+        std::println("{} tokens in {:.2f} s: {:.1f} tokens/s, last step {:.1f} ms ({} misses); Engram rows {:.2f} ms a "
+                     "step",
+                     gen, s, gen / s, engine.last_step().wall_ms, engine.last_step().misses,
+                     gen > 1 ? engram_ms / (gen - 1) : 0.0);
     }
     return 0;
 }

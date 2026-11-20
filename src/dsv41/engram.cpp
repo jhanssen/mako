@@ -198,7 +198,8 @@ void Engram::read(std::span<const int64_t> rows, float* out, gguf::ReadPool& poo
     const uint32_t L = layers();
     const size_t per_pos = size_t(L) * cols_;
     const size_t n = rows.size();
-    constexpr size_t kChunk = 32;
+    // One row a task for a decode step (as read_raw), batches for a prefill.
+    const size_t kChunk = std::max<size_t>(1, n / 256);
     const auto& v = lut().v;
     pool.run((n + kChunk - 1) / kChunk, [&](size_t chunk) {
         std::vector<uint8_t> raw(row_bytes_);
