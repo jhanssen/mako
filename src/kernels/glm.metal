@@ -1018,6 +1018,7 @@ struct PoolArgs {
     uint dim;      // indexer head dim, 128
     uint kpool;    // tokens per pool
     uint pool;     // the pool to build
+    uint row0;     // the position of the cache's first row
 };
 
 // pooled[d] = sum_m softmax_m(gate[m][d] + ape[m][d]) * key[m][d] over the pool's members m.
@@ -1031,7 +1032,7 @@ kernel void idx_pool(device const float* cache [[buffer(0)]], device const float
     const uint d = gid.x, pool = a.pool + gid.y;
     if (d >= a.dim)
         return;
-    const uint first = pool * a.kpool;
+    const uint first = pool * a.kpool - a.row0;
     float m = -INFINITY;
     for (uint j = 0; j < a.kpool; ++j)
         m = max(m, cache[uint64_t(first + j) * 2 * a.dim + a.dim + d] + ape[j * a.dim + d]);

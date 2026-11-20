@@ -54,15 +54,19 @@ public:
     uint32_t n_vocab() const override { return cfg_.n_vocab; }
     const Config& config() const { return cfg_; }
     void reset() override;
-    // state: the Engram history (every cache is positional).
+    // state: the Engram history, each window layer's last sliding_window rows and each indexer's rows of the group
+    // the position is in (what the sliding buffers hold that the positional caches do not).
     Checkpoint checkpoint() override;
     void restore(const Checkpoint& cp) override;
     uint32_t checkpoint_slots() const override { return opts_.checkpoints; }
-    uint64_t checkpoint_bytes() const { return engram_history_.size() * 4; }
-    // Every layer's latent and rope rows, the indexers' rows and pooled keys before pos.
+    uint64_t checkpoint_bytes() const;
+    // The indexer layers' latent and rope rows and pooled keys before pos.
     std::vector<std::byte> save_positions(uint32_t pos) const override;
     void load_positions(uint32_t pos, std::span<const std::byte> data) override;
     const core::StepStats& last_prefill() const { return last_prefill_; }
+    // At most the chunk the engine was built with (which sized its sliding buffers and scratch). Results do not depend
+    // on it.
+    void set_prefill_chunk(uint32_t chunk);
     void set_miss_penalty(float penalty)
     {
         opts_.miss_penalty = penalty;
@@ -96,6 +100,10 @@ private:
     void rope(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* freqs, uint32_t head_dim,
               uint32_t heads, uint32_t pos0, uint32_t T, uint32_t step = 1);
     uint64_t prefill_scratch(uint32_t chunk, uint32_t group) const;
+    // Before layer il's rows of T tokens at pos0 go into its sliding buffers (a window layer's latent and rope rows,
+    // an indexer's value | gate rows): when they would not fit, the rows still needed move to the front.
+    void slide(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t pos0, uint32_t T);
+    void move_rows(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* b, uint64_t row_bytes, uint32_t from, uint32_t n);
     std::vector<std::pair<MTL::Buffer*, uint64_t>> positional(uint32_t pos) const;
     uint32_t list_stride() const { return n_top_ * cfg_.indexer_kpool + cfg_.indexer_kpool; }
 
@@ -110,9 +118,12 @@ private:
     gguf::ModelFiles::Ref token_embd_;
     DevTensor output_norm_, output_, head_fn_, head_base_, head_scale_;
     mtl::Ref<MTL::Buffer> freq_full_, freq_swa_; // RoPE frequencies of the two kinds of layer
-    // Per layer: latent rows (half, kv_lora_rank) and rope rows (half, n_rot) of every position; per indexer layer
-    // its value | gate rows (float, 2 x dim) and pooled keys (float, dim).
+    // Per layer: latent rows (half, kv_lora_rank) and rope rows (half, n_rot), of every position for an indexer
+    // layer, of the last swa_cap_ from row_base_ on for a window layer; per indexer layer its value | gate rows
+    // (float, 2 x dim; idx_cap_ from idx_base_ on) and pooled keys (float, dim, every complete group).
     std::vector<mtl::Ref<MTL::Buffer>> lat_, pe_, idx_rows_, idx_pooled_;
+    std::vector<uint32_t> row_base_, idx_base_;
+    uint32_t swa_cap_ = 0, idx_cap_ = 0, built_chunk_ = 0;
     uint32_t pos_ = 0;
     std::vector<float> logits_;
     LogitsSink logits_sink_;

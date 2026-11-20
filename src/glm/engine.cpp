@@ -75,7 +75,7 @@ struct RouteArgs {
     uint32_t lookup, score;
 };
 struct PoolArgs {
-    uint32_t dim, kpool, pool;
+    uint32_t dim, kpool, pool, row0;
 };
 struct ScoreArgs {
     uint32_t dim, heads, first, kpool;
@@ -742,7 +742,7 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
 
     const uint32_t first = pos0 / kp, last = (pos0 + T) / kp;
     if (last > first) {
-        const PoolArgs pa{Di, kp, first};
+        const PoolArgs pa{Di, kp, first, 0};
         enc->setComputePipelineState(pso("idx_pool"));
         enc->setBuffer(cache, 0, 0);
         enc->setBuffer(L.idx_ape.buf, L.idx_ape.off, 1);

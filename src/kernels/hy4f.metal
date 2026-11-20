@@ -284,3 +284,11 @@ kernel void hy4_gate_mul(device float* y [[buffer(0)]], device const float* g [[
     if (i < n)
         y[i] *= sigmoidf(g[i]);
 }
+
+// y[i] = x[i] over n 32-bit words (rows moved within a cache; the ranges do not overlap).
+kernel void hy4_copy_words(device const uint* x [[buffer(0)]], device uint* y [[buffer(1)]], constant uint& n [[buffer(2)]],
+                           uint i [[thread_position_in_grid]])
+{
+    if (i < n)
+        y[i] = x[i];
+}

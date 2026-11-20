@@ -61,7 +61,7 @@ struct GatherArgs {
     uint32_t heads, dim, stride, splits, tokens;
 };
 struct PoolArgs {
-    uint32_t dim, kpool, pool;
+    uint32_t dim, kpool, pool, row0;
 };
 struct ScoreArgs {
     uint32_t dim, heads, first, kpool;
@@ -73,6 +73,13 @@ struct SelectArgs {
 };
 
 constexpr uint32_t kCommitLayers = 4; // decode: layers per command buffer
+// A window layer's keys for a token start at a multiple of this many positions (the rest of them masked): a score's
+// rounding depends on its key's place in the GEMM's tiles, so a fixed grid gives every token the same results
+// whatever chunk or step it runs in.
+constexpr uint32_t kKeyAlign = 64;
+
+// The first key position window layers attend for a token at pos (window W).
+uint32_t window_start(uint32_t pos, uint32_t W) { return pos + 1 > W ? (pos + 1 - W) / kKeyAlign * kKeyAlign : 0; }
 // The Engram norms leave eps unset in the reference: the fp32 machine epsilon, not rms_norm_eps.
 constexpr float kEngramEps = 1.1920929e-07f;
 
@@ -145,6 +152,11 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         return b;
     };
     const uint32_t R = cfg_.kv_lora_rank, Di = cfg_.indexer_dim;
+    // Sliding buffers: the rows a chunk's first token needs, the chunk's, and as many again so moves are rare.
+    built_chunk_ = opts_.prefill_chunk;
+    const uint32_t most = std::max(opts_.prefill_chunk, kMaxDecodeTokens);
+    swa_cap_ = std::min(2 * cfg_.sliding_window + most + kKeyAlign, opts_.max_ctx);
+    idx_cap_ = most + 2 * cfg_.indexer_kpool;
     uint64_t context_bytes = 0;
     const auto& eg_layers = cfg_.engram.layers;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
@@ -222,11 +234,12 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
             L->experts = {expert(p + "ffn_gate_exps.weight", true), expert(p + "ffn_up_exps.weight", true),
                           expert(p + "ffn_down_exps.weight", true)};
         }
-        lat_.push_back(buffer(uint64_t(opts_.max_ctx) * R * 2));
-        pe_.push_back(buffer(uint64_t(opts_.max_ctx) * cfg_.n_rot * 2));
+        const uint64_t rows = L->swa ? swa_cap_ : opts_.max_ctx;
+        lat_.push_back(buffer(rows * R * 2));
+        pe_.push_back(buffer(rows * cfg_.n_rot * 2));
         context_bytes += lat_.back()->length() + pe_.back()->length();
         if (L->indexer) {
-            idx_rows_.push_back(buffer(uint64_t(opts_.max_ctx) * 2 * Di * 4));
+            idx_rows_.push_back(buffer(uint64_t(idx_cap_) * 2 * Di * 4));
             idx_pooled_.push_back(buffer(uint64_t(opts_.max_ctx / cfg_.indexer_kpool + 1) * Di * 4));
             context_bytes += idx_rows_.back()->length() + idx_pooled_.back()->length();
         } else {
@@ -236,6 +249,8 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         layers_.push_back(std::move(L));
         layer_mla_.push_back(1);
     }
+    row_base_.assign(cfg_.n_layer, 0);
+    idx_base_.assign(cfg_.n_layer, 0);
 
     if (!eg_layers.empty()) {
         auto eg = dsv41::Engram::open(cfg_.engram, model_);
@@ -290,6 +305,48 @@ void Engine::reset()
     pos_ = 0;
     if (engram_)
         engram_history_.assign(engram_->history(), -1);
+    row_base_.assign(cfg_.n_layer, 0);
+    idx_base_.assign(cfg_.n_layer, 0);
+}
+
+void Engine::set_prefill_chunk(uint32_t chunk)
+{
+    if (chunk == 0 || chunk > built_chunk_)
+        throw std::runtime_error(std::format("prefill chunk {} outside 1..{} (the engine's)", chunk, built_chunk_));
+    opts_.prefill_chunk = chunk;
+}
+
+void Engine::move_rows(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* b, uint64_t row_bytes, uint32_t from, uint32_t n)
+{
+    if (!n)
+        return;
+    const uint32_t words = uint32_t(uint64_t(n) * row_bytes / 4);
+    enc->setComputePipelineState(pso("hy4_copy_words"));
+    enc->setBuffer(b, uint64_t(from) * row_bytes, 0);
+    enc->setBuffer(b, 0, 1);
+    enc->setBytes(&words, sizeof(words), 2);
+    enc->dispatchThreads(MTL::Size(words, 1, 1), MTL::Size(256, 1, 1));
+    after(enc, "hy4_copy_words");
+}
+
+void Engine::slide(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t pos0, uint32_t T)
+{
+    const Layer& L = *layers_[il];
+    if (L.swa && pos0 + T - row_base_[il] > swa_cap_) {
+        // From the chunk's first token's first key on.
+        const uint32_t nb = window_start(pos0, cfg_.sliding_window);
+        move_rows(enc, lat_[il].get(), uint64_t(cfg_.kv_lora_rank) * 2, nb - row_base_[il], pos0 - nb);
+        move_rows(enc, pe_[il].get(), uint64_t(cfg_.n_rot) * 2, nb - row_base_[il], pos0 - nb);
+        row_base_[il] = nb;
+    }
+    if (L.indexer && pos0 + T - idx_base_[il] > idx_cap_) {
+        // The rows of pos0's group before it, for that group's pool.
+        const uint32_t nb = pos0 / cfg_.indexer_kpool * cfg_.indexer_kpool;
+        move_rows(enc, idx_rows_[il].get(), uint64_t(cfg_.indexer_dim) * 8, nb - idx_base_[il], pos0 - nb);
+        idx_base_[il] = nb;
+    }
+    if (pos0 + T - row_base_[il] > (L.swa ? swa_cap_ : opts_.max_ctx) || (L.indexer && pos0 + T - idx_base_[il] > idx_cap_))
+        throw std::logic_error("more rows than a sliding buffer holds");
 }
 
 std::vector<std::pair<MTL::Buffer*, uint64_t>> Engine::positional(uint32_t pos) const
@@ -298,12 +355,12 @@ std::vector<std::pair<MTL::Buffer*, uint64_t>> Engine::positional(uint32_t pos) 
         throw std::runtime_error("position past the context size");
     std::vector<std::pair<MTL::Buffer*, uint64_t>> out;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+        if (layers_[il]->swa)
+            continue;
         out.emplace_back(lat_[il].get(), uint64_t(pos) * cfg_.kv_lora_rank * 2);
         out.emplace_back(pe_[il].get(), uint64_t(pos) * cfg_.n_rot * 2);
-        if (idx_rows_[il]) {
-            out.emplace_back(idx_rows_[il].get(), uint64_t(pos) * 2 * cfg_.indexer_dim * 4);
+        if (idx_pooled_[il])
             out.emplace_back(idx_pooled_[il].get(), uint64_t(pos / cfg_.indexer_kpool) * cfg_.indexer_dim * 4);
-        }
     }
     return out;
 }
@@ -337,12 +394,48 @@ void Engine::load_positions(uint32_t pos, std::span<const std::byte> data)
         throw std::runtime_error("positions from another engine");
 }
 
+// The state's layout: the Engram history; per window layer sliding_window + kKeyAlign latent then rope rows (the
+// positions from the next token's first key to pos, from the start); per indexer layer kpool value | gate rows (the
+// positions of pos's group before it, from the start).
+uint64_t Engine::checkpoint_bytes() const
+{
+    uint64_t n = engram_history_.size() * 4;
+    for (const auto& L : layers_) {
+        if (L->swa)
+            n += uint64_t(cfg_.sliding_window + kKeyAlign) * (cfg_.kv_lora_rank + cfg_.n_rot) * 2;
+        if (L->indexer)
+            n += uint64_t(cfg_.indexer_kpool) * cfg_.indexer_dim * 8;
+    }
+    return n;
+}
+
 Engine::Checkpoint Engine::checkpoint()
 {
     Checkpoint cp;
     cp.pos = pos_;
-    const auto* h = reinterpret_cast<const std::byte*>(engram_history_.data());
-    cp.state.assign(h, h + engram_history_.size() * 4);
+    cp.state.resize(checkpoint_bytes());
+    std::byte* p = cp.state.data();
+    std::memcpy(p, engram_history_.data(), engram_history_.size() * 4);
+    p += engram_history_.size() * 4;
+    const uint32_t W = cfg_.sliding_window, kp = cfg_.indexer_kpool;
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+        const Layer& L = *layers_[il];
+        if (L.swa) {
+            const uint32_t s = window_start(pos_, W), n = pos_ - s;
+            for (auto [buf, rb] : {std::pair{lat_[il].get(), uint64_t(cfg_.kv_lora_rank) * 2},
+                                   std::pair{pe_[il].get(), uint64_t(cfg_.n_rot) * 2}}) {
+                std::memcpy(p, static_cast<const std::byte*>(buf->contents()) + (s - row_base_[il]) * rb, n * rb);
+                p += (W + kKeyAlign) * rb;
+            }
+        }
+        if (L.indexer) {
+            const uint64_t rb = uint64_t(cfg_.indexer_dim) * 8;
+            const uint32_t g0 = pos_ / kp * kp;
+            std::memcpy(p, static_cast<const std::byte*>(idx_rows_[il]->contents()) + (g0 - idx_base_[il]) * rb,
+                        (pos_ - g0) * rb);
+            p += kp * rb;
+        }
+    }
     return cp;
 }
 
@@ -350,7 +443,29 @@ void Engine::restore(const Checkpoint& cp)
 {
     if (cp.pos > opts_.max_ctx || cp.state.size() != checkpoint_bytes())
         throw std::runtime_error("checkpoint from another engine");
-    std::memcpy(engram_history_.data(), cp.state.data(), cp.state.size());
+    const std::byte* p = cp.state.data();
+    std::memcpy(engram_history_.data(), p, engram_history_.size() * 4);
+    p += engram_history_.size() * 4;
+    const uint32_t W = cfg_.sliding_window, kp = cfg_.indexer_kpool;
+    for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
+        const Layer& L = *layers_[il];
+        if (L.swa) {
+            const uint32_t s = window_start(cp.pos, W);
+            row_base_[il] = s;
+            for (auto [buf, rb] : {std::pair{lat_[il].get(), uint64_t(cfg_.kv_lora_rank) * 2},
+                                   std::pair{pe_[il].get(), uint64_t(cfg_.n_rot) * 2}}) {
+                std::memcpy(buf->contents(), p, (cp.pos - s) * rb);
+                p += (W + kKeyAlign) * rb;
+            }
+        }
+        if (L.indexer) {
+            const uint64_t rb = uint64_t(cfg_.indexer_dim) * 8;
+            const uint32_t g0 = cp.pos / kp * kp;
+            idx_base_[il] = g0;
+            std::memcpy(idx_rows_[il]->contents(), p, (cp.pos - g0) * rb);
+            p += kp * rb;
+        }
+    }
     pos_ = cp.pos;
 }
 
@@ -421,7 +536,7 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     MTL::Buffer* ikr = scratch("hy_ikr", uint64_t(T) * Di * 4);
     MTL::Buffer* ikn = scratch("hy_ikn", uint64_t(T) * Di * 4);
     MTL::Buffer* rows = idx_rows_[il].get();
-    const uint64_t row = uint64_t(pos0) * 2 * Di * 4;
+    const uint64_t row = uint64_t(pos0 - idx_base_[il]) * 2 * Di * 4;
     proj(enc, L.idx_k, xn, 0, ikr, 0, T);
     norm(enc, ikr, &L.idx_k_norm, ikn, T, Di, Di, cfg_.rms_eps);
     proj(enc, L.idx_value, ikn, 0, rows, row, T, 2 * Di);
@@ -430,7 +545,7 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     const uint32_t first = pos0 / kp, last = (pos0 + T) / kp;
     if (last > first) {
         MTL::Buffer* pooled = idx_pooled_[il].get();
-        const PoolArgs pa{Di, kp, first};
+        const PoolArgs pa{Di, kp, first, idx_base_[il]};
         enc->setComputePipelineState(pso("idx_pool"));
         enc->setBuffer(rows, 0, 0);
         enc->setBuffer(L.idx_ape.buf, L.idx_ape.off, 1);
@@ -519,11 +634,13 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         probe(enc, "q_pe", int(il), qp, uint64_t(H) * NR);
         probe(enc, "k_pe", int(il), kpe, NR);
     }
+    slide(enc, il, pos0, T);
+    const uint32_t base = row_base_[il]; // the position of the latent and rope caches' first row
     for (auto [src, dst, w] : {std::tuple{kvn, lat_[il].get(), R}, std::tuple{kpe, pe_[il].get(), NR}}) {
         const uint32_t n = T * w;
         enc->setComputePipelineState(pso("store_half"));
         enc->setBuffer(src, 0, 0);
-        enc->setBuffer(dst, uint64_t(pos0) * w * 2, 1);
+        enc->setBuffer(dst, uint64_t(pos0 - base) * w * 2, 1);
         enc->setBytes(&n, sizeof(n), 2);
         for (int rep_ = repeats("store_half"); rep_ > 0; --rep_)
             enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
@@ -561,18 +678,18 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     after(enc, "to_half");
     // Dense: groups of query tokens over their keys from kbase on (scores of the latent and the rope part, a
     // softmax with the sinks over both, the latent rows weighted).
-    const uint32_t maxkv = W ? W + T : pos0 + T;
+    const uint32_t maxkv = W ? W + kKeyAlign + T : pos0 + T;
     const uint32_t group = std::clamp<uint32_t>((4u << 20) / (H * maxkv), 1, 16);
     // Each group writes its rows of `lat` (sum_splits at the group's offset).
     auto dense_at = [&](uint32_t t, uint32_t gt) {
-        const uint32_t p0 = pos0 + t, kbase = W && p0 + 1 > W ? p0 + 1 - W : 0;
+        const uint32_t p0 = pos0 + t, kbase = W ? window_start(p0, W) : 0;
         const uint32_t n_kv = p0 + gt - kbase, rows = gt * H;
         MTL::Buffer* sl = scratch("hy_sc_lat", uint64_t(rows) * n_kv * 4);
         MTL::Buffer* sp = scratch("hy_sc_pe", uint64_t(rows) * n_kv * 4);
-        gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, lat_[il].get(), uint64_t(kbase) * R * 2, qlh,
+        gemm_->encode(enc, gguf::Type::F16, R, n_kv, rows, lat_[il].get(), uint64_t(kbase - base) * R * 2, qlh,
                       uint64_t(t) * H * R * 2, sl, 0);
         // The dense kernel steps 64 columns at a time: the staged one's 256 would read past these 64-wide rows.
-        gemm_->encode(enc, gguf::Type::F16, NR, n_kv, rows, pe_[il].get(), uint64_t(kbase) * NR * 2, qph,
+        gemm_->encode(enc, gguf::Type::F16, NR, n_kv, rows, pe_[il].get(), uint64_t(kbase - base) * NR * 2, qph,
                       uint64_t(t) * H * NR * 2, sp, 0, 0, 0, true);
         after(enc, "attn scores");
         const AttnSoftmaxArgs sa{n_kv, scale, p0 + 1 - kbase, H, W};
@@ -590,7 +707,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         const PvArgs pa{rows, R, n_kv, keys_per_split};
         enc->setComputePipelineState(pso("attn_pv"));
         enc->setBuffer(sl, 0, 0);
-        enc->setBuffer(lat_[il].get(), uint64_t(kbase) * R * 2, 1);
+        enc->setBuffer(lat_[il].get(), uint64_t(kbase - base) * R * 2, 1);
         enc->setBuffer(partial, 0, 2);
         enc->setBytes(&pa, sizeof(pa), 3);
         for (int rep_ = repeats("attn_pv"); rep_ > 0; --rep_)
@@ -606,7 +723,9 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         after(enc, "sum_splits");
     };
     auto sparse = [&](uint32_t t, uint32_t gt) {
-        const uint32_t Ls = list_stride(), rows = gt * H, splits = gt < 8 ? 8 : 1;
+        // A fixed split of each token's list (a single token still fills the GPU): its sums in the same order in any
+        // group.
+        const uint32_t Ls = list_stride(), rows = gt * H, splits = 8;
         part(enc, "attn indexer select");
         indexer_select(enc, il, t, pos0 + t, gt);
         part(enc, "attn sparse");
@@ -671,7 +790,11 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     const uint32_t select_from = L.indexer ? (n_top_ + 1) * kp : UINT32_MAX;
     uint32_t t = 0;
     while (t < T && pos0 + t < select_from) {
-        const uint32_t gt = std::min({group, T - t, select_from - (pos0 + t)});
+        uint32_t gt = std::min({group, T - t, select_from - (pos0 + t)});
+        // A window layer's group ends where its tokens' first key would change: each token's keys then sit at the
+        // same places in the score GEMM in any chunk.
+        while (W && gt > 1 && window_start(pos0 + t + gt - 1, W) != window_start(pos0 + t, W))
+            --gt;
         dense_at(t, gt);
         t += gt;
     }

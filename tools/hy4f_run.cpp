@@ -46,7 +46,7 @@ int main(int argc, char** argv)
     mako::hy4f::Options opts;
     int gen = 0;
     bool use_prefill = false;
-    size_t steps_from = 0, out_from = 0;
+    size_t steps_from = 0, out_from = 0, out_to = SIZE_MAX;
     std::string logits_out, compare;
     const auto args =
         mako::app::Cli("hy4f_run", "<model-00001.gguf>", 1, 1)
@@ -69,6 +69,7 @@ int main(int argc, char** argv)
             .option("--steps-from", "N", "the first N ids through prefill, the rest one step each", steps_from)
             .option("--logits-out", "FILE", "write the logits of the positions from --out-from on", logits_out)
             .option("--out-from", "P", "the first position --logits-out writes and --compare reads", out_from)
+            .option("--out-to", "P", "the position after the last --logits-out writes and --compare reads", out_to)
             .option("--compare", "FILE", "KL against logits --logits-out wrote", compare)
             .option("-n", "N", "then N greedy tokens", gen)
             .option("--max-ctx", "N", "the context length in tokens", opts.max_ctx)
@@ -182,7 +183,7 @@ int main(int argc, char** argv)
     }
     if (!logits_out.empty()) {
         std::ofstream f(logits_out, std::ios::binary);
-        for (size_t p = out_from; p < logits.size(); ++p)
+        for (size_t p = out_from; p < std::min(out_to, logits.size()); ++p)
             f.write(reinterpret_cast<const char*>(logits[p].data()), std::streamsize(V) * 4);
     }
     if (!compare.empty()) {
@@ -190,7 +191,7 @@ int main(int argc, char** argv)
         std::vector<float> r(V);
         double sum = 0, worst = 0;
         size_t n = 0;
-        for (size_t p = out_from; p < logits.size() && f.read(reinterpret_cast<char*>(r.data()), std::streamsize(V) * 4); ++p) {
+        for (size_t p = out_from; p < std::min(out_to, logits.size()) && f.read(reinterpret_cast<char*>(r.data()), std::streamsize(V) * 4); ++p) {
             const auto rp = log_softmax(r.data(), V), lp = log_softmax(logits[p].data(), V);
             double kl = 0;
             for (uint32_t v = 0; v < V; ++v)
