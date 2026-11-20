@@ -17,6 +17,7 @@ models:
   ds            DeepSeek-V4.1-Flash-1017, Maya-S IQ2_XXS with its Engram tables (339 GB)
   ds-ista-xs    DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XS and the IQ4_NL Engram file (266 GB)
   ds-ista-xxs   DeepSeek-V4.1-Flash-1017, ISTA GSQ-RCO IQ2_XXS and the IQ4_NL Engram file (249 GB)
+  hy4f          Hy4-flash, Maya-M IQ3_XXS with its n-gram table (132 GB)
 
   --vision      the vision projector (1.0-1.2 GB; mako_serve --mmproj)
   --dspark      DeepSeek's DSpark drafter (8 GB, in DIR/dspark; mako_serve --dspark)
@@ -36,6 +37,7 @@ repo_ds=peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF@d1fc01009f21e26157acb685
 repo_unsloth=unsloth/GLM-5.3-Flash-GGUF@a38483c8cd5df544f53d70fb281afe97369d5ab6
 repo_ista=ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@a419d74cd28d5b9f8c5e2b9077d11a609c17bc32
 repo_abl=skafte/mako-ablations@b5a4188af1eb61375ebe2caf38f14d453052419d
+repo_hy4f=peasantsmith/Hy4-Flash-Maya-GGUF@61b46da72d98a5227bfb5fd41505d4ca337af1d3
 
 # group repo path size sha256
 manifest() {
@@ -66,6 +68,8 @@ ista-xxs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00006.gguf 39736
 ista-xxs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00006.gguf 39036908384 9eb9b4de1968f150dfc207eb31c27be9cd9b5666a9a6246bde8a22b184b4bee0
 ista-xxs ista DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00005-of-00006.gguf 19923784832 7e35f6b4e6fc46f6c4b152b593d84d683c5ece695ae6ad734f556198c041bec1
 ista-engram ista DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf 110595290816 3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3
+hy4f-m hy4f Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf 68391812128 9ef12ab340a06b631069f99b9faccc9e99b686cf9d98b74bb872c4923e4732af
+hy4f-m hy4f Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00002-of-00002.gguf 63360616160 5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244
 EOF
 }
 
@@ -93,6 +97,12 @@ glm) groups=glm vgroup=glm-vision agroup=glm-abl link= ;;
 ds) groups=ds vgroup=ds-vision agroup=ds-abl link= ;;
 ds-ista-xs) groups="ista-xs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS ;;
 ds-ista-xxs) groups="ista-xxs ista-engram" vgroup=ds-vision agroup=ds-abl link=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS ;;
+hy4f)
+    groups=hy4f-m vgroup= agroup= link=
+    if [ $vision = 1 ] || [ $ablate = 1 ] || [ $dspark = 1 ]; then
+        echo "--vision, --ablate and --dspark: mako runs none of them for Hy4-flash yet" >&2
+        exit 2
+    fi ;;
 *) usage ;;
 esac
 [ $vision = 1 ] && groups="$groups $vgroup"

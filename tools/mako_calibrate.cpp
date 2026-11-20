@@ -1,5 +1,6 @@
 // Runs a calibration text through the model and writes its routing profile, which later runs read to decide which
-// experts stay resident (GLM-5.3: step by step; DeepSeek-V4.1: through prefill, the same routing per token).
+// experts stay resident (GLM-5.3: step by step; DeepSeek-V4.1 and Hy4-flash: through prefill, the same routing per
+// token).
 //   mako_calibrate <model.gguf> [--corpus FILE] [--out FILE] [--arena-gb N] [--engram FILE]
 // Without --corpus it uses the built-in corpus; without --out it writes the model's default profile. --engram: the
 // GGUF with DeepSeek-V4.1's Engram tables (default: the model's own shards).
@@ -9,6 +10,8 @@
 #include "dsv41/engine.hpp"
 #include "glm/config.hpp"
 #include "glm/engine.hpp"
+#include "hy4f/config.hpp"
+#include "hy4f/engine.hpp"
 #include "gguf/model_files.hpp"
 #include "text/tokenizer.hpp"
 
@@ -65,7 +68,26 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     std::println("calibrating on {} tokens ({})", ids.size(), corpus_path.empty() ? "built-in corpus" : corpus_path);
     const auto t0 = std::chrono::steady_clock::now();
-    if (model->meta().get_string("general.architecture").value_or("") == "deepseek41") {
+    const std::string arch(model->meta().get_string("general.architecture").value_or(""));
+    if (arch == "hy_v4_flash") {
+        auto cfg = mako::hy4f::Config::load(*model);
+        if (!cfg) {
+            std::println(stderr, "{}", cfg.error());
+            return 1;
+        }
+        mako::hy4f::Options opts;
+        opts.arena_gb = arena_gb;
+        opts.max_ctx = std::max<uint32_t>(opts.max_ctx, uint32_t(ids.size()) + 1);
+        mako::hy4f::Engine engine(*model, *cfg, opts, ctx);
+        const auto path = out.empty() ? engine.default_profile() : std::filesystem::path(out);
+        engine.prefill(ids);
+        std::println("  {} tokens, {:.0f} s", ids.size(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        engine.save_profile(path, false);
+        std::println("wrote {}", path.string());
+        return 0;
+    }
+    if (arch == "deepseek41") {
         if (auto r = engram.empty() ? mako::dsv41::Engram::add_named(*model, model_path)
                                     : mako::dsv41::Engram::add_files(*model, engram);
             !r) {
