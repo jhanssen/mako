@@ -83,8 +83,9 @@ private:
     void attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn, MTL::Buffer* att,
                    uint32_t T, uint32_t pos0);
     // The indexer's rows and new pools for T tokens at pos0 (always), and its query and weights (with qrn).
+    // projected: the key, query and weight projections are already in their scratch buffers.
     void indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
-                         MTL::Buffer* qrn, uint32_t T, uint32_t pos0);
+                         MTL::Buffer* qrn, uint32_t T, uint32_t pos0, bool projected = false);
     // Cell lists of tokens t..t+count-1 (positions pos..) of the last indexer_project: their top pools and own group.
     void indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint32_t t, uint32_t pos, uint32_t count);
     // x = the pre-mix of the streams R (T rows from byte offset r_off) and pc their pre / post weights, then

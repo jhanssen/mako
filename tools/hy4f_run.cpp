@@ -45,7 +45,7 @@ int main(int argc, char** argv)
     std::string text, ref, probe_out;
     mako::hy4f::Options opts;
     int gen = 0;
-    bool use_prefill = false;
+    bool use_prefill = false, part_timing = false;
     size_t steps_from = 0, out_from = 0, out_to = SIZE_MAX;
     std::string logits_out, compare;
     const auto args =
@@ -77,11 +77,12 @@ int main(int argc, char** argv)
             .option("--chunk", "N", "prompt rows a prefill step", opts.prefill_chunk)
             .option("--group", "N", "prompt rows that read the missing experts once", opts.prefill_group)
             .option("--probe-out", "DIR", "write the engine's probes", probe_out)
-            .option("--telemetry", "summary|layers|kernels", "telemetry",
+            .option("--telemetry", "summary|layers|parts|kernels", "telemetry (with -n: GPU time per part or kernel)",
                     [&](const std::string& v) {
                         opts.telemetry = v == "summary"   ? mako::core::Telemetry::summary
                                          : v == "kernels" ? mako::core::Telemetry::kernels
                                                           : mako::core::Telemetry::layers;
+                        part_timing = v == "parts";
                     })
             .parse(argc, argv);
     auto m = mako::gguf::ModelFiles::open(args[0]);
@@ -108,6 +109,7 @@ int main(int argc, char** argv)
     mako::mtl::Context ctx;
     const auto t0 = std::chrono::steady_clock::now();
     mako::hy4f::Engine engine(*m, *cfg, opts, ctx);
+    engine.set_part_timing(part_timing);
     std::println(stderr, "loaded in {:.1f} s: arena {:.1f} GB",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                  engine.arena().bytes() / 1e9);
@@ -212,10 +214,31 @@ int main(int argc, char** argv)
         std::vector<int32_t> out;
         int32_t next = int32_t(std::max_element(logits.back().begin(), logits.back().end()) - logits.back().begin());
         const auto tg = std::chrono::steady_clock::now();
+        std::vector<mako::core::KernelTime> parts;
+        double gpu_ms = 0, wall_ms = 0;
         for (int i = 0; i < gen; ++i) {
             out.push_back(next);
             const auto& l = engine.step(next);
             next = int32_t(std::max_element(l.begin(), l.end()) - l.begin());
+            if (i == 0)
+                continue; // first-use costs
+            const auto& st = engine.last_step();
+            gpu_ms += st.gpu_ms;
+            wall_ms += st.wall_ms;
+            for (const auto* list : {&st.parts, &st.kernels})
+                for (const auto& k : *list) {
+                    auto it = std::ranges::find(parts, k.kernel, &mako::core::KernelTime::kernel);
+                    if (it == parts.end())
+                        it = parts.insert(it, mako::core::KernelTime{k.kernel, 0, 0});
+                    it->ms += k.ms;
+                    it->count += k.count;
+                }
+        }
+        if (gen > 1 && !parts.empty()) {
+            std::ranges::sort(parts, std::greater{}, &mako::core::KernelTime::ms);
+            std::println("per step after the first: wall {:.2f} ms, GPU {:.2f} ms", wall_ms / (gen - 1), gpu_ms / (gen - 1));
+            for (const auto& k : parts)
+                std::println("  {:40} {:7.3f} ms  ({} a step)", k.kernel, k.ms / (gen - 1), k.count / (gen - 1));
         }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
         std::println("generated: {}", tok->decode(out));

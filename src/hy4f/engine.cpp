@@ -530,14 +530,15 @@ void Engine::hc_post(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* out, const D
 // of the normed key), the pools those rows complete (normed, roped at their first position), and with qrn the
 // tokens' roped queries and head weights.
 void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_t il, MTL::Buffer* xn,
-                             MTL::Buffer* qrn, uint32_t T, uint32_t pos0)
+                             MTL::Buffer* qrn, uint32_t T, uint32_t pos0, bool projected)
 {
     const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads, kp = cfg_.indexer_kpool;
     MTL::Buffer* ikr = scratch("hy_ikr", uint64_t(T) * Di * 4);
     MTL::Buffer* ikn = scratch("hy_ikn", uint64_t(T) * Di * 4);
     MTL::Buffer* rows = idx_rows_[il].get();
     const uint64_t row = uint64_t(pos0 - idx_base_[il]) * 2 * Di * 4;
-    proj(enc, L.idx_k, xn, 0, ikr, 0, T);
+    if (!projected)
+        proj(enc, L.idx_k, xn, 0, ikr, 0, T);
     norm(enc, ikr, &L.idx_k_norm, ikn, T, Di, Di, cfg_.rms_eps);
     proj(enc, L.idx_value, ikn, 0, rows, row, T, 2 * Di);
     proj(enc, L.idx_gate, ikn, 0, rows, row + Di * 4, T, 2 * Di);
@@ -561,9 +562,11 @@ void Engine::indexer_project(MTL::ComputeCommandEncoder*& enc, const Layer& L, u
     if (qrn) {
         MTL::Buffer* iq = scratch("hy_iq", uint64_t(T) * Hi * Di * 4);
         MTL::Buffer* iw = scratch("hy_iw", uint64_t(T) * Hi * 4);
-        proj(enc, L.idx_q_b, qrn, 0, iq, 0, T);
+        if (!projected) {
+            proj(enc, L.idx_q_b, qrn, 0, iq, 0, T);
+            proj(enc, L.idx_proj, xn, 0, iw, 0, T);
+        }
         rope(enc, iq, 0, freq_full_.get(), Di, Hi, pos0, T);
-        proj(enc, L.idx_proj, xn, 0, iw, 0, T);
     }
 }
 
@@ -618,11 +621,35 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     MTL::Buffer* g = scratch("hy_gate", uint64_t(T) * H * HV * 4);
 
     part(enc, "attn q kv");
-    proj(enc, L.q_a, xn, 0, qr, 0, T);
-    norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
-    proj(enc, L.q_b, qrn, 0, q, 0, T);
-    proj(enc, L.kv_lat, xn, 0, kvl, 0, T);
-    proj(enc, L.kv_pe, xn, 0, kpe, 0, T);
+    // A few tokens: the projections of xn (q_a, the kv latent and rope parts, the gate, the indexer's key and head
+    // weights) in one dispatch, then those of the normed q latent (q_b, the indexer's query) in one.
+    bool projected = false;
+    if (T < gemm_min_tokens_) {
+        const uint32_t Di = cfg_.indexer_dim, Hi = cfg_.indexer_heads;
+        std::vector<mtl::Gemv::Job> first{gemv_job(L.q_a, xn, 0, qr, 0, 1, T, false),
+                                          gemv_job(L.kv_lat, xn, 0, kvl, 0, 1, T, false),
+                                          gemv_job(L.kv_pe, xn, 0, kpe, 0, 1, T, false),
+                                          gemv_job(L.gate, xn, 0, g, 0, 1, T, false)};
+        std::vector<mtl::Gemv::Job> second{gemv_job(L.q_b, qrn, 0, q, 0, 1, T, false)};
+        if (L.indexer) {
+            first.push_back(gemv_job(L.idx_k, xn, 0, scratch("hy_ikr", uint64_t(T) * Di * 4), 0, 1, T, false));
+            first.push_back(gemv_job(L.idx_proj, xn, 0, scratch("hy_iw", uint64_t(T) * Hi * 4), 0, 1, T, false));
+            second.push_back(gemv_job(L.idx_q_b, qrn, 0, scratch("hy_iq", uint64_t(T) * Hi * Di * 4), 0, 1, T, false));
+        }
+        if (gemv_jobs_ok(first) && gemv_jobs_ok(second)) {
+            gemv_jobs(enc, first);
+            norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+            gemv_jobs(enc, second);
+            projected = true;
+        }
+    }
+    if (!projected) {
+        proj(enc, L.q_a, xn, 0, qr, 0, T);
+        norm(enc, qr, &L.q_a_norm, qrn, T, QR, QR, cfg_.rms_eps);
+        proj(enc, L.q_b, qrn, 0, q, 0, T);
+        proj(enc, L.kv_lat, xn, 0, kvl, 0, T);
+        proj(enc, L.kv_pe, xn, 0, kpe, 0, T);
+    }
     norm(enc, kvl, &L.kv_norm, kvn, T, R, R, cfg_.rms_eps);
     const SplitArgs spa{H, NOPE, NR};
     dispatch(enc, "hy4_split_q", {q, qn, qp}, &spa, sizeof(spa), MTL::Size(HK, H, T), MTL::Size(256, 1, 1));
@@ -666,7 +693,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     per_head(L.k_b, qn, NOPE, qabs, R);
     if (L.indexer) {
         part(enc, "attn indexer project");
-        indexer_project(enc, L, il, xn, qrn, T, pos0);
+        indexer_project(enc, L, il, xn, qrn, T, pos0, projected);
     }
 
     const float scale = 1.0f / std::sqrt(float(HK));
@@ -807,7 +834,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     part(enc, "attn v_b");
     per_head(L.v_b, lat, R, vout, HV);
     part(enc, "attn output");
-    proj(enc, L.gate, xn, 0, g, 0, T);
+    if (!projected)
+        proj(enc, L.gate, xn, 0, g, 0, T);
     if (T == 1)
         probe(enc, "attn_kqv", int(il), vout, uint64_t(H) * HV);
     const uint32_t n = T * H * HV;
