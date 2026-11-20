@@ -65,6 +65,38 @@ void log_result(const std::string& id, const gen::GenerateResult& r, const char*
                  finish, conv);
 }
 
+// Where a prompt left the context the conversation held (an edited message, or a history rendered otherwise than
+// the model wrote it), with the tokens around it, each shown as its own piece.
+void log_divergence(const std::string& id, const gen::GenerateResult& r, const text::Tokenizer& tok)
+{
+    if (r.respelled)
+        log::info("{}: the prompt spells the context's {} tokens from token {} on with other tokens; kept the context's",
+                  id, r.respelled, r.respelled_at);
+    if (!r.diverged)
+        return;
+    const auto& d = *r.diverged;
+    const auto show = [&](const std::vector<int32_t>& ids) {
+        std::string s;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (d.from + i == d.at)
+                s += " >>";
+            s += " ";
+            for (char c : tok.decode(std::span(&ids[i], 1))) {
+                if (c == '\n')
+                    s += "\\n";
+                else if (c == '\t')
+                    s += "\\t";
+                else
+                    s += c;
+            }
+            s += std::format("[{}]", ids[i]);
+        }
+        return s;
+    };
+    log::info("{}: the prompt differs from the context ({} tokens) at token {}; context:{}; prompt:{}", id, d.held, d.at,
+              show(d.context), show(d.prompt));
+}
+
 } // namespace
 
 constexpr auto kKeepalive = std::chrono::seconds(5);
@@ -211,6 +243,11 @@ bool Server::Impl::generate(const std::string& id, const std::vector<int32_t>& p
     if (const auto it = std::ranges::find(prompt, user_turn); user_turn >= 0 && it != prompt.end())
         cr.gen.fork_point = size_t(it - prompt.begin());
     cr.gen.stop_tokens = {tok.eos(), tok.eot(), tok.find("<|observation|>")};
+    cr.gen.text = gen::GenerateParams::Text{
+        .piece = [this](int32_t id) { return tok.decode(std::span(&id, 1)); },
+        .control = [this](int32_t id) { return tok.decode(std::span(&id, 1), false).empty(); },
+        .encode = [this](std::string_view s) { return tok.encode(s, false); },
+    };
     const uint32_t room = max_context - uint32_t(prompt.size());
     cr.gen.max_tokens = cr.gen.max_tokens ? std::min(cr.gen.max_tokens, room) : room;
     cr.gen.speculative = opts.speculative;
@@ -412,6 +449,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
                 return; // gave up while waiting
             const size_t loop_keep = out.loop_keep;
             const End e = loop_keep ? End::stop : end_of(r, parser, stopped);
+            log_divergence(id, r, tok);
             log_result(id, r, end_name(e), out.conv);
             board.finished(id, r, end_name(e), out.conversation, cache());
             if (loop_keep) { // the reply up to the loop's first time through
@@ -470,6 +508,7 @@ void Server::Impl::serve(const httplib::Request& req, httplib::Response& res, co
                           [&] { keepalive(); }))
                 return false; // gave up while waiting
             const End e = out.loop_keep ? End::stop : end_of(r, parser, stopped);
+            log_divergence(id, r, tok);
             log_result(id, r, end_name(e), out.conv);
             board.finished(id, r, end_name(e), out.conversation, cache());
             if (e == End::cancelled)

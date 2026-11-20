@@ -9,6 +9,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -50,6 +52,15 @@ struct GenerateParams {
     // Where the part of the prompt other conversations may share ends (the system prompt and tools; 0: none): a
     // checkpoint kept there lets a new conversation with the same start begin from it (Session::fork).
     size_t fork_point = 0;
+    // The tokenizer, for keeping the context's tokens where the prompt spells the same text with other tokens (a
+    // reply the template renders again, encoded differently from how it was sampled): a token's text (control
+    // tokens' too), whether it is a control token, and plain text's tokens. Without it such a prompt diverges there.
+    struct Text {
+        std::function<std::string(int32_t)> piece;
+        std::function<bool(int32_t)> control;
+        std::function<std::vector<int32_t>(std::string_view)> encode;
+    };
+    std::optional<Text> text;
 };
 
 enum class Finish { stop_token, max_tokens, context_full, cancelled };
@@ -61,6 +72,16 @@ struct GenerateResult {
     double prefill_ms = 0, decode_ms = 0;
     uint32_t drafts = 0, accepted = 0; // speculative verifications and drafts kept
     uint32_t lookup_drafts = 0, lookup_accepted = 0; // of them, from repeats of the context
+    // When the prompt differed from the context held before it: the first differing position, the context's length,
+    // and the tokens of each from a few before that position.
+    struct Divergence {
+        uint32_t at = 0, held = 0, from = 0;
+        std::vector<int32_t> context, prompt;
+    };
+    std::optional<Divergence> diverged;
+    // Tokens of the context kept in place of the prompt's from position respelled_at, which spelled the same text
+    // (GenerateParams::text); prompt_tokens counts the prompt as run.
+    uint32_t respelled = 0, respelled_at = 0;
 };
 
 // A conversation's context on an engine. Each generate() gets the whole prompt (earlier turns included); the
@@ -118,6 +139,15 @@ private:
     };
     GenerateResult run(std::span<const int32_t> prompt, const GenerateParams& p,
                        const std::function<bool(int32_t)>& on_token);
+    // The prompt with the context's tokens from its first difference with the context to the context's end, when
+    // they spell the same text as the prompt's there (p.text), and its input rows moved to match; the position of
+    // the difference.
+    struct Respelled {
+        std::vector<int32_t> prompt;
+        std::vector<GenerateParams::PromptRows> rows;
+        size_t at = 0;
+    };
+    std::optional<Respelled> respell(std::span<const int32_t> prompt, const GenerateParams& p) const;
     void rewind(size_t keep);
     void save_checkpoint(bool fork = false);
     // The key of ctx_[i]: its span's in keys_, else 0.

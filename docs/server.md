@@ -6,6 +6,10 @@
 ```
 
 One request runs at a time on one session, so a conversation's next turn reuses the context the previous one left.
+A reply the chat template renders again in other tokens than the model sampled (the same text: `.` `\n\n` read
+back as `.\n\n`) keeps the sampled ones, so the next turn does not read the reply again (the log says `the prompt
+spells the context's N tokens ... with other tokens`). A prompt that differs from the context the conversation held
+is logged with the tokens around the first difference.
 
 ## Access
 
