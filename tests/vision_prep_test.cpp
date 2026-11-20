@@ -1,4 +1,4 @@
-// Vision preprocessing: each test image decoded, sized and normalised for both projector types, against the
+// Vision preprocessing: each test image decoded, sized and normalised for each projector type, against the
 // reference's SHA-256 of its prepared input (tests/data/vision/expected.txt).
 //   vision_prep_test <tests/data/vision>
 #include "vision/image.hpp"
@@ -40,6 +40,14 @@ vision::PrepParams params(const std::string& kind)
         p.std = {0.5f, 0.5f, 0.5f};
         p.min_pixels = 295936;
         p.max_pixels = 1806336;
+    } else if (kind == "hy4f") {
+        p.kind = vision::Projector::hy4f;
+        p.patch = 16;
+        p.merge = 2;
+        p.mean = {0.5f, 0.5f, 0.5f};
+        p.std = {0.5f, 0.5f, 0.5f};
+        p.min_pixels = 4096;
+        p.max_pixels = 4194304;
     } else {
         p.kind = vision::Projector::glm5v;
         p.merge = 2;

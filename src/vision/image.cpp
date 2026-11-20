@@ -179,7 +179,8 @@ struct Coefficients {
     std::vector<int32_t> weights;
 };
 
-Coefficients coefficients(int in, int out)
+// int16_weights: the weights rounded to int16, with as many fractional bits as the largest weight allows.
+Coefficients coefficients(int in, int out, bool int16_weights)
 {
     const double scale = double(in) / out, filterscale = std::max(scale, 1.0), support = 2.0 * filterscale;
     Coefficients c;
@@ -187,32 +188,41 @@ Coefficients coefficients(int in, int out)
     c.first.resize(out);
     c.count.resize(out);
     c.weights.assign(size_t(out) * c.ksize, 0);
-    std::vector<double> w(c.ksize);
+    std::vector<double> w(size_t(out) * c.ksize, 0.0);
     for (int o = 0; o < out; ++o) {
         const double center = (o + 0.5) * scale, ss = 1.0 / filterscale;
         const int lo = std::max(0, int(center - support + 0.5));
         const int n = std::min(in, int(center + support + 0.5)) - lo;
+        double* wo = w.data() + size_t(o) * c.ksize;
         double sum = 0.0;
         for (int i = 0; i < n; ++i) {
-            w[i] = bicubic((i + lo - center + 0.5) * ss);
-            sum += w[i];
+            wo[i] = bicubic((i + lo - center + 0.5) * ss);
+            sum += wo[i];
         }
-        for (int i = 0; i < n; ++i) {
-            const double v = sum != 0.0 ? w[i] / sum : w[i];
-            // +/- 0.5, then truncation toward zero
-            c.weights[size_t(o) * c.ksize + i] = int32_t(v * double(1 << kPrecision) + (v < 0 ? -0.5 : 0.5));
-        }
+        if (sum != 0.0)
+            for (int i = 0; i < n; ++i)
+                wo[i] /= sum;
         c.first[o] = lo;
         c.count[o] = n;
     }
+    int precision = kPrecision;
+    if (int16_weights) {
+        const double wmax = *std::max_element(w.begin(), w.end());
+        for (precision = 0; precision < kPrecision; ++precision)
+            if (int(0.5 + wmax * double(1 << (precision + 1))) >= (1 << 15))
+                break;
+    }
+    // +/- 0.5, then truncation toward zero
+    for (size_t i = 0; i < w.size(); ++i)
+        c.weights[i] = int32_t(std::ldexp(w[i], precision) + (w[i] < 0 ? -0.5 : 0.5)) * (1 << (kPrecision - precision));
     return c;
 }
 
 uint8_t clip8(int32_t v) { return uint8_t(std::clamp(v, 0, 255)); }
 
-Rgb8 horizontal(const Rgb8& in, uint32_t width)
+Rgb8 horizontal(const Rgb8& in, uint32_t width, bool int16_weights)
 {
-    const Coefficients c = coefficients(int(in.width), int(width));
+    const Coefficients c = coefficients(int(in.width), int(width), int16_weights);
     Rgb8 out{width, in.height, std::vector<uint8_t>(size_t(width) * in.height * 3)};
     for (uint32_t y = 0; y < in.height; ++y) {
         const uint8_t* row = in.px.data() + size_t(y) * in.width * 3;
@@ -234,9 +244,9 @@ Rgb8 horizontal(const Rgb8& in, uint32_t width)
     return out;
 }
 
-Rgb8 vertical(const Rgb8& in, uint32_t height)
+Rgb8 vertical(const Rgb8& in, uint32_t height, bool int16_weights)
 {
-    const Coefficients c = coefficients(int(in.height), int(height));
+    const Coefficients c = coefficients(int(in.height), int(height), int16_weights);
     const size_t row = size_t(in.width) * 3;
     Rgb8 out{in.width, height, std::vector<uint8_t>(row * height)};
     std::vector<int32_t> acc(row);
@@ -257,16 +267,16 @@ Rgb8 vertical(const Rgb8& in, uint32_t height)
 
 } // namespace
 
-Rgb8 resize_bicubic(const Rgb8& in, uint32_t width, uint32_t height)
+Rgb8 resize_bicubic(const Rgb8& in, uint32_t width, uint32_t height, bool int16_weights)
 {
     if (width == 0 || height == 0 || width > 65536 || height > 65536)
         throw std::runtime_error("resize target out of range");
     if (width == in.width && height == in.height)
         return in;
     if (width == in.width)
-        return vertical(in, height);
-    const Rgb8 h = horizontal(in, width);
-    return height == in.height ? h : vertical(h, height);
+        return vertical(in, height, int16_weights);
+    const Rgb8 h = horizontal(in, width, int16_weights);
+    return height == in.height ? h : vertical(h, height, int16_weights);
 }
 
 } // namespace mako::vision

@@ -23,7 +23,7 @@ public:
 
     // An image's rows for the text model, [rows][out_embd]: deepseek41v the whole block (start, each row of cells
     // followed by a newline, end); glm5v the cells in raster order (the text model's begin / end tokens go around
-    // them).
+    // them); hy4f each row of cells followed by a newline (begin / end tokens around them).
     struct Output {
         uint32_t rows = 0, cells_x = 0, cells_y = 0;
         std::vector<float> embd;
@@ -31,9 +31,12 @@ public:
     Output encode(const Prepared& img);
     // The rows encode() gives for an image prepared for this projector.
     static uint32_t rows_for(const Mmproj& mm, const Prepared& img);
+    // Their width in tokens where the text model gives them 2D positions (hy4f: a row of cells and its newline), else
+    // 0 (gen::InputRows::cols).
+    static uint32_t cols_for(const Mmproj& mm, const Prepared& img);
 
     // Called with each stage's output once the encode completes (patch_bias, layer_out-N, vit_out, merged,
-    // projected), as fp32 rows.
+    // projected), as fp32 rows (hy4f: in the 2x2 block order of its patches).
     std::function<void(std::string_view name, const float* data, size_t n)> probe;
 
     uint32_t out_embd() const { return out_embd_; }
@@ -48,7 +51,11 @@ private:
     using Tensor = MTL::Buffer*;
     struct Layer {
         Tensor ln1, qkv, qkv_b, qn, kn, out, out_b, ln2, gate, gate_b, up, up_b, down, down_b;
+        Tensor ln1_b = nullptr, ln2_b = nullptr; // hy4f's LayerNorms
     };
+    void load_hy4f();
+    Output encode_hy4f(const Prepared& img);
+    Tensor f16(const std::vector<float>& v);
     Tensor upload(const gguf::Tensor& t, bool to_f16);
     Tensor weight(std::string_view name, bool to_f16 = true, bool required = true);
     // Each output stage when probing: the GPU work so far completes first.
@@ -76,6 +83,12 @@ private:
     Tensor merger_ = nullptr, merger_b_ = nullptr, fc_ = nullptr, norm_w_ = nullptr, norm_b_ = nullptr;
     Tensor pgate_ = nullptr, pup_ = nullptr, pdown_ = nullptr;
     uint32_t proj_ff_ = 0;
+    // hy4f: the learned position grid (fp32 on the CPU, [grid][grid][n_embd]), the projector's RMSNorm, its two
+    // convolutions (the first rearranged as glm5v's merger), and the newline row (merger_, merger_b_, mm2_, mm2_b_,
+    // newline_).
+    std::vector<float> pos_grid_;
+    uint32_t grid_ = 0, ff_ = 0; // ff_: the MLP's width, padded
+    Tensor pre_norm_ = nullptr;
     std::map<std::string, mtl::Ref<MTL::Buffer>> scratch_;
     uint32_t out_embd_ = 0;
 };

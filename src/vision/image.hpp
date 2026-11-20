@@ -22,6 +22,7 @@ Rgb8 decode_image(std::span<const std::byte> data);
 
 // Bicubic resampling (a = -0.5) in two separable passes, horizontal first, each with 22-bit fixed-point weights
 // normalised to sum 1 and the intermediate image clamped to 8 bits; a dimension of the same size is not resampled.
-Rgb8 resize_bicubic(const Rgb8& in, uint32_t width, uint32_t height);
+// int16_weights: the weights rounded to int16 (as many fractional bits as the largest allows) instead.
+Rgb8 resize_bicubic(const Rgb8& in, uint32_t width, uint32_t height, bool int16_weights = false);
 
 } // namespace mako::vision

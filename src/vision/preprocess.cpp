@@ -4,6 +4,8 @@
 #include <bit>
 #include <cmath>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 namespace mako::vision {
 
@@ -146,13 +148,50 @@ Prepared prepare_glm(const PrepParams& p, const Rgb8& img)
     return normalise(p, padded, false);
 }
 
+// Sides of whole multiples of factor near the image's, aspect kept, scaled within [min_px, max_px] when outside it.
+std::pair<int64_t, int64_t> hy4f_size(int64_t height, int64_t width, int64_t factor, int64_t min_px, int64_t max_px)
+{
+    const double h = double(height), w = double(width), f = double(factor);
+    int64_t hb = int64_t(std::nearbyint(h / f)) * factor, wb = int64_t(std::nearbyint(w / f)) * factor;
+    if (hb * wb > max_px) {
+        const double beta = std::sqrt(h * w / double(max_px));
+        hb = std::max(factor, int64_t(std::floor(h / beta / f)) * factor);
+        wb = std::max(factor, int64_t(std::floor(w / beta / f)) * factor);
+    } else if (hb * wb < min_px) {
+        const double beta = std::sqrt(double(min_px) / (h * w));
+        hb = int64_t(std::ceil(h * beta / f)) * factor;
+        wb = int64_t(std::ceil(w * beta / f)) * factor;
+    }
+    return {hb, wb};
+}
+
+Prepared prepare_hy4f(const PrepParams& p, const Rgb8& img)
+{
+    const int64_t factor = p.patch * p.merge, height = img.height, width = img.width;
+    if (std::max(height, width) > 200 * std::min(height, width))
+        throw std::runtime_error("image aspect ratio over 200");
+    int64_t max_px = int64_t(p.max_pixels);
+    auto [h, w] = hy4f_size(height, width, factor, int64_t(p.min_pixels), max_px);
+    // max_tokens: the text model's rows, each row of cells followed by a newline.
+    const auto rows = [&] { return (h / factor) * (w / factor + 1); };
+    while (p.max_tokens && rows() > int64_t(p.max_tokens) && max_px > factor * factor) {
+        max_px = std::max(factor * factor, int64_t(double(max_px) * double(p.max_tokens) / double(rows())) - 1);
+        std::tie(h, w) = hy4f_size(height, width, factor, std::min(int64_t(p.min_pixels), max_px), max_px);
+    }
+    return normalise(p, resize_bicubic(img, uint32_t(w), uint32_t(h), true), false);
+}
+
 } // namespace
 
 Prepared prepare(const PrepParams& p, const Rgb8& img)
 {
     if (img.width == 0 || img.height == 0)
         throw std::runtime_error("empty image");
-    return p.kind == Projector::deepseek41v ? prepare_deepseek(p, img) : prepare_glm(p, img);
+    switch (p.kind) {
+    case Projector::deepseek41v: return prepare_deepseek(p, img);
+    case Projector::hy4f: return prepare_hy4f(p, img);
+    default: return prepare_glm(p, img);
+    }
 }
 
 } // namespace mako::vision

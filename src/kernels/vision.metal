@@ -174,44 +174,41 @@ kernel void vit_unfold3(device const float* x [[buffer(0)]], device half* y [[bu
 struct FlashArgs {
     uint n_tok;  // valid keys
     uint n_pad;  // rows of q, k, v a head (a multiple of 128)
-    uint width;  // o row length (heads * 64)
+    uint width;  // o row length (heads * D)
     float scale;
 };
 
-// o[q][h * 64 + d] = sum_j softmax_j(scale * q . k_j) v_j[d] over keys j < n_tok, for a block of 32 queries of head
-// h; q, k, v half [head][n_pad][64], n_pad a multiple of 128. The scores of 128 keys at a time go to threadgroup
+// o[q][h * D + d] = sum_j softmax_j(scale * q . k_j) v_j[d] over keys j < n_tok, for a block of 32 queries of head
+// h; q, k, v half [head][n_pad][D], n_pad a multiple of 128. The scores of 128 keys at a time go to threadgroup
 // memory for the running softmax (eight threads a row), the output stays in registers (rescaled when a row's
 // maximum grows) and both products run through matmul2d with float accumulation. Grid (n_pad / 32, heads), 8
 // simdgroups.
-kernel void vit_flash_attn(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
-                           device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
-                           constant FlashArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
-                           ushort tid [[thread_index_in_threadgroup]])
+template <int D>
+void flash_attn(device const half* q, device const half* k, device const half* v, device float* o,
+                constant FlashArgs& a, uint2 tg, ushort tid, threadgroup float* s, threadgroup half* p,
+                threadgroup float* row_scale)
 {
 #pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     constexpr int B = 32, K = 128;
-    threadgroup float s[B * K];
-    threadgroup half p[B * K];
-    threadgroup float row_scale[B];
     const uint q0 = tg.x * B, h = tg.y;
-    const uint64_t head = uint64_t(h) * a.n_pad * 64;
-    tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + head + uint64_t(q0) * 64,
-                                                                dextents<int32_t, 2>(64, B));
+    const uint64_t head = uint64_t(h) * a.n_pad * D;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + head + uint64_t(q0) * D,
+                                                                dextents<int32_t, 2>(D, B));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tk(const_cast<device half*>(k) + head,
-                                                                dextents<int32_t, 2>(64, int(a.n_pad)));
+                                                                dextents<int32_t, 2>(D, int(a.n_pad)));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tv(const_cast<device half*>(v) + head,
-                                                                dextents<int32_t, 2>(64, int(a.n_pad)));
+                                                                dextents<int32_t, 2>(D, int(a.n_pad)));
     tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> ts(s, dextents<int32_t, 2>(K, B));
     tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(p, dextents<int32_t, 2>(K, B));
-    constexpr auto qk_desc = matmul2d_descriptor(B, K, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+    constexpr auto qk_desc = matmul2d_descriptor(B, K, D, false, true, false, matmul2d_descriptor::mode::multiply);
     constexpr auto pv_desc =
-        matmul2d_descriptor(B, 64, K, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d_descriptor(B, D, K, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_desc, execution_simdgroups<8>> qk;
     matmul2d<pv_desc, execution_simdgroups<8>> pv;
     auto kt0 = tk.slice(0, 0);
-    auto sc = qk.get_destination_cooperative_tensor<decltype(tq), decltype(kt0), float>();
+    auto sc = qk.template get_destination_cooperative_tensor<decltype(tq), decltype(kt0), float>();
     auto vt0 = tv.slice(0, 0);
-    auto acc = pv.get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
+    auto acc = pv.template get_destination_cooperative_tensor<decltype(tp), decltype(vt0), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] = 0.0f;
@@ -262,8 +259,44 @@ kernel void vit_flash_attn(device const half* q [[buffer(0)]], device const half
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] *= row_scale[acc.get_multidimensional_index(i)[1]];
-    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(o + uint64_t(q0) * a.width + h * 64,
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(o + uint64_t(q0) * a.width + h * D,
                                                                  dextents<int32_t, 2>(int(a.width), B));
     auto ot = to.slice(0, 0);
     acc.store(ot);
+}
+
+#define VIT_FLASH_ATTN(name, D)                                                                                   \
+    kernel void name(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],                     \
+                     device const half* v [[buffer(2)]], device float* o [[buffer(3)]],                          \
+                     constant FlashArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],             \
+                     ushort tid [[thread_index_in_threadgroup]])                                                 \
+    {                                                                                                             \
+        threadgroup float s[32 * 128];                                                                            \
+        threadgroup half p[32 * 128];                                                                             \
+        threadgroup float row_scale[32];                                                                          \
+        flash_attn<D>(q, k, v, o, a, tg, tid, s, p, row_scale);                                                   \
+    }
+VIT_FLASH_ATTN(vit_flash_attn, 64)
+// Heads of 72 dims, zero-padded to 80.
+VIT_FLASH_ATTN(vit_flash_attn80, 80)
+
+struct SplitQkvArgs {
+    uint n_tok, n_pad, heads;
+    uint dim;  // a head's values
+    uint pad;  // a head's values in q, k, v (dim, then zeros)
+};
+
+// qkv rows [token][3][heads * dim] plus bias -> half q, k, v [head][n_pad][pad], zeros after dim. Grid (pad, heads * 3,
+// n_tok).
+kernel void vit_qkv_split(device const float* qkv [[buffer(0)]], device const float* bias [[buffer(1)]],
+                          device half* q [[buffer(2)]], device half* k [[buffer(3)]], device half* v [[buffer(4)]],
+                          constant SplitQkvArgs& a [[buffer(5)]], uint3 gid [[thread_position_in_grid]])
+{
+    const uint d = gid.x, part = gid.y % 3, h = gid.y / 3, t = gid.z;
+    if (d >= a.pad || h >= a.heads || t >= a.n_tok)
+        return;
+    const uint width = a.heads * a.dim, off = part * width + h * a.dim + d;
+    const float x = d < a.dim ? qkv[uint64_t(t) * 3 * width + off] + bias[off] : 0.0f;
+    device half* dst = part == 0 ? q : part == 1 ? k : v;
+    dst[(uint64_t(h) * a.n_pad + t) * a.pad + d] = half(x);
 }

@@ -38,6 +38,8 @@ std::expected<Mmproj, std::string> open_mmproj(const std::string& path)
     const gguf::File& g = m.file;
     if (type == "glm5v") {
         m.prep.kind = Projector::glm5v;
+    } else if (type == "hy_v4_flash") {
+        m.prep.kind = Projector::hy4f;
     } else if (type == "deepseek41v" || (type == "deepseek4v" && !g.tensor("v.token_embd.img_pad"))) {
         m.prep.kind = Projector::deepseek41v;
     } else {
@@ -52,8 +54,8 @@ std::expected<Mmproj, std::string> open_mmproj(const std::string& path)
     m.eps = float(g.get_float("clip.vision.attention.layer_norm_epsilon").value_or(0.0));
     m.swiglu_clamp = float(g.get_float("clip.vision.swiglu_clamp").value_or(0.0));
     m.prep.patch = u32("clip.vision.patch_size");
-    m.prep.merge = m.prep.kind == Projector::glm5v ? u32("clip.vision.spatial_merge_size")
-                                                   : u32("clip.vision.projector.scale_factor");
+    const bool ds = m.prep.kind == Projector::deepseek41v;
+    m.prep.merge = ds ? u32("clip.vision.projector.scale_factor") : u32("clip.vision.spatial_merge_size");
     m.prep.min_pixels = uint64_t(g.get_int("clip.vision.image_min_pixels").value_or(0));
     m.prep.max_pixels = uint64_t(g.get_int("clip.vision.image_max_pixels").value_or(0));
     const auto mean = triple(g, "clip.vision.image_mean"), sd = triple(g, "clip.vision.image_std");
@@ -64,10 +66,10 @@ std::expected<Mmproj, std::string> open_mmproj(const std::string& path)
     if (!m.n_embd || !m.n_head || m.n_embd % m.n_head || !m.n_ff || !m.n_layer || !m.out_embd || !m.prep.patch ||
         !m.prep.merge || m.eps <= 0.0f)
         return std::unexpected(std::format("{}: incomplete vision metadata", path));
-    // The kernels merge 2x2 patches (GLM) or 3x3 (DeepSeek).
-    if (m.prep.merge != (m.prep.kind == Projector::glm5v ? 2u : 3u))
+    // The kernels merge 2x2 patches (GLM, Hy4-flash) or 3x3 (DeepSeek).
+    if (m.prep.merge != (ds ? 3u : 2u))
         return std::unexpected(std::format("{}: unsupported patch merge {}", path, m.prep.merge));
-    if (m.prep.kind == Projector::glm5v && (!m.prep.min_pixels || !m.prep.max_pixels))
+    if (!ds && (!m.prep.min_pixels || !m.prep.max_pixels))
         return std::unexpected(std::format("{}: no image pixel range", path));
     return m;
 }

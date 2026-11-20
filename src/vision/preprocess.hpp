@@ -11,6 +11,7 @@ namespace mako::vision {
 enum class Projector {
     deepseek41v, // DeepSeek-V4.1-Flash
     glm5v,       // GLM-5.3-Flash
+    hy4f,        // Hy4-flash
 };
 
 // What sizing and normalising an image takes from the projector file.
@@ -18,7 +19,7 @@ struct PrepParams {
     Projector kind = Projector::glm5v;
     uint32_t patch = 14, merge = 2;
     std::array<float, 3> mean{}, std{};
-    uint64_t min_pixels = 0, max_pixels = 0; // max_pixels: glm5v only
+    uint64_t min_pixels = 0, max_pixels = 0; // max_pixels: glm5v and hy4f
     // The most rows an image may take in the prompt (0: the model's own limit, 1024 for deepseek41v, max_pixels'
     // worth of cells for glm5v); larger images are scaled down to fit.
     uint32_t max_tokens = 0;
@@ -36,6 +37,9 @@ struct Prepared {
 // centred on grey (127), and the normalised samples rounded to bf16.
 // glm5v: the image rounded up to a multiple of patch * merge, resized only to bring its pixels within [min_pixels,
 // max_pixels] (max_tokens cells, when lower), top left on black.
+// hy4f: the image resized (aspect kept) to sides of the nearest multiples of patch * merge (halves to even), scaled
+// within [min_pixels, max_pixels] (max_tokens rows of the text model, when lower); bicubic with int16
+// weights.
 Prepared prepare(const PrepParams& p, const Rgb8& img);
 
 } // namespace mako::vision
