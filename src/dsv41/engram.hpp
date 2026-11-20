@@ -13,7 +13,7 @@
 namespace mako::dsv41 {
 
 // The Engram tables: per Engram layer and position, (max_ngram - 1) * heads hashed n-gram rows of head_dim values,
-// MXFP8 (blocks of an E8M0 scale and 32 E4M3 codes), Q6_K or IQ4_NL on disk.
+// MXFP8 (blocks of an E8M0 scale and 32 E4M3 codes), E4M3, Q6_K or IQ4_NL on disk.
 class Engram {
 public:
 
@@ -58,6 +58,7 @@ private:
     std::vector<int32_t> token_map_;
     std::vector<int64_t> mult_, primes_, offsets_;
     int64_t pad_ = 0;
+    bool pad_each_ = false; // EngramConfig::pad_each
     gguf::Type type_ = gguf::Type::MXFP8;
     uint32_t ngram_ = 0, cols_ = 0, dim_ = 0, row_bytes_ = 0;
 };

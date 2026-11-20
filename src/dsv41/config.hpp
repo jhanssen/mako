@@ -19,6 +19,9 @@ struct EngramConfig {
     std::vector<int32_t> token_map;    // vocabulary -> compressed id
     std::vector<int64_t> multipliers;  // per layer, max_ngram
     std::vector<int64_t> primes, offsets; // per layer, (max_ngram - 1) * heads columns
+    // An n-gram's earlier tokens without an id each take the pad id, and the hash is unsigned (Hy4-flash); else
+    // the first one without an id pads it and everything before it.
+    bool pad_each = false;
     uint32_t columns() const { return (max_ngram - 1) * heads; }
 
     // From <arch>.ple.* / <arch>.engram.* keys (or integer tensors); problems are noted in k.missing.

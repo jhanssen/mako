@@ -154,3 +154,8 @@ add_test(NAME tokenizer_hy4f COMMAND tokenizer_test "${MAKO_HY4F_MODEL}" ${CMAKE
 add_test(NAME tokenizer_hy4f_special COMMAND tokenizer_test "${MAKO_HY4F_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/hy4f_tokenizer_cases.bin
          ${CMAKE_CURRENT_SOURCE_DIR}/data/hy4f_special_expected.txt)
 set_tests_properties(tokenizer_hy4f tokenizer_hy4f_special PROPERTIES LABELS "tokenizer;hy4f" SKIP_RETURN_CODE 77)
+add_executable(hy4f_ref_test hy4f_ref_test.cpp)
+target_link_libraries(hy4f_ref_test PRIVATE mako_hy4f)
+target_compile_definitions(hy4f_ref_test PRIVATE MAKO_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
+add_test(NAME hy4f_ref COMMAND hy4f_ref_test "${MAKO_HY4F_MODEL}")
+set_tests_properties(hy4f_ref PROPERTIES LABELS "hy4f;e2e" RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)

@@ -83,7 +83,7 @@ struct ScoreArgs {
     uint32_t stride;
 };
 struct SelectArgs {
-    uint32_t first, n_top, kpool, score_stride, list_stride;
+    uint32_t first, n_top, kpool, score_stride, list_stride, full_tail;
 };
 struct GatherArgs {
     uint32_t heads, dim, stride, splits, tokens;
@@ -789,7 +789,7 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     after(enc, "idx_reduce");
     if (pos == pos_ && count == 1)
         probe(enc, "indexer_score", int(il), score, n_pool);
-    const SelectArgs sel{pos + 1, n_top, kp, stride, sparse_list_stride()};
+    const SelectArgs sel{pos + 1, n_top, kp, stride, sparse_list_stride(), 0};
     enc->setComputePipelineState(pso("idx_select"));
     enc->setBuffer(score, 0, 0);
     enc->setBytes(&sel, sizeof(sel), 1);

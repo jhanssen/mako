@@ -1110,6 +1110,7 @@ struct SelectArgs {
     uint kpool;
     uint score_stride; // floats between tokens' score rows
     uint list_stride;  // entries between tokens' cell lists
+    uint full_tail;    // 1: a token's own group is always its tail (a pool it completes is not selectable)
 };
 struct SelectRow {
     uint n_pool, n_top, kpool, n_kv;
@@ -1146,7 +1147,7 @@ kernel void idx_select(device const float* score [[buffer(0)]], constant SelectA
 {
     score += uint64_t(j) * sa.score_stride;
     list += uint64_t(j) * sa.list_stride;
-    const SelectRow a{(sa.first + j) / sa.kpool, sa.n_top, sa.kpool, sa.first + j};
+    const SelectRow a{(sa.first + j - sa.full_tail) / sa.kpool, sa.n_top, sa.kpool, sa.first + j};
     threadgroup atomic_uint hist[256];
     threadgroup uint sums[TG / 32];
     threadgroup uint sh_prefix, sh_need;

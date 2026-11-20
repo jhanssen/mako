@@ -53,6 +53,9 @@ public:
     struct MoeWeights {
         DevTensor router, bias, sh_gate, sh_up, sh_down;
         DevTensor bias_vl; // routes the rows taking input rows (an image) when present
+        // Routed experts at a latent width: their input is lat_down(x), their weighted sum goes through lat_up before
+        // the shared expert's output is added. Unset: both at n_embd.
+        DevTensor lat_down, lat_up;
         float clamp_exp = 0, clamp_sh = 0;
     };
 

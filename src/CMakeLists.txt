@@ -1,6 +1,7 @@
 # The program's kernels: mako-common's and the models' (linked to mako_mtl).
 mako_add_kernels(mako_kernels SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/glm.metal
-                 ${CMAKE_CURRENT_SOURCE_DIR}/kernels/dsv41.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vision.metal)
+                 ${CMAKE_CURRENT_SOURCE_DIR}/kernels/dsv41.metal ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vision.metal
+                 ${CMAKE_CURRENT_SOURCE_DIR}/kernels/hy4f.metal)
 
 add_custom_target(mako_version
     COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/generated/mako_version.hpp
@@ -26,7 +27,7 @@ add_library(mako_dsv41 STATIC dsv41/config.cpp dsv41/engine.cpp dsv41/engram.cpp
 target_include_directories(mako_dsv41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_dsv41 PUBLIC mako_core mako_mtl mako_gguf PRIVATE glaze_headers)
 
-add_library(mako_hy4f STATIC hy4f/config.cpp)
+add_library(mako_hy4f STATIC hy4f/config.cpp hy4f/engine.cpp)
 target_include_directories(mako_hy4f PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mako_hy4f PUBLIC mako_dsv41 mako_core mako_mtl mako_gguf)
 

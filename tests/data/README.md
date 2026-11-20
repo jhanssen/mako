@@ -47,6 +47,22 @@ mass" they print is how much of the reference's probability that covers, ~0.99) 
 
   `--dump-logits` writes every position's logits as float32 rows of 129,280 (12.7 GB for the long prompt).
 
+### Hy4-flash (`hy4f_short_ref.bin`, `hy4f_long_ref.bin`)
+
+- Prompts: `hy4f_short_ids.txt` ("The quick brown fox jumps over the lazy dog. The capital of France is", 15 tokens,
+  no BOS) and `hy4f_long_ids.txt` (`docs/architecture.md` at the time, 2210 tokens: past the 512-token window and,
+  from position 2048, the indexer's selection), both tokenized as text with control tokens parsed.
+- Model: the Maya-M GGUF (`Maya-M/` of
+  [peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF) at
+  `61b46da72d98a5227bfb5fd41505d4ca337af1d3`).
+- Reference: llama.cpp pull request #32517 at `b7c3f5da30fe1c44f7d015dc051ef0f373c708ec`, CPU backend, through
+  `tools/ref_dump` (the short prompt one token at a time, the long one with `REF_BATCH=256`):
+
+  ```sh
+  build/tools/ref_dump/ref_dump <Maya-M shard 1> "@$(cat <text file>)" /tmp/ref_long
+  build/tests/hy4f_ref_test - --import-ref /tmp/ref_long long
+  ```
+
 ## Recorded outputs
 
 - `regress_expected.txt`: greedy tokens recorded from mako itself (`regress_test <model> --update`), to catch

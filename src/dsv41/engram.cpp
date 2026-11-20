@@ -73,6 +73,7 @@ std::expected<Engram, std::string> Engram::open(const EngramConfig& c, const ggu
     e.mult_ = c.multipliers;
     e.primes_ = c.primes;
     e.offsets_ = c.offsets;
+    e.pad_each_ = c.pad_each;
     if (e.dim_ % 32 || e.ngram_ < 2 || e.ngram_ > 8)
         return std::unexpected(std::format("engram: head_dim {} / max_ngram {} unsupported", e.dim_, e.ngram_));
     const auto pad = c.pad_token;
@@ -80,10 +81,10 @@ std::expected<Engram, std::string> Engram::open(const EngramConfig& c, const ggu
 
     auto table = [&](const gguf::ModelFiles::Ref& r, uint64_t first, uint64_t rows) -> std::expected<Table, std::string> {
         const auto& t = *r.tensor;
-        const bool ok = t.type == gguf::Type::MXFP8 || t.type == gguf::Type::IQ4_NL ||
+        const bool ok = t.type == gguf::Type::MXFP8 || t.type == gguf::Type::F8_E4M3 || t.type == gguf::Type::IQ4_NL ||
                         (t.type == gguf::Type::Q6_K && e.dim_ % 256 == 0);
         if (!ok || t.dims.size() != 2 || t.dims[0] != e.dim_)
-            return std::unexpected(std::format("engram: {} is not MXFP8, Q6_K or IQ4_NL [{} x rows]", t.name, e.dim_));
+            return std::unexpected(std::format("engram: {} is not MXFP8, E4M3, Q6_K or IQ4_NL [{} x rows]", t.name, e.dim_));
         if (!e.tables_.empty() && t.type != e.type_)
             return std::unexpected("engram: the tables mix formats");
         e.type_ = t.type;
@@ -149,8 +150,23 @@ void Engram::hash(std::span<const int32_t> tokens, std::span<const int32_t> befo
         bool blocked = false;
         for (uint32_t s = 0; s < ngram_; ++s) {
             const int32_t id = at(int64_t(t), s);
-            blocked = blocked || id < 0;
+            blocked = (blocked && !pad_each_) || id < 0;
             ids[s] = blocked ? pad_ : id;
+        }
+        if (pad_each_) {
+            for (uint32_t l = 0; l < L; ++l) {
+                const int64_t* mult = mult_.data() + size_t(l) * ngram_;
+                uint64_t h = uint64_t(ids[0]) * uint64_t(mult[0]);
+                for (uint32_t n = 1; n < ngram_; ++n) {
+                    h ^= uint64_t(ids[n]) * uint64_t(mult[n]);
+                    for (uint32_t head = 0; head < cols_ / (ngram_ - 1); ++head) {
+                        const uint32_t col = (n - 1) * (cols_ / (ngram_ - 1)) + head;
+                        const size_t k = size_t(l) * cols_ + col;
+                        out[l * cols_ + col] = int64_t(h % uint64_t(primes_[k])) + offsets_[k];
+                    }
+                }
+            }
+            continue;
         }
         for (uint32_t l = 0; l < L; ++l) {
             const int64_t* mult = mult_.data() + size_t(l) * ngram_;

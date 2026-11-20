@@ -71,8 +71,10 @@ std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
     c.hc_eps = k.f32("hyper_connection.epsilon");
     c.hc_magnitude = k.f32("hyper_connection.magnitude");
 
-    if (k.has("ple.layers"))
+    if (k.has("ple.layers")) {
         c.engram = dsv41::EngramConfig::load(k, m);
+        c.engram.pad_each = true;
+    }
 
     if (const auto* tokens = f.find("tokenizer.ggml.tokens"))
         if (const auto* a = std::get_if<gguf::Array>(tokens))
