@@ -1066,8 +1066,12 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
         most = std::max(most, uint32_t(users[e].size()));
     const uint32_t brows = std::min(rows, std::max(kBatchRows, most));
     MTL::Buffer* xb = scratch("p_xb", uint64_t(brows) * Ex * 2); // half, for the GEMMs
-    MTL::Buffer* gb = scratch("p_gb", uint64_t(brows) * nff * 4);
-    MTL::Buffer* ub = scratch("p_ub", uint64_t(brows) * nff * 4);
+    // Gate, up and the SwiGLU in one GEMM where the kernels have it (the same sums and math).
+    const ExpertArena::Part &pg = arena_->part(il, 0), &pu = arena_->part(il, 1);
+    const bool fused_glu =
+        pg.type == pu.type && pg.k == pu.k && pg.n == pu.n && mtl::Gemm::supports_glu(pg.type, pg.k);
+    MTL::Buffer* gb = fused_glu ? nullptr : scratch("p_gb", uint64_t(brows) * nff * 4);
+    MTL::Buffer* ub = fused_glu ? nullptr : scratch("p_ub", uint64_t(brows) * nff * 4);
     MTL::Buffer* mb = scratch("p_mb", uint64_t(brows) * nff * 2); // half
     // Expert outputs for all rows, combined once: an order of the sum that does not depend on the batches
     // (and so on which experts happened to be resident).
@@ -1107,20 +1111,32 @@ void EngineBase::moe_prefill(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder
             gemm_->encode(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wb, wo, xin,
                           uint64_t(start[e] - r0) * xw * 2, y, uint64_t(start[e] - r0) * yw * 4);
         };
-        for (size_t i = b0; i < b1; ++i) {
-            gemm_part(0, order[i], xb, Ex, gb, nff);
-            gemm_part(1, order[i], xb, Ex, ub, nff);
+        if (fused_glu) {
+            const ExpertArena::Part& p = arena_->part(il, 0);
+            for (size_t i = b0; i < b1; ++i) {
+                const int e = order[i];
+                const auto [wg, wgo] = weights(0, e);
+                const auto [wu, wuo] = weights(1, e);
+                gemm_->encode_glu(enc, p.type, p.k, p.n, uint32_t(users[e].size()), wg, wgo, wu, wuo, xb,
+                                  uint64_t(start[e] - r0) * Ex * 2, mb, uint64_t(start[e] - r0) * nff * 2,
+                                  sa0.limit);
+            }
+        } else {
+            for (size_t i = b0; i < b1; ++i) {
+                gemm_part(0, order[i], xb, Ex, gb, nff);
+                gemm_part(1, order[i], xb, Ex, ub, nff);
+            }
+            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            SwigluArgs sa = sa0;
+            sa.n = nr * nff;
+            enc->setComputePipelineState(pso("swiglu_half"));
+            enc->setBuffer(gb, 0, 0);
+            enc->setBuffer(ub, 0, 1);
+            enc->setBuffer(mb, 0, 2);
+            enc->setBytes(&sa, sizeof(sa), 3);
+            for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
+                enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
         }
-        enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        SwigluArgs sa = sa0;
-        sa.n = nr * nff;
-        enc->setComputePipelineState(pso("swiglu_half"));
-        enc->setBuffer(gb, 0, 0);
-        enc->setBuffer(ub, 0, 1);
-        enc->setBuffer(mb, 0, 2);
-        enc->setBytes(&sa, sizeof(sa), 3);
-        for (int rep_ = repeats(last_pso_); rep_ > 0; --rep_)
-            enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
         for (size_t i = b0; i < b1; ++i) {
             const int e = order[i];

@@ -73,6 +73,8 @@ add_test(NAME gemm_synthetic COMMAND gemm_test --synthetic)
 set_tests_properties(gemm_synthetic PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
 # DeepSeek-V4.1's expert formats (IQ3_S down projections, IQ2_S gate) against the GEMV.
 add_test(NAME gemm_ds41 COMMAND gemm_test "${MAKO_DS41_MODEL}" blk.0.ffn_down_exps.weight blk.0.ffn_gate_exps.weight)
+# Hy4-flash's IQ3_XXS experts, the fused gate-up-SwiGLU GEMM among them.
+add_test(NAME gemm_hy4f COMMAND gemm_test "${MAKO_HY4F_MODEL}" blk.5.ffn_gate_exps.weight blk.5.ffn_down_exps.weight)
 foreach(c decode prefill parity spec session pool ablate long)
     add_test(NAME e2e_${c} COMMAND regress_test "${MAKO_MODEL}" ${c})
     set_tests_properties(e2e_${c} PROPERTIES LABELS e2e RESOURCE_LOCK gpu_model SKIP_RETURN_CODE 77)
@@ -116,8 +118,8 @@ add_executable(models_test models_test.cpp)
 target_link_libraries(models_test PRIVATE mako_server httplib_headers)
 add_test(NAME models COMMAND models_test)
 set_tests_properties(models PROPERTIES LABELS "server;cpu")
-set_tests_properties(gemv gemm gemm_ds41 PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
-set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds41 chat server server_ds41 server_http gemv gemm PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(gemv gemm gemm_ds41 gemm_hy4f PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
+set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds41 gemm_hy4f chat server server_ds41 server_http gemv gemm PROPERTIES SKIP_RETURN_CODE 77)
 
 
 

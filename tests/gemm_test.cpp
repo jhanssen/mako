@@ -5,8 +5,11 @@
 //                           the GEMV; random BF16 weights with bfloat activations, against the CPU; rows shorter than
 //                           the GEMM's 256-column steps (Q8_0 of 192, F32 of 128), against the CPU
 // The activations are followed by NaNs, so a GEMM reading past the ends of their rows fails.
+// For an expert gate tensor (ffn_gate_exps) with its up tensor: the fused gate-up-SwiGLU GEMM against the two GEMMs and
+// the swiglu kernel, bit for bit, unclamped and clamped, and the speed of both.
 #include "gguf/gguf.hpp"
 #include "mtl/context.hpp"
+#include "mtl/embedded.hpp"
 #include "mtl/gemm.hpp"
 #include "mtl/gemv.hpp"
 #include "quant/dequant.hpp"
@@ -21,6 +24,112 @@
 #include <random>
 #include <string>
 #include <vector>
+
+namespace {
+
+int glu_check(const mako::mtl::Context& ctx, mako::mtl::Gemm& gemm, const mako::gguf::File& f, const std::string& gate,
+              std::mt19937& rng)
+{
+    std::string up_name = gate;
+    up_name.replace(up_name.find("ffn_gate_exps"), 13, "ffn_up_exps");
+    const mako::gguf::Tensor *g = f.tensor(gate), *u = f.tensor(up_name);
+    if (!g || !u || u->type != g->type || u->dims != g->dims) {
+        std::println("{:28} no up tensor of its type and shape: fused GEMM not checked", gate);
+        return 0;
+    }
+    const uint32_t k = uint32_t(g->dims[0]), n = uint32_t(g->dims[1]);
+    const auto tr = mako::gguf::traits(g->type);
+    if (!mako::mtl::Gemm::supports_glu(g->type, k)) {
+        std::println("{:28} {}: no fused GEMM", gate, tr.name);
+        return 1;
+    }
+    const uint64_t mat = uint64_t(k) / tr.block_elems * tr.block_bytes * n;
+    auto buffer = [&](uint64_t bytes) {
+        return mako::mtl::Ref<MTL::Buffer>(ctx.device()->newBuffer(bytes, MTL::ResourceStorageModeShared));
+    };
+    // 64 copies of expert 7's gate and up, so the timing reads them from memory as prefill does.
+    constexpr uint32_t copies = 64;
+    auto wg = buffer(mat * copies), wu = buffer(mat * copies);
+    for (uint32_t c = 0; c < copies; ++c) {
+        std::memcpy(static_cast<char*>(wg->contents()) + c * mat, f.data(*g).data() + 7 * mat, mat);
+        std::memcpy(static_cast<char*>(wu->contents()) + c * mat, f.data(*u).data() + 7 * mat, mat);
+    }
+    auto lib = ctx.load(mako::mtl::kernels_metallib());
+    auto swiglu = ctx.pipeline(lib.get(), "swiglu_half");
+    std::normal_distribution<float> nd;
+    int failures = 0;
+    constexpr uint32_t most = 512;
+    auto xh = buffer(uint64_t(k) * most * 2 + 4096 * 2);
+    auto* xp = static_cast<__fp16*>(xh->contents());
+    for (uint64_t i = 0; i < uint64_t(k) * most; ++i)
+        xp[i] = __fp16(nd(rng));
+    std::fill_n(xp + uint64_t(k) * most, 4096, __fp16(NAN));
+    auto gb = buffer(uint64_t(n) * most * 4), ub = buffer(uint64_t(n) * most * 4);
+    auto ref = buffer(uint64_t(n) * most * 2), out = buffer(uint64_t(n) * most * 2);
+    struct SwigluArgs {
+        uint32_t n;
+        float limit;
+    };
+    auto separate = [&](MTL::ComputeCommandEncoder* enc, uint32_t t, float limit, uint64_t w_off) {
+        gemm.encode(enc, g->type, k, n, t, wg.get(), w_off, xh.get(), 0, gb.get(), 0);
+        gemm.encode(enc, g->type, k, n, t, wu.get(), w_off, xh.get(), 0, ub.get(), 0);
+        enc->memoryBarrier(MTL::BarrierScopeBuffers);
+        const SwigluArgs sa{t * n, limit};
+        enc->setComputePipelineState(swiglu.get());
+        enc->setBuffer(gb.get(), 0, 0);
+        enc->setBuffer(ub.get(), 0, 1);
+        enc->setBuffer(ref.get(), 0, 2);
+        enc->setBytes(&sa, sizeof(sa), 3);
+        enc->dispatchThreads(MTL::Size(sa.n, 1, 1), MTL::Size(256, 1, 1));
+    };
+    gemm.set_few_tokens(0);
+    for (const float limit : {0.0f, 0.5f}) {
+        for (const uint32_t t : {1u, 5u, 16u, 17u, 37u, 64u, 100u, 128u, 129u, 200u, 256u, 300u, 512u}) {
+            auto* cb = ctx.queue()->commandBuffer();
+            auto* enc = cb->computeCommandEncoder();
+            separate(enc, t, limit, 0);
+            gemm.encode_glu(enc, g->type, k, n, t, wg.get(), 0, wu.get(), 0, xh.get(), 0, out.get(), 0, limit);
+            enc->endEncoding();
+            cb->commit();
+            cb->waitUntilCompleted();
+            const bool same = std::memcmp(ref->contents(), out->contents(), uint64_t(t) * n * 2) == 0;
+            failures += !same;
+            if (!same || t == 512)
+                std::println("{:28} {:7} fused gate-up-SwiGLU, limit {}, t {}: {}", gate, tr.name, limit,
+                             same ? "1-512" : std::to_string(t),
+                             same ? "bit-identical to the GEMMs and swiglu" : "DIFFERS (FAIL)");
+        }
+    }
+    for (const uint32_t t : {32u, 64u, 128u, 160u, 256u, 512u}) {
+        auto time = [&](bool fused) {
+            double best = 1e9;
+            for (int rep = 0; rep < 8; ++rep) {
+                auto* cb = ctx.queue()->commandBuffer();
+                auto* enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+                const int n_disp = rep < 3 ? 200 : 64;
+                for (int d = 0; d < n_disp; ++d) {
+                    const uint64_t w_off = uint64_t(d % copies) * mat;
+                    if (fused)
+                        gemm.encode_glu(enc, g->type, k, n, t, wg.get(), w_off, wu.get(), w_off, xh.get(), 0,
+                                        out.get(), 0, 0.0f);
+                    else
+                        separate(enc, t, 0.0f, w_off);
+                }
+                enc->endEncoding();
+                cb->commit();
+                cb->waitUntilCompleted();
+                if (rep >= 3)
+                    best = std::min(best, (cb->GPUEndTime() - cb->GPUStartTime()) / n_disp);
+            }
+            return best;
+        };
+        const double sep = time(false), fus = time(true);
+        std::println("{:28} t={:3}: gate, up and swiglu {:6.1f} us, fused {:6.1f} us", gate, t, sep * 1e6, fus * 1e6);
+    }
+    return failures;
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -239,6 +348,8 @@ int main(int argc, char** argv)
                                                            data.size() / fast / 1e9)
                                              : "");
         }
+        if (!synthetic && name.find("ffn_gate_exps") != std::string::npos)
+            failures += glu_check(ctx, gemm, *f, name, rng);
     }
     return failures ? 1 : 0;
 }
