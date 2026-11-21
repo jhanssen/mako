@@ -69,6 +69,10 @@ struct ScoreArgs {
 struct SelectArgs {
     uint32_t first, n_top, kpool, score_stride, list_stride, full_tail;
 };
+struct SelArgs {
+    uint32_t first, n_top, kpool, score_stride, list_stride, slice, slices, shift, bits;
+};
+constexpr uint32_t kSelWords = 2052; // hy4_sel_hist's per-token state
 
 constexpr uint32_t kCommitLayers = 4; // decode: layers per command buffer
 // A window layer's keys for a token start at a multiple of this many positions (the rest of them masked): a score's
@@ -78,6 +82,9 @@ constexpr uint32_t kKeyAlign = 64;
 
 // The first key position window layers attend for a token at pos (window W).
 uint32_t window_start(uint32_t pos, uint32_t W) { return pos + 1 > W ? (pos + 1 - W) / kKeyAlign * kKeyAlign : 0; }
+// Prefill: the indexer scores and selects for up to this many tokens at once (more fill the GPU), as many as fit
+// kSelectFloats of scores.
+constexpr uint32_t kSelectTokens = 128, kSelectFloats = 8u << 20;
 // The Engram norms leave eps unset in the reference: the fp32 machine epsilon, not rms_norm_eps.
 constexpr float kEngramEps = 1.1920929e-07f;
 
@@ -131,7 +138,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
     const auto t_load = Clock::now();
     // What the kernels are written for.
     if (cfg_.hc != 4 || cfg_.n_rot != 64 || cfg_.head_k != 256 || cfg_.kv_lora_rank != 512 || cfg_.indexer_dim != 128 ||
-        cfg_.indexer_heads > 32 || cfg_.n_expert > 512 || cfg_.n_expert % 2 || cfg_.n_expert_used > 16 ||
+        cfg_.indexer_heads != 16 || cfg_.n_expert > 512 || cfg_.n_expert % 2 || cfg_.n_expert_used > 16 ||
         cfg_.engram.head_dim > 128 || !cfg_.indexer_select_tail)
         throw std::runtime_error("unsupported Hy4-flash geometry");
     for (uint32_t h : cfg_.n_head)
@@ -168,6 +175,7 @@ Engine::Engine(const gguf::ModelFiles& model, const Config& cfg, const Options& 
         std::memset(b->contents(), 0, b->length());
         return b;
     };
+    sel_state_ = buffer(16ull * kSelWords * 4);
     const uint32_t R = cfg_.kv_lora_rank, Di = cfg_.indexer_dim;
     // Sliding buffers: the rows a chunk's first token needs, the chunk's, and as many again so moves are rare.
     built_chunk_ = opts_.prefill_chunk;
@@ -311,7 +319,8 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
                                R + cfg_.n_rot + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) +
                                3 * cfg_.indexer_dim + 3 * uint64_t(cfg_.n_ff) + H * (R + 64) / 2 + 5 * E;
     const uint64_t scores = 3 * (16ull << 20) + 64 * H * 3 * list_stride() + 64 * 64 * H * R +
-                            32ull * (opts_.max_ctx / cfg_.indexer_kpool + 1);
+                            32ull * (opts_.max_ctx / cfg_.indexer_kpool + 1) + kSelectFloats +
+                            uint64_t(kSelectTokens) * (list_stride() + 1);
     const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (Ex / 2 + 2 * nff + nff / 2);
     const uint64_t staging = group >= kStageMinTokens ? staging_bytes() : 0;
     return (uint64_t(group) * per_group + uint64_t(chunk) * per_chunk + scores + batch) * 4 + staging + (96ull << 20);
@@ -650,23 +659,63 @@ void Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     const uint32_t stride = opts_.max_ctx / kp + 1, last_pools = (pos + count - 1) / kp;
     MTL::Buffer* score = scratch("hy_idx_score", uint64_t(count) * stride * 4);
     const ScoreArgs sa{Di, Hi, pos, kp, 1.0f / std::sqrt(float(Di * Hi)), stride};
-    // A simdgroup a pool (the key dimension across its lanes): the pools are few enough per token that a thread a
-    // pool leaves most of the GPU idle.
-    enc->setComputePipelineState(pso("hy4_idx_score"));
+    // Matrix products of up to 8 tokens' queries with a threadgroup's pools (each key read once for them).
+    const uint32_t tj = count >= 8 ? 8 : count >= 4 ? 4 : count >= 2 ? 2 : 1;
+    const uint32_t mm[2] = {count, tj};
+    enc->setComputePipelineState(pso("hy4_idx_score_mm"));
     enc->setBuffer(scratch("hy_iq", 0), uint64_t(t) * Hi * Di * 4, 0);
     enc->setBuffer(scratch("hy_iw", 0), uint64_t(t) * Hi * 4, 1);
     enc->setBuffer(idx_pooled_[il].get(), 0, 2);
     enc->setBuffer(score, 0, 3);
     enc->setBytes(&sa, sizeof(sa), 4);
+    enc->setBytes(mm, sizeof(mm), 5);
     for (int rep_ = repeats("idx_score"); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size((last_pools + 7) / 8, count, 1), MTL::Size(256, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size((last_pools + 256 / tj - 1) / (256 / tj), (count + tj - 1) / tj, 1),
+                                  MTL::Size(256, 1, 1));
     after(enc, "idx_score");
+    MTL::Buffer* list = scratch("hy_idx_list", uint64_t(count) * list_stride() * 4);
+    MTL::Buffer* counts = scratch("hy_idx_count", uint64_t(count) * 4);
+    // A few tokens over many pools: many threadgroups a token (the same cells as idx_select's one).
+    if (count <= 16 && last_pools >= 8192) {
+        // Slices of at least 512 pools, at most 128 of them.
+        const uint32_t slice = std::max(512u, (last_pools + 127) / 128), slices = (last_pools + slice - 1) / slice;
+        SelArgs a{pos + 1, n_top_, kp, stride, list_stride(), slice, slices, 21, 11};
+        MTL::Buffer* cnt = scratch("hy_sel_cnt", uint64_t(count) * 128 * 2 * 4);
+        const MTL::Size grid(slices, count, 1), tg(256, 1, 1);
+        for (const auto [shift, bits] : {std::pair{21u, 11u}, {10u, 11u}, {0u, 10u}}) {
+            a.shift = shift;
+            a.bits = bits;
+            enc->setComputePipelineState(pso("hy4_sel_hist"));
+            enc->setBuffer(score, 0, 0);
+            enc->setBytes(&a, sizeof(a), 1);
+            enc->setBuffer(sel_state_.get(), 0, 2);
+            enc->dispatchThreadgroups(grid, tg);
+            after(enc, "hy4_sel_hist");
+        }
+        enc->setComputePipelineState(pso("hy4_sel_count"));
+        enc->setBuffer(score, 0, 0);
+        enc->setBytes(&a, sizeof(a), 1);
+        enc->setBuffer(sel_state_.get(), 0, 2);
+        enc->setBuffer(cnt, 0, 3);
+        enc->dispatchThreadgroups(grid, tg);
+        after(enc, "hy4_sel_count");
+        enc->setComputePipelineState(pso("hy4_sel_write"));
+        enc->setBuffer(score, 0, 0);
+        enc->setBytes(&a, sizeof(a), 1);
+        enc->setBuffer(sel_state_.get(), 0, 2);
+        enc->setBuffer(cnt, 0, 3);
+        enc->setBuffer(list, 0, 4);
+        enc->setBuffer(counts, 0, 5);
+        enc->dispatchThreadgroups(grid, tg);
+        after(enc, "hy4_sel_write");
+        return;
+    }
     const SelectArgs sel{pos + 1, n_top_, kp, stride, list_stride(), 1};
     enc->setComputePipelineState(pso("idx_select"));
     enc->setBuffer(score, 0, 0);
     enc->setBytes(&sel, sizeof(sel), 1);
-    enc->setBuffer(scratch("hy_idx_list", uint64_t(count) * list_stride() * 4), 0, 2);
-    enc->setBuffer(scratch("hy_idx_count", uint64_t(count) * 4), 0, 3);
+    enc->setBuffer(list, 0, 2);
+    enc->setBuffer(counts, 0, 3);
     for (int rep_ = repeats("idx_select"); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size(count, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "idx_select");
@@ -822,17 +871,15 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
             enc->dispatchThreads(MTL::Size(rows * R, 1, 1), MTL::Size(256, 1, 1));
         after(enc, "sum_splits");
     };
-    auto sparse = [&](uint32_t t, uint32_t gt) {
+    // Tokens t..t+gt-1, whose lists indexer_select made from token t - u on.
+    auto sparse = [&](uint32_t t, uint32_t gt, uint32_t u) {
         // A fixed split of each token's list (a single token still fills the GPU): its sums in the same order in any
         // group.
         const uint32_t Ls = list_stride(), rows = gt * H, splits = 8;
-        part(enc, "attn indexer select");
-        indexer_select(enc, il, t, pos0 + t, gt);
-        if (drafter_)
-            tap_lists(enc, il, pos0 + t, gt);
         part(enc, "attn sparse");
-        MTL::Buffer* list = scratch("hy_idx_list", uint64_t(gt) * Ls * 4);
-        MTL::Buffer* count = scratch("hy_idx_count", uint64_t(gt) * 4);
+        MTL::Buffer* list = scratch("hy_idx_list", 0);
+        MTL::Buffer* count = scratch("hy_idx_count", 0);
+        const uint64_t list_off = uint64_t(u) * Ls * 4, count_off = uint64_t(u) * 4;
         MTL::Buffer* sl = scratch("hy_sp_lat", uint64_t(rows) * Ls * 4);
         MTL::Buffer* sp = scratch("hy_sp_pe", uint64_t(rows) * Ls * 4);
         MTL::Buffer* partial = scratch("hy_sp_part", uint64_t(splits) * rows * R * 4);
@@ -840,8 +887,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         enc->setComputePipelineState(pso("attn_gather_scores"));
         enc->setBuffer(qlh, uint64_t(t) * H * R * 2, 0);
         enc->setBuffer(lat_[il].get(), 0, 1);
-        enc->setBuffer(list, 0, 2);
-        enc->setBuffer(count, 0, 3);
+        enc->setBuffer(list, list_off, 2);
+        enc->setBuffer(count, count_off, 3);
         enc->setBuffer(sl, 0, 4);
         enc->setBytes(&ga, sizeof(ga), 5);
         for (int rep_ = repeats("attn_gather_scores"); rep_ > 0; --rep_)
@@ -851,8 +898,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         enc->setComputePipelineState(pso("hy4_gather_rope"));
         enc->setBuffer(qp, uint64_t(t) * H * NR * 4, 0);
         enc->setBuffer(pe_[il].get(), 0, 1);
-        enc->setBuffer(list, 0, 2);
-        enc->setBuffer(count, 0, 3);
+        enc->setBuffer(list, list_off, 2);
+        enc->setBuffer(count, count_off, 3);
         enc->setBuffer(sp, 0, 4);
         enc->setBytes(&gr, sizeof(gr), 5);
         for (int rep_ = repeats("hy4_gather_rope"); rep_ > 0; --rep_)
@@ -862,7 +909,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         enc->setComputePipelineState(pso("hy4_softmax_list"));
         enc->setBuffer(sl, 0, 0);
         enc->setBuffer(sp, 0, 1);
-        enc->setBuffer(count, 0, 2);
+        enc->setBuffer(count, count_off, 2);
         enc->setBuffer(L.sinks.buf, L.sinks.off, 3);
         enc->setBytes(&la, sizeof(la), 4);
         for (int rep_ = repeats("hy4_softmax_list"); rep_ > 0; --rep_)
@@ -871,8 +918,8 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         enc->setComputePipelineState(pso("attn_gather_pv"));
         enc->setBuffer(sl, 0, 0);
         enc->setBuffer(lat_[il].get(), 0, 1);
-        enc->setBuffer(list, 0, 2);
-        enc->setBuffer(count, 0, 3);
+        enc->setBuffer(list, list_off, 2);
+        enc->setBuffer(count, count_off, 3);
         enc->setBuffer(partial, 0, 4);
         enc->setBytes(&ga, sizeof(ga), 5);
         for (int rep_ = repeats("attn_gather_pv"); rep_ > 0; --rep_)
@@ -900,10 +947,17 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         dense_at(t, gt);
         t += gt;
     }
+    // The score rows are max_ctx / kpool + 1 apart (one size of the buffer).
+    const uint32_t batch = std::clamp(kSelectFloats / (opts_.max_ctx / kp + 1) / 16 * 16, 16u, kSelectTokens);
     while (t < T) {
-        const uint32_t gt = std::min<uint32_t>(16, T - t);
-        sparse(t, gt);
-        t += gt;
+        const uint32_t bt = std::min(T - t, batch);
+        part(enc, "attn indexer select");
+        indexer_select(enc, il, t, pos0 + t, bt);
+        if (drafter_)
+            tap_lists(enc, il, pos0 + t, bt);
+        for (uint32_t u = 0; u < bt; u += 16)
+            sparse(t + u, std::min<uint32_t>(16, bt - u), u);
+        t += bt;
     }
 
     part(enc, "attn v_b");

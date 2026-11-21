@@ -31,3 +31,5 @@ target_link_libraries(hc_bench PRIVATE mako_mtl mako_gguf)
 
 add_executable(route_bench route_bench.cpp)
 target_link_libraries(route_bench PRIVATE mako_mtl mako_gguf)
+add_executable(idx_bench idx_bench.cpp)
+target_link_libraries(idx_bench PRIVATE mako_mtl)

@@ -169,6 +169,7 @@ private:
     // layer, of the last swa_cap_ from row_base_ on for a window layer; per indexer layer its value | gate rows
     // (float, 2 x dim; idx_cap_ from idx_base_ on) and pooled keys (float, dim, every complete group).
     std::vector<mtl::Ref<MTL::Buffer>> lat_, pe_, idx_rows_, idx_pooled_;
+    mtl::Ref<MTL::Buffer> sel_state_; // the many-threadgroup top-k's per-token histograms (zero between uses)
     std::vector<uint32_t> row_base_, idx_base_;
     uint32_t swa_cap_ = 0, idx_cap_ = 0, built_chunk_ = 0;
     uint32_t pos_ = 0;

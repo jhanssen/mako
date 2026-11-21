@@ -56,7 +56,7 @@ int main(int argc, char** argv)
     bool use_prefill = false, part_timing = false;
     size_t steps_from = 0, out_from = 0, out_to = SIZE_MAX;
     uint32_t indexer_top_k = 0;
-    bool spec = false, verify_cost = false;
+    bool spec = false, verify_cost = false, last_logits = false;
     std::string draft_log;
     std::string logits_out, compare;
     const auto args =
@@ -92,6 +92,7 @@ int main(int argc, char** argv)
             .option("--dfly2", "FILE", "the DFly2 drafter", opts.dfly2)
             .flag("--spec", "with -n: draft and verify", spec)
             .flag("--verify-cost", "time verifies of 1 to 8 tokens", verify_cost)
+            .flag("--last-logits", "with --prefill: only the last position's logits (long prompts)", last_logits)
             .option("--draft-conf", "C", "offer a draft while its confidence is at least C", opts.draft_conf)
             .option("--draft-cum", "C", "and while the product of the confidences is at least C", opts.draft_cum)
             .option("--draft-log", "FILE", "each round's confidences and outcomes", draft_log)
@@ -151,10 +152,14 @@ int main(int argc, char** argv)
         std::println(stderr, "{} steps in {:.2f} s", ids.size() - steps_from,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
     } else if (use_prefill) {
-        logits.assign(ids.size(), {});
-        engine.set_logits_sink([&](uint32_t pos, const float* l) { logits[pos].assign(l, l + V); });
+        if (!last_logits) {
+            logits.assign(ids.size(), {});
+            engine.set_logits_sink([&](uint32_t pos, const float* l) { logits[pos].assign(l, l + V); });
+        }
         const auto tp = std::chrono::steady_clock::now();
-        engine.prefill(ids);
+        const auto& last = engine.prefill(ids);
+        if (last_logits)
+            logits = {last};
         if (part_timing) { // the last prefill group's run
             auto parts = engine.last_step().parts;
             std::ranges::sort(parts, std::greater{}, &mako::core::KernelTime::ms);
@@ -194,9 +199,10 @@ int main(int argc, char** argv)
         const auto& l = logits[p];
         const uint32_t best = uint32_t(std::max_element(l.begin(), l.end()) - l.begin());
         const auto lp = log_softmax(l.data(), V);
-        if (p + 1 < ids.size())
+        if (p + 1 < logits.size())
             nll -= lp[ids[p + 1]];
-        std::string line = std::format("pos {:4} in {:6} top {:6} {:>14}", p, ids[p], best, tok->decode({&ids[p], 1}));
+        const size_t at = p + ids.size() - logits.size();
+        std::string line = std::format("pos {:4} in {:6} top {:6} {:>14}", at, ids[at], best, tok->decode({&ids[at], 1}));
         if (!ref.empty()) {
             std::ifstream f(std::filesystem::path(ref) / std::format("logits.{}.f32", p), std::ios::binary);
             std::vector<float> r(V);
@@ -235,7 +241,7 @@ int main(int argc, char** argv)
         }
         std::println("against {}: {} positions, mean KL {:.3e}, max {:.3e}", compare, n, n ? sum / double(n) : 0.0, worst);
     }
-    if (ids.size() > 1)
+    if (logits.size() > 1)
         std::println("perplexity of the ids' next tokens: {:.3f}", std::exp(nll / double(ids.size() - 1)));
     if (compared)
         std::println("against the reference: {} positions, top-1 agreement {:.1f}%, mean KL {:.5f}", compared,
@@ -254,6 +260,14 @@ int main(int argc, char** argv)
             }
             std::println("verify of {}: {:.2f} ms", w,
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count() / 20);
+            if (part_timing && (w == 1 || w == 8)) {
+                engine.verify(run);
+                auto parts = engine.last_step().parts;
+                engine.keep(1);
+                std::ranges::sort(parts, std::greater{}, &mako::core::KernelTime::ms);
+                for (const auto& k : parts)
+                    std::println("  {:40} {:8.2f} ms", k.kernel, k.ms);
+            }
         }
     }
     if (gen > 0 && spec && engine.has_drafter()) {
