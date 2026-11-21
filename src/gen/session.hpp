@@ -104,13 +104,15 @@ public:
     void clear();
 
     // How a prompt relates to this session's context. keep: the leading tokens it can keep in place, its whole
-    // context when the prompt continues it or one of the last turn's checkpoints (the three newest) when the prompt
-    // diverges after that (an edited last message, another try at the last turn). fork: else an earlier checkpoint,
-    // or the fork point's, which a new session can start from (fork()) leaving this one as it is. 0: none.
+    // context when the prompt continues it (or, with text, spells the rest of it with other tokens) or one of the
+    // last turn's checkpoints (the three newest) when the prompt diverges after that (an edited last message, another
+    // try at the last turn). fork: else an earlier checkpoint, or the fork point's, which a new session can start
+    // from (fork()) leaving this one as it is. 0: none.
     struct Match {
         size_t keep = 0, fork = 0;
     };
-    Match match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const;
+    Match match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
+                const GenerateParams::Text* text = nullptr) const;
     // A parked session holding src's context up to its checkpoint at pos: the engine holds src's context (src is
     // live) and gives the positions before pos.
     void fork(const Session& src, size_t pos);
@@ -147,7 +149,8 @@ private:
         std::vector<GenerateParams::PromptRows> rows;
         size_t at = 0;
     };
-    std::optional<Respelled> respell(std::span<const int32_t> prompt, const GenerateParams& p) const;
+    std::optional<Respelled> respell(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
+                                     const GenerateParams::Text& t) const;
     void rewind(size_t keep);
     void save_checkpoint(bool fork = false);
     // The key of ctx_[i]: its span's in keys_, else 0.

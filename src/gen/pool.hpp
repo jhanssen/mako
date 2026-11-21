@@ -50,7 +50,8 @@ public:
     // the most recently used); or, when another's earlier checkpoint holds more of it, a new session forked from
     // there; else an empty one. The previous one is parked, and parked sessions past the budget or the count are
     // given up, oldest first. Marks it in use until release(). The caller holds the turn (or is the only thread).
-    Pick acquire(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows);
+    Pick acquire(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
+                 const GenerateParams::Text* text = nullptr);
     void release(const Session* s);
 
     size_t size() const { return slots_.size(); }

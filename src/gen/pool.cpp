@@ -97,7 +97,8 @@ void SessionPool::make_live(Session* s)
 }
 
 SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
-                                       std::span<const GenerateParams::PromptRows> rows)
+                                       std::span<const GenerateParams::PromptRows> rows,
+                                       const GenerateParams::Text* text)
 {
     Pick pick;
     Session* keep = nullptr;
@@ -105,7 +106,7 @@ SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
     size_t keep_len = 0, fork_len = 0, fork_index = 0;
     uint64_t keep_used = 0;
     for (const Slot& s : slots_) {
-        const Session::Match m = s.session->match(prompt, rows);
+        const Session::Match m = s.session->match(prompt, rows, text);
         if (!s.busy && m.keep > 0 && (m.keep > keep_len || (m.keep == keep_len && s.used > keep_used))) {
             keep = s.session.get();
             keep_len = m.keep;
@@ -202,7 +203,7 @@ bool SessionPool::generate(std::span<const int32_t> prompt, GenerateParams p,
     } turn{*this};
     if (start && !start(p))
         return false;
-    pick = acquire(prompt, p.input_rows);
+    pick = acquire(prompt, p.input_rows, p.text ? &*p.text : nullptr);
     struct Release {
         SessionPool& pool;
         const Session* s;

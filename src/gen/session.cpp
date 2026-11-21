@@ -57,7 +57,8 @@ uint64_t key_in(std::span<const GenerateParams::PromptRows> rows, size_t i)
 
 } // namespace
 
-Session::Match Session::match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows) const
+Session::Match Session::match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
+                              const GenerateParams::Text* text) const
 {
     Match m;
     if (prompt.empty())
@@ -66,8 +67,8 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
     size_t common = 0;
     while (common < limit && ctx_[common] == prompt[common] && key_at(common) == key_in(rows, common))
         ++common;
-    if (common == ctx_.size()) {
-        m.keep = common;
+    if (common == ctx_.size() || (text && respell(prompt, rows, *text))) {
+        m.keep = ctx_.size();
         return m;
     }
     // The last turn's checkpoints rewind this session: where its reply ended, before its prompt's last token (another
@@ -204,14 +205,13 @@ void Session::save_checkpoint(bool fork)
     saved_.push_back({std::make_shared<const Model::Checkpoint>(e_->checkpoint()), ++clock_, fork});
 }
 
-std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prompt, const GenerateParams& p) const
+std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prompt,
+                                                   std::span<const GenerateParams::PromptRows> rows,
+                                                   const GenerateParams::Text& t) const
 {
-    if (!p.text || parked_ || e_->position() != ctx_.size())
-        return std::nullopt;
-    const auto& t = *p.text;
     const size_t held = ctx_.size(), n = prompt.size();
     size_t d = 0;
-    while (d < std::min(held, n) && ctx_[d] == prompt[d] && key_at(d) == key_in(p.input_rows, d))
+    while (d < std::min(held, n) && ctx_[d] == prompt[d] && key_at(d) == key_in(rows, d))
         ++d;
     if (d >= held || d >= n)
         return std::nullopt;
@@ -239,7 +239,7 @@ std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prom
         rest = b.substr(a.size());
     }
     for (size_t k = d; k < j; ++k)
-        if (key_in(p.input_rows, k))
+        if (key_in(rows, k))
             return std::nullopt;
     Respelled r;
     r.at = d;
@@ -252,7 +252,7 @@ std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prom
     if (std::ranges::equal(r.prompt, prompt) || r.prompt.size() <= held)
         return std::nullopt;
     const int64_t shift = int64_t(r.prompt.size()) - int64_t(n);
-    r.rows = p.input_rows;
+    r.rows.assign(rows.begin(), rows.end());
     for (auto& row : r.rows)
         if (row.rows.pos >= j)
             row.rows.pos = uint32_t(int64_t(row.rows.pos) + shift);
@@ -263,7 +263,10 @@ GenerateResult Session::generate(std::span<const int32_t> prompt, const Generate
                                  const std::function<bool(int32_t)>& on_token)
 {
     try {
-        if (auto r = respell(prompt, p)) {
+        std::optional<Respelled> r;
+        if (p.text && !parked_ && e_->position() == ctx_.size())
+            r = respell(prompt, p.input_rows, *p.text);
+        if (r) {
             GenerateParams q = p;
             q.input_rows = std::move(r->rows);
             const size_t held = ctx_.size();

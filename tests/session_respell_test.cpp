@@ -3,7 +3,10 @@
 // - a reply sampled as "." "\n" and rendered again as ".\n": the whole context is reused, only what follows is read;
 // - the context ending inside one of the prompt's tokens: the rest of that token's text is encoded again;
 // - other text, or a control token where the context has plain text: the prompt diverges as without respelling;
-// - input rows after the respelled part move with it.
+// - input rows after the respelled part move with it;
+// - a third turn that spells both earlier replies otherwise: the pool keeps the conversation instead of forking it
+//   from before the first reply.
+#include "gen/pool.hpp"
 #include "gen/session.hpp"
 
 #include <cstring>
@@ -157,6 +160,23 @@ int main()
         check(r.respelled == 3 && m.rows.size() == 1 && m.rows[0].pos == 7 && m.rows[0].count == 2,
               std::format("input rows after the respelled part move with it (at {})",
                           m.rows.empty() ? -1 : int(m.rows[0].pos)));
+    }
+    {
+        Recorder m;
+        mako::gen::SessionPool pool(m, 1 << 20);
+        const auto run = [&](const V& prompt, V reply) {
+            mako::gen::GenerateResult r;
+            mako::gen::SessionPool::Pick pick;
+            m.read = 0;
+            pool.generate(prompt, params(std::move(reply)), {}, r, pick);
+            return std::pair{r, pick};
+        };
+        run(V{0, 1, 3}, {5, 6, 4});                                 // context: a b <c> . \n x
+        run(V{0, 1, 3, 7, 4, 8, 0, 3}, {5, 6});                     // . \n x again as .\n x; context ... <end> a <c> . \n
+        const auto [r, pick] = run(V{0, 1, 3, 7, 4, 8, 0, 3, 7, 8, 1, 3}, {}); // both replies as .\n
+        check(!pick.forked && pick.usable == 11 && r.reused_tokens == 11 && m.read == 3 && pool.size() == 1,
+              std::format("both replies spelled otherwise: kept, not forked (forked {}, usable {}, read {})",
+                          pick.forked, pick.usable, m.read));
     }
     std::println("{} failures", failures);
     return failures ? 1 : 0;
