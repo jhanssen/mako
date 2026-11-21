@@ -260,13 +260,14 @@ int main(int argc, char** argv)
             }
             std::println("verify of {}: {:.2f} ms", w,
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count() / 20);
-            if (part_timing && (w == 1 || w == 8)) {
+            if ((part_timing || opts.telemetry == mako::core::Telemetry::kernels) && (w == 1 || w == 8)) {
                 engine.verify(run);
                 auto parts = engine.last_step().parts;
+                parts.insert(parts.end(), engine.last_step().kernels.begin(), engine.last_step().kernels.end());
                 engine.keep(1);
                 std::ranges::sort(parts, std::greater{}, &mako::core::KernelTime::ms);
                 for (const auto& k : parts)
-                    std::println("  {:40} {:8.2f} ms", k.kernel, k.ms);
+                    std::println("  {:40} {:8.2f} ms ({})", k.kernel, k.ms, k.count);
             }
         }
     }
