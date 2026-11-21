@@ -760,9 +760,9 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
         const uint32_t k = uint32_t(w.dims[0]), nr = uint32_t(w.dims[1]);
         const uint64_t mat = mtl::Gemv::row_bytes(w.type, k) * nr;
         MTL::Buffer* xh = halves(enc, x, 0, T, H * xw, 0);
-        for (uint32_t h = 0; h < H; ++h)
-            gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off + h * mat, xh, uint64_t(h) * xw * 2, y,
-                          uint64_t(h) * yw * 4, H * yw, H * xw);
+        // Every head in one dispatch.
+        gemm_->encode(enc, w.type, k, nr, T, w.buf, w.off, xh, 0, y, 0, H * yw, H * xw, false,
+                      {H, uint32_t(mat), xw, yw});
         after(enc, "per-head gemm");
     };
     part(enc, "attn k_b");

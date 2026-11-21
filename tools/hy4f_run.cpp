@@ -95,7 +95,8 @@ int main(int argc, char** argv)
             .option("--draft-conf", "C", "offer a draft while its confidence is at least C", opts.draft_conf)
             .option("--draft-cum", "C", "and while the product of the confidences is at least C", opts.draft_cum)
             .option("--draft-log", "FILE", "each round's confidences and outcomes", draft_log)
-            .option("--telemetry", "summary|layers|parts|kernels", "telemetry (with -n: GPU time per part or kernel)",
+            .option("--telemetry", "summary|layers|parts|kernels",
+                    "telemetry (with -n: GPU time per part or kernel; parts with --prefill: the last group's)",
                     [&](const std::string& v) {
                         opts.telemetry = v == "summary"   ? mako::core::Telemetry::summary
                                          : v == "kernels" ? mako::core::Telemetry::kernels
@@ -154,6 +155,16 @@ int main(int argc, char** argv)
         engine.set_logits_sink([&](uint32_t pos, const float* l) { logits[pos].assign(l, l + V); });
         const auto tp = std::chrono::steady_clock::now();
         engine.prefill(ids);
+        if (part_timing) { // the last prefill group's run
+            auto parts = engine.last_step().parts;
+            std::ranges::sort(parts, std::greater{}, &mako::core::KernelTime::ms);
+            double tot = 0;
+            for (auto& k : parts) tot += k.ms;
+            std::println(stderr, "the prefill's last group: wall {:.0f} ms, GPU {:.0f} ms (in parts {:.0f})",
+                         engine.last_step().wall_ms, engine.last_step().gpu_ms, tot);
+            for (const auto& k : parts)
+                std::println(stderr, "  {:40} {:8.1f} ms", k.kernel, k.ms);
+        }
         std::println(stderr, "prefill of {} in {:.2f} s", ids.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
         engine.set_logits_sink({});
