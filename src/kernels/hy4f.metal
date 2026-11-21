@@ -395,3 +395,31 @@ kernel void hy4_draft_pick(device const float* logits [[buffer(0)]], device cons
         }
     }
 }
+
+struct IdxScoreArgs {
+    uint dim, heads, first, kpool;
+    float w_scale;
+    uint stride; // floats between tokens' score rows
+};
+
+// score[j][p] = w_scale * sum_h relu(q[j][h] . pooled[p]) * w[j][h] over token j's complete pools: a simdgroup a pool
+// (8 a threadgroup), lane l holding dims 4l .. 4l + 3 (dim 128) of every head's query; grid (pools of the last token
+// / 8, tokens).
+kernel void hy4_idx_score(device const float* q [[buffer(0)]], device const float* w [[buffer(1)]],
+                          device const float* pooled [[buffer(2)]], device float* score [[buffer(3)]],
+                          constant IdxScoreArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint j = tg.y, p = tg.x * 8 + sg;
+    if (p >= (a.first + j) / a.kpool)
+        return;
+    device const float4* q4 = reinterpret_cast<device const float4*>(q + uint64_t(j) * a.heads * a.dim);
+    const float4 k = reinterpret_cast<device const float4*>(pooled + uint64_t(p) * a.dim)[lane];
+    float total = 0.0f;
+    for (uint h = 0; h < a.heads; ++h) {
+        const float d = simd_sum(dot(q4[h * (a.dim / 4) + lane], k));
+        total += max(d, 0.0f) * w[uint64_t(j) * a.heads + h];
+    }
+    if (lane == 0)
+        score[uint64_t(j) * a.stride + p] = total * a.w_scale;
+}

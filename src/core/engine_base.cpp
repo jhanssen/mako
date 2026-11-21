@@ -186,6 +186,9 @@ void EngineBase::init_runtime(ArenaInit init)
             experts += double(part.bytes) * dims_.n_expert;
     const double slack = std::max(0.0, arena_plan_.budget - experts);
     arena_plan_.park = init.park_gb >= 0 ? init.park_gb * 1e9 : std::clamp(slack, 1e9, 8e9);
+    // Room for a prefill's scratch besides the experts and the parked conversations: it is allocated, not lent
+    // (lending evicts experts the next step reads back from the model file).
+    scratch_fits_ = slack - arena_plan_.park >= init.lendable;
     if (init.arena_gb < 0)
         arena_plan_.budget = std::max(1e9, arena_plan_.budget - std::max(0.0, arena_plan_.park - slack));
     auto t_phase = Clock::now();
@@ -333,7 +336,7 @@ void EngineBase::apply_pressure()
 EngineBase::ScratchLoan::ScratchLoan(EngineBase& e, uint64_t need) : e_(e)
 {
     constexpr uint64_t kLendBelow = 256ull << 20;
-    lend_ = need > kLendBelow && e.arena_->lendable_bytes() > 0;
+    lend_ = need > kLendBelow && e.arena_->lendable_bytes() > 0 && !e.scratch_fits_;
     if (!lend_)
         return;
     for (const auto& [name, b] : e.scratch_)

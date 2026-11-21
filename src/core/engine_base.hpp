@@ -211,6 +211,7 @@ protected:
     // steps by apply_pressure(), which lends the arena's lendable slots under pressure and takes them back after.
     std::atomic<int> pressure_{0};
     bool pressure_lent_ = false;
+    bool scratch_fits_ = false; // the budget leaves a prefill's scratch room: ScratchLoan does not lend
     dispatch_queue_t pressure_queue_ = nullptr;
     dispatch_source_t pressure_src_ = nullptr;
     std::unique_ptr<ExpertArena> arena_;

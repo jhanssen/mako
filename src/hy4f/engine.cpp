@@ -653,14 +653,16 @@ void Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     const uint32_t stride = opts_.max_ctx / kp + 1, last_pools = (pos + count - 1) / kp;
     MTL::Buffer* score = scratch("hy_idx_score", uint64_t(count) * stride * 4);
     const ScoreArgs sa{Di, Hi, pos, kp, 1.0f / std::sqrt(float(Di * Hi)), stride};
-    enc->setComputePipelineState(pso("idx_score"));
+    // A simdgroup a pool (the key dimension across its lanes): the pools are few enough per token that a thread a
+    // pool leaves most of the GPU idle.
+    enc->setComputePipelineState(pso("hy4_idx_score"));
     enc->setBuffer(scratch("hy_iq", 0), uint64_t(t) * Hi * Di * 4, 0);
     enc->setBuffer(scratch("hy_iw", 0), uint64_t(t) * Hi * 4, 1);
     enc->setBuffer(idx_pooled_[il].get(), 0, 2);
     enc->setBuffer(score, 0, 3);
     enc->setBytes(&sa, sizeof(sa), 4);
     for (int rep_ = repeats("idx_score"); rep_ > 0; --rep_)
-        enc->dispatchThreadgroups(MTL::Size((last_pools + 255) / 256, count, 1), MTL::Size(256, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size((last_pools + 7) / 8, count, 1), MTL::Size(256, 1, 1));
     after(enc, "idx_score");
     const SelectArgs sel{pos + 1, n_top_, kp, stride, list_stride(), 1};
     enc->setComputePipelineState(pso("idx_select"));
