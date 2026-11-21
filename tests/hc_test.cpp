@@ -7,6 +7,7 @@
 #include "mtl/context.hpp"
 #include "mtl/embedded.hpp"
 #include "mtl/gemv.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,11 +23,7 @@ namespace {
 using mako::mtl::Ref;
 
 // Layouts must match glm.metal's.
-struct NormArgs {
-    uint32_t n, wn;
-    float eps;
-    uint32_t ystride;
-};
+using mako::kernels::NormArgs;
 struct HcArgs {
     uint32_t n_embd, iters;
     float eps;

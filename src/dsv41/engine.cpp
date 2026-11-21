@@ -2,6 +2,7 @@
 
 #include "gguf/read_pool.hpp"
 #include "quant/dequant.hpp"
+#include "kernels/args.h"
 
 #include <glaze/glaze.hpp>
 
@@ -55,16 +56,8 @@ struct AttnArgs {
     float scale;
     uint32_t block;
 };
-struct RouteArgs {
-    uint32_t n_expert, n_used, norm;
-    float scale;
-    uint32_t lookup, score;
-    float miss_penalty;
-};
-struct SwigluArgs {
-    uint32_t n;
-    float limit;
-};
+using kernels::RouteArgs;
+using kernels::SwigluArgs;
 struct CombineArgs {
     uint32_t n, n_used;
 };

@@ -8,6 +8,7 @@
 // For an expert gate tensor (ffn_gate_exps) with its up tensor: the fused gate-up-SwiGLU GEMM against the two GEMMs and
 // the swiglu kernel, bit for bit, unclamped and clamped, and the speed of both.
 #include "gguf/gguf.hpp"
+#include "kernels/args.h"
 #include "mtl/context.hpp"
 #include "mtl/embedded.hpp"
 #include "mtl/gemm.hpp"
@@ -66,15 +67,11 @@ int glu_check(const mako::mtl::Context& ctx, mako::mtl::Gemm& gemm, const mako::
     std::fill_n(xp + uint64_t(k) * most, 4096, __fp16(NAN));
     auto gb = buffer(uint64_t(n) * most * 4), ub = buffer(uint64_t(n) * most * 4);
     auto ref = buffer(uint64_t(n) * most * 2), out = buffer(uint64_t(n) * most * 2);
-    struct SwigluArgs {
-        uint32_t n;
-        float limit;
-    };
     auto separate = [&](MTL::ComputeCommandEncoder* enc, uint32_t t, float limit, uint64_t w_off) {
         gemm.encode(enc, g->type, k, n, t, wg.get(), w_off, xh.get(), 0, gb.get(), 0);
         gemm.encode(enc, g->type, k, n, t, wu.get(), w_off, xh.get(), 0, ub.get(), 0);
         enc->memoryBarrier(MTL::BarrierScopeBuffers);
-        const SwigluArgs sa{t * n, limit};
+        const mako::kernels::SwigluArgs sa{t * n, limit};
         enc->setComputePipelineState(swiglu.get());
         enc->setBuffer(gb.get(), 0, 0);
         enc->setBuffer(ub.get(), 0, 1);

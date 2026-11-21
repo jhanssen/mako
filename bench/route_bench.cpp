@@ -9,6 +9,7 @@
 #include "mtl/context.hpp"
 #include "mtl/embedded.hpp"
 #include "mtl/gemv.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <cstring>
@@ -20,12 +21,7 @@
 
 namespace {
 
-struct RouteArgs {
-    uint32_t n_expert, n_used, norm;
-    float scale;
-    uint32_t lookup, score;
-    float miss_penalty;
-};
+using mako::kernels::RouteArgs;
 
 using Link = std::function<void(MTL::CommandBuffer*, MTL::ComputeCommandEncoder*&, int)>;
 

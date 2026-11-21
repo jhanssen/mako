@@ -4,6 +4,7 @@
 
 #include "mtl/embedded.hpp"
 #include "quant/dequant.hpp"
+#include "kernels/args.h"
 
 #include <array>
 #include <fcntl.h>
@@ -33,11 +34,7 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 
-struct NormArgs {
-    uint32_t n, wn;
-    float eps;
-    uint32_t ystride;
-};
+using kernels::NormArgs;
 struct HcArgs {
     uint32_t n_embd, iters;
     float eps;
@@ -55,25 +52,16 @@ struct L2Args {
     float eps;
     uint32_t token_stride;
 };
-struct ScanArgs {
-    uint32_t head_dim, tokens, qkv_stride, inner, heads, snap;
-};
+using kernels::ScanArgs;
 struct PrepArgs {
     uint32_t channels, kernel_len, tokens, snap, head_dim, heads;
     float lower_bound, l2_eps;
 };
-struct SwigluArgs {
-    uint32_t n;
-    float limit;
-};
+using kernels::SwigluArgs;
 struct CombineArgs {
     uint32_t n, n_used;
 };
-struct RouteArgs {
-    uint32_t n_expert, n_used, norm;
-    float scale;
-    uint32_t lookup, score;
-};
+using kernels::RouteArgs;
 struct PoolArgs {
     uint32_t dim, kpool, pool, row0;
 };
@@ -85,27 +73,20 @@ struct ScoreArgs {
 struct SelectArgs {
     uint32_t first, n_top, kpool, score_stride, list_stride, full_tail;
 };
-struct GatherArgs {
-    uint32_t heads, dim, stride, splits, tokens;
-};
+using kernels::GatherArgs;
+using kernels::IdxDotArgs;
 struct ListSoftmaxArgs {
     uint32_t stride;
     float scale;
     uint32_t heads;
 };
-struct LayerNormArgs {
-    uint32_t n;
-    float eps;
-    uint32_t ystride;
-};
+using kernels::LayerNormArgs;
 struct SoftmaxArgs {
     uint32_t n_kv;
     float scale;
     uint32_t first_kv, heads;
 };
-struct PvArgs {
-    uint32_t heads, dim, n_kv, keys_per_split;
-};
+using kernels::PvArgs;
 
 } // namespace
 
@@ -770,12 +751,12 @@ bool Engine::indexer_select(MTL::ComputeCommandEncoder*& enc, uint32_t il, uint3
     if (Hi != 32)
         throw std::runtime_error("the indexer's matmul expects 32 heads");
     MTL::Buffer* dots = scratch("idx_dots", uint64_t(count) * Hi * stride * 4);
-    const uint32_t da[4] = {Hi, Di, last_pools, stride};
+    const IdxDotArgs da{Hi, Di, last_pools, stride};
     enc->setComputePipelineState(pso("idx_dots"));
     enc->setBuffer(scratch("iq", 0), uint64_t(t) * Hi * Di * 4, 0);
     enc->setBuffer(idx_pooled_[il].get(), 0, 1);
     enc->setBuffer(dots, 0, 2);
-    enc->setBytes(da, sizeof(da), 3);
+    enc->setBytes(&da, sizeof(da), 3);
     for (int rep_ = repeats("idx_dots"); rep_ > 0; --rep_)
         enc->dispatchThreadgroups(MTL::Size((last_pools + 63) / 64, 1, count), MTL::Size(128, 1, 1));
     after(enc, "idx_dots");

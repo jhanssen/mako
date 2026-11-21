@@ -2,6 +2,7 @@
 
 #include "mtl/embedded.hpp"
 #include "quant/dequant.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <bit>
@@ -40,20 +41,9 @@ struct RowsArgs {
 struct UnfoldArgs {
     uint32_t px, py, cells_x, n_cells, n_embd;
 };
-struct NormArgs {
-    uint32_t n, wn;
-    float eps;
-    uint32_t ystride;
-};
-struct LayerNormArgs {
-    uint32_t n;
-    float eps;
-    uint32_t ystride;
-};
-struct SwigluArgs {
-    uint32_t n;
-    float limit;
-};
+using kernels::NormArgs;
+using kernels::LayerNormArgs;
+using kernels::SwigluArgs;
 struct SplitQkvArgs {
     uint32_t n_tok, n_pad, heads, dim, pad;
 };

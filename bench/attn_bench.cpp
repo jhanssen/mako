@@ -3,6 +3,7 @@
 //   attn_bench [queries] [keys] [heads] [block]   (block: the bidirectional image block's first position)
 #include "mtl/context.hpp"
 #include "mtl/embedded.hpp"
+#include "kernels/args.h"
 
 #include <chrono>
 #include <cmath>
@@ -19,10 +20,7 @@ namespace {
 
 using mako::mtl::Ref;
 
-struct AttnArgs {
-    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
-    float scale;
-};
+using mako::kernels::AttnArgs;
 
 uint32_t round_up(uint32_t x, uint32_t m) { return (x + m - 1) / m * m; }
 

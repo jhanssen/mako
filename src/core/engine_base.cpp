@@ -4,6 +4,7 @@
 #include "quant/dequant.hpp"
 #include "quant/quantize.hpp"
 #include "log/log.hpp"
+#include "kernels/args.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -38,10 +39,7 @@ struct HcStepArgs {
     float eps, rms_eps;
     uint32_t wn;
 };
-struct SwigluArgs {
-    uint32_t n;
-    float limit;
-};
+using kernels::SwigluArgs;
 struct Swiglu2Args {
     uint32_t n0, n1;
     float limit0, limit1;
@@ -49,12 +47,7 @@ struct Swiglu2Args {
 struct CombineArgs {
     uint32_t n, n_used;
 };
-struct RouteArgs {
-    uint32_t n_expert, n_used, norm;
-    float scale;
-    uint32_t lookup, score;
-    float miss_penalty;
-};
+using kernels::RouteArgs;
 
 } // namespace
 

@@ -3,6 +3,7 @@
 #include "gguf/read_pool.hpp"
 #include "safetensors/safetensors.hpp"
 #include "quant/dequant.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <array>
@@ -55,12 +56,8 @@ struct ListSoftmaxArgs {
     float scale;
     uint32_t heads;
 };
-struct PvArgs {
-    uint32_t heads, dim, n_kv, keys_per_split;
-};
-struct GatherArgs {
-    uint32_t heads, dim, stride, splits, tokens;
-};
+using kernels::PvArgs;
+using kernels::GatherArgs;
 struct PoolArgs {
     uint32_t dim, kpool, pool, row0;
 };

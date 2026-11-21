@@ -5,6 +5,7 @@
 // past the limit and names the kernel (MAKO_THREADGROUP_CAP lowers the limit it sees).
 //   tg_limit_test
 #include "gpu/runtime.hpp"
+#include "kernels/args.h"
 #include "mtl/context.hpp"
 #include "mtl/embedded.hpp"
 
@@ -23,9 +24,9 @@ struct Probe : mako::gpu::Runtime {
         MTL::Buffer* b = scratch("probe", 64);
         MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
         MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
-        const uint32_t args[4] = {16, 0, 0, 0};
+        const mako::kernels::NormArgs args{16, 0, 0.0f, 0};
         try {
-            dispatch(enc, "rms_norm", {b, b, b}, args, sizeof(args), MTL::Size(1, 1, 1), MTL::Size(threads, 1, 1),
+            dispatch(enc, "rms_norm", {b, b, b}, &args, sizeof(args), MTL::Size(1, 1, 1), MTL::Size(threads, 1, 1),
                      false);
         } catch (...) {
             enc->endEncoding();
