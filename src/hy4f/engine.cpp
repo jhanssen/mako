@@ -313,7 +313,7 @@ uint64_t Engine::prefill_scratch(uint32_t chunk, uint32_t group) const
     const uint64_t per_chunk = 3 * E + 2 * cfg_.q_lora_rank + H * (cfg_.head_k + 2 * R + 2 * cfg_.head_v + 64) +
                                R + cfg_.n_rot + uint64_t(cfg_.indexer_heads) * (cfg_.indexer_dim + 1) +
                                3 * cfg_.indexer_dim + 3 * uint64_t(cfg_.n_ff) + H * (R + 64) / 2 + 5 * E;
-    const uint64_t scores = 3 * (4ull << 20) + 64 * H * 3 * list_stride() + 16 * 64 * H * R +
+    const uint64_t scores = 3 * (16ull << 20) + 64 * H * 3 * list_stride() + 64 * 64 * H * R +
                             32ull * (opts_.max_ctx / cfg_.indexer_kpool + 1);
     const uint64_t batch = std::min<uint64_t>(kBatchRows, uint64_t(group) * k) * (Ex / 2 + 2 * nff + nff / 2);
     const uint64_t staging = group >= kStageMinTokens ? staging_bytes() : 0;
@@ -782,7 +782,7 @@ void Engine::attention(MTL::ComputeCommandEncoder*& enc, const Layer& L, uint32_
     // Dense: groups of query tokens over their keys from kbase on (scores of the latent and the rope part, a
     // softmax with the sinks over both, the latent rows weighted).
     const uint32_t maxkv = W ? W + kKeyAlign + T : pos0 + T;
-    const uint32_t group = std::clamp<uint32_t>((4u << 20) / (H * maxkv), 1, 16);
+    const uint32_t group = std::clamp<uint32_t>((16u << 20) / (H * maxkv), 1, 64);
     // Each group writes its rows of `lat` (sum_splits at the group's offset).
     auto dense_at = [&](uint32_t t, uint32_t gt) {
         const uint32_t p0 = pos0 + t, kbase = W ? window_start(p0, W) : 0;
