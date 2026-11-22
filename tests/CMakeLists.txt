@@ -13,6 +13,9 @@ target_link_libraries(server_test PRIVATE mako_server glaze_headers)
 add_executable(server_http_test server_http_test.cpp)
 target_link_libraries(server_http_test PRIVATE mako_server httplib_headers)
 
+add_executable(server_cancel_test server_cancel_test.cpp)
+target_link_libraries(server_cancel_test PRIVATE mako_server httplib_headers glaze_headers)
+
 add_executable(template_cases_test template_cases_test.cpp)
 target_link_libraries(template_cases_test PRIVATE mako_chat mako_gguf)
 
@@ -94,10 +97,12 @@ add_test(NAME server COMMAND server_test "${MAKO_MODEL}")
 add_test(NAME server_checks COMMAND server_test --no-model)
 add_test(NAME server_ds41 COMMAND server_test "${MAKO_DS41_MODEL}")
 add_test(NAME server_http COMMAND server_http_test "${MAKO_MODEL}")
+add_test(NAME server_cancel COMMAND server_cancel_test "${MAKO_MODEL}")
+add_test(NAME server_cancel_hy4f COMMAND server_cancel_test "${MAKO_HY4F_MODEL}")
 add_test(NAME chat COMMAND chat_test "${MAKO_MODEL}" ${CMAKE_CURRENT_SOURCE_DIR}/data/glm_chat_cases.bin)
 set_tests_properties(tokenizer tokenizer_ds41 template_ds41 chat PROPERTIES LABELS tokenizer)
 set_tests_properties(engram_ds41 PROPERTIES LABELS dsv41)
-set_tests_properties(server server_ds41 server_http PROPERTIES LABELS server)
+set_tests_properties(server server_ds41 server_http server_cancel server_cancel_hy4f PROPERTIES LABELS server)
 # cpu: no GPU and no model (what CI runs on GitHub's macOS runners, which have no usable Metal device).
 set_tests_properties(sampler PROPERTIES LABELS "sampler;cpu")
 set_tests_properties(loop_guard PROPERTIES LABELS "sampler;cpu")
@@ -119,7 +124,7 @@ target_link_libraries(models_test PRIVATE mako_server httplib_headers)
 add_test(NAME models COMMAND models_test)
 set_tests_properties(models PROPERTIES LABELS "server;cpu")
 set_tests_properties(gemv gemm gemm_ds41 gemm_hy4f PROPERTIES LABELS kernels RESOURCE_LOCK gpu_model)
-set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds41 gemm_hy4f chat server server_ds41 server_http gemv gemm PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(tokenizer tokenizer_ds41 template_ds41 engram_ds41 gemm_ds41 gemm_hy4f chat server server_ds41 server_http server_cancel server_cancel_hy4f gemv gemm PROPERTIES SKIP_RETURN_CODE 77)
 
 
 

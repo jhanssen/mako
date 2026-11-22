@@ -105,9 +105,9 @@ public:
 
     // How a prompt relates to this session's context. keep: the leading tokens it can keep in place, its whole
     // context when the prompt continues it (or, with text, spells the rest of it with other tokens) or one of the
-    // last turn's checkpoints (the three newest) when the prompt diverges after that (an edited last message, another
-    // try at the last turn). fork: else an earlier checkpoint, or the fork point's, which a new session can start
-    // from (fork()) leaving this one as it is. 0: none.
+    // last turn's checkpoints (the three newest) when the prompt diverges after that, by tokens or by text (an edited
+    // last message, another try at the last turn, a reply cut off and left out). fork: else an earlier checkpoint, or
+    // the fork point's, which a new session can start from (fork()) leaving this one as it is. 0: none.
     struct Match {
         size_t keep = 0, fork = 0;
     };
@@ -141,13 +141,13 @@ private:
     };
     GenerateResult run(std::span<const int32_t> prompt, const GenerateParams& p,
                        const std::function<bool(int32_t)>& on_token);
-    // The prompt with the context's tokens from its first difference with the context to the context's end, when
-    // they spell the same text as the prompt's there (p.text), and its input rows moved to match; the position of
-    // the difference.
+    // The prompt with the context's tokens from its first difference with the context (at) to where the prompt
+    // stops spelling the context's text (kept: the context's end, or the last place both were at a token boundary
+    // with the same text), and its input rows moved to match.
     struct Respelled {
         std::vector<int32_t> prompt;
         std::vector<GenerateParams::PromptRows> rows;
-        size_t at = 0;
+        size_t at = 0, kept = 0;
     };
     std::optional<Respelled> respell(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
                                      const GenerateParams::Text& t) const;

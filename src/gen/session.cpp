@@ -67,7 +67,15 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
     size_t common = 0;
     while (common < limit && ctx_[common] == prompt[common] && key_at(common) == key_in(rows, common))
         ++common;
-    if (common == ctx_.size() || (text && respell(prompt, rows, *text))) {
+    if (common < ctx_.size() && text)
+        if (const auto r = respell(prompt, rows, *text)) {
+            // As run() will: the tokens it has in common with the context past the part kept.
+            common = r->kept;
+            while (common < std::min(r->prompt.size() - 1, ctx_.size()) && ctx_[common] == r->prompt[common] &&
+                   key_at(common) == key_in(r->rows, common))
+                ++common;
+        }
+    if (common == ctx_.size()) {
         m.keep = ctx_.size();
         return m;
     }
@@ -215,46 +223,75 @@ std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prom
         ++d;
     if (d >= held || d >= n)
         return std::nullopt;
-    for (size_t i = d; i < held; ++i)
-        if (key_at(i))
-            return std::nullopt;
-    // Runs of plain tokens must spell the same text, control tokens be the same; the context's last run may end
-    // inside one of the prompt's tokens (the rest of its text is encoded again).
-    size_t i = d, j = d;
-    std::string rest;
-    while (i < held) {
-        if (t.control(ctx_[i])) {
-            if (j >= n || prompt[j] != ctx_[i])
-                return std::nullopt;
-            ++i, ++j;
-            continue;
-        }
-        std::string a, b;
-        while (i < held && !t.control(ctx_[i]))
+    // From d on: control tokens must be the same, plain tokens spell the same text. `a` and `b` hold the context's
+    // and the prompt's text past the last place both are at a token boundary (the furthest before the prompt's end:
+    // upto, at); the context's text may end inside one of the prompt's tokens (the rest of its text, encoded again).
+    size_t i = d, j = d, upto = d, at = d, same = 0;
+    bool whole = false;
+    std::string a, b;
+    while (true) {
+        if (a.size() == b.size()) {
+            a.clear(), b.clear(), same = 0;
+            if (i == held) {
+                whole = true;
+                break;
+            }
+            if (j == n)
+                break;
+            upto = i, at = j;
+            if (key_at(i) || key_in(rows, j))
+                break;
+            if (t.control(ctx_[i]) || t.control(prompt[j])) {
+                if (ctx_[i] != prompt[j])
+                    break;
+                ++i, ++j;
+                continue;
+            }
             a += t.piece(ctx_[i++]);
-        while (j < n && !t.control(prompt[j]) && (i < held || b.size() < a.size()))
+        } else if (a.size() < b.size()) {
+            if (i == held) {
+                whole = true;
+                break;
+            }
+            if (key_at(i) || t.control(ctx_[i]))
+                break;
+            a += t.piece(ctx_[i++]);
+        } else {
+            if (j == n || key_in(rows, j) || t.control(prompt[j]))
+                break;
             b += t.piece(prompt[j++]);
-        if (i < held ? a != b : b.size() < a.size() || b.compare(0, a.size(), a) != 0)
-            return std::nullopt;
-        rest = b.substr(a.size());
+        }
+        const size_t m = std::min(a.size(), b.size());
+        if (a.compare(same, m - same, b, same, m - same) != 0)
+            break;
+        same = m;
     }
-    for (size_t k = d; k < j; ++k)
-        if (key_in(rows, k))
-            return std::nullopt;
     Respelled r;
     r.at = d;
-    r.prompt.assign(ctx_.begin(), ctx_.end());
-    if (!rest.empty()) {
-        const std::vector<int32_t> more = t.encode(rest);
-        r.prompt.insert(r.prompt.end(), more.begin(), more.end());
+    if (whole) {
+        r.kept = held;
+        r.prompt.assign(ctx_.begin(), ctx_.end());
+        if (b.size() > a.size()) {
+            const std::vector<int32_t> more = t.encode(std::string_view(b).substr(a.size()));
+            r.prompt.insert(r.prompt.end(), more.begin(), more.end());
+        }
+        if (r.prompt.size() + (n - j) > held)
+            at = j;
+        else
+            whole = false; // the prompt ends within the context
     }
-    r.prompt.insert(r.prompt.end(), prompt.begin() + j, prompt.end());
-    if (std::ranges::equal(r.prompt, prompt) || r.prompt.size() <= held)
-        return std::nullopt;
+    if (!whole) {
+        // The context's tokens up to the last place the prompt still spelled it, when a checkpoint there keeps more.
+        if (std::ranges::none_of(saved_, [&](const Saved& s) { return s.cp->pos > d && s.cp->pos <= upto; }))
+            return std::nullopt;
+        r.kept = upto;
+        r.prompt.assign(ctx_.begin(), ctx_.begin() + upto);
+    }
+    r.prompt.insert(r.prompt.end(), prompt.begin() + at, prompt.end());
     const int64_t shift = int64_t(r.prompt.size()) - int64_t(n);
     r.rows.assign(rows.begin(), rows.end());
     for (auto& row : r.rows)
-        if (row.rows.pos >= j)
+        if (row.rows.pos >= at)
             row.rows.pos = uint32_t(int64_t(row.rows.pos) + shift);
     return r;
 }
@@ -269,9 +306,8 @@ GenerateResult Session::generate(std::span<const int32_t> prompt, const Generate
         if (r) {
             GenerateParams q = p;
             q.input_rows = std::move(r->rows);
-            const size_t held = ctx_.size();
             GenerateResult res = run(r->prompt, q, on_token);
-            res.respelled = uint32_t(held - r->at);
+            res.respelled = uint32_t(r->kept - r->at);
             res.respelled_at = uint32_t(r->at);
             return res;
         }

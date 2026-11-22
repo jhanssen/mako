@@ -5,7 +5,9 @@
 // - other text, or a control token where the context has plain text: the prompt diverges as without respelling;
 // - input rows after the respelled part move with it;
 // - a third turn that spells both earlier replies otherwise: the pool keeps the conversation instead of forking it
-//   from before the first reply.
+//   from before the first reply;
+// - a reply cut off and left out of the next prompt, which adds a message instead (a client's cancel): the
+//   respelled context is kept up to that prompt's last token, not read again from the first respelled token.
 #include "gen/pool.hpp"
 #include "gen/session.hpp"
 
@@ -177,6 +179,31 @@ int main()
         check(!pick.forked && pick.usable == 11 && r.reused_tokens == 11 && m.read == 3 && pool.size() == 1,
               std::format("both replies spelled otherwise: kept, not forked (forked {}, usable {}, read {})",
                           pick.forked, pick.usable, m.read));
+    }
+    {
+        Recorder m;
+        mako::gen::SessionPool pool(m, 1 << 20);
+        const auto run = [&](const V& prompt, V reply, size_t cut = 0) {
+            mako::gen::GenerateResult r;
+            mako::gen::SessionPool::Pick pick;
+            m.read = 0;
+            size_t emitted = 0;
+            pool.generate(prompt, params(std::move(reply)), [&](int32_t) { return !cut || ++emitted < cut; }, r, pick);
+            return std::pair{r, pick};
+        };
+        run(V{0, 1, 3}, {5, 6, 4});
+        run(V{0, 1, 3, 7, 4, 8, 0, 3}, {5, 6});
+        const V turn = {0, 1, 3, 7, 4, 8, 0, 3, 7, 8, 1}; // both replies as .\n, then "b"
+        V cut = turn, next = turn;
+        cut.push_back(3);
+        const auto [r3, p3] = run(cut, {4, 4, 4, 4, 4}, 2); // cancelled after two tokens
+        next.insert(next.end(), {8, 0, 0, 3});              // the cut reply left out, another message after "b"
+        const auto [r, pick] = run(next, {});
+        check(r3.finish == mako::gen::Finish::cancelled && !pick.forked && r.reused_tokens == 13 && m.read == 4 &&
+                  r.respelled == 10 && pool.size() == 1,
+              std::format("a cut-off reply left out: the respelled context kept to before its prompt's last token "
+                          "(reused {}, read {}, respelled {}, forked {})",
+                          r.reused_tokens, m.read, r.respelled, pick.forked));
     }
     std::println("{} failures", failures);
     return failures ? 1 : 0;
