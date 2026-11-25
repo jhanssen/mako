@@ -35,10 +35,10 @@ cp "$src/docs/presets.example.json" "$pkg/examples/presets.json"
 
 # Each license from the copy the build downloaded, under the component and the version the build pins.
 version() { sed -n "$2" "$src/$1" | head -n 1; }
-llama=$(version cmake/llama_cpp_sources.cmake 's/^set(LLAMA_CPP_RELEASE \(.*\))$/\1/p')
-httplib=$(version cmake/server_deps.cmake 's/.*cpp-httplib\/\(v[0-9.]*\)\/.*/\1/p')
-glaze=$(version cmake/server_deps.cmake 's/.*glaze\/archive\/refs\/tags\/\(v[0-9.]*\)\.tar\.gz.*/\1/p')
-metal_cpp=$(version CMakeLists.txt 's/.*metal-cpp_\([0-9.]*\)\.zip.*/\1/p')
+llama=$(version external/mako-common/cmake/llama_cpp_sources.cmake 's/^set(LLAMA_CPP_RELEASE \(.*\))$/\1/p')
+httplib=$(version external/mako-common/cmake/server_deps.cmake 's/.*cpp-httplib\/\(v[0-9.]*\)\/.*/\1/p')
+glaze=$(version external/mako-common/cmake/server_deps.cmake 's/.*glaze\/archive\/refs\/tags\/\(v[0-9.]*\)\.tar\.gz.*/\1/p')
+metal_cpp=$(version external/mako-common/CMakeLists.txt 's/.*metal-cpp_\([0-9.]*\)\.zip.*/\1/p')
 {
     echo "Third-party code built into mako, with its licenses."
     for entry in \
