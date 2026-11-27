@@ -36,6 +36,8 @@ public:
         uint32_t evicted = 0;
         uint32_t switches = 0; // times the request gave the engine up and took it back
         double switch_ms = 0;  // taking its context back in those
+        // fresh or forked: where the prompt left the conversation that held most of it
+        std::optional<GenerateResult::Divergence> diverged;
         size_t conversations = 0; // kept when the request ended, and their parked bytes
         uint64_t parked = 0;
     };

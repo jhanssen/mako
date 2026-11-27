@@ -75,10 +75,10 @@ void log_divergence(const std::string& id, const gen::GenerateResult& r, const t
     if (!r.diverged)
         return;
     const auto& d = *r.diverged;
-    const auto show = [&](const std::vector<int32_t>& ids) {
+    const auto show = [&](const std::vector<int32_t>& ids, size_t from, size_t at) {
         std::string s;
         for (size_t i = 0; i < ids.size(); ++i) {
-            if (d.from + i == d.at)
+            if (from + i == at)
                 s += " >>";
             s += " ";
             for (char c : tok.decode(std::span(&ids[i], 1))) {
@@ -93,8 +93,10 @@ void log_divergence(const std::string& id, const gen::GenerateResult& r, const t
         }
         return s;
     };
-    log::info("{}: the prompt differs from the context ({} tokens) at token {}; context:{}; prompt:{}", id, d.held, d.at,
-              show(d.context), show(d.prompt));
+    log::info("{}: the prompt differs from {} ({} tokens) at token {}{}; context:{}; prompt:{}", id,
+              d.conversation ? std::format("conversation {}'s context", *d.conversation) : "the context", d.held, d.at,
+              d.prompt_at != d.at ? std::format(" (the prompt's token {})", d.prompt_at) : "",
+              show(d.context, d.from, d.at), show(d.prompt, d.prompt_from, d.prompt_at));
 }
 
 } // namespace

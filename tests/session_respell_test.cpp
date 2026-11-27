@@ -7,7 +7,8 @@
 // - a third turn that spells both earlier replies otherwise: the pool keeps the conversation instead of forking it
 //   from before the first reply;
 // - a reply cut off and left out of the next prompt, which adds a message instead (a client's cancel): the
-//   respelled context is kept up to that prompt's last token, not read again from the first respelled token.
+//   respelled context is kept up to that prompt's last token, not read again from the first respelled token;
+// - a prompt no conversation can keep: where it left the closest one is reported.
 #include "gen/pool.hpp"
 #include "gen/session.hpp"
 
@@ -136,8 +137,12 @@ int main()
         s.generate(V{0, 1, 3}, params({5, 6, 4}));
         m.read = 0;
         const auto r = s.generate(V{0, 1, 3, 7, 0, 8, 0, 3}, params({})); // ".\na", not ".\nx"
-        check(r.respelled == 0 && r.reused_tokens == 2 && r.diverged && r.diverged->at == 3,
-              std::format("other text: diverges as before (reused {}, respelled {})", r.reused_tokens, r.respelled));
+        check(r.respelled == 0 && r.reused_tokens == 2 && r.diverged && r.diverged->at == 5 &&
+                  r.diverged->prompt_at == 4,
+              std::format("other text: diverges as before, reported where the text differs (reused {}, respelled {}, "
+                          "at {} and the prompt's {})",
+                          r.reused_tokens, r.respelled, r.diverged ? int(r.diverged->at) : -1,
+                          r.diverged ? int(r.diverged->prompt_at) : -1));
     }
     {
         Recorder m;
@@ -204,6 +209,23 @@ int main()
               std::format("a cut-off reply left out: the respelled context kept to before its prompt's last token "
                           "(reused {}, read {}, respelled {}, forked {})",
                           r.reused_tokens, m.read, r.respelled, pick.forked));
+    }
+    {
+        Recorder m;
+        mako::gen::SessionPool pool(m, 1 << 20);
+        const auto run = [&](const V& prompt, V reply) {
+            mako::gen::GenerateResult r;
+            mako::gen::SessionPool::Pick pick;
+            pool.generate(prompt, params(std::move(reply)), {}, r, pick);
+            return std::pair{r, pick};
+        };
+        const auto [r1, p1] = run(V{0, 1, 3}, {5, 6, 4});
+        run(V{0, 1, 3, 5, 6, 4, 8, 0, 3}, {5, 6});
+        const auto [r, pick] = run(V{0, 0, 3, 5, 6, 4, 8, 0, 3, 5, 6, 8, 1, 3}, {}); // the first message edited
+        check(pick.fresh && r.diverged && r.diverged->conversation == p1.index && r.diverged->at == 1 &&
+                  r.diverged->held == 11,
+              std::format("a new conversation: where the prompt left the old one is reported (fresh {}, at {}, held {})",
+                          pick.fresh, r.diverged ? int(r.diverged->at) : -1, r.diverged ? int(r.diverged->held) : -1));
     }
     std::println("{} failures", failures);
     return failures ? 1 : 0;

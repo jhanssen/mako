@@ -105,8 +105,13 @@ SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
     Session* fork = nullptr;
     size_t keep_len = 0, fork_len = 0, fork_index = 0;
     uint64_t keep_used = 0;
+    std::optional<GenerateResult::Divergence> diverged;
     for (const Slot& s : slots_) {
-        const Session::Match m = s.session->match(prompt, rows, text);
+        Session::Match m = s.session->match(prompt, rows, text);
+        if (m.diverged && (!diverged || m.diverged->at > diverged->at)) {
+            diverged = std::move(m.diverged);
+            diverged->conversation = s.index;
+        }
         if (!s.busy && m.keep > 0 && (m.keep > keep_len || (m.keep == keep_len && s.used > keep_used))) {
             keep = s.session.get();
             keep_len = m.keep;
@@ -123,6 +128,7 @@ SessionPool::Pick SessionPool::acquire(std::span<const int32_t> prompt,
     if (!keep || fork_len > keep_len) {
         slots_.push_back({std::make_unique<Session>(*model_), next_index_++, 0, false});
         s = slots_.back().session.get();
+        pick.diverged = std::move(diverged);
         if (fork && fork_len > keep_len) {
             make_live(fork);
             s->fork(*fork, fork_len);
@@ -223,6 +229,9 @@ bool SessionPool::generate(std::span<const int32_t> prompt, GenerateParams p,
         slice_start = std::chrono::steady_clock::now();
     };
     result = pick.session->generate(prompt, p, on_token);
+    // A new session holds only what matched: the departure from the old conversation is in the pick.
+    if (!result.diverged && pick.diverged)
+        result.diverged = pick.diverged;
     pick.conversations = slots_.size();
     pick.parked = parked_bytes();
     return true;

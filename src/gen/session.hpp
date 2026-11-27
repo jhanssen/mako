@@ -72,11 +72,15 @@ struct GenerateResult {
     double prefill_ms = 0, decode_ms = 0;
     uint32_t drafts = 0, accepted = 0; // speculative verifications and drafts kept
     uint32_t lookup_drafts = 0, lookup_accepted = 0; // of them, from repeats of the context
-    // When the prompt differed from the context held before it: the first differing position, the context's length,
-    // and the tokens of each from a few before that position.
+    // When the prompt differed from the context held before it: the first differing position in each (past text the
+    // prompt spells with other tokens, at the last place both were at a token boundary), the context's length, and
+    // the tokens of each from a few before that position. conversation: another conversation's context, when the
+    // pool started a new one (SessionPool::Pick).
     struct Divergence {
         uint32_t at = 0, held = 0, from = 0;
+        uint32_t prompt_at = 0, prompt_from = 0;
         std::vector<int32_t> context, prompt;
+        std::optional<size_t> conversation;
     };
     std::optional<Divergence> diverged;
     // Tokens of the context kept in place of the prompt's from position respelled_at, which spelled the same text
@@ -108,8 +112,10 @@ public:
     // last turn's checkpoints (the three newest) when the prompt diverges after that, by tokens or by text (an edited
     // last message, another try at the last turn, a reply cut off and left out). fork: else an earlier checkpoint, or
     // the fork point's, which a new session can start from (fork()) leaving this one as it is. 0: none.
+    // diverged: where the prompt leaves the context, when it does.
     struct Match {
         size_t keep = 0, fork = 0;
+        std::optional<GenerateResult::Divergence> diverged;
     };
     Match match(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
                 const GenerateParams::Text* text = nullptr) const;
@@ -149,8 +155,11 @@ private:
         std::vector<GenerateParams::PromptRows> rows;
         size_t at = 0, kept = 0;
     };
+    // stop: when the text differs and nothing is kept, the context's and the prompt's positions where it last agreed.
     std::optional<Respelled> respell(std::span<const int32_t> prompt, std::span<const GenerateParams::PromptRows> rows,
-                                     const GenerateParams::Text& t) const;
+                                     const GenerateParams::Text& t,
+                                     std::optional<std::pair<size_t, size_t>>* stop = nullptr) const;
+    GenerateResult::Divergence divergence(size_t at, std::span<const int32_t> prompt, size_t prompt_at) const;
     void rewind(size_t keep);
     void save_checkpoint(bool fork = false);
     // The key of ctx_[i]: its span's in keys_, else 0.

@@ -67,8 +67,10 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
     size_t common = 0;
     while (common < limit && ctx_[common] == prompt[common] && key_at(common) == key_in(rows, common))
         ++common;
+    std::optional<Respelled> r;
+    std::optional<std::pair<size_t, size_t>> stop;
     if (common < ctx_.size() && text)
-        if (const auto r = respell(prompt, rows, *text)) {
+        if ((r = respell(prompt, rows, *text, &stop))) {
             // As run() will: the tokens it has in common with the context past the part kept.
             common = r->kept;
             while (common < std::min(r->prompt.size() - 1, ctx_.size()) && ctx_[common] == r->prompt[common] &&
@@ -79,6 +81,8 @@ Session::Match Session::match(std::span<const int32_t> prompt, std::span<const G
         m.keep = ctx_.size();
         return m;
     }
+    m.diverged = stop ? divergence(stop->first, prompt, stop->second)
+                      : divergence(common, r ? std::span<const int32_t>(r->prompt) : prompt, common);
     // The last turn's checkpoints rewind this session: where its reply ended, before its prompt's last token (another
     // try at it) and where the reply before it ended (an edited last message), the three newest. An older one, or
     // the fork point's, starts another session from there.
@@ -215,7 +219,8 @@ void Session::save_checkpoint(bool fork)
 
 std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prompt,
                                                    std::span<const GenerateParams::PromptRows> rows,
-                                                   const GenerateParams::Text& t) const
+                                                   const GenerateParams::Text& t,
+                                                   std::optional<std::pair<size_t, size_t>>* stop) const
 {
     const size_t held = ctx_.size(), n = prompt.size();
     size_t d = 0;
@@ -282,8 +287,11 @@ std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prom
     }
     if (!whole) {
         // The context's tokens up to the last place the prompt still spelled it, when a checkpoint there keeps more.
-        if (std::ranges::none_of(saved_, [&](const Saved& s) { return s.cp->pos > d && s.cp->pos <= upto; }))
+        if (std::ranges::none_of(saved_, [&](const Saved& s) { return s.cp->pos > d && s.cp->pos <= upto; })) {
+            if (stop)
+                *stop = std::pair{upto, at};
             return std::nullopt;
+        }
         r.kept = upto;
         r.prompt.assign(ctx_.begin(), ctx_.begin() + upto);
     }
@@ -296,13 +304,34 @@ std::optional<Session::Respelled> Session::respell(std::span<const int32_t> prom
     return r;
 }
 
+GenerateResult::Divergence Session::divergence(size_t at, std::span<const int32_t> prompt, size_t prompt_at) const
+{
+    GenerateResult::Divergence d;
+    d.at = uint32_t(at);
+    d.held = uint32_t(ctx_.size());
+    d.from = uint32_t(at - std::min<size_t>(at, 8));
+    d.context.assign(ctx_.begin() + d.from, ctx_.begin() + std::min(ctx_.size(), at + 16));
+    d.prompt_at = uint32_t(prompt_at);
+    d.prompt_from = uint32_t(prompt_at - std::min<size_t>(prompt_at, 8));
+    d.prompt.assign(prompt.begin() + d.prompt_from, prompt.begin() + std::min(prompt.size(), prompt_at + 16));
+    return d;
+}
+
 GenerateResult Session::generate(std::span<const int32_t> prompt, const GenerateParams& p,
                                  const std::function<bool(int32_t)>& on_token)
 {
     try {
         std::optional<Respelled> r;
+        std::optional<std::pair<size_t, size_t>> stop;
         if (p.text && !parked_ && e_->position() == ctx_.size())
-            r = respell(prompt, p.input_rows, *p.text);
+            r = respell(prompt, p.input_rows, *p.text, &stop);
+        if (!r && stop) {
+            const auto d = divergence(stop->first, prompt, stop->second);
+            GenerateResult res = run(prompt, p, on_token);
+            if (res.diverged)
+                res.diverged = d;
+            return res;
+        }
         if (r) {
             GenerateParams q = p;
             q.input_rows = std::move(r->rows);
@@ -343,15 +372,8 @@ GenerateResult Session::run(std::span<const int32_t> prompt, const GenerateParam
     while (common < std::min(limit, ctx_.size()) && ctx_[common] == prompt[common] &&
            key_at(common) == prompt_key(common))
         ++common;
-    if (common < ctx_.size() && common < limit) {
-        GenerateResult::Divergence d;
-        d.at = uint32_t(common);
-        d.held = uint32_t(ctx_.size());
-        d.from = uint32_t(common - std::min<size_t>(common, 8));
-        d.context.assign(ctx_.begin() + d.from, ctx_.begin() + std::min(ctx_.size(), common + 16));
-        d.prompt.assign(prompt.begin() + d.from, prompt.begin() + std::min(prompt.size(), common + 16));
-        res.diverged = std::move(d);
-    }
+    if (common < ctx_.size() && common < limit)
+        res.diverged = divergence(common, prompt, common);
     rewind(common);
     res.reused_tokens = uint32_t(ctx_.size());
     // The engine reads the rows only while the prompt runs.
