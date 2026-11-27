@@ -65,12 +65,18 @@ std::expected<Config, std::string> Config::load(const gguf::ModelFiles& m)
     for (double kv : k.per_layer("attention.head_count_kv", blocks))
         c.is_kda.push_back(kv == 0.0);
 
+    // Per trunk layer, absent meaning all true: false reuses the previous attention layer's selection.
+    if (f.find("glm5-next.attention.indexer.types")) {
+        const std::vector<bool> full = k.bools("attention.indexer.types", c.n_layer);
+        for (uint32_t il = 0; il < c.n_layer; ++il)
+            if (!c.is_kda[il] && !full[il])
+                k.missing += std::format(" attention.indexer.types(layer {} shares an indexer: not supported)", il);
+    }
+
     if (!k.missing.empty())
         return std::unexpected("glm5-next metadata missing or invalid:" + k.missing);
     if (c.hc != 4)
         return std::unexpected(std::format("hyper_connection.count {} is not supported", c.hc));
-    if (f.find("glm5-next.attention.indexer.types"))
-        return std::unexpected("per-layer indexer types are not supported yet");
     return c;
 }
 
