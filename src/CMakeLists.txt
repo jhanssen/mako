@@ -9,9 +9,9 @@ add_custom_target(mako_version
     BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/mako_version.hpp
     COMMENT "Checking the commit")
 
-add_library(mako_chat STATIC chat/template.cpp)
+add_library(mako_chat STATIC chat/template.cpp chat/template_source.cpp)
 target_include_directories(mako_chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mako_chat PRIVATE jinja_engine)
+target_link_libraries(mako_chat PRIVATE jinja_engine glaze_headers)
 
 # Detokenizing a stream into whole characters.
 add_library(mako_stream STATIC text/stream.cpp)

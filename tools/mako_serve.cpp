@@ -5,7 +5,7 @@
 //              [--prefetch-ahead D] [--imatrix FILE] [--prefill-skip 0|1] [--api-key KEY | --api-key-file FILE]
 //              [--reasoning-effort E] [--reasoning-budget N] [--mmproj FILE] [--image-max-tokens N]
 //              [--park-gb N] [--conversations N] [--slice-ms N] [--loop-guard N] [--no-spin-wait] [--no-keepalive] [--no-page-cache]
-//              [--lookup-draft N]
+//              [--lookup-draft N] [--chat-template FILE] [--template-edits FILE]
 // --api-key KEY[,KEY...] / --api-key-file FILE (a key per line) / MAKO_API_KEY (KEY[,KEY...], when neither is given):
 // requests need one of the keys ("Authorization: Bearer KEY" or "x-api-key: KEY"); a --host other than the loopback
 // address requires one. Without keys, requests from web pages (an Origin or Host header that is not loopback) get 403.
@@ -28,7 +28,9 @@
 // most N prompt rows (default: the model's limit, 1024 for DeepSeek-V4.1, 8000 for GLM-5.3). Each conversation keeps
 // its context between requests: up to --conversations (default 16) besides the one generating are parked in memory,
 // within --park-gb (default: what the expert cache leaves when every expert is resident, 1-8 GB; taken from the
-// expert cache beyond that), the least recently used given up first. Requests take turns: while others wait, the
+// expert cache beyond that), the least recently used given up first. --chat-template replaces the model's chat
+// template with a file's, --template-edits applies find/replace pairs to it (chat::apply_edits; chat_template prints
+// the result). Requests take turns: while others wait, the
 // one generating gives the engine up every --slice-ms (default 1000; at a decode step, or between prompt pieces of the
 // engine's prefill group) and queues again. Another process on this machine (an image server) may borrow the LLM's
 // memory (POST /v1/memory/acquire): it waits for the chat requests in progress, then the LLM is unloaded (its
@@ -36,6 +38,7 @@
 #include "app/cli.hpp"
 #include "app/dense_quant.hpp"
 #include "chat/template.hpp"
+#include "chat/template_source.hpp"
 #include "log/log.hpp"
 #include "dsv41/config.hpp"
 #include "dsv41/engram.hpp"
@@ -95,6 +98,7 @@ int main(int argc, char** argv)
     uint32_t prefetch_k = 4, prefetch_ahead = 2;
     bool prefill_skip = true, spin_wait = true, keepalive = true, page_cache = true;
     std::optional<mako::gguf::Type> dense_quant;
+    mako::chat::TemplateSource template_src;
     const auto args =
         mako::app::Cli("mako_serve", "<model.gguf>", 1, 1)
             .option("--host", "H", "address to listen on (default 127.0.0.1; others need an API key)", so.host)
@@ -163,6 +167,10 @@ int main(int argc, char** argv)
             .option("--ablate-scale", "S", "multiply the ablation's strength", ablate_scale)
             .flag("--learn", "add the session's routing counts to the model's profile on exit", learn)
             .option("--dump-requests", "DIR", "write each request body to DIR", so.dump_dir)
+            .option("--chat-template", "FILE", "a Jinja file to use instead of the model's chat template",
+                    template_src.file)
+            .option("--template-edits", "FILE", "find/replace pairs (JSON) to apply to the chat template",
+                    template_src.edits)
             .parse(argc, argv);
     const char* model_path = args[0].c_str();
     // SIGINT and SIGTERM go to one thread that stops the server (every thread started later inherits the mask).
@@ -198,14 +206,22 @@ int main(int argc, char** argv)
     }
     const auto& meta = model->meta(); // (after add(), which may move the files)
     auto tok = mako::text::Tokenizer::load(meta);
-    const auto source = meta.get_string("tokenizer.chat_template");
-    if (!tok || !source) {
-        mako::log::error("{}", !tok ? tok.error() : "the model has no chat template");
+    if (!tok) {
+        mako::log::error("{}", tok.error());
         return 1;
     }
+    auto source = mako::chat::template_source(meta.get_string("tokenizer.chat_template"), template_src);
+    if (!source) {
+        mako::log::error("{}", source.error());
+        return 1;
+    }
+    if (!template_src.file.empty())
+        mako::log::info("chat template from {}", template_src.file);
+    if (!template_src.edits.empty())
+        mako::log::info("chat template edited by {}", template_src.edits);
     std::optional<mako::chat::Template> tmpl;
     try {
-        tmpl.emplace(std::string(*source));
+        tmpl.emplace(std::move(*source));
     } catch (const std::exception& e) {
         mako::log::error("{}", e.what());
         return 1;

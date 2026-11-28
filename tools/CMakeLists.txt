@@ -45,3 +45,6 @@ add_executable(arena_replay arena_replay.cpp)
 
 add_executable(hy4f_run hy4f_run.cpp)
 target_link_libraries(hy4f_run PRIVATE mako_hy4f mako_text mako_app)
+
+add_executable(chat_template chat_template.cpp)
+target_link_libraries(chat_template PRIVATE mako_chat mako_gguf mako_app)

@@ -9,7 +9,7 @@ one's options.
   tokens. `ds_run` also compares logits with a reference dump, measures decode widths and collects an imatrix.
 - `vision_run`, `vision_chat`: the vision encoder on an image, and a chat with images.
 - `prefill_sweep`: prefill timing over prompt lengths (`--parts` for the GPU time by part).
-- Inspection: `gguf_dump`, `tokenize`, `render_template`, `engram_rows`, `logit_compare`.
+- Inspection: `gguf_dump`, `tokenize`, `chat_template` (prints the template a model uses), `render_template`, `engram_rows`, `logit_compare`.
 - `ref_dump` and `ref_vision`: logits and image embeddings from the reference implementation, when CMake is given its
   checkout (`MAKO_REF_SRC`, `MAKO_REF_BUILD`; `ref_vision` needs its `mtmd` library built).
 - Python, in `tools/`: the generators of test data (`gen_*.py`; the unicode tables' in mako-common), `make_ablation.py`, `hy4f_ablation.py`, `gguf_retag.py`, `self_check.py`.

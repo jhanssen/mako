@@ -47,6 +47,21 @@ here has examples for both models. mako-image's programs read the same file, and
 MAKO_ARENA_GB=40 ./build/tools/mako_serve ~/models/glm/model-00001-of-00003.gguf
 ```
 
+## Chat template
+
+`mako_serve` uses the GGUF's `tokenizer.chat_template` unless told otherwise:
+
+- `--chat-template FILE`: a Jinja file instead of the model's template.
+- `--template-edits FILE`: find/replace pairs applied in order to the template (the model's or the file's), as JSON:
+  `[{"find": "...", "replace": "..."}]`. Each find must occur exactly once in the text it is applied to; one that
+  occurs zero or several times stops the server, naming the edit, so an edit that no longer matches the template does
+  not go unnoticed.
+
+`chat_template <model.gguf>...` prints each model's template (from the first shard), with the same two options
+applied as `mako_serve` would, and `--check` parses the result. The output is the template byte for byte, so
+`chat_template model.gguf > my.jinja` gives a file to edit for `--chat-template`. Both options work in presets
+(`"--template-edits": "~/Library/Application Support/mako/steam-edits.json"`).
+
 ## DeepSeek-V4.1 speed and accuracy
 
 Measured in `performance.md`.

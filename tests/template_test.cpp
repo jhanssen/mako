@@ -3,6 +3,7 @@
 // JSON the engine rejects.
 //   template_test
 #include "chat/template.hpp"
+#include "chat/template_source.hpp"
 
 #include <print>
 #include <stdexcept>
@@ -128,6 +129,38 @@ int main()
              {"bad literal", R"({"x": tru})"},
          })
         expect_throw(name, context);
+
+    // Template edits: applied in order, each find exactly once; anything else is an error naming the edit.
+    {
+        auto edit = [](const std::string& source, const std::string& edits) {
+            auto r = mako::chat::apply_edits(source, edits);
+            return r ? *r : "<error> " + r.error();
+        };
+        auto check = [](const std::string& name, const std::string& got, const std::string& want) {
+            if (got != want) {
+                std::println("FAIL {}:\n  want: {}\n  got:  {}", name, want, got);
+                ++failures;
+            }
+        };
+        auto fails = [](const std::string& name, const std::string& got, const std::string& part) {
+            if (!got.starts_with("<error> ") || got.find(part) == std::string::npos) {
+                std::println("FAIL {}: want an error with \"{}\", got {}", name, part, got);
+                ++failures;
+            }
+        };
+        const std::string src = "You are a helpful assistant.\n{{ messages }}";
+        check("edit", edit(src, R"([{"find": "a helpful assistant", "replace": "terse"}])"), "You are terse.\n{{ messages }}");
+        check("edits in order", edit(src, R"([{"find": "helpful", "replace": "careful"}, {"find": "careful a", "replace": "careful, a"}])"),
+              "You are a careful, assistant.\n{{ messages }}");
+        check("no edits", edit(src, "[]"), src);
+        check("multi-line", edit("a\nb\nc", R"([{"find": "a\nb", "replace": "x"}])"), "x\nc");
+        fails("missing find", edit(src, R"([{"find": "absent", "replace": ""}])"), "edit 1: its find occurs 0 times");
+        fails("twice", edit("aXa", R"([{"find": "a", "replace": "b"}])"), "occurs 2 times");
+        fails("empty find", edit(src, R"([{"find": "", "replace": "x"}])"), "an empty find");
+        fails("no replace key", edit(src, R"([{"find": "You"}])"), "template edits");
+        fails("not an array", edit(src, R"({"find": "You", "replace": "x"})"), "template edits");
+        fails("second edit", edit(src, R"([{"find": "You", "replace": "We"}, {"find": "You", "replace": "x"}])"), "edit 2");
+    }
 
     if (failures) {
         std::println("{} failures", failures);
